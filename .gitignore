@@ -1,0 +1,13 @@
+.worktrees/
+.superpowers/sdd/
+workspace/
+backend/.venv/
+backend/__pycache__/
+**/__pycache__/
+.pytest_cache/
+.coverage
+.env
+.env.local
+frontend/node_modules/
+frontend/dist/
+
