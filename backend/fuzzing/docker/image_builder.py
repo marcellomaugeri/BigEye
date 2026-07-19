@@ -22,21 +22,29 @@ class ImageBuilder:
             path=str(dockerfile.parent), dockerfile=dockerfile.name, tag=tag,
             platform=PLATFORM, decode=True, rm=True,
         )
-        image_id = None
         for entry in stream:
             if not isinstance(entry, dict):
                 raise ImageBuildFailed("Docker build stream contained an invalid entry")
             text = entry.get("stream")
             if text:
                 sink(text)
-            error = entry.get("error") or entry.get("errorDetail", {}).get("message")
+            detail = entry.get("errorDetail") or {}
+            error = entry.get("error") or (detail.get("message") if isinstance(detail, dict) else detail)
             if error:
                 message = str(error)
                 sink(message if message.endswith("\n") else f"{message}\n")
                 raise ImageBuildFailed(message)
-            auxiliary = entry.get("aux") or {}
-            if auxiliary.get("ID"):
-                image_id = str(auxiliary["ID"])
-        if image_id is None:
-            raise ImageBuildFailed("Docker build stream ended without an image ID")
-        return image_id
+            status = entry.get("status")
+            identifier = entry.get("id")
+            progress = entry.get("progress")
+            if status or identifier or progress:
+                prefix = f"{identifier}: " if identifier else ""
+                rendered = f"{prefix}{status or ''}{(' ' + progress) if progress else ''}".strip()
+                sink(f"{rendered}\n")
+        try:
+            image_id = self._client.api.inspect_image(tag)["Id"]
+        except Exception as error:
+            raise ImageBuildFailed(f"built image {tag} could not be inspected: {error}") from error
+        if not image_id:
+            raise ImageBuildFailed(f"built image {tag} could not be inspected: no image ID")
+        return str(image_id)

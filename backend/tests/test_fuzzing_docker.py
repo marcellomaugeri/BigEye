@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
+import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,12 +28,15 @@ class TestImageBuilder:
             def build(self, **kwargs):
                 calls.append(kwargs)
                 return iter(({"stream": "Step 1/1 : FROM ubuntu:24.04\n"}, {"aux": {"ID": "sha256:built"}}))
+            def inspect_image(self, tag):
+                assert tag == "bigeye-llvm:test"
+                return {"Id": "sha256:canonical"}
         api = Api()
         logs: list[str] = []
 
         image_id = ImageBuilder(SimpleNamespace(api=api)).build(dockerfile, "bigeye-llvm:test", logs.append)
 
-        assert image_id == "sha256:built"
+        assert image_id == "sha256:canonical"
         assert calls == [{"path": str(tmp_path), "dockerfile": "Dockerfile", "tag": "bigeye-llvm:test", "platform": "linux/amd64", "decode": True, "rm": True}]
         assert logs == ["Step 1/1 : FROM ubuntu:24.04\n"]
 
@@ -51,6 +57,31 @@ class TestImageBuilder:
             ImageBuilder(SimpleNamespace(api=Api())).build(dockerfile, "bigeye-llvm:test", logs.append)
         assert logs == ["building\n", "daemon build failed\n"]
         assert calls[0]["platform"] == "linux/amd64"
+
+    def test_build_supports_classic_success_stream_and_forwards_status_progress(self, tmp_path: Path) -> None:
+        from backend.fuzzing.docker.image_builder import ImageBuilder
+
+        dockerfile = tmp_path / "Dockerfile"
+        dockerfile.write_text("FROM ubuntu:24.04\n")
+        class Api:
+            def build(self, **kwargs):
+                return iter(({"id": "ubuntu", "status": "Pulling", "progress": "[====>    ]"}, {"stream": "Successfully built legacy\n"}))
+            def inspect_image(self, tag): return {"Id": "sha256:classic"}
+        logs: list[str] = []
+
+        assert ImageBuilder(SimpleNamespace(api=Api())).build(dockerfile, "bigeye-llvm:classic", logs.append) == "sha256:classic"
+        assert logs == ["ubuntu: Pulling [====>    ]\n", "Successfully built legacy\n"]
+
+    def test_build_without_aux_raises_when_tag_is_not_inspectable(self, tmp_path: Path) -> None:
+        from backend.fuzzing.docker.image_builder import ImageBuildFailed, ImageBuilder
+
+        dockerfile = tmp_path / "Dockerfile"
+        dockerfile.write_text("FROM ubuntu:24.04\n")
+        class Api:
+            def build(self, **kwargs): return iter(({"stream": "Successfully built legacy\n"},))
+            def inspect_image(self, tag): raise RuntimeError("tag absent")
+        with pytest.raises(ImageBuildFailed, match="could not be inspected"):
+            ImageBuilder(SimpleNamespace(api=Api())).build(dockerfile, "bigeye-llvm:missing", lambda text: None)
 
 
 class TestImageInspector:
@@ -122,7 +153,8 @@ class TestContainerRunner:
         assert options == {
             "platform": "linux/amd64", "network_disabled": True, "read_only": True,
             "cap_drop": ["ALL"], "security_opt": ["no-new-privileges"], "pids_limit": 64,
-            "mem_limit": "512m", "nano_cpus": 1_000_000_000, "detach": True,
+            "mem_limit": "512m", "nano_cpus": 1_000_000_000,
+            "tmpfs": {"/tmp": "rw,nosuid,nodev,exec,size=64m,mode=1777"}, "detach": True,
         }
 
     def test_runner_cleans_exact_container_when_wait_times_out(self) -> None:
@@ -142,6 +174,55 @@ class TestContainerRunner:
         with pytest.raises(ContainerTimedOut):
             run(ContainerRunner(SimpleNamespace(containers=Containers())).run("image", ["true"], 1, lambda text: None))
         assert cleaned == [("stop", 0), ("kill",), ("remove", True)]
+
+    def test_runner_bounds_output_and_cleans_the_exact_container(self) -> None:
+        from backend.fuzzing.docker.container_runner import ContainerOutputExceeded, ContainerRunner, MAX_OUTPUT_BYTES
+
+        cleaned, logs = [], []
+        class Container:
+            id = "container-output"
+            def start(self): pass
+            def wait(self, timeout): return {"StatusCode": 0}
+            def logs(self, **kwargs): return iter((b"x" * (MAX_OUTPUT_BYTES + 1),))
+            def stop(self, timeout=0): cleaned.append(("stop", timeout))
+            def kill(self): cleaned.append(("kill",))
+            def remove(self, force=False): cleaned.append(("remove", force))
+        class Containers:
+            def create(self, *args, **kwargs): return Container()
+
+        with pytest.raises(ContainerOutputExceeded, match="output exceeded"):
+            run(ContainerRunner(SimpleNamespace(containers=Containers())).run("image", ["true"], 1, logs.append))
+        assert logs == [f"container output exceeded {MAX_OUTPUT_BYTES} bytes\n"]
+        assert cleaned == [("stop", 0), ("kill",), ("remove", True)]
+
+    def test_cancellation_before_create_publication_cleans_later_container(self) -> None:
+        from backend.fuzzing.docker.container_runner import ContainerRunner
+
+        entered, release, removed, cleaned = threading.Event(), threading.Event(), threading.Event(), []
+        class Container:
+            id = "container-race"
+            def start(self): pass
+            def wait(self, timeout): return {"StatusCode": 0}
+            def logs(self, **kwargs): return iter(())
+            def stop(self, timeout=0): cleaned.append(("stop", timeout))
+            def kill(self): cleaned.append(("kill",))
+            def remove(self, force=False): cleaned.append(("remove", force)); removed.set()
+        class Containers:
+            def create(self, *args, **kwargs):
+                entered.set()
+                assert release.wait(1)
+                return Container()
+
+        async def scenario():
+            operation = asyncio.create_task(ContainerRunner(SimpleNamespace(containers=Containers())).run("image", ["true"], 10, lambda text: None))
+            assert await asyncio.to_thread(entered.wait, 1)
+            operation.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await operation
+            release.set()
+            assert await asyncio.to_thread(removed.wait, 1)
+            assert cleaned == [("stop", 0), ("kill",), ("remove", True)]
+        run(scenario())
 
 
 class TestToolchainBuilder:
@@ -170,8 +251,51 @@ class TestToolchainBuilder:
         with pytest.raises(UnsupportedImagePlatform):
             ToolchainBuilder(dockerfile, image_builder, inspector).ensure(lambda text: None)
 
+    def test_concurrent_missing_tag_builds_once_then_reinspects(self, tmp_path: Path) -> None:
+        from backend.fuzzing.docker.image_inspector import ImageInfo, MissingImage
+        from backend.fuzzing.toolchain.builder import ToolchainBuilder
+
+        dockerfile = tmp_path / "Dockerfile"
+        dockerfile.write_text("FROM ubuntu:24.04\n")
+        barrier, built, calls = threading.Barrier(2), False, []
+        class Inspector:
+            def inspect(self, tag):
+                nonlocal built
+                calls.append(tag)
+                if not built and len(calls) <= 2:
+                    barrier.wait(timeout=1)
+                    raise MissingImage("missing")
+                if not built: raise MissingImage("missing")
+                return ImageInfo("sha256:ready", "linux", "amd64")
+        class Builder:
+            count = 0
+            def build(self, dockerfile, tag, sink):
+                nonlocal built
+                self.count += 1
+                built = True
+        image_builder = Builder()
+        builder = ToolchainBuilder(dockerfile, image_builder, Inspector())
+        threads = [threading.Thread(target=builder.ensure, args=(lambda text: None,)) for _ in range(2)]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join(timeout=2)
+        assert all(not thread.is_alive() for thread in threads)
+        assert image_builder.count == 1
+
 
 class TestToolchainVerifier:
+    def test_probe_source_uses_valid_std_integer_and_size_types(self, tmp_path: Path) -> None:
+        from backend.fuzzing.toolchain.verifier import FUZZER_SOURCE
+
+        assert "#include <cstddef>" in FUZZER_SOURCE
+        assert "#include <cstdint>" in FUZZER_SOURCE
+        assert "const std::uint8_t*" in FUZZER_SOURCE and "std::size_t" in FUZZER_SOURCE
+        clang = shutil.which("clang++")
+        if clang:
+            source = tmp_path / "probe.cc"
+            source.write_text(FUZZER_SOURCE)
+            checked = subprocess.run([clang, "-std=c++17", "-fsyntax-only", str(source)], capture_output=True, text=True)
+            assert checked.returncode == 0, checked.stderr
+
     def test_verifier_runs_real_llvm_and_sanitized_libfuzzer_probe(self) -> None:
         from backend.fuzzing.toolchain.verifier import ToolchainVerifier
 

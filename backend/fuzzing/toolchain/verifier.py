@@ -9,13 +9,20 @@ class ToolchainVerificationFailed(RuntimeError):
     """Raised when the maintained compiler image cannot satisfy its contract."""
 
 
-_PROBE = """set -eu
+FUZZER_SOURCE = """#include <cstddef>
+#include <cstdint>
+extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t*, std::size_t) { return 0; }
+"""
+
+
+_PROBE = f"""set -eu
 clang-18 --version
 clang++-18 --version
 ld.lld-18 --version
 llvm-config-18 --version
-printf '#include <cstdint>\\nextern \\"C\\" int LLVMFuzzerTestOneInput(const uint8_t*, size_t) { return 0; }\\n' > /tmp/bigeye-fuzzer.cc
-clang++-18 -fsanitize=fuzzer,address,undefined -g -O1 /tmp/bigeye-fuzzer.cc -o /tmp/bigeye-fuzzer
+cat > /tmp/bigeye-fuzzer.cc <<'BIGEYE_FUZZER_SOURCE'
+{FUZZER_SOURCE}BIGEYE_FUZZER_SOURCE
+clang++-18 -std=c++17 -fsanitize=fuzzer,address,undefined -g -O1 /tmp/bigeye-fuzzer.cc -o /tmp/bigeye-fuzzer
 /tmp/bigeye-fuzzer -runs=1
 """
 
