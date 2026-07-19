@@ -72,6 +72,19 @@ def validate_image_id(image_id: str) -> None:
         raise ValueError("image_id must be an immutable sha256 image ID")
 
 
+def validate_afl_asan_environment(environment: Mapping[str, str]) -> None:
+    options = {}
+    for item in environment.get("ASAN_OPTIONS", "").split(":"):
+        if not item:
+            continue
+        key, separator, value = item.partition("=")
+        if separator:
+            options[key] = value
+    for key, expected in (("abort_on_error", "1"), ("symbolize", "0")):
+        if options.get(key) != expected:
+            raise ValueError(f"ASAN_OPTIONS must include {key}={expected}")
+
+
 def _is_absolute_container_path(value: str) -> bool:
     return isinstance(value, str) and value.startswith("/") and "\x00" not in value and ".." not in PurePosixPath(value).parts
 

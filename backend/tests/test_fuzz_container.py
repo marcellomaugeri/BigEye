@@ -1,29 +1,22 @@
-"""Durable ownership and isolation contracts for long-running fuzzers."""
+"""Adversarial ownership and isolation contracts for long-running fuzzers."""
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 
 IMAGE_ID = "sha256:" + "c" * 64
+BASE_ENVIRONMENT = {"PATH": "/usr/local/bin:/usr/bin"}
+BASE_LABELS = {"bigeye.layer": "target"}
 
 
-def _campaign(tmp_path: Path, **changes):
+def _campaign():
     from backend.fuzzing.docker.fuzz_container import FuzzCampaign
 
-    workspace = tmp_path / "campaign-3"
-    workspace.mkdir(exist_ok=True)
-    values = {
-        "id": 3,
-        "project_id": 7,
-        "commit_sha": "a" * 40,
-        "workspace": workspace,
-    }
-    values.update(changes)
-    return FuzzCampaign(**values)
+    return FuzzCampaign(id=3, project_id=7, commit_sha="a" * 40)
 
 
 def _invocation(**changes):
@@ -32,8 +25,11 @@ def _invocation(**changes):
     values = {
         "engine": "afl",
         "image_id": IMAGE_ID,
-        "command": ["afl-fuzz", "-i", "/campaign/corpus", "-o", "/campaign/output", "--", "/opt/bigeye/target"],
-        "environment": {"ASAN_OPTIONS": "abort_on_error=1"},
+        "command": [
+            "afl-fuzz", "-i", "/campaign/corpus", "-o", "/campaign/output",
+            "-M", "main", "-t", "1000+", "-m", "0", "--", "/opt/bigeye/target", "@@",
+        ],
+        "environment": {"ASAN_OPTIONS": "abort_on_error=1:symbolize=0", "AFL_NO_UI": "1"},
         "campaign_labels": {"bigeye.configuration": "basic"},
         "network_disabled": True,
         "read_only_source": True,
@@ -44,23 +40,49 @@ def _invocation(**changes):
     return ContainerInvocation(**values)
 
 
+class FakeApi:
+    def __init__(self):
+        self.os = "linux"
+        self.architecture = "amd64"
+
+    def inspect_image(self, image_id):
+        assert image_id == IMAGE_ID
+        return {
+            "Id": IMAGE_ID,
+            "Os": self.os,
+            "Architecture": self.architecture,
+            "Config": {"Env": [f"{key}={value}" for key, value in BASE_ENVIRONMENT.items()], "Labels": dict(BASE_LABELS)},
+        }
+
+
 class FakeContainer:
-    def __init__(self, container_id="container-3", *, labels=None, image_id=IMAGE_ID, status="created", logs=b"final log\n"):
+    def __init__(
+        self,
+        container_id="container-3",
+        *,
+        attrs=None,
+        status="created",
+        logs=b"final log\n",
+        start_error=None,
+        start_status="running",
+        log_delay=0.0,
+    ):
         self.id = container_id
         self.status = status
+        self.attrs = attrs or {}
+        self.attrs.setdefault("State", {})["Status"] = status
         self._logs = logs
-        self.attrs = {
-            "Id": container_id,
-            "Image": image_id,
-            "State": {"Status": status},
-            "Config": {"Labels": labels or {}},
-        }
+        self._start_error = start_error
+        self._start_status = start_status
+        self._log_delay = log_delay
         self.calls = []
 
     def start(self):
         self.calls.append(("start",))
-        self.status = "running"
-        self.attrs["State"]["Status"] = "running"
+        self.status = self._start_status
+        self.attrs["State"]["Status"] = self.status
+        if self._start_error is not None:
+            raise self._start_error
 
     def reload(self):
         self.calls.append(("reload",))
@@ -68,9 +90,14 @@ class FakeContainer:
 
     def logs(self, **kwargs):
         self.calls.append(("logs", kwargs))
-        if kwargs.get("stream"):
-            return iter(self._logs.splitlines(keepends=True))
-        return self._logs
+
+        def chunks():
+            if self._log_delay:
+                time.sleep(self._log_delay)
+            for line in self._logs.splitlines(keepends=True) or [self._logs]:
+                yield line
+
+        return chunks() if kwargs.get("stream") else self._logs
 
     def stop(self, timeout):
         self.calls.append(("stop", timeout))
@@ -87,14 +114,72 @@ class FakeContainer:
 
 
 class FakeContainers:
-    def __init__(self, listed=()):
-        self.listed = list(listed)
+    def __init__(self):
+        self.listed = []
         self.created = []
-        self.by_id = {container.id: container for container in listed}
+        self.by_id = {}
+        self.next_start_error = None
+        self.next_start_status = "running"
+        self.next_logs = b"final log\n"
+        self.next_log_delay = 0.0
+        self.next_stop_error = None
+        self.next_kill_error = None
 
-    def create(self, image, command, **kwargs):
-        container = FakeContainer(labels=kwargs["labels"], image_id=image)
-        self.created.append((image, command, kwargs, container))
+    def create(self, image, command, **options):
+        environment = dict(BASE_ENVIRONMENT)
+        environment.update(options["environment"])
+        labels = dict(BASE_LABELS)
+        labels.update(options["labels"])
+        mounts = [
+            {
+                "Type": "bind", "Source": source, "Destination": mount["bind"],
+                "Mode": mount["mode"], "RW": mount["mode"] == "rw",
+            }
+            for source, mount in options["volumes"].items()
+        ]
+        attrs = {
+            "Id": "container-3",
+            "Image": image,
+            "Platform": "linux",
+            "Name": f"/{options['name']}",
+            "Config": {
+                "Cmd": list(command),
+                "Env": [f"{key}={value}" for key, value in environment.items()],
+                "Labels": labels,
+                "User": options["user"],
+                "NetworkDisabled": options["network_disabled"],
+            },
+            "HostConfig": {
+                "NetworkMode": options["network_mode"],
+                "Privileged": options["privileged"],
+                "ReadonlyRootfs": options["read_only"],
+                "CapDrop": list(options["cap_drop"]),
+                "CapAdd": [],
+                "SecurityOpt": list(options["security_opt"]),
+                "PidsLimit": options["pids_limit"],
+                "Memory": int(options["mem_limit"].removesuffix("m")) * 1024 * 1024,
+                "NanoCpus": options["nano_cpus"],
+                "Tmpfs": dict(options["tmpfs"]),
+                "AutoRemove": options["auto_remove"],
+            },
+            "Mounts": mounts,
+            "NetworkSettings": {"Networks": {}},
+        }
+        container = FakeContainer(
+            attrs=attrs,
+            logs=self.next_logs,
+            start_error=self.next_start_error,
+            start_status=self.next_start_status,
+            log_delay=self.next_log_delay,
+        )
+        if self.next_stop_error is not None:
+            error = self.next_stop_error
+            container.stop = lambda timeout: (_ for _ in ()).throw(error)
+        if self.next_kill_error is not None:
+            error = self.next_kill_error
+            container.kill = lambda: (_ for _ in ()).throw(error)
+        self.created.append((image, command, options, container))
+        self.listed.append(container)
         self.by_id[container.id] = container
         return container
 
@@ -106,196 +191,377 @@ class FakeContainers:
         return self.by_id[container_id]
 
 
-def _expected_labels():
-    return {
-        "com.bigeye.managed": "fuzz-campaign",
-        "com.bigeye.campaign-id": "3",
-        "com.bigeye.project-id": "7",
-        "com.bigeye.commit-sha": "a" * 40,
-        "com.bigeye.image-id": IMAGE_ID,
-        "com.bigeye.engine": "afl",
-        "bigeye.configuration": "basic",
-    }
+class FakeClient:
+    def __init__(self, containers=None):
+        self.containers = containers or FakeContainers()
+        self.api = FakeApi()
+
+
+def _workspace(tmp_path: Path) -> Path:
+    root = tmp_path / "workspace"
+    root.mkdir(exist_ok=True)
+    return root
+
+
+def _service(tmp_path: Path, client=None, **settings):
+    from backend.fuzzing.docker.fuzz_container import FuzzContainerService
+
+    client = client or FakeClient()
+    return FuzzContainerService(client, _workspace(tmp_path), **settings), client
+
+
+def _campaign_path(root: Path) -> Path:
+    return root / "projects" / "7" / "campaigns" / "3"
 
 
 class TestFuzzContainerStart:
-    def test_creates_persistent_container_with_exact_isolation_and_only_campaign_mount(self, tmp_path: Path) -> None:
+    def test_creates_exact_persistent_isolation_and_reloads_before_return(self, tmp_path: Path) -> None:
+        service, client = _service(tmp_path)
+
+        identity = service.start(_campaign(), _invocation())
+
+        image, command, options, container = client.containers.created[0]
+        workspace = _campaign_path(_workspace(tmp_path))
+        assert image == IMAGE_ID and command == _invocation().command
+        assert options == {
+            "name": "bigeye-campaign-3",
+            "platform": "linux/amd64",
+            "network_disabled": True,
+            "network_mode": "none",
+            "privileged": False,
+            "read_only": True,
+            "cap_drop": ["ALL"],
+            "security_opt": ["no-new-privileges"],
+            "user": options["user"],
+            "pids_limit": 256,
+            "mem_limit": "512m",
+            "nano_cpus": 1_000_000_000,
+            "tmpfs": {"/tmp": "rw,nosuid,nodev,noexec,size=64m,mode=1777"},
+            "volumes": {
+                str(workspace / "corpus"): {"bind": "/campaign/corpus", "mode": "rw"},
+                str(workspace / "output"): {"bind": "/campaign/output", "mode": "rw"},
+                str(workspace / "config"): {"bind": "/campaign/config", "mode": "ro"},
+            },
+            "environment": _invocation().environment,
+            "labels": {
+                "com.bigeye.managed": "fuzz-campaign",
+                "com.bigeye.campaign-id": "3",
+                "com.bigeye.project-id": "7",
+                "com.bigeye.commit-sha": "a" * 40,
+                "com.bigeye.image-id": IMAGE_ID,
+                "com.bigeye.engine": "afl",
+                "bigeye.configuration": "basic",
+            },
+            "auto_remove": False,
+            "detach": True,
+        }
+        assert options["user"].split(":")[0] != "0"
+        assert container.calls[:2] == [("start",), ("reload",)]
+        assert identity.container_id == "container-3"
+
+    def test_service_requires_an_explicit_real_workspace_root(self, tmp_path: Path) -> None:
         from backend.fuzzing.docker.fuzz_container import FuzzContainerService
 
-        containers = FakeContainers()
-        identity = FuzzContainerService(SimpleNamespace(containers=containers)).start(_campaign(tmp_path), _invocation())
-
-        image, command, options, container = containers.created[0]
-        assert image == IMAGE_ID
-        assert command[0] == "afl-fuzz"
-        assert options["platform"] == "linux/amd64"
-        assert options["network_disabled"] is True
-        assert options["privileged"] is False
-        assert options["read_only"] is True
-        assert options["cap_drop"] == ["ALL"]
-        assert options["security_opt"] == ["no-new-privileges"]
-        assert options["pids_limit"] == 256
-        assert options["mem_limit"] == "512m"
-        assert options["nano_cpus"] == 1_000_000_000
-        assert options["tmpfs"] == {"/tmp": "rw,nosuid,nodev,noexec,size=64m,mode=1777"}
-        assert options["auto_remove"] is False
-        assert options["detach"] is True
-        uid, gid = options["user"].split(":")
-        assert uid.isdigit() and gid.isdigit()
-        workspace = _campaign(tmp_path).workspace.resolve()
-        assert options["volumes"] == {
-            str(workspace / "corpus"): {"bind": "/campaign/corpus", "mode": "rw"},
-            str(workspace / "output"): {"bind": "/campaign/output", "mode": "rw"},
-            str(workspace / "config"): {"bind": "/campaign/config", "mode": "ro"},
-        }
-        assert options["labels"] == _expected_labels()
-        assert container.calls == [("start",)]
-        assert identity.container_id == "container-3"
-        assert identity.expected_labels == _expected_labels()
+        with pytest.raises(TypeError):
+            FuzzContainerService(FakeClient())
+        real = tmp_path / "real"
+        real.mkdir()
+        link = tmp_path / "linked-workspace"
+        link.symlink_to(real, target_is_directory=True)
+        with pytest.raises(ValueError, match="symlink"):
+            FuzzContainerService(FakeClient(), link)
 
     def test_never_runs_the_fuzzer_as_root(self, tmp_path: Path, monkeypatch) -> None:
         from backend.fuzzing.docker import fuzz_container
-        from backend.fuzzing.docker.fuzz_container import FuzzContainerService
 
         monkeypatch.setattr(fuzz_container.os, "getuid", lambda: 0)
         monkeypatch.setattr(fuzz_container.os, "getgid", lambda: 0)
-        containers = FakeContainers()
+        service, client = _service(tmp_path)
 
-        FuzzContainerService(SimpleNamespace(containers=containers)).start(_campaign(tmp_path), _invocation())
+        service.start(_campaign(), _invocation())
 
-        assert containers.created[0][2]["user"] == "65534:65534"
+        assert client.containers.created[0][2]["user"] == "65534:65534"
 
     @pytest.mark.parametrize(
-        "change",
+        "command",
         [
-            {"network_disabled": False},
-            {"read_only_source": False},
-            {"memory_limit_mb": 0},
+            ["afl-fuzz", "--", "/opt/bigeye/target"],
+            ["afl-fuzz", "-i", "/campaign/corpus", "-o", "/campaign/output", "-M", "main", "-t", "1000+", "-m", "0", "--", "/opt/bigeye/../bin/sh"],
+            ["afl-fuzz", "-i", "/campaign/corpus", "-o", "/campaign/output", "-M", "main", "-t", "1000+", "-m", "0", "--", "/opt/bigeye/bash", "-c", "id"],
+            ["afl-fuzz", "-i", "/campaign/corpus", "-o", "/campaign/output", "-M", "main", "-t", "1000+", "-m", "512", "--", "/opt/bigeye/target"],
+            ["afl-fuzz", "-i", "/campaign/corpus", "-o", "/campaign/output", "-M", "main", "-t", "1000+", "-m", "0", "--", "--", "/opt/bigeye/target"],
         ],
     )
-    def test_rejects_unsafe_invocation_before_container_creation(self, tmp_path: Path, change) -> None:
+    def test_rejects_smuggled_or_noncanonical_afl_commands(self, tmp_path: Path, command) -> None:
+        service, client = _service(tmp_path)
+
+        with pytest.raises(ValueError, match="AFL"):
+            service.start(_campaign(), _invocation(command=command))
+
+        assert client.containers.created == []
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            ["/opt/bigeye/bash", "-c", "id", "/campaign/corpus", "-artifact_prefix=/campaign/output/", "-timeout=1", "-rss_limit_mb=512"],
+            ["/opt/bigeye/../target", "/campaign/corpus", "-artifact_prefix=/campaign/output/", "-timeout=1", "-rss_limit_mb=512"],
+            ["/opt/bigeye/target", "/campaign/corpus", "-artifact_prefix=/tmp/", "-timeout=1", "-rss_limit_mb=512"],
+        ],
+    )
+    def test_rejects_smuggled_or_noncanonical_libfuzzer_commands(self, tmp_path: Path, command) -> None:
+        service, client = _service(tmp_path)
+        invocation = _invocation(engine="libfuzzer", command=command, environment={})
+
+        with pytest.raises(ValueError, match="libFuzzer"):
+            service.start(_campaign(), invocation)
+
+        assert client.containers.created == []
+
+    def test_recovers_deterministically_when_start_raises_after_running(self, tmp_path: Path) -> None:
+        client = FakeClient()
+        client.containers.next_start_error = RuntimeError("daemon disconnected")
+        client.containers.next_start_status = "running"
+        service, _ = _service(tmp_path, client)
+
+        with pytest.raises(RuntimeError, match="daemon disconnected"):
+            service.start(_campaign(), _invocation())
+
+        container = client.containers.created[0][3]
+        assert ("stop", 10) in container.calls
+        assert container.calls[-1] == ("remove", False)
+
+    def test_start_failure_removes_never_started_container_without_force(self, tmp_path: Path) -> None:
+        client = FakeClient()
+        client.containers.next_start_error = RuntimeError("start rejected")
+        client.containers.next_start_status = "created"
+        client.containers.next_stop_error = RuntimeError("cannot stop created")
+        client.containers.next_kill_error = RuntimeError("cannot kill created")
+        service, _ = _service(tmp_path, client)
+
+        with pytest.raises(RuntimeError, match="start rejected"):
+            service.start(_campaign(), _invocation())
+
+        assert client.containers.created[0][3].calls[-1] == ("remove", False)
+
+
+class TestWorkspaceContainment:
+    def test_rejects_symlinked_project_ancestor_before_container_creation(self, tmp_path: Path) -> None:
+        root = _workspace(tmp_path)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (root / "projects").symlink_to(outside, target_is_directory=True)
+        service, client = _service(tmp_path)
+
+        with pytest.raises(ValueError, match="symlink"):
+            service.start(_campaign(), _invocation())
+
+        assert client.containers.created == []
+
+    def test_rejects_campaign_path_swap_while_descriptor_is_held(self, tmp_path: Path) -> None:
         from backend.fuzzing.docker.fuzz_container import FuzzContainerService
 
-        containers = FakeContainers()
-        with pytest.raises(ValueError):
-            FuzzContainerService(SimpleNamespace(containers=containers)).start(_campaign(tmp_path), _invocation(**change))
-        assert containers.created == []
+        root = _workspace(tmp_path)
 
-    def test_reserved_campaign_label_cannot_be_overridden(self, tmp_path: Path) -> None:
-        from backend.fuzzing.docker.fuzz_container import FuzzContainerService
+        class SwappingService(FuzzContainerService):
+            def _after_campaign_opened(self, descriptor, campaign_path):
+                moved = campaign_path.with_name("3-moved")
+                campaign_path.rename(moved)
+                campaign_path.mkdir()
 
-        with pytest.raises(ValueError, match="reserved"):
-            FuzzContainerService(SimpleNamespace(containers=FakeContainers())).start(
-                _campaign(tmp_path),
-                _invocation(campaign_labels={"com.bigeye.commit-sha": "wrong"}),
-            )
+        client = FakeClient()
+        service = SwappingService(client, root)
 
-    def test_rejects_invalid_log_destination_before_creating_a_container(self, tmp_path: Path) -> None:
-        from backend.fuzzing.docker.fuzz_container import FuzzContainerService
+        with pytest.raises(ValueError, match="changed"):
+            service.start(_campaign(), _invocation())
 
-        campaign = _campaign(tmp_path)
-        (campaign.workspace / "logs").write_text("not a directory")
-        containers = FakeContainers()
+        assert client.containers.created == []
 
-        with pytest.raises(ValueError, match="log path"):
-            FuzzContainerService(SimpleNamespace(containers=containers)).start(campaign, _invocation())
+    def test_workspace_swap_after_adoption_blocks_stop_and_log_writes(self, tmp_path: Path) -> None:
+        service, client = _service(tmp_path)
+        identity = service.start(_campaign(), _invocation())
+        campaign_path = _campaign_path(_workspace(tmp_path))
+        campaign_path.rename(campaign_path.with_name("3-moved"))
+        campaign_path.mkdir()
 
-        assert containers.created == []
+        with pytest.raises(ValueError, match="changed"):
+            service.stop(identity)
+
+        assert not any(call[0] in {"stop", "kill", "remove", "logs"} for call in client.containers.created[0][3].calls[2:])
+
+    def test_symlinked_final_log_is_rejected_without_touching_target(self, tmp_path: Path) -> None:
+        service, client = _service(tmp_path)
+        identity = service.start(_campaign(), _invocation())
+        victim = tmp_path / "victim"
+        victim.write_text("safe")
+        log_path = _campaign_path(_workspace(tmp_path)) / "logs" / "container.log"
+        log_path.symlink_to(victim)
+
+        with pytest.raises(ValueError, match="log"):
+            service.stop(identity)
+
+        assert victim.read_text() == "safe"
+        assert not any(call[0] in {"stop", "kill", "remove"} for call in client.containers.created[0][3].calls[2:])
 
 
 class TestFuzzContainerRecovery:
-    def test_adopts_only_running_container_with_exact_campaign_commit_image_and_engine_labels(self, tmp_path: Path) -> None:
-        from backend.fuzzing.docker.fuzz_container import FuzzContainerService
+    def test_adopts_only_container_with_complete_service_owned_runtime_contract(self, tmp_path: Path) -> None:
+        service, client = _service(tmp_path)
+        service.start(_campaign(), _invocation())
+        recovered, _ = _service(tmp_path, client)
 
-        container = FakeContainer(labels=_expected_labels(), status="running")
-        containers = FakeContainers([container])
+        identity = recovered.recover(_campaign(), _invocation())
 
-        identity = FuzzContainerService(SimpleNamespace(containers=containers)).recover(_campaign(tmp_path), _invocation())
+        assert identity is not None and identity.container_id == "container-3"
 
-        assert identity is not None
-        assert identity.container_id == container.id
-        assert containers.created == []
-        assert containers.list_calls == [{"all": True, "filters": {"label": ["com.bigeye.managed=fuzz-campaign", "com.bigeye.campaign-id=3"]}}]
+    def test_incomplete_mandatory_labels_are_rejected(self, tmp_path: Path) -> None:
+        service, client = _service(tmp_path)
+        service.start(_campaign(), _invocation())
+        del client.containers.created[0][3].attrs["Config"]["Labels"]["com.bigeye.engine"]
+        recovered, _ = _service(tmp_path, client)
+
+        with pytest.raises(Exception, match="ownership|contract"):
+            recovered.recover(_campaign(), _invocation())
 
     @pytest.mark.parametrize(
-        ("label", "value"),
+        ("field", "value"),
         [
-            ("com.bigeye.commit-sha", "b" * 40),
-            ("com.bigeye.image-id", "sha256:other"),
-            ("com.bigeye.campaign-id", "4"),
+            ("command", ["afl-fuzz", "--", "/opt/bigeye/target"]),
+            ("platform", "windows"),
+            ("network", "bridge"),
+            ("network_flag", False),
+            ("privileged", True),
+            ("read_only", False),
+            ("mount", "/tmp/foreign"),
+            ("memory", 1),
+            ("pids", 999),
+            ("cpus", 2_000_000_000),
+            ("user", "0:0"),
+            ("caps", []),
+            ("security", []),
+            ("tmpfs", {}),
+            ("environment", ["PATH=/usr/local/bin:/usr/bin"]),
+            ("name", "/forged-name"),
         ],
     )
-    def test_rejects_mismatched_container_ownership(self, tmp_path: Path, label: str, value: str) -> None:
-        from backend.fuzzing.docker.fuzz_container import ContainerOwnershipMismatch, FuzzContainerService
+    def test_rejects_any_runtime_contract_drift(self, tmp_path: Path, field: str, value) -> None:
+        service, client = _service(tmp_path)
+        service.start(_campaign(), _invocation())
+        container = client.containers.created[0][3]
+        if field == "command": container.attrs["Config"]["Cmd"] = value
+        elif field == "platform": container.attrs["Platform"] = value
+        elif field == "network": container.attrs["HostConfig"]["NetworkMode"] = value
+        elif field == "network_flag": container.attrs["Config"]["NetworkDisabled"] = value
+        elif field == "privileged": container.attrs["HostConfig"]["Privileged"] = value
+        elif field == "read_only": container.attrs["HostConfig"]["ReadonlyRootfs"] = value
+        elif field == "mount": container.attrs["Mounts"][0]["Source"] = value
+        elif field == "memory": container.attrs["HostConfig"]["Memory"] = value
+        elif field == "pids": container.attrs["HostConfig"]["PidsLimit"] = value
+        elif field == "cpus": container.attrs["HostConfig"]["NanoCpus"] = value
+        elif field == "user": container.attrs["Config"]["User"] = value
+        elif field == "caps": container.attrs["HostConfig"]["CapDrop"] = value
+        elif field == "security": container.attrs["HostConfig"]["SecurityOpt"] = value
+        elif field == "tmpfs": container.attrs["HostConfig"]["Tmpfs"] = value
+        elif field == "environment": container.attrs["Config"]["Env"] = value
+        elif field == "name": container.attrs["Name"] = value
+        recovered, _ = _service(tmp_path, client)
 
-        labels = _expected_labels()
-        labels[label] = value
-        container = FakeContainer(labels=labels, status="running")
+        with pytest.raises(Exception, match="contract"):
+            recovered.recover(_campaign(), _invocation())
 
-        with pytest.raises(ContainerOwnershipMismatch):
-            FuzzContainerService(SimpleNamespace(containers=FakeContainers([container]))).recover(_campaign(tmp_path), _invocation())
+    def test_rejects_non_amd64_image_during_recovery(self, tmp_path: Path) -> None:
+        service, client = _service(tmp_path)
+        service.start(_campaign(), _invocation())
+        client.api.architecture = "arm64"
+        recovered, _ = _service(tmp_path, client)
 
-    def test_returns_none_when_no_managed_container_exists(self, tmp_path: Path) -> None:
-        from backend.fuzzing.docker.fuzz_container import FuzzContainerService
+        with pytest.raises(Exception, match="linux/amd64"):
+            recovered.recover(_campaign(), _invocation())
 
-        assert FuzzContainerService(SimpleNamespace(containers=FakeContainers())).inspect(_campaign(tmp_path), _invocation()) is None
+    def test_identity_fields_are_not_accepted_as_ownership_proof(self, tmp_path: Path) -> None:
+        from backend.fuzzing.docker.fuzz_container import ContainerIdentity, ContainerOwnershipMismatch
+
+        service, client = _service(tmp_path)
+        service.start(_campaign(), _invocation())
+        fresh, _ = _service(tmp_path, client)
+        forged = ContainerIdentity("container-3", 3, 7, "running")
+
+        with pytest.raises(ContainerOwnershipMismatch, match="unknown"):
+            fresh.stream_logs(forged, lambda _: None, follow=False)
 
 
 class TestFuzzContainerLifecycle:
-    def test_stream_logs_verifies_ownership_and_forwards_text(self, tmp_path: Path) -> None:
-        from backend.fuzzing.docker.fuzz_container import FuzzContainerService
-
-        container = FakeContainer(labels=_expected_labels(), status="running", logs=b"one\ntwo\n")
-        containers = FakeContainers([container])
-        service = FuzzContainerService(SimpleNamespace(containers=containers))
-        identity = service.recover(_campaign(tmp_path), _invocation())
+    def test_stream_logs_rechecks_full_owned_contract(self, tmp_path: Path) -> None:
+        service, client = _service(tmp_path)
+        identity = service.start(_campaign(), _invocation())
         output = []
 
         service.stream_logs(identity, output.append, follow=False)
 
-        assert output == ["one\n", "two\n"]
+        assert output == ["final log\n"]
 
-    def test_stop_persists_final_logs_then_removes_only_exited_matching_container(self, tmp_path: Path) -> None:
-        from backend.fuzzing.docker.fuzz_container import FuzzContainerService
-
-        container = FakeContainer(labels=_expected_labels(), status="running")
-        containers = FakeContainers([container])
-        service = FuzzContainerService(SimpleNamespace(containers=containers), stop_timeout_seconds=7)
-        identity = service.recover(_campaign(tmp_path), _invocation())
+    def test_stop_persists_final_logs_and_removes_only_exited_matching_container(self, tmp_path: Path) -> None:
+        service, client = _service(tmp_path, stop_timeout_seconds=7)
+        identity = service.start(_campaign(), _invocation())
+        log_path = service.log_path(identity)
 
         service.stop(identity)
 
-        assert identity.log_path.read_bytes() == b"final log\n"
+        container = client.containers.created[0][3]
+        assert log_path.read_bytes() == b"final log\n"
         assert ("stop", 7) in container.calls
         assert ("kill",) not in container.calls
         assert container.calls[-1] == ("remove", False)
 
-    def test_stop_kills_after_grace_period_and_never_force_removes_a_running_container(self, tmp_path: Path) -> None:
-        from backend.fuzzing.docker.fuzz_container import FuzzContainerService
+    def test_final_logs_are_byte_bounded_with_a_truncation_marker(self, tmp_path: Path) -> None:
+        client = FakeClient()
+        client.containers.next_logs = b"0123456789abcdefghijklmnopqrstuvwxyz"
+        service, _ = _service(tmp_path, client, final_log_max_bytes=8)
+        identity = service.start(_campaign(), _invocation())
+        log_path = service.log_path(identity)
 
-        class StubbornContainer(FakeContainer):
-            def stop(self, timeout): self.calls.append(("stop", timeout))
+        service.stop(identity)
 
-        container = StubbornContainer(labels=_expected_labels(), status="running")
-        containers = FakeContainers([container])
-        service = FuzzContainerService(SimpleNamespace(containers=containers), stop_timeout_seconds=2)
-        identity = service.recover(_campaign(tmp_path), _invocation())
+        content = log_path.read_bytes()
+        assert content.startswith(b"01234567")
+        assert b"truncated" in content.lower()
+        assert len(content) < 256
 
+    def test_final_logs_are_time_bounded_with_a_truncation_marker(self, tmp_path: Path) -> None:
+        client = FakeClient()
+        client.containers.next_logs = b"late log"
+        client.containers.next_log_delay = 0.2
+        service, _ = _service(tmp_path, client, final_log_timeout_seconds=0.01)
+        identity = service.start(_campaign(), _invocation())
+        log_path = service.log_path(identity)
+        started = time.monotonic()
+
+        service.stop(identity)
+
+        assert time.monotonic() - started < 0.15
+        assert b"truncated" in log_path.read_bytes().lower()
+
+    def test_stop_kills_after_grace_period_before_nonforce_removal(self, tmp_path: Path) -> None:
+        service, client = _service(tmp_path, stop_timeout_seconds=2)
+        identity = service.start(_campaign(), _invocation())
+        container = client.containers.created[0][3]
+
+        def stubborn_stop(timeout):
+            container.calls.append(("stop", timeout))
+
+        container.stop = stubborn_stop
         service.stop(identity)
 
         assert ("stop", 2) in container.calls
         assert ("kill",) in container.calls
         assert container.calls[-1] == ("remove", False)
 
-    def test_stop_refuses_container_whose_labels_changed_after_adoption(self, tmp_path: Path) -> None:
-        from backend.fuzzing.docker.fuzz_container import ContainerOwnershipMismatch, FuzzContainerService
-
-        container = FakeContainer(labels=_expected_labels(), status="running")
-        containers = FakeContainers([container])
-        service = FuzzContainerService(SimpleNamespace(containers=containers))
-        identity = service.recover(_campaign(tmp_path), _invocation())
+    def test_stop_refuses_runtime_changed_after_adoption(self, tmp_path: Path) -> None:
+        service, client = _service(tmp_path)
+        identity = service.start(_campaign(), _invocation())
+        container = client.containers.created[0][3]
         container.attrs["Config"]["Labels"]["com.bigeye.image-id"] = "sha256:swapped"
 
-        with pytest.raises(ContainerOwnershipMismatch):
+        with pytest.raises(Exception, match="contract"):
             service.stop(identity)
-        assert not any(call[0] in {"stop", "kill", "remove"} for call in container.calls)
+
+        assert not any(call[0] in {"stop", "kill", "remove"} for call in container.calls[2:])

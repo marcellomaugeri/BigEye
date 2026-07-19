@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from math import isfinite
+
 from backend.fuzzing.engines.contracts import EngineStatistics
 
 
@@ -60,6 +62,8 @@ def _number(values: dict[str, str], key: str, required: bool = False) -> float:
         value = float(values[key])
     except ValueError as error:
         raise ValueError(f"{key} must be a number") from error
+    if not isfinite(value):
+        raise ValueError(f"{key} must be finite")
     if value < 0:
         raise ValueError(f"{key} must not be negative")
     return value

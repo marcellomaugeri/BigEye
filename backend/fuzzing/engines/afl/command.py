@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from backend.fuzzing.engines.contracts import ContainerInvocation, EngineSpec
-from backend.fuzzing.engines.validation import validate_campaign_path, validate_common, validate_container_path
+from backend.fuzzing.engines.validation import (
+    validate_afl_asan_environment,
+    validate_campaign_path,
+    validate_common,
+    validate_container_path,
+)
 
 
 class AflCommand:
@@ -14,10 +19,11 @@ class AflCommand:
             validate_campaign_path(spec.dictionary_path, "dictionary_path", "/campaign/config")
         if spec.grammar_path is not None:
             validate_container_path(spec.grammar_path, "grammar_path")
+        validate_afl_asan_environment(spec.sanitizer_environment)
 
         command = ["afl-fuzz", "-i", spec.corpus_path, "-o", spec.output_path]
         command.extend(("-M", "main") if spec.role == "main" else ("-S", spec.role))
-        command.extend(("-t", f"{spec.timeout_ms}+", "-m", str(spec.memory_limit_mb)))
+        command.extend(("-t", f"{spec.timeout_ms}+", "-m", "0"))
         if spec.dictionary_path is not None:
             command.extend(("-x", spec.dictionary_path))
         command.append("--")

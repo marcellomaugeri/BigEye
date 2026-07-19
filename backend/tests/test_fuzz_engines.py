@@ -19,7 +19,7 @@ def _spec(**changes):
         "corpus_path": "/campaign/corpus",
         "output_path": "/campaign/output",
         "role": "main",
-        "sanitizer_environment": {"ASAN_OPTIONS": "abort_on_error=1"},
+        "sanitizer_environment": {"ASAN_OPTIONS": "abort_on_error=1:symbolize=0"},
         "dictionary_path": None,
         "grammar_path": None,
         "timeout_ms": 1_500,
@@ -41,9 +41,10 @@ class TestAflCommand:
         ]
         assert invocation.command[-1] == "@@"
         assert invocation.command[5:7] == ["-M", "main"]
+        assert invocation.command[9:11] == ["-m", "0"]
         assert invocation.network_disabled is True
         assert invocation.read_only_source is True
-        assert invocation.environment["ASAN_OPTIONS"] == "abort_on_error=1"
+        assert invocation.environment["ASAN_OPTIONS"] == "abort_on_error=1:symbolize=0"
 
     def test_secondary_stdin_dictionary_and_grammar_are_rendered_without_a_shell(self) -> None:
         from backend.fuzzing.engines.afl.command import AflCommand
@@ -71,6 +72,9 @@ class TestAflCommand:
             ({"target_command": ("sh", "-c", "target")}, "absolute"),
             ({"role": "bad role"}, "role"),
             ({"image_id": "sha256:not-a-digest"}, "immutable sha256"),
+            ({"sanitizer_environment": {"ASAN_OPTIONS": "symbolize=0"}}, "abort_on_error=1"),
+            ({"sanitizer_environment": {"ASAN_OPTIONS": "abort_on_error=1"}}, "symbolize=0"),
+            ({"sanitizer_environment": {"ASAN_OPTIONS": "abort_on_error=1:abort_on_error=0:symbolize=0"}}, "abort_on_error=1"),
         ],
     )
     def test_rejects_invalid_contracts(self, change, message) -> None:
@@ -142,6 +146,13 @@ saved_hangs       : 3
         with pytest.raises(ValueError, match="execs_done"):
             AflStats.parse("execs_done : twelve\nexecs_per_sec : 1\n")
 
+    @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+    def test_afl_parser_rejects_non_finite_rates(self, value: str) -> None:
+        from backend.fuzzing.engines.afl.stats import AflStats
+
+        with pytest.raises(ValueError, match="finite"):
+            AflStats.parse(f"execs_done : 1\nexecs_per_sec : {value}\n")
+
     def test_libfuzzer_parser_uses_latest_progress_and_literal_failure_evidence(self) -> None:
         from backend.fuzzing.engines.libfuzzer.stats import LibFuzzerStats
 
@@ -177,3 +188,10 @@ SUMMARY: AddressSanitizer: heap-buffer-overflow
         stats = LibFuzzerStats.parse("#9 pulse corp: 2/3Kb exec/s: 4\n")
 
         assert stats.corpus_size == 3 * 1024
+
+    @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+    def test_libfuzzer_parser_rejects_non_finite_rates(self, value: str) -> None:
+        from backend.fuzzing.engines.libfuzzer.stats import LibFuzzerStats
+
+        with pytest.raises(ValueError, match="finite"):
+            LibFuzzerStats.parse(f"#9 pulse corp: 2/3b exec/s: {value}\n")
