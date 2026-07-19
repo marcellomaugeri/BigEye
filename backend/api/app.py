@@ -13,17 +13,21 @@ from backend.database.connection import create_pool
 def create_app(services=None, workspace: Path | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        pool = None
         if services is not None:
             app.state.services = services
-            yield
-            return
-        pool = await create_pool()
-        app.state.services = build_services(pool, workspace or Path("workspace"))
-        await app.state.services.recovery.recover()
+        else:
+            pool = await create_pool()
+            app.state.services = build_services(pool, workspace or Path("workspace"))
         try:
+            await app.state.services.recovery.recover()
             yield
         finally:
-            await pool.close()
+            close = getattr(app.state.services, "close", None)
+            if close is not None:
+                await close()
+            if pool is not None:
+                await pool.close()
 
     app = FastAPI(lifespan=lifespan)
     app.include_router(projects.router, prefix="/api")

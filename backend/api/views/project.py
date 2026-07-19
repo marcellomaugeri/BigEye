@@ -2,10 +2,12 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class CreateProjectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     repository_url: str = Field(min_length=1, max_length=2048)
     worker_count: int = Field(gt=0)
 

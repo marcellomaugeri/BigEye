@@ -28,6 +28,11 @@ class Services:
     recovery: object
     analysis: object | None = None
 
+    async def close(self) -> None:
+        close = getattr(self.recovery, "close", None)
+        if close is not None:
+            await close()
+
 
 def build_services(pool, workspace: Path) -> Services:
     projects = ProjectRepository(pool)

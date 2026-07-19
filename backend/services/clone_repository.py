@@ -1,6 +1,7 @@
 """Contained, argv-only repository cloning."""
 
-import subprocess
+import asyncio
+import re
 from pathlib import Path
 
 from backend.services.create_project import validate_repository_url
@@ -21,13 +22,35 @@ def contained_path(workspace: Path, *parts: str) -> Path:
     return candidate
 
 
-def _run(argv: list[str], cwd: Path | None = None) -> str:
-    result = subprocess.run(argv, cwd=cwd, check=True, capture_output=True, text=True)
-    return result.stdout.strip()
+class GitCommandFailed(RuntimeError):
+    """Raised when Git fails without exposing command output to callers."""
+
+
+async def run_command(argv: list[str], cwd: Path | None = None) -> str:
+    """Run a Git argv list and clean up the child process on cancellation."""
+    process = await asyncio.create_subprocess_exec(
+        *argv,
+        cwd=str(cwd) if cwd is not None else None,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, _ = await process.communicate()
+    except asyncio.CancelledError:
+        process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5)
+        except TimeoutError:
+            process.kill()
+            await process.wait()
+        raise
+    if process.returncode != 0:
+        raise GitCommandFailed("Git command failed")
+    return stdout.decode("utf-8", errors="replace").strip()
 
 
 class CloneRepositoryService:
-    def __init__(self, workspace: Path, command=_run, projects=None):
+    def __init__(self, workspace: Path, command=run_command, projects=None):
         self._workspace = workspace
         self._command = command
         self._projects = projects
@@ -39,9 +62,9 @@ class CloneRepositoryService:
         project_root.mkdir(parents=True, exist_ok=True)
         if destination.exists() or destination.is_symlink():
             raise UnsafeWorkspacePath("repository destination already exists")
-        self._command(["git", "clone", "--", repository_url, str(destination)])
-        commit_sha = self._command(["git", "rev-parse", "HEAD"], cwd=destination)
-        if len(commit_sha) != 40 or any(character not in "0123456789abcdef" for character in commit_sha.lower()):
-            raise RuntimeError("Git did not return a commit SHA")
+        await self._command(["git", "clone", "--", repository_url, str(destination)])
+        commit_sha = await self._command(["git", "rev-parse", "HEAD"], cwd=destination)
+        if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", commit_sha) is None:
+            raise GitCommandFailed("Git did not return a full object ID")
         await self._projects.set_commit_sha(project.id, commit_sha)
         return commit_sha
