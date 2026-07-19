@@ -111,19 +111,19 @@ class ProjectEventStore:
 
     def _read_records(self, descriptor: int, stream: str, after: int, limit: int) -> list[StoredEvent]:
         size = os.fstat(descriptor).st_size
-        if after >= size:
+        if after > size:
+            raise InvalidEventCursor("event cursor is not a record boundary")
+        if after == size:
             return []
         records: list[StoredEvent] = []
         consumed = 0
         with os.fdopen(os.dup(descriptor), "rb", closefd=True) as file:
             if after >= 0:
-                if after == size:
-                    return []
-                file.seek(0)
-                while file.tell() != after:
-                    if file.tell() > after or file.tell() >= size:
+                if after > 0:
+                    file.seek(after - 1)
+                    if file.read(1) != b"\n":
                         raise InvalidEventCursor("event cursor is not a record boundary")
-                    self._read_line(file)
+                file.seek(after)
                 self._read_line(file)
             while len(records) < limit:
                 offset = file.tell()

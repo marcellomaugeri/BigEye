@@ -189,6 +189,45 @@ def test_empty_event_log_accepts_only_initial_or_exact_eof_cursor(tmp_path: Path
         run(store.read(7, "events", 1, 20))
 
 
+def test_nonempty_event_log_rejects_cursor_beyond_exact_eof(tmp_path: Path) -> None:
+    from backend.services.observability.event_store import InvalidEventCursor, ProjectEventStore
+
+    store = ProjectEventStore(tmp_path)
+    run(store.append(7, "events", {"name": "project"}))
+    size = store.path_for(7, "events").stat().st_size
+
+    assert run(store.read(7, "events", size, 20)) == []
+    with pytest.raises(InvalidEventCursor, match="cursor"):
+        run(store.read(7, "events", size + 1, 20))
+
+
+def test_cursor_boundary_validation_reads_constant_bytes_not_prior_records(tmp_path: Path, monkeypatch) -> None:
+    from backend.services.observability import event_store
+    from backend.services.observability.event_store import ProjectEventStore
+
+    store = ProjectEventStore(tmp_path)
+    records = [run(store.append(7, "activity", {"message": str(number)})) for number in range(80)]
+    calls = []
+    original = event_store.os.fdopen
+
+    class CountingFile:
+        def __init__(self, file): self._file = file
+        def __enter__(self): return self
+        def __exit__(self, *args): return self._file.close()
+        def read(self, size=-1):
+            calls.append(("read", size))
+            return self._file.read(size)
+        def readline(self, size=-1):
+            calls.append(("readline", size))
+            return self._file.readline(size)
+        def __getattr__(self, name): return getattr(self._file, name)
+
+    monkeypatch.setattr(event_store.os, "fdopen", lambda *args, **kwargs: CountingFile(original(*args, **kwargs)))
+    assert run(store.read(7, "activity", records[-1].id, 20)) == []
+    assert calls.count(("read", 1)) == 1
+    assert sum(1 for name, _ in calls if name == "readline") <= 2
+
+
 def test_activity_and_debug_query_routes_exclude_internal_events(tmp_path: Path) -> None:
     from backend.api.controllers.events import get_project_log
     from backend.services.observability.event_store import ProjectEventStore
