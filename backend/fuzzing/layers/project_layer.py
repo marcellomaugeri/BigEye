@@ -1,0 +1,228 @@
+"""Reusable dependency layer built from a clean repository layer and build asset."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import tempfile
+import threading
+import re
+from hashlib import sha256
+from pathlib import Path
+
+from backend.fuzzing.layers.manifest import LayerManifest
+from backend.fuzzing.layers.policy import validate_generated_dockerfile
+from backend.fuzzing.assets.validation import collection_hash
+
+
+class _GeneratedLayerService:
+    """Shared implementation for content-addressed generated build contexts."""
+
+    _tag_locks: dict[str, threading.Lock] = {}
+    _tag_locks_guard = threading.Lock()
+
+    def __init__(self, workspace: Path, image_builder, inspector):
+        self._workspace = Path(workspace).resolve()
+        self._image_builder = image_builder
+        self._inspector = inspector
+
+    @classmethod
+    def _lock_for(cls, tag: str) -> threading.Lock:
+        with cls._tag_locks_guard:
+            return cls._tag_locks.setdefault(tag, threading.Lock())
+
+    def _prepare(self, project, parent_manifest: LayerManifest, assets, dockerfile_template: str, sink, network_mode: str | None):
+        if parent_manifest.kind != self._parent_kind:
+            raise ValueError(f"{self._kind} layers require a {self._parent_kind} parent")
+        parent = self._inspector.inspect(parent_manifest.tag)
+        project_id = self._project_id(project)
+        commit_sha = self._commit(project)
+        assets = tuple(assets)
+        asset_digest = self._assets_digest(project_id, assets)
+        template = dockerfile_template.format(parent=parent_manifest.tag, content_hash="{content_hash}")
+        content_hash = self._digest(parent.image_id, commit_sha, template, asset_digest)
+        kind = self._kind
+        dockerfile_text = dockerfile_template.format(parent=parent_manifest.tag, content_hash=content_hash)
+        validate_generated_dockerfile(dockerfile_text, parent_manifest.tag, allow_network=self._network_allowed)
+        tag_hash = self._digest(parent.image_id, commit_sha, dockerfile_text, asset_digest)
+        tag = f"bigeye-{kind}:{tag_hash[:20]}"
+        labels = {
+            "bigeye.project": str(project_id),
+            "bigeye.commit": commit_sha,
+            "bigeye.layer": kind,
+            "bigeye.content-hash": content_hash,
+            "bigeye.parent-image": parent.image_id,
+        }
+        root = self._workspace / "projects" / str(project_id) / "build-contexts" / f"{kind}-{tag_hash}"
+        context_dir = root / "context"
+        dockerfile = context_dir / "Dockerfile"
+        with self._lock_for(tag):
+            root.parent.mkdir(parents=True, exist_ok=True)
+            if root.exists() or root.is_symlink():
+                if not self._valid_context(context_dir, dockerfile_text, project_id, assets):
+                    self._remove_context(root, root.parent)
+            if not root.exists():
+                self._publish_context(root.parent, root, dockerfile_text, project_id, assets)
+            manifest = LayerManifest(kind, tag, content_hash, parent_manifest.tag, dockerfile, context_dir, labels)
+            if self._image_builder.inspect_matching(tag, labels) is None:
+                self._image_builder.build(dockerfile, tag, sink=sink, network_mode=network_mode)
+            return manifest
+
+    def _assets_digest(self, project_id: int, assets) -> str:
+        digest = sha256()
+        for context_name, asset in assets:
+            self._validated_asset(project_id, asset)
+            path = self._asset_path(project_id, asset)
+            if not path.is_dir() or path.is_symlink():
+                raise ValueError("validated asset directory is missing")
+            for entry in path.rglob("*"):
+                if entry.is_symlink() or not (entry.is_file() or entry.is_dir()):
+                    raise ValueError("asset path contains an unsafe entry")
+            files = {
+                entry.relative_to(path).as_posix(): (entry, None)
+                for entry in path.rglob("*") if entry.is_file() and not entry.is_symlink()
+            }
+            if collection_hash(files, asset.kind) != asset.content_hash:
+                raise ValueError("validated asset content hash does not match its files")
+            field = f"{context_name}\0{asset.id}\0{asset.content_hash}".encode("utf-8")
+            digest.update(len(field).to_bytes(8, "big")); digest.update(field)
+            for entry in sorted(path.rglob("*"), key=lambda item: item.as_posix()):
+                if entry.is_dir():
+                    continue
+                relative = entry.relative_to(path).as_posix().encode("utf-8")
+                data = entry.read_bytes()
+                for value in (relative, data):
+                    digest.update(len(value).to_bytes(8, "big")); digest.update(value)
+        return digest.hexdigest()
+
+    def _asset_path(self, project_id: int, asset) -> Path:
+        if not isinstance(asset.id, int) or asset.id <= 0:
+            raise ValueError("asset ID must be positive")
+        return self._workspace / "projects" / str(project_id) / "assets" / str(asset.id)
+
+    @staticmethod
+    def _validated_asset(project_id: int, asset) -> None:
+        if getattr(asset, "project_id", None) != project_id:
+            raise ValueError("asset does not belong to this project")
+        if getattr(asset, "validated_at", None) is None or getattr(asset, "error", None) is not None:
+            raise ValueError("asset must be validated without an error")
+
+    @staticmethod
+    def _asset_entrypoint(asset) -> str:
+        name = getattr(asset, "name", "")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", name):
+            raise ValueError("asset script name is unsafe for a Dockerfile")
+        return name
+
+    @staticmethod
+    def _digest(*values: str) -> str:
+        return sha256(b"\0".join(value.encode("utf-8") for value in values)).hexdigest()
+
+    @staticmethod
+    def _project_id(project) -> int:
+        if not isinstance(project.id, int) or project.id <= 0:
+            raise ValueError("project ID must be positive")
+        return project.id
+
+    @staticmethod
+    def _commit(project) -> str:
+        if not isinstance(project.commit_sha, str) or not project.commit_sha:
+            raise ValueError("project must have a resolved commit")
+        return project.commit_sha
+
+    def _valid_context(self, context: Path, dockerfile_text: str, project_id: int, assets) -> bool:
+        dockerfile = context / "Dockerfile"
+        if context.is_symlink() or dockerfile.is_symlink() or not dockerfile.is_file():
+            return False
+        try:
+            if dockerfile.read_text() != dockerfile_text:
+                return False
+            expected = {"Dockerfile", *(name for name, _ in assets)}
+            if {entry.name for entry in context.iterdir()} != expected:
+                return False
+            for name, asset in assets:
+                generated = context / name
+                source = self._asset_path(project_id, asset)
+                if generated.is_symlink() or not generated.is_dir() or self._tree_digest(generated) != self._tree_digest(source):
+                    return False
+            return True
+        except (OSError, ValueError):
+            return False
+
+    @staticmethod
+    def _tree_digest(root: Path) -> str:
+        digest = sha256()
+        for entry in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+            if entry.is_dir():
+                continue
+            if entry.is_symlink() or not entry.is_file():
+                raise ValueError("generated context contains an unsafe entry")
+            relative = entry.relative_to(root).as_posix().encode("utf-8")
+            data = entry.read_bytes()
+            for value in (relative, data):
+                digest.update(len(value).to_bytes(8, "big")); digest.update(value)
+        return digest.hexdigest()
+
+    def _publish_context(self, parent: Path, destination: Path, dockerfile_text: str, project_id: int, assets) -> None:
+        staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}.staging-", dir=parent))
+        try:
+            context = staging / "context"
+            context.mkdir()
+            (context / "Dockerfile").write_text(dockerfile_text)
+            for name, asset in assets:
+                source = self._asset_path(project_id, asset)
+                if source.is_symlink() or not source.is_dir():
+                    raise ValueError("validated asset directory is missing")
+                shutil.copytree(source, context / name, symlinks=False)
+            self._fsync_tree(context)
+            os.replace(staging, destination)
+            self._fsync_directory(parent)
+        finally:
+            if staging.exists() and not staging.is_symlink():
+                shutil.rmtree(staging)
+
+    @classmethod
+    def _fsync_tree(cls, root: Path) -> None:
+        for directory, _, files in os.walk(root, topdown=False):
+            folder = Path(directory)
+            for name in files:
+                with (folder / name).open("rb") as handle:
+                    os.fsync(handle.fileno())
+            cls._fsync_directory(folder)
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _remove_context(path: Path, parent: Path) -> None:
+        if path.parent.resolve(strict=True) != parent.resolve(strict=True):
+            raise RuntimeError("generated context escaped its project")
+        if path.is_symlink():
+            path.unlink()
+        else:
+            shutil.rmtree(path)
+
+
+class ProjectLayerService(_GeneratedLayerService):
+    """Build project dependencies, the only generated layer allowed build-time network access."""
+
+    _kind = "project"
+    _parent_kind = "repository"
+    _network_allowed = True
+
+    def prepare(self, project, repository_manifest: LayerManifest, build_asset, sink) -> LayerManifest:
+        parent_image = self._inspector.inspect(repository_manifest.tag).image_id
+        build_name = self._asset_entrypoint(build_asset)
+        template = (
+            "FROM {parent}\nWORKDIR /src\nCOPY build/ /bigeye/build/\n"
+            "RUN /bin/sh /bigeye/build/" + build_name + "\n"
+            f"LABEL bigeye.project=\"{project.id}\" bigeye.commit=\"{project.commit_sha}\" "
+            "bigeye.layer=\"project\" bigeye.content-hash=\"{content_hash}\" "
+            f"bigeye.parent-image=\"{parent_image}\"\n"
+        )
+        return self._prepare(project, repository_manifest, (("build", build_asset),), template, sink, None)

@@ -25,14 +25,17 @@ class ImageBuilder:
     def __init__(self, client):
         self._client = client
 
-    def build(self, dockerfile: Path, tag: str, sink, cancellation_signal=None) -> str:
+    def build(self, dockerfile: Path, tag: str, sink, cancellation_signal=None, network_mode: str | None = None) -> str:
         dockerfile = Path(dockerfile)
         if dockerfile.name != "Dockerfile" or not dockerfile.is_file():
             raise ValueError("dockerfile must be an existing Dockerfile")
-        stream = self._client.api.build(
-            path=str(dockerfile.parent), dockerfile=dockerfile.name, tag=tag,
-            platform=PLATFORM, decode=True, rm=True, timeout=DOCKER_REQUEST_TIMEOUT_SECONDS,
-        )
+        kwargs = {
+            "path": str(dockerfile.parent), "dockerfile": dockerfile.name, "tag": tag,
+            "platform": PLATFORM, "decode": True, "rm": True, "timeout": DOCKER_REQUEST_TIMEOUT_SECONDS,
+        }
+        if network_mode is not None:
+            kwargs["network_mode"] = network_mode
+        stream = self._client.api.build(**kwargs)
         emitted = 0
         def emit(text: str) -> None:
             nonlocal emitted
