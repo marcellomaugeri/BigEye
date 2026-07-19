@@ -106,6 +106,26 @@ def test_event_stream_replays_only_events_after_last_id(tmp_path: Path) -> None:
     assert "second" not in run(replay())
 
 
+def test_event_stream_replays_preexisting_backlog_beyond_one_page_without_new_append(tmp_path: Path) -> None:
+    from backend.services.observability.event_store import ProjectEventStore
+    from backend.services.observability.event_stream import ProjectEventStream
+
+    store = ProjectEventStore(tmp_path)
+    durable = [store.append_sync(7, "events", {"name": "project"}) for _ in range(1001)]
+    events = ProjectEventStream(store)
+
+    async def replay():
+        stream = events.stream(7, -1)
+        try:
+            frames = [await anext(stream) for _ in range(1001)]
+            return frames[-1]
+        finally:
+            await stream.aclose()
+
+    last = run(asyncio.wait_for(replay(), 2))
+    assert f"id: {durable[-1].id}" in last
+
+
 def test_event_stream_waits_for_new_durable_invalidation(tmp_path: Path) -> None:
     from backend.services.observability.event_store import ProjectEventStore
     from backend.services.observability.event_stream import ProjectEventStream

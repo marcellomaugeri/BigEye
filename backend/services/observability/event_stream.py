@@ -51,7 +51,9 @@ class ProjectEventStream:
                     cursor = event.id
                     emitted = True
                     yield self.frame(event)
-                if not emitted and events.next_offset != cursor:
+                if emitted:
+                    continue
+                if events.next_offset != cursor:
                     cursor = events.next_offset
                     continue
                 await signal.wait()
