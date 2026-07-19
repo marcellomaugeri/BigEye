@@ -30,6 +30,7 @@ class GitCommandFailed(RuntimeError):
 
 MAX_GIT_OUTPUT_BYTES = 1_048_576
 GIT_COMMAND_TIMEOUT_SECONDS = 60
+GIT_OUTPUT_TRUNCATED_MESSAGE = "Git output exceeded 1048576 bytes and was truncated\n"
 
 
 class GitCommandTimedOut(RuntimeError):
@@ -88,7 +89,7 @@ async def run_command(argv: list[str], cwd: Path | None = None, sink=None, env: 
             if len(allowed) != len(chunk) and not truncated:
                 truncated = True
                 if sink is not None:
-                    sink("Git output exceeded 1048576 bytes and was truncated\n")
+                    sink(GIT_OUTPUT_TRUNCATED_MESSAGE)
     drains = (asyncio.create_task(drain(process.stdout, True)), asyncio.create_task(drain(process.stderr, False)))
     wait = asyncio.create_task(process.wait())
     try:
@@ -170,7 +171,18 @@ class CloneRepositoryService:
 
         def flush() -> None:
             if output:
-                self._logs.append_sync(task, "".join(output).replace(token, "[REDACTED]"))
+                content = "".join(output)
+                truncated = content.endswith(GIT_OUTPUT_TRUNCATED_MESSAGE)
+                if truncated:
+                    content = content[:-len(GIT_OUTPUT_TRUNCATED_MESSAGE)]
+                content = content.replace(token, "[REDACTED]")
+                if truncated:
+                    for length in range(min(len(token) - 1, len(content)), 0, -1):
+                        if content.endswith(token[:length]):
+                            content = f"{content[:-length]}[REDACTED]"
+                            break
+                    content += GIT_OUTPUT_TRUNCATED_MESSAGE
+                self._logs.append_sync(task, content)
                 output.clear()
 
         sink.flush = flush

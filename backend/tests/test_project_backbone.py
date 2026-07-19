@@ -232,6 +232,46 @@ class TestCloneRepository:
         assert logged == ["remote output includes [REDACTED] and continues\n"] * 3
         assert all(token not in text for text in logged)
 
+    def test_clone_redacts_truncated_repository_token_prefix_at_output_cap(self, tmp_path: Path, monkeypatch) -> None:
+        from backend.services.projects import clone_repository
+        from backend.services.projects.clone_repository import CloneRepositoryService, GitCommandFailed
+
+        token = "secret"
+        logged = []
+
+        class Reader:
+            def __init__(self, chunks): self.chunks = list(chunks)
+            async def read(self, size): return self.chunks.pop(0) if self.chunks else b""
+
+        class Process:
+            returncode = 0
+            def __init__(self): self.stdout, self.stderr = Reader([b"ok secre", b"t"]), Reader([])
+            async def wait(self): return 0
+
+        async def spawn(*argv, **kwargs):
+            Path(argv[-1]).mkdir(parents=True)
+            return Process()
+
+        async def command(argv, cwd=None, sink=None, env=None):
+            if argv[1] == "clone":
+                return await clone_repository.run_command(argv, cwd, sink, env)
+            return "a" * 40 if argv[1] == "rev-parse" else ""
+
+        monkeypatch.setattr(clone_repository, "MAX_GIT_OUTPUT_BYTES", 8)
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+        project_repository = AsyncMock()
+        project_repository.get_repository_token.return_value = token
+        logs = SimpleNamespace(append_sync=lambda item, text: logged.append(text))
+        value = replace(project(), token_present=True)
+
+        with pytest.raises(GitCommandFailed, match="exceeded"):
+            run(CloneRepositoryService(tmp_path, command, project_repository, logs).clone(value, task()))
+
+        output = "".join(logged)
+        assert token not in output and token[:-1] not in output
+        assert output.startswith("ok ") and "[REDACTED]" in output
+        assert "Git output exceeded 1048576 bytes and was truncated\n" in output
+
     def test_clone_rejects_workspace_symlink_escape(self, tmp_path: Path) -> None:
         from backend.services.projects.clone_repository import CloneRepositoryService, UnsafeWorkspacePath
 
