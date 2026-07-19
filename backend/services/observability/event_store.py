@@ -141,7 +141,6 @@ class ProjectEventStore:
                     break
                 raw = file.readline(min(EVENT_RECORD_MAX_BYTES, remaining) + 1)
                 if not raw:
-                    next_offset = size
                     break
                 if len(raw) > remaining:
                     file.seek(offset)

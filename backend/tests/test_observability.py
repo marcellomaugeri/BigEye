@@ -126,6 +126,44 @@ def test_event_stream_waits_for_new_durable_invalidation(tmp_path: Path) -> None
     assert "event: activity" in run(receive())
 
 
+def test_existing_empty_events_file_does_not_advance_initial_sse_cursor(tmp_path: Path) -> None:
+    from backend.services.observability.event_store import ProjectEventStore
+    from backend.services.observability.event_stream import ProjectEventStream
+
+    path = tmp_path / "projects/7/logs"
+    path.mkdir(parents=True)
+    (path / "events.jsonl").write_bytes(b"")
+    store = ProjectEventStore(tmp_path)
+    events = ProjectEventStream(store)
+
+    async def receive():
+        stream = events.stream(7, -1)
+        waiting = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+        await store.append(7, "activity", {"message": "first"})
+        try:
+            return await asyncio.wait_for(waiting, 1)
+        finally:
+            await stream.aclose()
+
+    assert "event: activity" in run(receive())
+
+
+@pytest.mark.parametrize("stream", ["activity", "debug"])
+def test_page_cursor_at_eof_still_receives_a_later_append(tmp_path: Path, stream: str) -> None:
+    from backend.services.observability.event_store import ProjectEventStore
+
+    store = ProjectEventStore(tmp_path)
+    first = run(store.append(7, stream, {"message": "first"}))
+    page = run(store.read(7, stream, -1, 20))
+    second = run(store.append(7, stream, {"message": "second"}))
+
+    assert page.next_offset == first.id
+    later = run(store.read(7, stream, page.next_offset, 20))
+    assert [event.id for event in later] == [second.id]
+    assert [event.payload["message"] for event in later] == ["second"]
+
+
 def test_event_log_read_stays_bounded_and_at_record_boundaries(tmp_path: Path, monkeypatch) -> None:
     from backend.services.observability import event_store
     from backend.services.observability.event_store import ProjectEventStore
@@ -151,15 +189,22 @@ def test_every_examined_record_charges_the_bounded_scan_budget(tmp_path: Path, m
     from backend.services.observability import event_store
     from backend.services.observability.event_store import ProjectEventStore
 
-    monkeypatch.setattr(event_store, "EVENT_RESPONSE_MAX_BYTES", len(raw) * 2)
+    valid = b'{"id":0,"created_at":"2026-07-19T00:00:00+00:00","stream":"activity","payload":{"message":"ok"}}\n'
+    monkeypatch.setattr(event_store, "EVENT_RESPONSE_MAX_BYTES", max(len(raw) * 2, len(raw) + len(valid)))
     path = tmp_path / "projects/7/logs"
     path.mkdir(parents=True)
-    (path / "activity.jsonl").write_bytes(raw * 3)
+    (path / "activity.jsonl").write_bytes(raw * 3 + valid)
 
-    page = run(ProjectEventStore(tmp_path).read(7, "activity", -1, 20))
+    store = ProjectEventStore(tmp_path)
+    page = run(store.read(7, "activity", -1, 20))
 
     assert page == []
-    assert page.next_offset == len(raw)
+    assert page.next_offset in {len(raw), len(raw) * 2}
+    for _ in range(3):
+        page = run(store.read(7, "activity", page.next_offset, 20))
+        if page:
+            break
+    assert [event.payload for event in page] == [{"message": "ok"}]
 
 
 def test_valid_record_after_a_wrong_stream_record_is_still_returned(tmp_path: Path) -> None:
