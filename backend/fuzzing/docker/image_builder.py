@@ -75,3 +75,17 @@ class ImageBuilder:
         if not image_id:
             raise ImageBuildFailed(f"built image {tag} could not be inspected: no image ID")
         return str(image_id)
+
+    def inspect_matching(self, tag: str, labels: dict[str, str]) -> str | None:
+        """Return an existing linux/amd64 image only when every layer label matches."""
+        try:
+            image = self._client.api.inspect_image(tag)
+        except Exception:
+            return None
+        if image.get("Os") != "linux" or image.get("Architecture") != "amd64":
+            return None
+        actual = image.get("Config", {}).get("Labels", {})
+        if not isinstance(actual, dict) or any(actual.get(key) != value for key, value in labels.items()):
+            return None
+        image_id = image.get("Id")
+        return str(image_id) if image_id else None

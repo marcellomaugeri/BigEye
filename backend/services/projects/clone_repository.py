@@ -4,6 +4,8 @@ import asyncio
 import os
 import re
 import shutil
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 from backend.services.projects.create_project import validate_repository_url
@@ -35,6 +37,12 @@ GIT_OUTPUT_TRUNCATED_MESSAGE = "Git output exceeded 1048576 bytes and was trunca
 
 class GitCommandTimedOut(RuntimeError):
     """Raised when a Git child exceeds its bounded command lifetime."""
+
+
+def clone_argv(repository_url: str, revision: str, destination: str) -> list[str]:
+    """Return the non-checking-out clone command for a requested revision."""
+    del revision
+    return ["git", "clone", "--no-checkout", "--", repository_url, destination]
 
 
 async def _stop_process(process, drains=()) -> None:
@@ -130,22 +138,24 @@ class CloneRepositoryService:
                     return recovered
             raise UnsafeWorkspacePath("repository destination already exists")
         self._remove_staging(staging, project_root)
-        kwargs = {}
         token = None
         if project.token_present:
             token = await self._projects.get_repository_token(project.id) or None
-            if token:
-                kwargs["env"] = {
-                    "GIT_CONFIG_COUNT": "1",
-                    "GIT_CONFIG_KEY_0": "http.extraHeader",
-                    "GIT_CONFIG_VALUE_0": f"Authorization: Bearer {token}",
-                }
-        if self._logs is not None and task is not None:
-            kwargs["sink"] = self._task_log_sink(task, token)
         try:
-            await self._run_command(["git", "clone", "--", repository_url, str(staging)], kwargs)
-            await self._run_command(["git", "checkout", "--detach", project.requested_revision], kwargs, staging)
-            commit_sha = await self._head(staging, kwargs)
+            with self._git_auth(project_root, token) as env:
+                await self._run_git(
+                    "clone", clone_argv(repository_url, project.requested_revision, str(staging)), env
+                )
+                await self._run_git(
+                    "fetch requested revision",
+                    ["git", "fetch", "--no-tags", "origin", "--", project.requested_revision],
+                    env,
+                    staging,
+                )
+                commit_sha = await self._resolve_revision(staging, env)
+                await self._run_git("checkout exact commit", ["git", "checkout", "--detach", commit_sha], env, staging)
+                if await self._head(staging, env) != commit_sha:
+                    raise GitCommandFailed("Git command failed during checkout verification")
             os.replace(staging, destination)
             await self._projects.set_commit_sha(project.id, commit_sha)
             return commit_sha
@@ -161,46 +171,46 @@ class CloneRepositoryService:
             raise UnsafeWorkspacePath("repository staging directory is unsafe")
         shutil.rmtree(staging)
 
-    def _task_log_sink(self, task, token: str | None):
-        if token is None:
-            return lambda text: self._logs.append_sync(task, text)
-        output = []
-
-        def sink(text: str) -> None:
-            output.append(text)
-
-        def flush() -> None:
-            if output:
-                content = "".join(output)
-                truncated = content.endswith(GIT_OUTPUT_TRUNCATED_MESSAGE)
-                if truncated:
-                    content = content[:-len(GIT_OUTPUT_TRUNCATED_MESSAGE)]
-                content = content.replace(token, "[REDACTED]")
-                if truncated:
-                    for length in range(min(len(token) - 1, len(content)), 0, -1):
-                        if content.endswith(token[:length]):
-                            content = f"{content[:-length]}[REDACTED]"
-                            break
-                    content += GIT_OUTPUT_TRUNCATED_MESSAGE
-                self._logs.append_sync(task, content)
-                output.clear()
-
-        sink.flush = flush
-        return sink
-
-    async def _run_command(self, argv: list[str], kwargs, cwd: Path | None = None) -> str:
+    @contextmanager
+    def _git_auth(self, project_root: Path, token: str | None):
+        if not token:
+            yield None
+            return
+        directory = Path(tempfile.mkdtemp(prefix=".git-auth-", dir=project_root))
         try:
-            return await self._command(argv, cwd=cwd, **kwargs)
+            directory.chmod(0o700)
+            askpass = directory / "askpass"
+            askpass.write_text(
+                "#!/bin/sh\ncase \"$1\" in *Username*) printf '%s\\n' 'x-access-token' ;; *) printf '%s\\n' \"$BIGEYE_GIT_TOKEN\" ;; esac\n"
+            )
+            askpass.chmod(0o700)
+            yield {"GIT_ASKPASS": str(askpass), "BIGEYE_GIT_TOKEN": token}
         finally:
-            sink = kwargs.get("sink")
-            flush = getattr(sink, "flush", None)
-            if flush is not None:
-                flush()
+            if directory.exists() and directory.is_dir() and not directory.is_symlink():
+                if directory.parent.resolve(strict=True) == project_root.resolve(strict=True):
+                    shutil.rmtree(directory)
 
-    async def _head(self, destination: Path, kwargs) -> str:
-        commit_sha = await self._run_command(["git", "rev-parse", "HEAD"], kwargs, destination)
+    async def _run_git(self, operation: str, argv: list[str], env: dict[str, str] | None, cwd: Path | None = None) -> str:
+        try:
+            kwargs = {"env": env} if env is not None else {}
+            return await self._command(argv, cwd=cwd, **kwargs)
+        except (GitCommandFailed, GitCommandTimedOut):
+            raise GitCommandFailed(f"Git command failed during {operation}") from None
+
+    async def _resolve_revision(self, destination: Path, env: dict[str, str] | None) -> str:
+        commit_sha = await self._run_git(
+            "resolve requested revision", ["git", "rev-parse", "--verify", "FETCH_HEAD^{commit}"], env, destination
+        )
+        return self._valid_commit(commit_sha, "resolve requested revision")
+
+    async def _head(self, destination: Path, env: dict[str, str] | None) -> str:
+        commit_sha = await self._run_git("read checkout HEAD", ["git", "rev-parse", "HEAD"], env, destination)
+        return self._valid_commit(commit_sha, "read checkout HEAD")
+
+    @staticmethod
+    def _valid_commit(commit_sha: str, operation: str) -> str:
         if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", commit_sha) is None:
-            raise GitCommandFailed("Git did not return a full object ID")
+            raise GitCommandFailed(f"Git command failed during {operation}")
         return commit_sha
 
     async def recover_published(self, project, task=None) -> str | None:
@@ -209,8 +219,7 @@ class CloneRepositoryService:
             return None
         if destination.is_symlink() or not destination.is_dir() or not (destination / ".git").is_dir():
             raise GitCommandFailed("published repository is not a valid Git repository")
-        kwargs = {"sink": lambda text: self._logs.append_sync(task, text)} if self._logs is not None and task is not None else {}
-        commit_sha = await self._head(destination, kwargs)
+        commit_sha = await self._head(destination, None)
         await self._projects.set_commit_sha(project.id, commit_sha)
         return commit_sha
 

@@ -184,8 +184,11 @@ class TestCloneRepository:
 
         run(service.clone(project()))
 
-        assert calls[0] == ["git", "clone", "--", "https://github.com/acme/demo.git", str(tmp_path / "projects/7/repository.clone")]
-        assert calls[1] == ["git", "checkout", "--detach", "HEAD"]
+        assert calls[0] == ["git", "clone", "--no-checkout", "--", "https://github.com/acme/demo.git", str(tmp_path / "projects/7/repository.clone")]
+        assert calls[1] == ["git", "fetch", "--no-tags", "origin", "--", "HEAD"]
+        assert calls[2] == ["git", "rev-parse", "--verify", "FETCH_HEAD^{commit}"]
+        assert calls[3] == ["git", "checkout", "--detach", commit_sha]
+        assert calls[4] == ["git", "rev-parse", "HEAD"]
         project_repository.set_commit_sha.assert_awaited_once_with(7, commit_sha)
 
     def test_clone_checks_out_requested_revision_and_keeps_token_out_of_argv(self, tmp_path: Path) -> None:
@@ -195,6 +198,10 @@ class TestCloneRepository:
 
         async def command(argv, cwd=None, env=None):
             calls.append((argv, env))
+            if env is not None:
+                askpass = Path(env["GIT_ASKPASS"])
+                assert askpass.stat().st_mode & 0o777 == 0o700
+                assert askpass.parent.stat().st_mode & 0o777 == 0o700
             if argv[1] == "clone":
                 Path(argv[-1]).mkdir(parents=True)
             return "a" * 40 if argv[1] == "rev-parse" else ""
@@ -205,21 +212,24 @@ class TestCloneRepository:
 
         run(CloneRepositoryService(tmp_path, command, project_repository).clone(value))
 
-        assert calls[1][0] == ["git", "checkout", "--detach", "stable"]
+        assert calls[0][0] == ["git", "clone", "--no-checkout", "--", "https://github.com/acme/demo.git", str(tmp_path / "projects/7/repository.clone")]
+        assert calls[1][0] == ["git", "fetch", "--no-tags", "origin", "--", "stable"]
+        assert calls[2][0] == ["git", "rev-parse", "--verify", "FETCH_HEAD^{commit}"]
+        assert calls[3][0] == ["git", "checkout", "--detach", "a" * 40]
         assert all("secret-read-token" not in " ".join(argv) for argv, _ in calls)
-        assert calls[0][1]["GIT_CONFIG_VALUE_0"] == "Authorization: Bearer secret-read-token"
+        askpass = Path(calls[0][1]["GIT_ASKPASS"])
+        assert askpass.name == "askpass" and not askpass.exists()
+        assert calls[0][1]["BIGEYE_GIT_TOKEN"] == "secret-read-token"
 
-    def test_clone_redacts_repository_token_from_git_output_before_task_log(self, tmp_path: Path) -> None:
+    def test_clone_does_not_forward_git_output_to_task_logs(self, tmp_path: Path) -> None:
         from backend.services.projects.clone_repository import CloneRepositoryService
 
         token = "secret-read-token"
         logged = []
 
-        async def command(argv, cwd=None, sink=None, env=None):
+        async def command(argv, cwd=None, env=None):
             if argv[1] == "clone":
                 Path(argv[-1]).mkdir(parents=True)
-            sink("remote output includes secret-")
-            sink("read-token and continues\n")
             return "a" * 40 if argv[1] == "rev-parse" else ""
 
         project_repository = AsyncMock()
@@ -229,48 +239,21 @@ class TestCloneRepository:
 
         run(CloneRepositoryService(tmp_path, command, project_repository, logs).clone(value, task()))
 
-        assert logged == ["remote output includes [REDACTED] and continues\n"] * 3
-        assert all(token not in text for text in logged)
+        assert logged == []
 
-    def test_clone_redacts_truncated_repository_token_prefix_at_output_cap(self, tmp_path: Path, monkeypatch) -> None:
-        from backend.services.projects import clone_repository
+    def test_clone_error_is_sanitized_without_the_repository_token(self, tmp_path: Path) -> None:
         from backend.services.projects.clone_repository import CloneRepositoryService, GitCommandFailed
 
         token = "secret"
-        logged = []
-
-        class Reader:
-            def __init__(self, chunks): self.chunks = list(chunks)
-            async def read(self, size): return self.chunks.pop(0) if self.chunks else b""
-
-        class Process:
-            returncode = 0
-            def __init__(self): self.stdout, self.stderr = Reader([b"ok secre", b"t"]), Reader([])
-            async def wait(self): return 0
-
-        async def spawn(*argv, **kwargs):
-            Path(argv[-1]).mkdir(parents=True)
-            return Process()
-
-        async def command(argv, cwd=None, sink=None, env=None):
-            if argv[1] == "clone":
-                return await clone_repository.run_command(argv, cwd, sink, env)
-            return "a" * 40 if argv[1] == "rev-parse" else ""
-
-        monkeypatch.setattr(clone_repository, "MAX_GIT_OUTPUT_BYTES", 8)
-        monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+        async def command(argv, cwd=None, env=None):
+            raise GitCommandFailed(f"remote rejected {token}")
         project_repository = AsyncMock()
         project_repository.get_repository_token.return_value = token
-        logs = SimpleNamespace(append_sync=lambda item, text: logged.append(text))
         value = replace(project(), token_present=True)
 
-        with pytest.raises(GitCommandFailed, match="exceeded"):
-            run(CloneRepositoryService(tmp_path, command, project_repository, logs).clone(value, task()))
-
-        output = "".join(logged)
-        assert token not in output and token[:-1] not in output
-        assert output.startswith("ok ") and "[REDACTED]" in output
-        assert "Git output exceeded 1048576 bytes and was truncated\n" in output
+        with pytest.raises(GitCommandFailed, match="Git command failed during clone") as error:
+            run(CloneRepositoryService(tmp_path, command, project_repository).clone(value, task()))
+        assert token not in str(error.value)
 
     def test_clone_rejects_workspace_symlink_escape(self, tmp_path: Path) -> None:
         from backend.services.projects.clone_repository import CloneRepositoryService, UnsafeWorkspacePath
