@@ -1,25 +1,42 @@
-"""Bounded, repeatable startup probes for prepared fuzz targets."""
+"""Application-observed target probes joined to attested clean coverage."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-import json
+from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Protocol
 
 from backend.fuzzing.docker.container_runner import ContainerTimedOut
 
 
-_RESULT_PREFIX = "BIGEYE_PROBE_RESULT="
 _INPUT_ROLES = frozenset({"empty", "minimum", "seed"})
 _SHELL_NAMES = frozenset({"sh", "bash", "dash", "zsh", "env"})
-_MAX_COMMAND_PARTS = 64
-_MAX_COMMAND_PART_CHARS = 4_096
-_MAX_SANITIZER_CHARS = 32_768
 _SANITIZER_MARKERS = (
     "AddressSanitizer", "UndefinedBehaviorSanitizer", "MemorySanitizer",
     "ThreadSanitizer", "LeakSanitizer", "runtime error:",
 )
+_SIGNAL_EXIT_CODES = frozenset({128 + value for value in range(1, 32)})
+_MAX_COMMAND_PARTS = 64
+_MAX_COMMAND_PART_CHARS = 4_096
+_MAX_SANITIZER_CHARS = 32_768
+_MAX_COVERAGE_LINES = 1_000_000
+
+
+def _exact_image_id(value: str, name: str) -> str:
+    if (
+        not isinstance(value, str) or not value.startswith("sha256:") or len(value) != 71
+        or any(character not in "0123456789abcdef" for character in value[7:])
+    ):
+        raise ValueError(f"{name} is not an exact image ID")
+    return value
+
+
+def _hex(value: str, lengths: set[int], name: str) -> str:
+    if not isinstance(value, str) or len(value) not in lengths or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise ValueError(f"{name} is invalid")
+    return value
 
 
 @dataclass(frozen=True)
@@ -36,8 +53,7 @@ class ProbeInvocation:
         if self.role not in _INPUT_ROLES:
             raise ValueError("probe input role is invalid")
         if (
-            not isinstance(self.command, tuple)
-            or not 1 <= len(self.command) <= _MAX_COMMAND_PARTS
+            not isinstance(self.command, tuple) or not 1 <= len(self.command) <= _MAX_COMMAND_PARTS
             or any(
                 not isinstance(part, str) or not part or "\x00" in part or len(part) > _MAX_COMMAND_PART_CHARS
                 for part in self.command
@@ -46,8 +62,7 @@ class ProbeInvocation:
             raise ValueError("probe command is invalid")
         executable = PurePosixPath(self.command[0])
         if (
-            not executable.is_absolute()
-            or executable.name.casefold() in _SHELL_NAMES
+            not executable.is_absolute() or executable.name.casefold() in _SHELL_NAMES
             or any(part in {"", ".", ".."} for part in executable.parts)
             or executable.parts[:3] != ("/", "opt", "bigeye")
         ):
@@ -55,89 +70,244 @@ class ProbeInvocation:
 
 
 @dataclass(frozen=True)
+class CleanCoverageProvenance:
+    """Application-attested identity for one exact clean replay."""
+
+    project_id: int
+    commit_sha: str
+    clean_image_id: str
+    testcase_sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.project_id) is not int or self.project_id <= 0:
+            raise ValueError("coverage provenance project ID is invalid")
+        _hex(self.commit_sha, {40, 64}, "coverage provenance commit")
+        _exact_image_id(self.clean_image_id, "coverage provenance image")
+        _hex(self.testcase_sha256, {64}, "coverage provenance testcase")
+
+
+def _coverage_set(values, name: str) -> frozenset[str]:
+    if not isinstance(values, frozenset) or len(values) > _MAX_COVERAGE_LINES or any(
+        not isinstance(value, str) or not value or len(value) > 2_000 for value in values
+    ):
+        raise ValueError(f"{name} coverage is invalid")
+    return values
+
+
+@dataclass(frozen=True)
+class AttestedCoverage:
+    """Coverage measured by BigEye's clean replay, never by generated target output."""
+
+    project_lines: frozenset[str]
+    harness_lines: frozenset[str]
+    startup_lines: frozenset[str]
+    contract_valid: bool
+    provenance: CleanCoverageProvenance
+
+    def __post_init__(self) -> None:
+        _coverage_set(self.project_lines, "project")
+        _coverage_set(self.harness_lines, "harness")
+        _coverage_set(self.startup_lines, "startup")
+        if type(self.contract_valid) is not bool:
+            raise ValueError("clean replay contract evidence is invalid")
+        if not isinstance(self.provenance, CleanCoverageProvenance):
+            raise ValueError("clean replay provenance is invalid")
+
+
+@dataclass(frozen=True)
+class ProbeProcessObservation:
+    """Facts derived from the bounded container result and inspected state."""
+
+    exit_code: int | None
+    alive: bool
+    timed_out: bool
+    immediate_crash: bool
+    sanitizer_output: str
+
+    def __post_init__(self) -> None:
+        if self.exit_code is not None and (type(self.exit_code) is not int):
+            raise ValueError("probe process exit code is invalid")
+        for name in ("alive", "timed_out", "immediate_crash"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"probe process {name} is invalid")
+        if not isinstance(self.sanitizer_output, str) or len(self.sanitizer_output) > _MAX_SANITIZER_CHARS:
+            raise ValueError("probe process sanitizer output is invalid")
+
+
+class ProbeRunner:
+    """Convert bounded Docker outcomes into application-owned process evidence."""
+
+    def __init__(self, bounded_runner):
+        self._bounded_runner = bounded_runner
+
+    async def run(self, image_id: str, invocation: ProbeInvocation, timeout: float, sink) -> ProbeProcessObservation:
+        _exact_image_id(image_id, "probe image")
+        try:
+            result = await self._bounded_runner.run(
+                image_id, list(invocation.command), timeout, sink,
+            )
+        except ContainerTimedOut:
+            return ProbeProcessObservation(None, False, True, False, "")
+        exit_code = getattr(result, "exit_code", None)
+        if type(exit_code) is not int:
+            raise ValueError("bounded probe returned an invalid exit code")
+        output = getattr(result, "output", None)
+        if not isinstance(output, str):
+            raise ValueError("bounded probe returned non-text output")
+        sanitizer = "\n".join(
+            line for line in output.splitlines()
+            if any(marker in line for marker in _SANITIZER_MARKERS)
+        )[:_MAX_SANITIZER_CHARS]
+        oom_killed = getattr(result, "oom_killed", False)
+        if type(oom_killed) is not bool:
+            raise ValueError("bounded probe returned invalid OOM state")
+        state = getattr(result, "state", "exited")
+        if not isinstance(state, str):
+            raise ValueError("bounded probe returned invalid container state")
+        immediate_crash = bool(sanitizer) or oom_killed or exit_code < 0 or exit_code in _SIGNAL_EXIT_CODES
+        alive = not immediate_crash and state not in {"dead", "removing"}
+        return ProbeProcessObservation(exit_code, alive, False, immediate_crash, sanitizer)
+
+
+class CleanCoverageCollector(Protocol):
+    """Task 14 boundary for replaying one exact input in the verified clean image."""
+
+    async def collect(
+        self,
+        prepared_target,
+        invocation: ProbeInvocation,
+        process: ProbeProcessObservation,
+    ) -> AttestedCoverage: ...
+
+
+@dataclass(frozen=True)
+class ProbeExecutionEvidence:
+    process: ProbeProcessObservation
+    coverage: AttestedCoverage
+    accepted_input: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.process, ProbeProcessObservation) or not isinstance(self.coverage, AttestedCoverage):
+            raise ValueError("probe execution evidence is invalid")
+        if type(self.accepted_input) is not bool:
+            raise ValueError("probe input acceptance evidence is invalid")
+
+    @property
+    def exit_code(self):
+        return self.process.exit_code
+
+    @property
+    def alive(self):
+        return self.process.alive
+
+    @property
+    def timed_out(self):
+        return self.process.timed_out
+
+    @property
+    def immediate_crash(self):
+        return self.process.immediate_crash
+
+    @property
+    def sanitizer_output(self):
+        return self.process.sanitizer_output
+
+
+@dataclass(frozen=True)
 class ProbeInputEvidence:
-    """Exact supervised evidence retained for one logical input."""
+    """Both executions retained for one logical startup input."""
 
     name: str
     role: str
-    exit_code: int | None
-    alive: bool
-    accepts_input: bool
+    first: ProbeExecutionEvidence
+    replay: ProbeExecutionEvidence
     deterministic: bool
-    project_lines: int
-    harness_lines: int
-    startup_lines: int
-    immediate_crash: bool
-    timed_out: bool
-    sanitizer_output: str
-    invalid_api_use: bool
-    replayed_immediate_crash: bool
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name or len(self.name) > 500:
             raise ValueError("probe evidence name is invalid")
         if self.role not in _INPUT_ROLES:
             raise ValueError("probe evidence role is invalid")
-        if self.exit_code is not None and (isinstance(self.exit_code, bool) or not isinstance(self.exit_code, int)):
-            raise ValueError("probe exit code is invalid")
-        for field in (
-            "alive", "accepts_input", "deterministic", "immediate_crash", "timed_out",
-            "invalid_api_use", "replayed_immediate_crash",
-        ):
-            if type(getattr(self, field)) is not bool:
-                raise ValueError(f"probe {field} evidence is invalid")
-        for field in ("project_lines", "harness_lines", "startup_lines"):
-            value = getattr(self, field)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(f"probe {field} evidence is invalid")
-        if not isinstance(self.sanitizer_output, str) or len(self.sanitizer_output) > _MAX_SANITIZER_CHARS:
-            raise ValueError("probe sanitizer output is invalid")
+        if not isinstance(self.first, ProbeExecutionEvidence) or not isinstance(self.replay, ProbeExecutionEvidence):
+            raise ValueError("probe execution pair is invalid")
+        if type(self.deterministic) is not bool:
+            raise ValueError("probe determinism evidence is invalid")
+
+    @property
+    def executions(self) -> tuple[ProbeExecutionEvidence, ProbeExecutionEvidence]:
+        return self.first, self.replay
 
 
 @dataclass(frozen=True)
 class ProbeEvidence:
-    """Aggregate facts used by the deterministic startup gate."""
+    """All supervised evidence, including rejected crash replay facts."""
 
     inputs: tuple[ProbeInputEvidence, ...]
-    exit_codes: tuple[int | None, ...]
-    alive: bool
-    accepts_input: bool
-    deterministic: bool
-    project_lines: int
-    harness_lines: int
-    startup_lines: int
-    immediate_crash: bool
-    timed_out: bool
-    sanitizer_output: str
-    replayed_immediate_crash: bool
-    seed_independent_crash: bool
-    invalid_api_use: bool
 
     @classmethod
     def from_inputs(cls, inputs) -> "ProbeEvidence":
         values = tuple(inputs)
         if not values or any(not isinstance(item, ProbeInputEvidence) for item in values):
             raise ValueError("probe evidence requires input results")
-        sanitizer = "\n".join(
-            value for value in dict.fromkeys(item.sanitizer_output for item in values) if value
+        return cls(values)
+
+    @property
+    def executions(self) -> tuple[ProbeExecutionEvidence, ...]:
+        return tuple(execution for item in self.inputs for execution in item.executions)
+
+    @property
+    def exit_codes(self) -> tuple[int | None, ...]:
+        return tuple(value.exit_code for value in self.executions)
+
+    @property
+    def alive(self) -> bool:
+        return all(value.alive for value in self.executions)
+
+    @property
+    def accepts_input(self) -> bool:
+        seeds = tuple(item for item in self.inputs if item.role == "seed")
+        return bool(seeds) and any(
+            item.first.accepted_input and item.replay.accepted_input for item in seeds
+        )
+
+    @property
+    def deterministic(self) -> bool:
+        return all(item.deterministic for item in self.inputs)
+
+    @property
+    def project_lines(self) -> frozenset[str]:
+        return frozenset(line for value in self.executions for line in value.coverage.project_lines)
+
+    @property
+    def harness_lines(self) -> frozenset[str]:
+        return frozenset(line for value in self.executions for line in value.coverage.harness_lines)
+
+    @property
+    def startup_lines(self) -> frozenset[str]:
+        return frozenset(line for value in self.executions for line in value.coverage.startup_lines)
+
+    @property
+    def immediate_crash(self) -> bool:
+        return any(value.immediate_crash for value in self.executions)
+
+    @property
+    def timed_out(self) -> bool:
+        return any(value.timed_out for value in self.executions)
+
+    @property
+    def sanitizer_output(self) -> str:
+        return "\n".join(
+            value for value in dict.fromkeys(item.sanitizer_output for item in self.executions) if value
         )[:_MAX_SANITIZER_CHARS]
-        crashes = tuple(item for item in values if item.immediate_crash)
-        seeds = tuple(item for item in values if item.role == "seed")
-        return cls(
-            inputs=values,
-            exit_codes=tuple(item.exit_code for item in values),
-            alive=all(item.alive for item in values),
-            accepts_input=bool(seeds) and any(item.accepts_input for item in seeds),
-            deterministic=all(item.deterministic for item in values),
-            project_lines=max(item.project_lines for item in values),
-            harness_lines=max(item.harness_lines for item in values),
-            startup_lines=max(item.startup_lines for item in values),
-            immediate_crash=bool(crashes),
-            timed_out=any(item.timed_out for item in values),
-            sanitizer_output=sanitizer,
-            replayed_immediate_crash=bool(crashes) and all(item.replayed_immediate_crash for item in crashes),
-            seed_independent_crash=any(item.immediate_crash and item.role != "seed" for item in values),
-            invalid_api_use=any(item.invalid_api_use for item in values),
+
+    @property
+    def invalid_api_use(self) -> bool:
+        return any(not value.coverage.contract_valid for value in self.executions)
+
+    @property
+    def seed_independent_crash(self) -> bool:
+        return any(
+            value.immediate_crash for item in self.inputs if item.role != "seed" for value in item.executions
         )
 
 
@@ -148,7 +318,7 @@ class ProbeAcceptance:
 
 
 class ProbePolicy:
-    """Accept only a deterministic target that reaches real project code."""
+    """Accept only a healthy target whose real seed reaches attested project code twice."""
 
     @staticmethod
     def accept(evidence: ProbeEvidence) -> ProbeAcceptance:
@@ -156,150 +326,102 @@ class ProbePolicy:
             raise TypeError("probe policy requires ProbeEvidence")
         if evidence.timed_out:
             return ProbeAcceptance(False, "the supervised probe timed out")
+        if evidence.immediate_crash:
+            return ProbeAcceptance(False, "an immediate crash was preserved for crash triage")
+        if evidence.sanitizer_output:
+            return ProbeAcceptance(False, "the supervised probe produced sanitizer output for crash triage")
         if not evidence.alive:
             return ProbeAcceptance(False, "the target did not remain healthy through supervised startup")
-        if not evidence.accepts_input:
-            return ProbeAcceptance(False, "the target did not accept a real seed input")
+        if any(value.exit_code != 0 for value in evidence.executions):
+            return ProbeAcceptance(False, "a supervised probe returned a failing exit code")
         if not evidence.deterministic:
-            return ProbeAcceptance(False, "the target did not produce deterministic probe evidence")
+            return ProbeAcceptance(False, "the target did not reproduce deterministic process and clean coverage evidence")
         if evidence.invalid_api_use:
-            return ProbeAcceptance(False, "the harness violates the observed API contract")
-        accepted_seeds = tuple(
-            item for item in evidence.inputs if item.role == "seed" and item.accepts_input
-        )
-        if not any(item.project_lines > 0 for item in accepted_seeds):
-            return ProbeAcceptance(False, "the accepted real seed did not reach project code")
-        if any(item.exit_code != 0 and not item.immediate_crash for item in evidence.inputs):
-            return ProbeAcceptance(False, "a noncrashing probe input returned a failing exit code")
-        if evidence.sanitizer_output:
-            return ProbeAcceptance(False, "the supervised probe produced sanitizer output")
-        if evidence.project_lines <= 0:
+            return ProbeAcceptance(False, "the harness violates the clean replay API contract")
+        seeds = tuple(item for item in evidence.inputs if item.role == "seed")
+        if not any(
+            item.first.accepted_input and item.replay.accepted_input
+            and item.first.coverage.project_lines and item.replay.coverage.project_lines
+            for item in seeds
+        ):
+            return ProbeAcceptance(False, "the accepted real seed did not reproducibly reach project code")
+        if not evidence.project_lines:
             return ProbeAcceptance(False, "the probe reached harness or startup code but no project code")
-        if evidence.immediate_crash and not evidence.replayed_immediate_crash:
-            return ProbeAcceptance(False, "an immediate crash must be replayed before the target can be accepted")
-        if evidence.seed_independent_crash:
-            return ProbeAcceptance(False, "the target has a seed-independent harness or startup crash")
-        return ProbeAcceptance(True, "the target accepts a real seed and reaches project code reproducibly")
-
-
-class _PreparedTarget(Protocol):
-    image: str
-    probe_invocations: tuple[ProbeInvocation, ...]
+        return ProbeAcceptance(True, "the target accepts a real seed and reaches attested project code reproducibly")
 
 
 class ProbeService:
-    """Run every input twice through the existing bounded container runner."""
+    """Repeat each input and join process evidence with an exact clean replay."""
 
-    def __init__(self, runner, timeout_seconds: float = 10.0, sink=None):
+    def __init__(self, runner: ProbeRunner, clean_coverage: CleanCoverageCollector, timeout_seconds: float = 10.0, sink=None):
+        if not isinstance(runner, ProbeRunner):
+            raise TypeError("probe service requires the application ProbeRunner")
         if type(timeout_seconds) is not float or not 0 < timeout_seconds <= 60:
             raise ValueError("probe timeout must be a float between 0 and 60 seconds")
         self._runner = runner
+        self._clean_coverage = clean_coverage
         self._timeout = timeout_seconds
         self._sink = sink or (lambda _text: None)
 
-    async def run(self, prepared_target: _PreparedTarget) -> ProbeEvidence:
-        image = getattr(prepared_target, "image", None)
-        invocations = getattr(prepared_target, "probe_invocations", None)
-        if (
-            not isinstance(image, str)
-            or not image.startswith("sha256:")
-            or len(image) != 71
-            or any(character not in "0123456789abcdef" for character in image[7:])
-            or not isinstance(invocations, tuple)
-        ):
-            raise ValueError("prepared target probe contract is invalid")
-        if any(not isinstance(item, ProbeInvocation) for item in invocations):
-            raise ValueError("prepared target contains an invalid probe invocation")
-        roles = {item.role for item in invocations}
-        if not {"empty", "minimum", "seed"}.issubset(roles):
+    async def run(self, prepared_target) -> ProbeEvidence:
+        self._validate_target(prepared_target)
+        invocations = prepared_target.probe_invocations
+        roles = tuple(item.role for item in invocations)
+        if roles.count("empty") != 1 or roles.count("minimum") != 1 or roles.count("seed") < 1:
             raise ValueError("prepared target requires empty, minimum, and real seed probes")
         if len(invocations) > 34 or len({item.name for item in invocations}) != len(invocations):
             raise ValueError("prepared target probe inputs are outside their bound")
-
         evidence = []
         for invocation in invocations:
-            first = await self._run_once(image, invocation)
-            replay = await self._run_once(image, invocation)
-            deterministic = self._signature(first) == self._signature(replay)
-            replayed_crash = first.immediate_crash and deterministic and replay.immediate_crash
-            evidence.append(replace(
+            first = await self._execution(prepared_target, invocation)
+            replay = await self._execution(prepared_target, invocation)
+            evidence.append(ProbeInputEvidence(
+                invocation.name,
+                invocation.role,
                 first,
-                deterministic=deterministic,
-                replayed_immediate_crash=replayed_crash,
+                replay,
+                self._signature(first) == self._signature(replay),
             ))
         return ProbeEvidence.from_inputs(evidence)
 
-    async def _run_once(self, image: str, invocation: ProbeInvocation) -> ProbeInputEvidence:
-        try:
-            result = await self._runner.run(
-                image, list(invocation.command), self._timeout, self._sink,
-            )
-        except ContainerTimedOut:
-            return ProbeInputEvidence(
-                invocation.name, invocation.role, None, False, False, True,
-                0, 0, 0, False, True, "", False, False,
-            )
-        return self._parse(invocation, result.exit_code, result.output)
+    async def _execution(self, target, invocation: ProbeInvocation) -> ProbeExecutionEvidence:
+        process = await self._runner.run(target.image, invocation, self._timeout, self._sink)
+        coverage = await self._clean_coverage.collect(target, invocation, process)
+        if not isinstance(coverage, AttestedCoverage):
+            raise ValueError("clean coverage collector returned invalid evidence")
+        provenance = coverage.provenance
+        if (
+            provenance.project_id != target.project_id
+            or provenance.commit_sha != target.commit_sha
+            or provenance.clean_image_id != target.coverage_image_id
+        ):
+            raise ValueError("clean coverage provenance does not match the prepared target")
+        accepted = (
+            process.alive and not process.timed_out and not process.immediate_crash
+            and process.exit_code == 0 and coverage.contract_valid
+            and bool(coverage.project_lines or coverage.harness_lines or coverage.startup_lines)
+        )
+        return ProbeExecutionEvidence(process, coverage, accepted)
 
     @staticmethod
-    def _parse(invocation: ProbeInvocation, exit_code: int, output: str) -> ProbeInputEvidence:
-        if isinstance(exit_code, bool) or not isinstance(exit_code, int):
-            raise ValueError("bounded probe returned an invalid exit code")
-        if not isinstance(output, str):
-            raise ValueError("bounded probe returned non-text output")
-        records = [line[len(_RESULT_PREFIX):] for line in output.splitlines() if line.startswith(_RESULT_PREFIX)]
-        if len(records) != 1:
-            sanitizer = output[-_MAX_SANITIZER_CHARS:]
-            return ProbeInputEvidence(
-                invocation.name, invocation.role, exit_code, False, False, True,
-                0, 0, 0, exit_code != 0, False, sanitizer, False, False,
-            )
-        try:
-            value = json.loads(records[0])
-        except json.JSONDecodeError as error:
-            raise ValueError("probe result record is invalid JSON") from error
-        if not isinstance(value, dict) or set(value) != {
-            "alive", "accepted_input", "project_lines", "harness_lines", "startup_lines",
-            "immediate_crash", "invalid_api_use", "sanitizer_output",
-        }:
-            raise ValueError("probe result record has an invalid shape")
-        for field in ("alive", "accepted_input", "immediate_crash", "invalid_api_use"):
-            if type(value[field]) is not bool:
-                raise ValueError(f"probe result {field} is invalid")
-        for field in ("project_lines", "harness_lines", "startup_lines"):
-            if isinstance(value[field], bool) or not isinstance(value[field], int) or value[field] < 0:
-                raise ValueError(f"probe result {field} is invalid")
-        sanitizer = value["sanitizer_output"]
-        if not isinstance(sanitizer, str) or len(sanitizer) > _MAX_SANITIZER_CHARS:
-            raise ValueError("probe result sanitizer output is invalid")
-        external_sanitizer = "\n".join(
-            line for line in output.splitlines()
-            if not line.startswith(_RESULT_PREFIX) and any(marker in line for marker in _SANITIZER_MARKERS)
-        )
-        sanitizer = "\n".join(
-            part for part in dict.fromkeys((sanitizer, external_sanitizer)) if part
-        )[:_MAX_SANITIZER_CHARS]
-        return ProbeInputEvidence(
-            invocation.name,
-            invocation.role,
-            exit_code,
-            value["alive"],
-            value["accepted_input"],
-            True,
-            value["project_lines"],
-            value["harness_lines"],
-            value["startup_lines"],
-            value["immediate_crash"],
-            False,
-            sanitizer,
-            value["invalid_api_use"],
-            False,
-        )
-
-    @staticmethod
-    def _signature(value: ProbeInputEvidence) -> tuple:
+    def _signature(value: ProbeExecutionEvidence) -> tuple:
         return (
-            value.exit_code, value.alive, value.accepts_input, value.project_lines,
-            value.harness_lines, value.startup_lines, value.immediate_crash,
-            value.timed_out, value.sanitizer_output, value.invalid_api_use,
+            value.process,
+            value.coverage.project_lines,
+            value.coverage.harness_lines,
+            value.coverage.startup_lines,
+            value.coverage.contract_valid,
+            value.coverage.provenance,
+            value.accepted_input,
         )
+
+    @staticmethod
+    def _validate_target(target) -> None:
+        if type(getattr(target, "project_id", None)) is not int or target.project_id <= 0:
+            raise ValueError("prepared target project ID is invalid")
+        _hex(getattr(target, "commit_sha", None), {40, 64}, "prepared target commit")
+        _exact_image_id(getattr(target, "image", None), "prepared target image")
+        _exact_image_id(getattr(target, "coverage_image_id", None), "prepared coverage image")
+        invocations = getattr(target, "probe_invocations", None)
+        if not isinstance(invocations, tuple) or any(not isinstance(item, ProbeInvocation) for item in invocations):
+            raise ValueError("prepared target contains invalid probe invocations")

@@ -18,11 +18,24 @@ ResultValue = TypeVar("ResultValue")
 
 
 @dataclass(frozen=True)
+class ActionError:
+    """A bounded action failure retained without cancelling sibling actions."""
+
+    error_type: str
+    message: str
+
+
+@dataclass(frozen=True)
 class ActionResult(Generic[ResultValue]):
     """The typed output associated with one application-owned action ID."""
 
     action_id: str
-    output: ResultValue
+    output: ResultValue | None
+    error: ActionError | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.error is None
 
 
 class DecisionExecutor:
@@ -62,24 +75,31 @@ class DecisionExecutor:
         return list(results)
 
     async def _execute_one(self, project, action_id: str, record) -> ActionResult:
-        if isinstance(record, TargetProposalRecord):
-            output = await self._target_preparation.prepare(project, record)
-            return ActionResult(action_id, output)
-        if isinstance(record, ContainedOperationRequestRecord):
-            if (
-                not record.actionable
-                or record.executed
-                or record.provenance != "agent_request"
-                or record.trusted_instructions
-            ):
-                raise ValueError("contained operation is not manager-validated for execution")
-            if self._bounded_operations is None:
-                raise ValueError("no bounded operation service is configured")
-            output = await self._bounded_operations.execute(project, record)
-            return ActionResult(action_id, output)
-        if isinstance(record, TriageResultRecord):
-            return ActionResult(action_id, record.triage)
-        raise TypeError("manager-selected action record type is unsupported")
+        try:
+            if isinstance(record, TargetProposalRecord):
+                output = await self._target_preparation.prepare(project, record)
+                return ActionResult(action_id, output)
+            if isinstance(record, ContainedOperationRequestRecord):
+                if (
+                    not record.actionable
+                    or record.executed
+                    or record.provenance != "agent_request"
+                    or record.trusted_instructions
+                ):
+                    raise ValueError("contained operation is not manager-validated for execution")
+                if self._bounded_operations is None:
+                    raise ValueError("no bounded operation service is configured")
+                output = await self._bounded_operations.execute(project, record)
+                return ActionResult(action_id, output)
+            if isinstance(record, TriageResultRecord):
+                return ActionResult(action_id, record.triage)
+            raise TypeError("manager-selected action record type is unsupported")
+        except Exception as error:
+            return ActionResult(
+                action_id,
+                None,
+                ActionError(type(error).__name__, str(error)),
+            )
 
     @staticmethod
     def _records(decision: CampaignReviewResult) -> dict[str, object]:

@@ -12,7 +12,10 @@ class CoverageLayerService(_GeneratedLayerService):
     _network_allowed = False
     _dockerfile_asset_index = 0
 
-    def prepare(self, project, project_manifest, adapter_asset, coverage_configuration, sink):
+    def prepare(
+        self, project, project_manifest, adapter_asset, coverage_configuration, sink,
+        cancellation_signal=None,
+    ):
         LayerPolicy().validate_coverage_inputs((
             (adapter_asset.name, adapter_asset.kind), (coverage_configuration.name, coverage_configuration.kind),
         ))
@@ -29,4 +32,5 @@ class CoverageLayerService(_GeneratedLayerService):
         return self._prepare(
             project, project_manifest,
             (("adapter", adapter_asset), ("coverage-configuration", coverage_configuration)), template, sink, "none",
+            cancellation_signal,
         )

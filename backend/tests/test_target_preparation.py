@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -12,10 +14,15 @@ from backend.agents.outputs.campaign_decision import CampaignDecision
 from backend.agents.outputs.campaign_review import CampaignReviewResult, TargetProposalRecord
 from backend.agents.outputs.target_proposal import TargetProposal
 from backend.fuzzing.campaigns.probe import (
+    AttestedCoverage,
+    CleanCoverageProvenance,
     ProbeEvidence,
+    ProbeExecutionEvidence,
     ProbeInputEvidence,
     ProbeInvocation,
     ProbePolicy,
+    ProbeProcessObservation,
+    ProbeRunner,
     ProbeService,
 )
 from backend.fuzzing.campaigns.target_preparation import (
@@ -23,12 +30,14 @@ from backend.fuzzing.campaigns.target_preparation import (
     DeterministicPreparationError,
     PreparationPlan,
     PreparedTarget,
+    TargetRepair,
     TargetPreparationFailed,
     TargetPreparationService,
 )
 from backend.fuzzing.docker.container_runner import ContainerResult, ContainerTimedOut
+from backend.fuzzing.docker.image_builder import ImageBuildCancelled, ImageBuildFailed, ImageCompilationFailed
 from backend.fuzzing.layers.manifest import LayerManifest
-from backend.services.campaigns.decision_executor import ActionResult, DecisionExecutor
+from backend.services.campaigns.decision_executor import ActionError, ActionResult, DecisionExecutor
 
 
 def run(awaitable):
@@ -76,21 +85,22 @@ def input_evidence(
     invalid_api_use: bool = False,
     replayed_immediate_crash: bool = False,
 ) -> ProbeInputEvidence:
+    project_set = frozenset(f"src/parser.cc:{index}" for index in range(1, project_lines + 1))
+    harness_set = frozenset(f"harness.cc:{index}" for index in range(1, harness_lines + 1))
+    startup_set = frozenset(f"src/main.cc:{index}" for index in range(1, startup_lines + 1))
+    coverage = AttestedCoverage(
+        project_set, harness_set, startup_set, not invalid_api_use,
+        CleanCoverageProvenance(7, "a" * 40, "sha256:" + "c" * 64, "d" * 64),
+    )
+
+    def execution(crash):
+        process = ProbeProcessObservation(exit_code, alive, timed_out, crash, sanitizer_output)
+        return ProbeExecutionEvidence(process, coverage, accepts_input)
+
     return ProbeInputEvidence(
-        name=name,
-        role=role,
-        exit_code=exit_code,
-        alive=alive,
-        accepts_input=accepts_input,
-        deterministic=deterministic,
-        project_lines=project_lines,
-        harness_lines=harness_lines,
-        startup_lines=startup_lines,
-        immediate_crash=immediate_crash,
-        timed_out=timed_out,
-        sanitizer_output=sanitizer_output,
-        invalid_api_use=invalid_api_use,
-        replayed_immediate_crash=replayed_immediate_crash,
+        name, role, execution(immediate_crash),
+        execution(immediate_crash if replayed_immediate_crash or not immediate_crash else False),
+        deterministic,
     )
 
 
@@ -127,7 +137,7 @@ def test_probe_rejects_target_that_only_reaches_harness_code() -> None:
     ],
 )
 def test_probe_rejects_unhealthy_or_unreproducible_targets(change, reason) -> None:
-    evidence = probe_evidence(replace(input_evidence(), **change))
+    evidence = probe_evidence(input_evidence(**change))
 
     result = ProbePolicy.accept(evidence)
 
@@ -135,7 +145,7 @@ def test_probe_rejects_unhealthy_or_unreproducible_targets(change, reason) -> No
     assert reason in result.reason
 
 
-def test_probe_requires_immediate_crash_replay_and_rejects_seed_independent_crashes() -> None:
+def test_probe_rejects_immediate_crashes_even_when_replayed() -> None:
     unreplayed = probe_evidence(input_evidence(immediate_crash=True))
     seed_independent = probe_evidence(
         input_evidence(
@@ -145,8 +155,8 @@ def test_probe_requires_immediate_crash_replay_and_rejects_seed_independent_cras
         input_evidence(immediate_crash=True, replayed_immediate_crash=True),
     )
 
-    assert "replayed" in ProbePolicy.accept(unreplayed).reason
-    assert "seed-independent" in ProbePolicy.accept(seed_independent).reason
+    assert "immediate crash" in ProbePolicy.accept(unreplayed).reason
+    assert "immediate crash" in ProbePolicy.accept(seed_independent).reason
 
 
 def test_probe_requires_the_accepted_seed_itself_to_reach_project_code() -> None:
@@ -169,7 +179,7 @@ def test_probe_requires_the_accepted_seed_itself_to_reach_project_code() -> None
     ],
 )
 def test_probe_rejects_noncrash_exit_failures_and_sanitizer_reports(change, reason) -> None:
-    result = ProbePolicy.accept(probe_evidence(replace(input_evidence(), **change)))
+    result = ProbePolicy.accept(probe_evidence(input_evidence(**change)))
 
     assert result.accepted is False
     assert reason in result.reason
@@ -217,14 +227,21 @@ def test_probe_runs_empty_minimum_and_real_seed_twice_and_records_exact_evidence
         ),
     )
 
-    evidence = run(ProbeService(runner, timeout_seconds=2.0).run(target))
+    target.project_id = 7
+    target.commit_sha = "a" * 40
+    target.coverage_image_id = "sha256:" + "c" * 64
+    evidence = run(ProbeService(
+        ProbeRunner(runner), _CleanCoverage([_attested() for _ in range(6)]), timeout_seconds=2.0,
+    ).run(target))
 
     assert [call[1][-1] for call in runner.calls] == [
         "empty", "empty", "minimum", "minimum", "tests/data/message.bin", "tests/data/message.bin",
     ]
-    assert evidence.exit_codes == (0, 0, 0)
+    assert evidence.exit_codes == (0, 0, 0, 0, 0, 0)
     assert evidence.alive and evidence.accepts_input and evidence.deterministic
-    assert evidence.project_lines == 5 and evidence.harness_lines == 2 and evidence.startup_lines == 1
+    assert evidence.project_lines == frozenset({"src/parser.cc:12"})
+    assert evidence.harness_lines == frozenset({"adapter.cc:4"})
+    assert evidence.startup_lines == frozenset({"src/main.cc:8"})
     assert ProbePolicy.accept(evidence).accepted is True
 
 
@@ -242,10 +259,15 @@ def test_probe_timeout_is_retained_as_evidence_instead_of_retried_as_transport()
         ),
     )
 
-    evidence = run(ProbeService(runner, timeout_seconds=1.0).run(target))
+    target.project_id = 7
+    target.commit_sha = "a" * 40
+    target.coverage_image_id = "sha256:" + "c" * 64
+    evidence = run(ProbeService(
+        ProbeRunner(runner), _CleanCoverage([_attested() for _ in range(6)]), timeout_seconds=1.0,
+    ).run(target))
 
     assert evidence.timed_out is True
-    assert evidence.exit_codes == (0, 0, None)
+    assert evidence.exit_codes == (0, 0, 0, 0, None, None)
     assert "timed out" in ProbePolicy.accept(evidence).reason
 
 
@@ -262,7 +284,12 @@ def test_probe_preserves_sanitizer_report_emitted_outside_the_result_record() ->
         ),
     )
 
-    evidence = run(ProbeService(runner, timeout_seconds=1.0).run(target))
+    target.project_id = 7
+    target.commit_sha = "a" * 40
+    target.coverage_image_id = "sha256:" + "c" * 64
+    evidence = run(ProbeService(
+        ProbeRunner(runner), _CleanCoverage([_attested() for _ in range(6)]), timeout_seconds=1.0,
+    ).run(target))
 
     assert "runtime error" in evidence.sanitizer_output
     assert ProbePolicy.accept(evidence).accepted is False
@@ -300,15 +327,12 @@ class _NormalBuild:
 
 
 class _Planner:
-    def __init__(self, shared_key="parser-target"):
-        self.shared_key = shared_key
-
     def plan(self, selected_project, selected_proposal):
         name = selected_proposal.target_name
         requests = (
             AssetVersionRequest(
                 "target", "harness", "harness.cc", {"harness.cc": f"draft:{name}"},
-                self.shared_key, (f"component/{name}/harness.cc",),
+                (f"component/{name}/harness.cc",),
             ),
         )
         return PreparationPlan(
@@ -369,7 +393,10 @@ class _TargetLayers:
         self.calls = []
         self.fail = False
 
-    def prepare(self, selected_project, project_manifest, target, configuration, sink, fuzz_patch_asset=None):
+    def prepare(
+        self, selected_project, project_manifest, target, configuration, sink,
+        fuzz_patch_asset=None, cancellation_signal=None,
+    ):
         self.calls.append((selected_project.id, target.id, configuration.id, fuzz_patch_asset))
         if self.fail:
             raise DeterministicPreparationError("target compilation failed")
@@ -380,7 +407,10 @@ class _CoverageLayers:
     def __init__(self):
         self.calls = []
 
-    def prepare(self, selected_project, project_manifest, adapter, configuration, sink):
+    def prepare(
+        self, selected_project, project_manifest, adapter, configuration, sink,
+        cancellation_signal=None,
+    ):
         self.calls.append((selected_project.id, adapter.id, configuration.id))
         return _manifest("coverage", f"bigeye-coverage:{adapter.id}")
 
@@ -401,7 +431,10 @@ class _Repairer:
 
     async def repair(self, selected_project, selected_proposal, failure, model):
         self.calls.append((selected_proposal.target_name, str(failure), model))
-        return selected_proposal.model_copy(update={"uncertainty": "repaired target requires a fresh probe"})
+        return TargetRepair(
+            selected_proposal.model_copy(update={"uncertainty": "repaired target requires a fresh probe"}),
+            "gpt-5.6-terra",
+        )
 
 
 def preparation(**changes):
@@ -506,6 +539,19 @@ def test_second_deterministic_failure_retains_last_validated_target() -> None:
     assert captured.value.retained_target.target_manifest.tag == first.target_manifest.tag
 
 
+def test_crashing_probe_is_not_repaired_and_returns_both_executions_for_triage() -> None:
+    crash = probe_evidence(input_evidence(immediate_crash=True, replayed_immediate_crash=True))
+    repairer = _Repairer()
+    service = preparation(probe=_Probe(crash), repairer=repairer)
+
+    with pytest.raises(TargetPreparationFailed) as captured:
+        run(service.prepare(project(), proposal()))
+
+    assert repairer.calls == []
+    assert captured.value.probe_evidence is crash
+    assert len(captured.value.probe_evidence.inputs[0].executions) == 2
+
+
 def test_transport_failure_is_not_sent_to_terra() -> None:
     class TransportFailureProbe:
         async def run(self, prepared):
@@ -520,10 +566,52 @@ def test_transport_failure_is_not_sent_to_terra() -> None:
     assert repairer.calls == []
 
 
+def test_only_typed_compilation_failure_gets_one_terra_repair() -> None:
+    class CompilationThenSuccess(_TargetLayers):
+        def prepare(self, *arguments, cancellation_signal=None):
+            self.calls.append(arguments)
+            if len(self.calls) == 1:
+                raise ImageCompilationFailed("compiler returned an error")
+            return _manifest("target", "bigeye-target:repaired")
+
+    repairer = _Repairer()
+    prepared = run(preparation(target_layers=CompilationThenSuccess(), repairer=repairer).prepare(project(), proposal()))
+
+    assert prepared.agent_attempts == ("gpt-5.6-luna", "gpt-5.6-terra")
+    assert len(repairer.calls) == 1
+
+
+def test_daemon_build_failure_is_fatal_and_never_sent_to_repair() -> None:
+    class DaemonFailure(_TargetLayers):
+        def prepare(self, *arguments, cancellation_signal=None):
+            raise ImageBuildFailed("Docker build stream disconnected") from ConnectionError("daemon unavailable")
+
+    repairer = _Repairer()
+    with pytest.raises(ImageBuildFailed, match="disconnected"):
+        run(preparation(target_layers=DaemonFailure(), repairer=repairer).prepare(project(), proposal()))
+
+    assert repairer.calls == []
+
+
+def test_repair_result_must_be_typed_and_exactly_terra() -> None:
+    class LunaRepair:
+        async def repair(self, selected_project, selected_proposal, failure, model):
+            return TargetRepair(selected_proposal, "gpt-5.6-luna")
+
+    service = preparation(
+        probe=_Probe(probe_evidence(input_evidence(project_lines=0))), repairer=LunaRepair(),
+    )
+
+    with pytest.raises(TargetPreparationFailed, match="Terra") as captured:
+        run(service.prepare(project(), proposal()))
+
+    assert captured.value.agent_attempts == ("gpt-5.6-luna", "gpt-5.6-luna")
+
+
 def test_repair_cannot_silently_change_target_identity() -> None:
     class IdentityChangingRepairer:
         async def repair(self, selected_project, selected_proposal, failure, model):
-            return proposal("different-target")
+            return TargetRepair(proposal("different-target"), "gpt-5.6-terra")
 
     service = preparation(
         probe=_Probe(probe_evidence(input_evidence(project_lines=0))),
@@ -536,36 +624,132 @@ def test_repair_cannot_silently_change_target_identity() -> None:
     assert captured.value.agent_attempts == ("gpt-5.6-luna", "gpt-5.6-terra")
 
 
-def test_same_project_asset_is_serialized_but_distinct_targets_prepare_in_parallel() -> None:
-    shared_store = _AssetStore()
-    shared_service = preparation(asset_store=shared_store, planner=_Planner(shared_key="shared"))
+class _ExistingAssetPlanner:
+    def __init__(self):
+        self.assets = {
+            "target": _existing_asset(100, "harness", "harness.cc"),
+            "configuration": _existing_asset(101, "script", "build.sh"),
+            "coverage_adapter": _existing_asset(102, "adapter", "adapter.cc"),
+            "coverage_configuration": _existing_asset(103, "script", "coverage.sh"),
+        }
 
-    async def same_asset():
-        await asyncio.gather(
-            shared_service.prepare(project(), proposal("first")),
-            shared_service.prepare(project(), proposal("second")),
+    def plan(self, selected_project, selected_proposal):
+        return PreparationPlan(
+            asset_versions=(),
+            existing_assets=self.assets,
+            probe_invocations=(
+                ProbeInvocation("empty", "empty", ("/opt/bigeye/probe", "empty")),
+                ProbeInvocation("minimum", "minimum", ("/opt/bigeye/probe", "minimum")),
+                ProbeInvocation("seed", "seed", ("/opt/bigeye/probe", "seed")),
+            ),
         )
 
-    run(same_asset())
-    assert shared_store.max_active == 1
 
-    distinct_store = _AssetStore()
+class _ConcurrentTargetLayers(_TargetLayers):
+    def __init__(self):
+        super().__init__()
+        self.active = 0
+        self.max_active = 0
+        self._guard = threading.Lock()
 
-    class DistinctPlanner(_Planner):
-        def plan(self, selected_project, selected_proposal):
-            self.shared_key = selected_proposal.target_name
-            return super().plan(selected_project, selected_proposal)
+    def prepare(self, *arguments, cancellation_signal=None):
+        with self._guard:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        time.sleep(0.03)
+        with self._guard:
+            self.active -= 1
+        return _manifest("target", "bigeye-target:existing")
 
-    distinct_service = preparation(asset_store=distinct_store, planner=DistinctPlanner())
 
-    async def distinct_assets():
+def _existing_proposal(target_name="parser", instance_type="component-level"):
+    return proposal(target_name).model_copy(update={
+        "instance_type": instance_type,
+        "generated_asset_intents": [],
+    })
+
+
+def test_preparation_lock_is_derived_from_persisted_assets_and_full_target_identity() -> None:
+    target_layers = _ConcurrentTargetLayers()
+    service = preparation(planner=_ExistingAssetPlanner(), target_layers=target_layers)
+
+    async def same_target():
         await asyncio.gather(
-            distinct_service.prepare(project(), proposal("first")),
-            distinct_service.prepare(project(), proposal("second")),
+            service.prepare(project(), _existing_proposal()),
+            service.prepare(project(), _existing_proposal()),
         )
 
-    run(distinct_assets())
-    assert distinct_store.max_active > 1
+    run(same_target())
+    assert target_layers.max_active == 1
+
+    target_layers = _ConcurrentTargetLayers()
+    service = preparation(planner=_ExistingAssetPlanner(), target_layers=target_layers)
+
+    async def distinct_target_identity():
+        await asyncio.gather(
+            service.prepare(project(), _existing_proposal("parser-component", "component-level")),
+            service.prepare(project(), _existing_proposal("parser-system", "system-level")),
+        )
+
+    run(distinct_target_identity())
+    assert target_layers.max_active > 1
+
+
+def test_cancelled_build_is_stopped_and_joined_before_releasing_its_target_lock() -> None:
+    class CancellableTargetLayers(_TargetLayers):
+        def __init__(self):
+            super().__init__()
+            self.started = threading.Event()
+            self.cleaned = threading.Event()
+            self.second_saw_cleanup = False
+            self.call_count = 0
+            self._guard = threading.Lock()
+
+        def prepare(self, *arguments, cancellation_signal=None):
+            with self._guard:
+                self.call_count += 1
+                call = self.call_count
+            assert cancellation_signal is not None
+            if call == 1:
+                self.started.set()
+                while not cancellation_signal.wait(0.005):
+                    pass
+                self.cleaned.set()
+                raise ImageBuildCancelled("cancelled test build")
+            self.second_saw_cleanup = self.cleaned.is_set()
+            return _manifest("target", "bigeye-target:after-cancel")
+
+    async def scenario():
+        layers = CancellableTargetLayers()
+        service = preparation(planner=_ExistingAssetPlanner(), target_layers=layers)
+        selected = _existing_proposal()
+        first = asyncio.create_task(service.prepare(project(), selected))
+        assert await asyncio.to_thread(layers.started.wait, 1.0)
+        second = asyncio.create_task(service.prepare(project(), selected))
+        await asyncio.sleep(0.01)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        prepared = await asyncio.wait_for(second, 1.0)
+        return layers, prepared
+
+    layers, prepared = run(scenario())
+
+    assert layers.cleaned.is_set()
+    assert layers.second_saw_cleanup is True
+    assert prepared.target_manifest.tag == "bigeye-target:after-cancel"
+
+
+def test_retained_target_identity_includes_instance_type() -> None:
+    service = preparation()
+    run(service.prepare(project(), proposal()))
+    service._probe = _Probe(probe_evidence(input_evidence(project_lines=0)))
+
+    system_proposal = proposal().model_copy(update={"instance_type": "system-level"})
+    with pytest.raises(TargetPreparationFailed) as captured:
+        run(service.prepare(project(), system_proposal))
+
+    assert captured.value.retained_target is None
 
 
 def _record(result_id: str = "target_known") -> TargetProposalRecord:
@@ -615,6 +799,53 @@ def test_decision_executor_accepts_only_manager_selected_known_ids_and_returns_t
     assert results == [ActionResult("target_known", prepared)]
 
 
+def test_decision_executor_waits_for_siblings_and_returns_typed_failures() -> None:
+    failed = _record("target_failed").model_copy(update={"proposal": proposal("failed")})
+    succeeded = _record("target_succeeded").model_copy(update={"proposal": proposal("succeeded")})
+    review = CampaignReviewResult(
+        decision=CampaignDecision(
+            decision="prepare independent targets",
+            motivation="both targets have repository evidence",
+            evidence_ids=["source:parser"],
+            bounded_actions=[failed.result_id, succeeded.result_id],
+            next_review_condition="after both preparations settle",
+            uncertainty="runtime behavior is not known yet",
+        ),
+        known_action_ids=(failed.result_id, succeeded.result_id),
+        selected_action_ids=(failed.result_id, succeeded.result_id),
+        known_target_proposals=(failed, succeeded),
+        selected_target_proposals=(failed, succeeded),
+        known_triage_results=(),
+        selected_triage_results=(),
+        known_operation_requests=(),
+        selected_operation_requests=(),
+        quarantined_operation_requests=(),
+    )
+
+    class Preparation:
+        def __init__(self):
+            self.succeeded = False
+
+        async def prepare(self, selected_project, record):
+            if record.result_id == "target_failed":
+                await asyncio.sleep(0.01)
+                raise DeterministicPreparationError("target did not compile")
+            await asyncio.sleep(0.03)
+            self.succeeded = True
+            return SimpleNamespace(target_name="succeeded")
+
+    preparation_service = Preparation()
+    results = run(DecisionExecutor(preparation_service).execute(project(), review))
+
+    assert preparation_service.succeeded is True
+    assert results[0] == ActionResult(
+        "target_failed", None,
+        ActionError("DeterministicPreparationError", "target did not compile"),
+    )
+    assert results[1].succeeded is True
+    assert results[1].output.target_name == "succeeded"
+
+
 @pytest.mark.parametrize(
     "review",
     [
@@ -641,3 +872,73 @@ def test_decision_executor_rejects_duplicate_known_action_ids() -> None:
 
     with pytest.raises(ValueError, match="manager-validated"):
         run(DecisionExecutor(SimpleNamespace()).execute(project(), review))
+
+
+class _CleanCoverage:
+    def __init__(self, observations):
+        self.observations = list(observations)
+        self.calls = []
+
+    async def collect(self, prepared, invocation, process):
+        self.calls.append((prepared.coverage_image_id, invocation.name, process.exit_code))
+        return self.observations.pop(0)
+
+
+def _attested(project_lines=frozenset({"src/parser.cc:12"}), *, input_digest="d" * 64):
+    return AttestedCoverage(
+        project_lines=project_lines,
+        harness_lines=frozenset({"adapter.cc:4"}),
+        startup_lines=frozenset({"src/main.cc:8"}),
+        contract_valid=True,
+        provenance=CleanCoverageProvenance(
+            project_id=7,
+            commit_sha="a" * 40,
+            clean_image_id="sha256:" + "c" * 64,
+            testcase_sha256=input_digest,
+        ),
+    )
+
+
+def _probe_target():
+    return SimpleNamespace(
+        project_id=7,
+        commit_sha="a" * 40,
+        image="sha256:" + "b" * 64,
+        coverage_image_id="sha256:" + "c" * 64,
+        probe_invocations=(
+            ProbeInvocation("empty", "empty", ("/opt/bigeye/probe", "empty")),
+            ProbeInvocation("minimum", "minimum", ("/opt/bigeye/probe", "minimum")),
+            ProbeInvocation("seed", "seed", ("/opt/bigeye/probe", "seed")),
+        ),
+    )
+
+
+def test_forged_target_probe_json_cannot_replace_clean_coverage_attestation() -> None:
+    forged = ContainerResult(
+        0,
+        'BIGEYE_PROBE_RESULT={"alive":true,"accepted_input":true,"project_lines":999,'
+        '"harness_lines":0,"startup_lines":0,"immediate_crash":false,'
+        '"invalid_api_use":false,"sanitizer_output":""}\n',
+    )
+    runner = ProbeRunner(_ProbeRunner([forged for _ in range(6)]))
+    coverage = _CleanCoverage([_attested(frozenset()) for _ in range(6)])
+
+    evidence = run(ProbeService(runner, coverage, timeout_seconds=1.0).run(_probe_target()))
+
+    assert evidence.project_lines == frozenset()
+    assert "project code" in ProbePolicy.accept(evidence).reason
+
+
+def test_replay_only_crash_is_preserved_and_rejects_target() -> None:
+    healthy = ContainerResult(0, "target output\n")
+    replay_crash = ContainerResult(139, "ERROR: AddressSanitizer: heap-buffer-overflow\n")
+    bounded = _ProbeRunner([healthy, healthy, healthy, healthy, healthy, replay_crash])
+    coverage = _CleanCoverage([_attested() for _ in range(6)])
+
+    evidence = run(ProbeService(ProbeRunner(bounded), coverage, timeout_seconds=1.0).run(_probe_target()))
+
+    seed = next(item for item in evidence.inputs if item.role == "seed")
+    assert seed.first.immediate_crash is False
+    assert seed.replay.immediate_crash is True
+    assert "AddressSanitizer" in seed.replay.sanitizer_output
+    assert ProbePolicy.accept(evidence).accepted is False

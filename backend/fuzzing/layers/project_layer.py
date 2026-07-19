@@ -13,6 +13,7 @@ from pathlib import Path
 from backend.fuzzing.layers.manifest import LayerManifest
 from backend.fuzzing.layers.policy import validate_generated_dockerfile
 from backend.fuzzing.assets.validation import collection_hash
+from backend.fuzzing.docker.image_builder import ImageBuildCancelled
 
 
 _CONTENT_HASH_SENTINEL = "__BIGEYE_CONTENT_HASH_SENTINEL__"
@@ -34,7 +35,12 @@ class _GeneratedLayerService:
         with cls._tag_locks_guard:
             return cls._tag_locks.setdefault(tag, threading.Lock())
 
-    def _prepare(self, project, parent_manifest: LayerManifest, assets, dockerfile_template: str, sink, network_mode: str | None):
+    def _prepare(
+        self, project, parent_manifest: LayerManifest, assets, dockerfile_template: str,
+        sink, network_mode: str | None, cancellation_signal=None,
+    ):
+        if cancellation_signal is not None and cancellation_signal.is_set():
+            raise ImageBuildCancelled(f"{self._kind} layer build cancelled")
         if parent_manifest.kind != self._parent_kind:
             raise ValueError(f"{self._kind} layers require a {self._parent_kind} parent")
         project_id = self._project_id(project)
@@ -63,6 +69,8 @@ class _GeneratedLayerService:
         context_dir = root / "context"
         dockerfile = context_dir / "Dockerfile"
         with self._lock_for(tag):
+            if cancellation_signal is not None and cancellation_signal.is_set():
+                raise ImageBuildCancelled(f"{self._kind} layer build cancelled")
             root.parent.mkdir(parents=True, exist_ok=True)
             if root.exists() or root.is_symlink():
                 if not self._valid_context(context_dir, dockerfile_text, project_id, assets):
@@ -71,7 +79,12 @@ class _GeneratedLayerService:
                 self._publish_context(root.parent, root, dockerfile_text, project_id, assets)
             manifest = LayerManifest(kind, tag, content_hash, parent_manifest.tag, dockerfile, context_dir, labels)
             if self._image_builder.inspect_matching(tag, labels) is None:
-                self._image_builder.build(dockerfile, tag, sink=sink, network_mode=network_mode)
+                if cancellation_signal is not None and cancellation_signal.is_set():
+                    raise ImageBuildCancelled(f"{self._kind} layer build cancelled")
+                build_arguments = {"sink": sink, "network_mode": network_mode}
+                if cancellation_signal is not None:
+                    build_arguments["cancellation_signal"] = cancellation_signal
+                self._image_builder.build(dockerfile, tag, **build_arguments)
             return manifest
 
     def _assets_digest(self, project_id: int, assets) -> str:
@@ -266,7 +279,10 @@ class ProjectLayerService(_GeneratedLayerService):
     _network_allowed = True
     _dockerfile_asset_index = 0
 
-    def prepare(self, project, repository_manifest: LayerManifest, build_asset, sink) -> LayerManifest:
+    def prepare(
+        self, project, repository_manifest: LayerManifest, build_asset, sink,
+        cancellation_signal=None,
+    ) -> LayerManifest:
         parent_image = self._inspector.inspect(repository_manifest.tag).image_id
         build_name = self._asset_entrypoint(build_asset)
         template = (
@@ -276,4 +292,7 @@ class ProjectLayerService(_GeneratedLayerService):
             "bigeye.layer=\"project\" bigeye.content-hash=\"{content_hash}\" "
             f"bigeye.parent-image=\"{parent_image}\"\n"
         )
-        return self._prepare(project, repository_manifest, (("build", build_asset),), template, sink, None)
+        return self._prepare(
+            project, repository_manifest, (("build", build_asset),), template, sink, None,
+            cancellation_signal,
+        )

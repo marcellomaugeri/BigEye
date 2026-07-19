@@ -1,6 +1,7 @@
 """Build maintained images through Docker's low-level Engine API."""
 
 from pathlib import Path
+import threading
 
 from backend.fuzzing.docker.client import DOCKER_REQUEST_TIMEOUT_SECONDS
 
@@ -13,12 +14,53 @@ class ImageBuildFailed(RuntimeError):
     """Raised when Docker reports, or truncates, an image build."""
 
 
+class ImageCompilationFailed(ImageBuildFailed):
+    """Docker completed a build step and reported a deterministic command failure."""
+
+
 class ImageBuildCancelled(ImageBuildFailed):
     """Raised when a caller cancels a build at an event boundary."""
 
 
 class ImageBuildLogLimitExceeded(ImageBuildFailed):
     """Raised before build output would exceed the retained log budget."""
+
+
+class BuildCancellationSignal:
+    """A thread-safe event that can immediately close registered build streams."""
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._guard = threading.Lock()
+        self._callbacks = set()
+
+    def is_set(self) -> bool:
+        return self._event.is_set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self._event.wait(timeout)
+
+    def set(self) -> None:
+        with self._guard:
+            self._event.set()
+            callbacks = tuple(self._callbacks)
+            self._callbacks.clear()
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                pass
+
+    def add_callback(self, callback) -> None:
+        with self._guard:
+            if not self._event.is_set():
+                self._callbacks.add(callback)
+                return
+        callback()
+
+    def remove_callback(self, callback) -> None:
+        with self._guard:
+            self._callbacks.discard(callback)
 
 
 class ImageBuilder:
@@ -35,7 +77,25 @@ class ImageBuilder:
         }
         if network_mode is not None:
             kwargs["network_mode"] = network_mode
+        if cancellation_signal is not None and cancellation_signal.is_set():
+            raise ImageBuildCancelled("image build cancelled before it started")
         stream = self._client.api.build(**kwargs)
+        close = getattr(stream, "close", None)
+
+        def close_stream() -> None:
+            if close is not None:
+                try:
+                    close()
+                except Exception:
+                    pass
+
+        register = getattr(cancellation_signal, "add_callback", None)
+        unregister = getattr(cancellation_signal, "remove_callback", None)
+        if register is not None:
+            register(close_stream)
+        if cancellation_signal is not None and cancellation_signal.is_set():
+            close_stream()
+            raise ImageBuildCancelled("image build cancelled before streaming")
         emitted = 0
         def emit(text: str) -> None:
             nonlocal emitted
@@ -58,6 +118,8 @@ class ImageBuilder:
                 if error:
                     message = str(error)
                     emit(message if message.endswith("\n") else f"{message}\n")
+                    if self._is_compilation_failure(message):
+                        raise ImageCompilationFailed(message)
                     raise ImageBuildFailed(message)
                 status = entry.get("status")
                 identifier = entry.get("id")
@@ -67,10 +129,14 @@ class ImageBuilder:
                     rendered = f"{prefix}{status or ''}{(' ' + progress) if progress else ''}".strip()
                     emit(f"{rendered}\n")
         except BaseException:
-            close = getattr(stream, "close", None)
-            if close is not None:
-                close()
+            close_stream()
             raise
+        finally:
+            if unregister is not None:
+                unregister(close_stream)
+        if cancellation_signal is not None and cancellation_signal.is_set():
+            close_stream()
+            raise ImageBuildCancelled("image build cancelled before inspection")
         try:
             image_id = self._client.api.inspect_image(tag)["Id"]
         except Exception as error:
@@ -78,6 +144,17 @@ class ImageBuilder:
         if not image_id:
             raise ImageBuildFailed(f"built image {tag} could not be inspected: no image ID")
         return str(image_id)
+
+    @staticmethod
+    def _is_compilation_failure(message: str) -> bool:
+        lowered = message.casefold()
+        return any(marker in lowered for marker in (
+            "did not complete successfully",
+            "returned a non-zero code",
+            "returned non-zero code",
+            "executor failed running",
+            "process did not complete successfully",
+        ))
 
     def inspect_matching(self, tag: str, labels: dict[str, str]) -> str | None:
         """Return an existing linux/amd64 image only when every layer label matches."""

@@ -43,7 +43,7 @@ class TestImageBuilder:
         assert logs == ["Step 1/1 : FROM ubuntu:24.04\n"]
 
     def test_build_forwards_daemon_error_text_and_does_not_report_success(self, tmp_path: Path) -> None:
-        from backend.fuzzing.docker.image_builder import ImageBuildFailed, ImageBuilder
+        from backend.fuzzing.docker.image_builder import ImageBuildFailed, ImageBuilder, ImageCompilationFailed
 
         dockerfile = tmp_path / "Dockerfile"
         dockerfile.write_text("FROM ubuntu:24.04\n")
@@ -55,10 +55,83 @@ class TestImageBuilder:
                 return iter(({"stream": "building\n"}, {"errorDetail": {"message": "daemon build failed"}}))
 
         logs: list[str] = []
-        with pytest.raises(ImageBuildFailed, match="daemon build failed"):
+        with pytest.raises(ImageBuildFailed, match="daemon build failed") as captured:
             ImageBuilder(SimpleNamespace(api=Api())).build(dockerfile, "bigeye-llvm:test", logs.append)
+        assert not isinstance(captured.value, ImageCompilationFailed)
         assert logs == ["building\n", "daemon build failed\n"]
         assert calls[0]["platform"] == "linux/amd64"
+
+    def test_build_classifies_only_deterministic_command_exit_as_compilation_failure(self, tmp_path: Path) -> None:
+        from backend.fuzzing.docker.image_builder import ImageBuilder, ImageCompilationFailed
+
+        dockerfile = tmp_path / "Dockerfile"
+        dockerfile.write_text("FROM ubuntu:24.04\n")
+
+        class Api:
+            def build(self, **kwargs):
+                return iter(({
+                    "errorDetail": {
+                        "message": "process /bin/sh -c cmake --build build did not complete successfully: exit code: 2",
+                    },
+                },))
+
+        with pytest.raises(ImageCompilationFailed, match="did not complete successfully"):
+            ImageBuilder(SimpleNamespace(api=Api())).build(
+                dockerfile, "bigeye-target:test", lambda _text: None,
+            )
+
+    def test_cancellation_closes_active_build_stream_and_joins_cleanly(self, tmp_path: Path) -> None:
+        from backend.fuzzing.docker.image_builder import (
+            BuildCancellationSignal,
+            ImageBuildCancelled,
+            ImageBuilder,
+        )
+
+        dockerfile = tmp_path / "Dockerfile"
+        dockerfile.write_text("FROM ubuntu:24.04\n")
+        entered = threading.Event()
+        closed = threading.Event()
+
+        class Stream:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                entered.set()
+                assert closed.wait(1.0)
+                raise StopIteration
+
+            def close(self):
+                closed.set()
+
+        class Api:
+            def build(self, **kwargs):
+                return Stream()
+
+            def inspect_image(self, tag):
+                raise AssertionError("cancelled build must not be inspected")
+
+        signal = BuildCancellationSignal()
+        errors = []
+
+        def build():
+            try:
+                ImageBuilder(SimpleNamespace(api=Api())).build(
+                    dockerfile, "bigeye-target:test", lambda _text: None,
+                    cancellation_signal=signal,
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=build)
+        worker.start()
+        assert entered.wait(1.0)
+        signal.set()
+        worker.join(1.0)
+
+        assert not worker.is_alive()
+        assert closed.is_set()
+        assert len(errors) == 1 and isinstance(errors[0], ImageBuildCancelled)
 
     def test_build_supports_classic_success_stream_and_forwards_status_progress(self, tmp_path: Path) -> None:
         from backend.fuzzing.docker.image_builder import ImageBuilder
