@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 
 class _Coverage:
-    async def project_tree(self, project_id):
+    async def project_tree(self, project_id, limit=1_000, offset=0):
         return {"project_id": project_id, "commit_sha": "a" * 40, "files": [
             {"path": "src/a.c", "covered_lines": 2, "cpu_exposure_seconds": 4.0},
         ]}
@@ -22,10 +22,10 @@ class _Coverage:
                        "strategy_count": 1, "cpu_exposure_seconds": 2.0}],
         }
 
-    async def function_summaries(self, project_id, path):
+    async def function_summaries(self, project_id, path, limit=1_000, offset=0):
         return [{"name": "parse", "path": path, "covered_lines": 2, "cpu_exposure_seconds": 4.0}]
 
-    async def line_evidence(self, project_id, path, line_number):
+    async def line_evidence(self, project_id, path, line_number, limit=500, offset=0):
         return [{
             "campaign_id": 4, "strategy_asset_id": 33, "testcase_sha256": "b" * 64,
             "replay_command": ["/target", "{input}"], "target_asset_id": 31,
@@ -88,3 +88,12 @@ def test_source_route_maps_containment_failure_without_leaking_host_path():
 
     assert response.status_code == 422
     assert response.json() == {"detail": "invalid source path or range"}
+
+
+def test_coverage_pagination_is_bounded_at_http_boundary():
+    with _client() as client:
+        tree = client.get("/api/projects/7/coverage/tree", params={"limit": 1001})
+        functions = client.get("/api/projects/7/coverage/functions", params={"path": "src/a.c", "offset": -1})
+        evidence = client.get("/api/projects/7/coverage/lines/1", params={"path": "src/a.c", "limit": 501})
+
+    assert (tree.status_code, functions.status_code, evidence.status_code) == (422, 422, 422)

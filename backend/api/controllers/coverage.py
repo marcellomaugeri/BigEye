@@ -28,9 +28,14 @@ def _translate(error):
 
 
 @router.get("/projects/{project_id}/coverage/tree", response_model=CoverageTreeResponse)
-async def project_tree(project_id: int, request: Request):
+async def project_tree(
+    project_id: int,
+    request: Request,
+    limit: int = Query(default=1_000, ge=1, le=1_000),
+    offset: int = Query(default=0, ge=0, le=10_000_000),
+):
     try:
-        return await _coverage(request).project_tree(project_id)
+        return await _coverage(request).project_tree(project_id, limit=limit, offset=offset)
     except (ValueError, KeyError, CoverageIntegrityError) as error:
         _translate(error)
 
@@ -55,9 +60,11 @@ async def functions(
     project_id: int,
     request: Request,
     path: str = Query(min_length=1, max_length=4096),
+    limit: int = Query(default=1_000, ge=1, le=1_000),
+    offset: int = Query(default=0, ge=0, le=10_000_000),
 ):
     try:
-        return await _coverage(request).function_summaries(project_id, path)
+        return await _coverage(request).function_summaries(project_id, path, limit=limit, offset=offset)
     except (ValueError, KeyError, CoverageIntegrityError) as error:
         _translate(error)
 
@@ -68,8 +75,12 @@ async def line_evidence(
     line_number: int,
     request: Request,
     path: str = Query(min_length=1, max_length=4096),
+    limit: int = Query(default=500, ge=1, le=500),
+    offset: int = Query(default=0, ge=0, le=10_000_000),
 ):
     try:
-        return await _coverage(request).line_evidence(project_id, path, line_number)
+        return await _coverage(request).line_evidence(
+            project_id, path, line_number, limit=limit, offset=offset
+        )
     except (ValueError, KeyError, CoverageIntegrityError) as error:
         _translate(error)

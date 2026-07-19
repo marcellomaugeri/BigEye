@@ -1,88 +1,175 @@
-"""Persist the first testcase that reproducibly reaches each source line."""
+"""Atomically retain the first testcase that reproducibly reaches each clean source line."""
 
 from __future__ import annotations
 
+import inspect
 import json
+import math
 import os
 import stat
 from collections import defaultdict
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
+from uuid import uuid4
 
 from backend.fuzzing.coverage.llvm_coverage import CoverageIntegrityError
+from backend.services.projects.clone_repository import run_command
+
+
+@dataclass(frozen=True)
+class TrustedCheckout:
+    project_id: int
+    commit_sha: str
+    root: Path
+    device: int
+    inode: int
+
+
+class ProjectCheckoutRegistry:
+    """Resolve a project checkout only after database and detached-HEAD verification."""
+
+    def __init__(self, workspace: Path, projects):
+        self._workspace = Path(os.path.abspath(workspace))
+        self._projects = projects
+
+    async def resolve(self, project_id: int, commit_sha: str) -> TrustedCheckout:
+        _positive(project_id, "project ID")
+        _commit(commit_sha)
+        project = await self._projects.get(project_id)
+        if project is None or project.commit_sha != commit_sha:
+            raise CoverageIntegrityError("coverage commit does not match the project")
+        root = self._workspace / "projects" / str(project_id) / "repository"
+        descriptor = _open_checkout(self._workspace, project_id)
+        try:
+            details = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        head = await run_command(["git", "rev-parse", "HEAD"], cwd=root)
+        if head != commit_sha:
+            raise CoverageIntegrityError("checkout HEAD does not match the coverage commit")
+        descriptor = _open_checkout(self._workspace, project_id)
+        try:
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        if (after.st_dev, after.st_ino) != (details.st_dev, details.st_ino):
+            raise CoverageIntegrityError("project checkout changed during commit verification")
+        return TrustedCheckout(project_id, commit_sha, root, details.st_dev, details.st_ino)
+
+    async def verify(self, checkout: TrustedCheckout) -> None:
+        current = await self.resolve(checkout.project_id, checkout.commit_sha)
+        if (current.device, current.inode) != (checkout.device, checkout.inode):
+            raise CoverageIntegrityError("project checkout changed during coverage processing")
+
+
+@dataclass(frozen=True)
+class ReplayVerification:
+    project_id: int
+    commit_sha: str
+    campaign_id: int
+    strategy_asset_id: int
+    target_asset_id: int
+    configuration_asset_id: int | None
+    coverage_asset_id: int
+    clean_image_id: str
+    clean_content_hash: str
+    clean_parent_image_id: str
+    source_path: str
+    line_number: int
+    testcase_path: Path
+    testcase_sha256: str
+    replay_command: tuple[str, ...]
 
 
 @dataclass(frozen=True)
 class _RetainedHit:
+    parent_descriptor: int
+    final_descriptor: int
+    final_name: str
     directory: Path
-    descriptor: int
-    identity: tuple[int, int]
+    directory_identity: tuple[int, int]
     testcase_name: str
     metadata_name: str
-    testcase_created: bool
-    metadata_created: bool
+    testcase_identity: tuple[int, int, int, int, int]
+    metadata_identity: tuple[int, int, int, int, int]
     testcase_content: bytes
     metadata_content: bytes
+    created: bool
 
 
 class TraceabilityService:
-    def __init__(self, workspace: Path, repository, replay_verifier):
+    def __init__(self, workspace: Path, repository, replay_verifier, checkout_registry):
         self._workspace = Path(os.path.abspath(workspace))
         self._repository = repository
         self._replay_verifier = replay_verifier
+        self._checkouts = checkout_registry
 
     async def record(self, snapshot):
-        if snapshot.build_kind != "clean":
-            raise CoverageIntegrityError("only clean coverage can be recorded")
-        existing = await self._repository.list_for_project(snapshot.project_id)
-        known = {
-            (item.commit_sha, item.source_path, item.line_number, item.asset_id)
-            for item in existing
-        }
+        self._validate_snapshot(snapshot)
+        checkout = await self._checkouts.resolve(snapshot.project_id, snapshot.commit_sha)
         lines = {(item.source_path, item.line_number): item for item in snapshot.lines}
         created = []
         for hit in snapshot.hits:
             line = lines.get((hit.source_path, hit.line_number))
             if line is None:
                 raise CoverageIntegrityError("testcase hit is absent from the clean snapshot")
-            self._validate_source(snapshot.repository_root, hit.source_path)
-            key = (snapshot.commit_sha, hit.source_path, hit.line_number, snapshot.strategy_asset_id)
-            if key in known:
-                continue
+            source_path = self._safe_source_path(hit.source_path)
+            source_content = _read_checkout_source(checkout, source_path)
+            source_hash = sha256(source_content).hexdigest()
+            if line.source_sha256 is not None and line.source_sha256 != source_hash:
+                raise CoverageIntegrityError("clean source hash does not match the checkout")
             if sha256(hit.testcase).hexdigest() != hit.testcase_sha256:
                 raise CoverageIntegrityError("testcase content does not match its SHA-256")
-            actual_source_sha256 = self._source_sha256(snapshot.repository_root, hit.source_path)
-            if line.source_sha256 is not None and line.source_sha256 != actual_source_sha256:
-                raise CoverageIntegrityError("clean source hash does not match the checkout")
-            retained = self._persist_first_hit(snapshot, hit, actual_source_sha256)
+            retained = None
             try:
-                self._require_retained(retained)
-                testcase = retained.directory / retained.testcase_name
-                if not self._replay_verifier(snapshot, hit, testcase):
-                    self._remove_uncommitted(retained)
-                    raise CoverageIntegrityError("retained testcase did not reproduce the source line")
-                self._require_retained(retained)
-                evidence = await self._repository.create(
+                async with self._repository.claim(
                     project_id=snapshot.project_id,
                     commit_sha=snapshot.commit_sha,
-                    source_path=hit.source_path,
+                    source_path=source_path,
                     line_number=hit.line_number,
-                    function_name=line.function_name,
-                    campaign_id=snapshot.campaign_id,
                     asset_id=snapshot.strategy_asset_id,
-                    first_testcase_sha256=hit.testcase_sha256,
-                    cpu_exposure_seconds=snapshot.cpu_exposure_seconds,
-                )
+                ) as claim:
+                    if claim.existing is not None:
+                        continue
+                    retained = self._publish(snapshot, hit, source_hash)
+                    self._require_retained(retained)
+                    verification = self._verification(snapshot, hit, retained)
+                    if self._replay_verifier is None:
+                        raise CoverageIntegrityError("coverage replay verifier is not configured")
+                    outcome = self._replay_verifier(verification)
+                    if inspect.isawaitable(outcome):
+                        outcome = await outcome
+                    if outcome is not True:
+                        raise CoverageIntegrityError("retained testcase did not reproduce the source line")
+                    await self._checkouts.verify(checkout)
+                    self._require_retained(retained)
+                    evidence = await claim.create(
+                        function_name=line.function_name,
+                        campaign_id=snapshot.campaign_id,
+                        first_testcase_sha256=hit.testcase_sha256,
+                        cpu_exposure_seconds=snapshot.cpu_exposure_seconds,
+                    )
+                    await self._checkouts.verify(checkout)
+                    self._require_retained(retained)
+            except BaseException:
+                if retained is not None and retained.created:
+                    self._remove_attempt(retained)
+                raise
             finally:
-                os.close(retained.descriptor)
-            known.add(key)
+                if retained is not None:
+                    os.close(retained.final_descriptor)
+                    os.close(retained.parent_descriptor)
             created.append(evidence)
         return created
 
-    async def project_tree(self, project_id: int):
-        evidence = await self._repository.list_for_project(project_id)
-        commit = self._single_commit(evidence)
+    async def project_tree(self, project_id: int, limit: int = 1_000, offset: int = 0):
+        commit = await self._project_commit(project_id)
+        evidence = await self._repository.list_for_project(project_id, limit=limit, offset=offset)
+        if not evidence:
+            raise KeyError("coverage not found")
+        self._require_commit(evidence, commit)
+        await self._checkouts.resolve(project_id, commit)
         grouped = defaultdict(list)
         for item in evidence:
             grouped[item.source_path].append(item)
@@ -101,26 +188,26 @@ class TraceabilityService:
 
     async def source_file(self, project_id: int, path: str, start_line: int, end_line: int):
         self._validate_range(start_line, end_line)
-        evidence = await self._repository.list_for_project(project_id)
-        commit = self._single_commit(evidence)
+        commit = await self._project_commit(project_id)
         relative = self._safe_source_path(path)
-        selected = [item for item in evidence if item.source_path == relative]
-        if not selected:
-            raise KeyError("source coverage not found")
-        expected_hashes = {
-            self._read_metadata(
-                project_id, item.campaign_id, item.asset_id, item.first_testcase_sha256
-            )["source_sha256"]
-            for item in selected
-        }
+        evidence = await self._repository.list_for_source(project_id, commit, relative, limit=5_000, offset=0)
+        if not evidence:
+            raise KeyError("coverage not found")
+        self._require_commit(evidence, commit)
+        expected_hashes = {self._read_metadata(item)["source_sha256"] for item in evidence}
         if len(expected_hashes) != 1:
             raise CoverageIntegrityError("source evidence does not identify one clean source blob")
-        source = self._read_source(project_id, commit, relative, next(iter(expected_hashes)))
+        checkout = await self._checkouts.resolve(project_id, commit)
+        source = _read_checkout_source(checkout, relative)
+        if sha256(source).hexdigest() != next(iter(expected_hashes)):
+            raise CoverageIntegrityError("checkout source does not match the exact clean image")
         lines = source.decode("utf-8", errors="replace").splitlines()
         by_line = defaultdict(list)
-        for item in selected:
+        for item in evidence:
             by_line[item.line_number].append(item)
         actual_end = min(end_line, len(lines))
+        if actual_end < start_line:
+            raise KeyError("coverage not found")
         return {
             "project_id": project_id,
             "commit_sha": commit,
@@ -139,13 +226,20 @@ class TraceabilityService:
             ],
         }
 
-    async def function_summaries(self, project_id: int, path: str):
+    async def function_summaries(self, project_id: int, path: str, limit: int = 1_000, offset: int = 0):
+        commit = await self._project_commit(project_id)
         relative = self._safe_source_path(path)
-        evidence = await self._repository.list_for_project(project_id)
+        evidence = await self._repository.list_for_source(project_id, commit, relative, limit=limit, offset=offset)
+        if not evidence:
+            raise KeyError("coverage not found")
+        self._require_commit(evidence, commit)
+        await self._checkouts.resolve(project_id, commit)
         grouped = defaultdict(list)
         for item in evidence:
-            if item.source_path == relative and item.function_name:
+            if item.function_name:
                 grouped[item.function_name].append(item)
+        if not grouped:
+            raise KeyError("coverage not found")
         return [
             {
                 "name": name,
@@ -156,16 +250,23 @@ class TraceabilityService:
             for name, items in sorted(grouped.items())
         ]
 
-    async def line_evidence(self, project_id: int, path: str, line_number: int):
+    async def line_evidence(
+        self, project_id: int, path: str, line_number: int, limit: int = 500, offset: int = 0,
+    ):
         if type(line_number) is not int or line_number < 1:
             raise ValueError("line number must be positive")
+        commit = await self._project_commit(project_id)
         relative = self._safe_source_path(path)
-        evidence = await self._repository.list_for_project(project_id)
+        evidence = await self._repository.list_for_line(
+            project_id, commit, relative, line_number, limit=limit, offset=offset
+        )
+        if not evidence:
+            raise KeyError("coverage not found")
+        self._require_commit(evidence, commit)
+        await self._checkouts.resolve(project_id, commit)
         result = []
         for item in evidence:
-            if item.source_path != relative or item.line_number != line_number:
-                continue
-            metadata = self._read_metadata(project_id, item.campaign_id, item.asset_id, item.first_testcase_sha256)
+            metadata = self._read_metadata(item)
             result.append({
                 "campaign_id": item.campaign_id,
                 "strategy_asset_id": item.asset_id,
@@ -178,283 +279,315 @@ class TraceabilityService:
             })
         return result
 
-    def _persist_first_hit(self, snapshot, hit, source_sha256):
-        descriptor, directory = self._open_strategy_directory(
-            snapshot.project_id, snapshot.campaign_id, snapshot.strategy_asset_id
-        )
-        testcase_name = f"{hit.testcase_sha256}.input"
-        metadata_name = f"{hit.testcase_sha256}.json"
-        metadata = {
-            "campaign_id": snapshot.campaign_id,
-            "clean_image_id": snapshot.clean_image_id,
-            "configuration_asset_id": snapshot.configuration_asset_id,
-            "replay_command": list(snapshot.replay_command),
-            "strategy_asset_id": snapshot.strategy_asset_id,
-            "target_asset_id": snapshot.target_asset_id,
-            "testcase_sha256": hit.testcase_sha256,
-            "source_sha256": source_sha256,
-        }
-        testcase_created = False
-        metadata_created = False
-        metadata_content = (json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n").encode()
-        try:
-            testcase_created = self._write_once(descriptor, testcase_name, hit.testcase)
-            metadata_created = self._write_once(
-                descriptor,
-                metadata_name,
-                metadata_content,
-            )
-            os.fsync(descriptor)
-        except BaseException:
-            self._remove_created(descriptor, testcase_name, metadata_name, testcase_created, metadata_created)
-            os.close(descriptor)
-            raise
-        details = os.fstat(descriptor)
-        return _RetainedHit(
-            directory,
-            descriptor,
-            (details.st_dev, details.st_ino),
-            testcase_name,
-            metadata_name,
-            testcase_created,
-            metadata_created,
-            hit.testcase,
-            metadata_content,
-        )
+    async def _project_commit(self, project_id):
+        _positive(project_id, "project ID")
+        commits = await self._repository.list_commits(project_id)
+        if not commits:
+            raise KeyError("coverage not found")
+        if len(commits) != 1:
+            raise CoverageIntegrityError("project coverage spans multiple commits")
+        _commit(commits[0])
+        return commits[0]
 
     @staticmethod
-    def _write_once(parent: int, name: str, content: bytes) -> bool:
+    def _require_commit(evidence, commit):
+        if any(item.commit_sha != commit for item in evidence):
+            raise CoverageIntegrityError("coverage row commit does not match the project")
+
+    def _publish(self, snapshot, hit, source_hash):
+        parent, parent_path, logical = self._open_logical_parent(
+            snapshot.project_id, snapshot.commit_sha, snapshot.strategy_asset_id,
+            hit.source_path, hit.line_number,
+        )
+        metadata = self._metadata(snapshot, hit, source_hash, logical)
+        metadata_content = (json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        testcase_name = f"{hit.testcase_sha256}.input"
+        metadata_name = "evidence.json"
         try:
-            descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400, dir_fd=parent)
-        except FileExistsError:
-            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
             try:
-                if not stat.S_ISREG(os.fstat(descriptor).st_mode) or os.read(descriptor, len(content) + 1) != content:
-                    raise CoverageIntegrityError("retained first-hit artifact does not match")
-            finally:
-                os.close(descriptor)
-            return False
+                existing = os.open(logical, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            except FileNotFoundError:
+                existing = None
+            if existing is not None:
+                try:
+                    self._require_files(existing, testcase_name, hit.testcase, metadata_name, metadata_content)
+                finally:
+                    os.close(existing)
+                self._remove_orphan(parent, logical, testcase_name, metadata_name)
+            staging = f".{logical}.staging-{uuid4().hex}"
+            os.mkdir(staging, 0o700, dir_fd=parent)
+            staging_fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            try:
+                testcase_identity = self._write_file(staging_fd, testcase_name, hit.testcase)
+                metadata_identity = self._write_file(staging_fd, metadata_name, metadata_content)
+                os.fsync(staging_fd)
+                os.fchmod(staging_fd, 0o500)
+                os.fsync(staging_fd)
+                os.rename(staging, logical, src_dir_fd=parent, dst_dir_fd=parent)
+                os.fsync(parent)
+            except BaseException:
+                self._remove_directory(parent, staging_fd, staging, testcase_name, metadata_name)
+                os.close(staging_fd)
+                raise
+            details = os.fstat(staging_fd)
+            return _RetainedHit(
+                parent, staging_fd, logical, parent_path / logical, (details.st_dev, details.st_ino),
+                testcase_name, metadata_name, testcase_identity, metadata_identity,
+                hit.testcase, metadata_content, True,
+            )
+        except BaseException:
+            os.close(parent)
+            raise
+
+    def _open_logical_parent(self, project_id, commit, strategy_id, source_path, line_number):
+        _positive(project_id, "project ID")
+        _positive(strategy_id, "strategy asset ID")
+        _positive(line_number, "line number")
+        _commit(commit)
+        source_path = self._safe_source_path(source_path)
+        logical = sha256(
+            f"{project_id}\0{commit}\0{source_path}\0{line_number}\0{strategy_id}".encode()
+        ).hexdigest()
+        self._workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor = os.open(self._workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        root = descriptor
+        parts = ("projects", str(project_id), "coverage", "first-hits", commit, str(strategy_id))
         try:
-            view = memoryview(content)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:
-                    raise OSError("could not persist first-hit artifact")
-                view = view[written:]
+            for part in parts:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=descriptor)
+                    os.fsync(descriptor)
+                except FileExistsError:
+                    pass
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+                if descriptor != root:
+                    os.close(descriptor)
+                descriptor = child
+            os.close(root)
+            return descriptor, self._workspace.joinpath(*parts), logical
+        except BaseException:
+            if descriptor != root:
+                os.close(descriptor)
+            os.close(root)
+            raise
+
+    @staticmethod
+    def _write_file(parent, name, content):
+        descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400, dir_fd=parent)
+        try:
+            _write_all(descriptor, content)
             os.fsync(descriptor)
             os.fchmod(descriptor, 0o400)
             os.fsync(descriptor)
+            return _file_identity(os.fstat(descriptor))
         finally:
             os.close(descriptor)
-        return True
 
-    def _open_strategy_directory(self, project_id, campaign_id, strategy_id, create: bool = True):
-        identifiers = (project_id, campaign_id, strategy_id)
-        if any(type(value) is not int or value <= 0 for value in identifiers):
-            raise ValueError("coverage path identities must be positive integers")
-        if create:
-            self._workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
-        root = os.open(self._workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        descriptor = root
-        parts = ("projects", str(project_id), "coverage", str(campaign_id), str(strategy_id))
-        try:
-            for part in parts:
-                if create:
-                    try:
-                        os.mkdir(part, 0o700, dir_fd=descriptor)
-                        os.fsync(descriptor)
-                    except FileExistsError:
-                        pass
-                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
-                if descriptor != root:
-                    os.close(descriptor)
-                descriptor = child
-            os.close(root)
-            return descriptor, self._workspace.joinpath(*parts)
-        except BaseException:
-            if descriptor != root:
-                os.close(descriptor)
-            os.close(root)
-            raise
-
-    def _require_retained(self, retained: _RetainedHit) -> None:
-        try:
-            canonical, _ = self._open_strategy_directory_from_path(retained.directory)
-        except OSError as error:
-            raise CoverageIntegrityError("coverage strategy directory changed during replay") from error
-        try:
-            details = os.fstat(canonical)
-            if (details.st_dev, details.st_ino) != retained.identity:
-                raise CoverageIntegrityError("coverage strategy directory changed during replay")
-        finally:
-            os.close(canonical)
-        for name, expected in (
-            (retained.testcase_name, retained.testcase_content),
-            (retained.metadata_name, retained.metadata_content),
-        ):
-            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=retained.descriptor)
-            try:
-                details = os.fstat(descriptor)
-                if not stat.S_ISREG(details.st_mode) or details.st_size != len(expected):
-                    raise CoverageIntegrityError("retained first-hit artifact changed during replay")
-                if self._read_descriptor(descriptor, len(expected)) != expected:
-                    raise CoverageIntegrityError("retained first-hit artifact changed during replay")
-            finally:
-                os.close(descriptor)
-
-    def _open_strategy_directory_from_path(self, directory: Path):
-        relative = directory.relative_to(self._workspace)
-        descriptor = os.open(self._workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        root = descriptor
-        try:
-            for part in relative.parts:
-                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
-                if descriptor != root:
-                    os.close(descriptor)
-                descriptor = child
-            os.close(root)
-            return descriptor, directory
-        except BaseException:
-            if descriptor != root:
-                os.close(descriptor)
-            os.close(root)
-            raise
-
-    @staticmethod
-    def _read_descriptor(descriptor: int, expected: int) -> bytes:
-        content = bytearray()
-        while len(content) <= expected:
-            chunk = os.read(descriptor, min(64 * 1024, expected + 1 - len(content)))
-            if not chunk:
-                break
-            content.extend(chunk)
-        return bytes(content)
-
-    @staticmethod
-    def _remove_created(parent, testcase_name, metadata_name, testcase_created, metadata_created):
-        for name, created in ((testcase_name, testcase_created), (metadata_name, metadata_created)):
-            if created:
-                try:
-                    os.unlink(name, dir_fd=parent)
-                except FileNotFoundError:
-                    pass
-        os.fsync(parent)
-
-    @staticmethod
-    def _remove_uncommitted(retained: _RetainedHit):
-        TraceabilityService._remove_created(
-            retained.descriptor,
-            retained.testcase_name,
-            retained.metadata_name,
-            retained.testcase_created,
-            retained.metadata_created,
+    def _require_retained(self, retained):
+        details = os.stat(retained.final_name, dir_fd=retained.parent_descriptor, follow_symlinks=False)
+        if not stat.S_ISDIR(details.st_mode) or (details.st_dev, details.st_ino) != retained.directory_identity:
+            raise CoverageIntegrityError("coverage artifact directory changed during replay")
+        self._require_files(
+            retained.final_descriptor,
+            retained.testcase_name, retained.testcase_content,
+            retained.metadata_name, retained.metadata_content,
+            retained.testcase_identity, retained.metadata_identity,
         )
 
-    def _read_metadata(self, project_id, campaign_id, strategy_id, digest):
-        descriptor, _ = self._open_strategy_directory(project_id, campaign_id, strategy_id, create=False)
+    @staticmethod
+    def _require_files(parent, testcase_name, testcase, metadata_name, metadata, testcase_identity=None, metadata_identity=None):
+        names = []
+        with os.scandir(parent) as entries:
+            names.extend(entry.name for entry in entries)
+        if set(names) != {testcase_name, metadata_name}:
+            raise CoverageIntegrityError("coverage artifact directory contains unexpected files")
+        for name, expected, identity in (
+            (testcase_name, testcase, testcase_identity), (metadata_name, metadata, metadata_identity),
+        ):
+            content, current = _read_at(parent, name, max(len(expected), 16 * 1024))
+            if content != expected or (identity is not None and current != identity):
+                raise CoverageIntegrityError("coverage artifact changed during replay")
+
+    def _remove_attempt(self, retained):
         try:
-            file_descriptor = os.open(f"{digest}.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptor)
-            try:
-                details = os.fstat(file_descriptor)
-                if not stat.S_ISREG(details.st_mode) or details.st_size > 16 * 1024:
-                    raise CoverageIntegrityError("first-hit metadata is invalid")
-                content = os.read(file_descriptor, 16 * 1024 + 1)
-            finally:
-                os.close(file_descriptor)
+            details = os.stat(retained.final_name, dir_fd=retained.parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISDIR(details.st_mode) or (details.st_dev, details.st_ino) != retained.directory_identity:
+            return
+        self._remove_directory(
+            retained.parent_descriptor, retained.final_descriptor, retained.final_name,
+            retained.testcase_name, retained.metadata_name,
+        )
+
+    @staticmethod
+    def _remove_orphan(parent, name, testcase_name, metadata_name):
+        descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        try:
+            TraceabilityService._remove_directory(parent, descriptor, name, testcase_name, metadata_name)
         finally:
             os.close(descriptor)
+
+    @staticmethod
+    def _remove_directory(parent, descriptor, name, testcase_name, metadata_name):
+        os.fchmod(descriptor, 0o700)
+        for filename in (testcase_name, metadata_name):
+            try:
+                os.unlink(filename, dir_fd=descriptor)
+            except FileNotFoundError:
+                pass
+        os.fsync(descriptor)
+        os.rmdir(name, dir_fd=parent)
+        os.fsync(parent)
+
+    def _read_metadata(self, evidence):
+        parent, _, logical = self._open_logical_parent(
+            evidence.project_id, evidence.commit_sha, evidence.asset_id,
+            evidence.source_path, evidence.line_number,
+        )
+        try:
+            directory = os.open(logical, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            try:
+                details = os.fstat(directory)
+                if stat.S_IMODE(details.st_mode) != 0o500:
+                    raise CoverageIntegrityError("first-hit artifact directory is not immutable")
+                testcase_name = f"{evidence.first_testcase_sha256}.input"
+                with os.scandir(directory) as entries:
+                    names = {entry.name for entry in entries}
+                if names != {testcase_name, "evidence.json"}:
+                    raise CoverageIntegrityError("first-hit artifact directory contains unexpected files")
+                for name in names:
+                    file_details = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    if not stat.S_ISREG(file_details.st_mode) or stat.S_IMODE(file_details.st_mode) != 0o400:
+                        raise CoverageIntegrityError("first-hit artifact file is not immutable")
+                testcase, _ = _read_at(directory, testcase_name, 16 * 1024 * 1024)
+                if sha256(testcase).hexdigest() != evidence.first_testcase_sha256:
+                    raise CoverageIntegrityError("first-hit testcase does not match its evidence")
+                content, _ = _read_at(directory, "evidence.json", 16 * 1024)
+            finally:
+                os.close(directory)
+        finally:
+            os.close(parent)
         try:
             document = json.loads(content)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise CoverageIntegrityError("first-hit metadata is invalid") from error
-        if not isinstance(document, dict) or (
-            document.get("campaign_id") != campaign_id
-            or document.get("strategy_asset_id") != strategy_id
-            or document.get("testcase_sha256") != digest
-        ):
+        expected = {
+            "project_id": evidence.project_id,
+            "commit_sha": evidence.commit_sha,
+            "source_path": evidence.source_path,
+            "line_number": evidence.line_number,
+            "strategy_asset_id": evidence.asset_id,
+            "testcase_sha256": evidence.first_testcase_sha256,
+            "logical_key": logical,
+            "campaign_id": evidence.campaign_id,
+        }
+        if not isinstance(document, dict) or any(document.get(key) != value for key, value in expected.items()):
             raise CoverageIntegrityError("first-hit metadata identity does not match its evidence")
-        source_digest = document.get("source_sha256")
-        image_id = document.get("clean_image_id")
-        target_id = document.get("target_asset_id")
-        configuration_id = document.get("configuration_asset_id")
-        replay = document.get("replay_command")
+        for key in ("source_sha256", "clean_content_hash"):
+            _digest(document.get(key), key.replace("_", " "))
         if (
-            not isinstance(source_digest, str)
-            or len(source_digest) != 64
-            or any(character not in "0123456789abcdef" for character in source_digest)
-            or not isinstance(image_id, str)
-            or not image_id.startswith("sha256:")
-            or type(target_id) is not int
-            or target_id <= 0
-            or (configuration_id is not None and (type(configuration_id) is not int or configuration_id <= 0))
-            or not isinstance(replay, list)
-            or not 1 <= len(replay) <= 64
-            or any(not isinstance(argument, str) or not argument or len(argument) > 4096 for argument in replay)
-            or "{input}" not in replay
+            not isinstance(document.get("clean_image_id"), str)
+            or not document["clean_image_id"].startswith("sha256:")
+            or not isinstance(document.get("clean_parent_image_id"), str)
+            or not document["clean_parent_image_id"].startswith("sha256:")
+            or type(document.get("target_asset_id")) is not int
+            or document["target_asset_id"] <= 0
+            or type(document.get("coverage_asset_id")) is not int
+            or document["coverage_asset_id"] <= 0
+            or (
+                document.get("configuration_asset_id") is not None
+                and (type(document["configuration_asset_id"]) is not int or document["configuration_asset_id"] <= 0)
+            )
+            or not isinstance(document.get("replay_command"), list)
+            or not 1 <= len(document["replay_command"]) <= 64
+            or any(not isinstance(argument, str) or not argument or len(argument) > 4096 for argument in document["replay_command"])
+            or sum(len(argument) for argument in document["replay_command"]) > 16 * 1024
         ):
             raise CoverageIntegrityError("first-hit metadata is invalid")
         return document
 
     @staticmethod
-    def _validate_source(root: Path, source_path: str):
-        relative = TraceabilityService._safe_source_path(source_path)
-        descriptor = os.open(Path(os.path.abspath(root)), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            for part in PurePosixPath(relative).parts[:-1]:
-                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
-                os.close(descriptor)
-                descriptor = child
-            source = os.open(PurePosixPath(relative).parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptor)
-            try:
-                if not stat.S_ISREG(os.fstat(source).st_mode):
-                    raise CoverageIntegrityError("coverage source is not a regular checkout file")
-            finally:
-                os.close(source)
-        finally:
-            os.close(descriptor)
+    def _metadata(snapshot, hit, source_hash, logical):
+        return {
+            "project_id": snapshot.project_id,
+            "commit_sha": snapshot.commit_sha,
+            "source_path": hit.source_path,
+            "line_number": hit.line_number,
+            "strategy_asset_id": snapshot.strategy_asset_id,
+            "logical_key": logical,
+            "campaign_id": snapshot.campaign_id,
+            "clean_image_id": snapshot.clean_image_id,
+            "clean_content_hash": snapshot.clean_content_hash,
+            "clean_parent_image_id": snapshot.clean_parent_image_id,
+            "configuration_asset_id": snapshot.configuration_asset_id,
+            "coverage_asset_id": snapshot.coverage_asset_id,
+            "replay_command": list(snapshot.replay_command),
+            "target_asset_id": snapshot.target_asset_id,
+            "testcase_sha256": hit.testcase_sha256,
+            "source_sha256": source_hash,
+        }
 
     @staticmethod
-    def _source_sha256(root: Path, source_path: str) -> str:
-        return sha256(TraceabilityService._source_content(root, source_path)).hexdigest()
+    def _verification(snapshot, hit, retained):
+        return ReplayVerification(
+            snapshot.project_id, snapshot.commit_sha, snapshot.campaign_id,
+            snapshot.strategy_asset_id, snapshot.target_asset_id, snapshot.configuration_asset_id,
+            snapshot.coverage_asset_id, snapshot.clean_image_id, snapshot.clean_content_hash,
+            snapshot.clean_parent_image_id, hit.source_path, hit.line_number,
+            retained.directory / retained.testcase_name, hit.testcase_sha256,
+            snapshot.replay_command,
+        )
 
     @staticmethod
-    def _source_content(root: Path, source_path: str) -> bytes:
-        TraceabilityService._validate_source(root, source_path)
-        relative = PurePosixPath(source_path)
-        descriptor = os.open(Path(os.path.abspath(root)), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            for part in relative.parts[:-1]:
-                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
-                os.close(descriptor)
-                descriptor = child
-            source = os.open(relative.parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptor)
-            try:
-                details = os.fstat(source)
-                if details.st_size > 2 * 1024 * 1024:
-                    raise CoverageIntegrityError("project source exceeds its byte limit")
-                content = TraceabilityService._read_descriptor(source, details.st_size)
-                after = os.fstat(source)
-                if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (
-                    details.st_dev, details.st_ino, details.st_size, details.st_mtime_ns, details.st_ctime_ns
-                ):
-                    raise CoverageIntegrityError("project source changed while being recorded")
-                return content
-            finally:
-                os.close(source)
-        finally:
-            os.close(descriptor)
+    def _validate_snapshot(snapshot):
+        if snapshot.build_kind != "clean":
+            raise CoverageIntegrityError("only clean coverage can be recorded")
+        for value, label in (
+            (snapshot.project_id, "project ID"), (snapshot.campaign_id, "campaign ID"),
+            (snapshot.strategy_asset_id, "strategy asset ID"), (snapshot.target_asset_id, "target asset ID"),
+            (snapshot.coverage_asset_id, "coverage asset ID"),
+        ):
+            _positive(value, label)
+        if snapshot.configuration_asset_id is not None:
+            _positive(snapshot.configuration_asset_id, "configuration asset ID")
+        _commit(snapshot.commit_sha)
+        _digest(snapshot.clean_content_hash, "clean content hash")
+        if (
+            not isinstance(snapshot.clean_image_id, str)
+            or not snapshot.clean_image_id.startswith("sha256:")
+            or not isinstance(snapshot.clean_parent_image_id, str)
+            or not snapshot.clean_parent_image_id.startswith("sha256:")
+        ):
+            raise CoverageIntegrityError("clean image provenance is invalid")
+        if (
+            not isinstance(snapshot.replay_command, tuple)
+            or not 1 <= len(snapshot.replay_command) <= 64
+            or any(not isinstance(argument, str) or not argument or len(argument) > 4096 for argument in snapshot.replay_command)
+            or sum(len(argument) for argument in snapshot.replay_command) > 16 * 1024
+        ):
+            raise CoverageIntegrityError("replay command is invalid")
+        if (
+            isinstance(snapshot.cpu_exposure_seconds, bool)
+            or not isinstance(snapshot.cpu_exposure_seconds, (int, float))
+            or not math.isfinite(snapshot.cpu_exposure_seconds)
+            or snapshot.cpu_exposure_seconds < 0
+        ):
+            raise CoverageIntegrityError("CPU exposure is invalid")
 
     @staticmethod
-    def _safe_source_path(path: str) -> str:
+    def _safe_source_path(path):
         if not isinstance(path, str) or not path:
             raise ValueError("source path is required")
         value = PurePosixPath(path)
         if value.is_absolute() or not value.parts or any(part in {"", ".", "..", ".git"} for part in value.parts):
             raise ValueError("source path must be repository-relative")
-        if value.suffix.lower() == ".patch":
-            raise ValueError("patches are not project source")
         first = value.parts[0].lower()
-        if first in {"build", "generated", "harness", "fuzz-target", "fuzz_target", ".bigeye"} or first.startswith("cmake-build"):
+        if (
+            value.suffix.lower() == ".patch"
+            or first in {"build", "generated", "harness", "fuzz-target", "fuzz_target", ".bigeye"}
+            or first.startswith("cmake-build")
+        ):
             raise ValueError("generated and fuzz-only paths are not project source")
         return value.as_posix()
 
@@ -463,21 +596,85 @@ class TraceabilityService:
         if type(start) is not int or type(end) is not int or start < 1 or end < start or end - start + 1 > 500:
             raise ValueError("source range must contain between 1 and 500 lines")
 
-    @staticmethod
-    def _single_commit(evidence):
-        commits = {item.commit_sha for item in evidence}
-        if not commits:
-            raise KeyError("coverage not found")
-        if len(commits) != 1:
-            raise CoverageIntegrityError("project coverage spans multiple commits")
-        return next(iter(commits))
 
-    def _read_source(self, project_id, commit, relative, expected_sha256):
-        root = self._workspace / "projects" / str(project_id) / "repository"
-        self._validate_source(root, relative)
-        if not isinstance(commit, str) or len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
-            raise CoverageIntegrityError("coverage commit is invalid")
-        content = self._source_content(root, relative)
-        if sha256(content).hexdigest() != expected_sha256:
-            raise CoverageIntegrityError("checkout source does not match the exact clean image")
-        return content
+def _open_checkout(workspace, project_id):
+    descriptor = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    root = descriptor
+    try:
+        for part in ("projects", str(project_id), "repository"):
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            if descriptor != root:
+                os.close(descriptor)
+            descriptor = child
+        os.close(root)
+        return descriptor
+    except BaseException:
+        if descriptor != root:
+            os.close(descriptor)
+        os.close(root)
+        raise
+
+
+def _read_checkout_source(checkout, source_path):
+    descriptor = os.open(checkout.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    details = os.fstat(descriptor)
+    if (details.st_dev, details.st_ino) != (checkout.device, checkout.inode):
+        os.close(descriptor)
+        raise CoverageIntegrityError("project checkout changed during source read")
+    try:
+        parts = PurePosixPath(source_path).parts
+        for part in parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return _read_at(descriptor, parts[-1], 2 * 1024 * 1024)[0]
+    finally:
+        os.close(descriptor)
+
+
+def _read_at(parent, name, maximum):
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > maximum:
+            raise CoverageIntegrityError("artifact is not a bounded regular file")
+        content = bytearray()
+        while len(content) <= maximum:
+            chunk = os.read(descriptor, min(64 * 1024, maximum + 1 - len(content)))
+            if not chunk:
+                break
+            content.extend(chunk)
+        after = os.fstat(descriptor)
+        if _file_identity(before) != _file_identity(after) or len(content) > maximum:
+            raise CoverageIntegrityError("artifact changed while being read")
+        return bytes(content), _file_identity(before)
+    finally:
+        os.close(descriptor)
+
+
+def _write_all(descriptor, content):
+    view = memoryview(content)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("file write did not progress")
+        view = view[written:]
+
+
+def _file_identity(details):
+    return details.st_dev, details.st_ino, details.st_size, details.st_mtime_ns, details.st_ctime_ns
+
+
+def _positive(value, label):
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"{label} must be a positive integer")
+
+
+def _commit(value):
+    if not isinstance(value, str) or len(value) not in {40, 64} or any(char not in "0123456789abcdef" for char in value):
+        raise CoverageIntegrityError("coverage commit is invalid")
+
+
+def _digest(value, label):
+    if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+        raise CoverageIntegrityError(f"{label} is invalid")
