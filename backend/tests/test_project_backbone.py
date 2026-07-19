@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import threading
+from dataclasses import replace
 import warnings
 from datetime import UTC, datetime
 from pathlib import Path
@@ -357,6 +358,79 @@ class TestApi:
             response = client.get("/api/settings")
 
         assert response.json() == {"database": True, "docker": False, "openai_api_key_present": True, "toolchain": False}
+
+    def test_asgi_repository_journey_uses_real_scheduler_logs_analysis_and_events(self, tmp_path: Path) -> None:
+        """HTTP SSE is infinite, so this journey reads its real watcher directly."""
+        import httpx
+        from backend.api.app import create_app
+        from backend.api.dependencies import Services
+        from backend.models.project import Project
+        from backend.models.task import Task
+        from backend.services.create_project import CreateProjectService
+        from backend.services.execute_project_backbone import ExecuteProjectBackbone
+        from backend.services.read_analysis import AnalysisReader
+        from backend.services.run_project_backbone import ProjectBackboneService, ProjectEventWatcher
+        from backend.services.stream_task_output import TaskLogWriter
+
+        class Projects:
+            def __init__(self): self.items, self.next_id = {}, 1
+            async def create_with_tasks(self, url, workers, names):
+                identifier = self.next_id; self.next_id += 1
+                item = Project(identifier, url, workers, None, NOW, None, None); self.items[identifier] = item
+                await tasks.add(identifier, names); return item
+            async def get(self, identifier): return self.items.get(identifier)
+            async def list(self): return list(self.items.values())
+            async def list_unfinished(self): return [item for item in self.items.values() if item.finished_at is None]
+            async def set_commit_sha(self, identifier, sha): self.items[identifier] = replace(self.items[identifier], commit_sha=sha)
+            async def finish(self, identifier, error=None): self.items[identifier] = replace(self.items[identifier], finished_at=NOW, error=error)
+        class Tasks:
+            def __init__(self): self.items, self.next_id = {}, 1
+            async def add(self, project_id, names):
+                for name in names:
+                    identifier = self.next_id; self.next_id += 1
+                    self.items[identifier] = Task(identifier, project_id, name, NOW, None, None)
+            async def get(self, identifier): return self.items.get(identifier)
+            async def list_for_project(self, project_id): return [item for item in self.items.values() if item.project_id == project_id]
+            async def finish(self, identifier, error=None): self.items[identifier] = replace(self.items[identifier], finished_at=NOW, error=error)
+        tasks, projects, completed = Tasks(), Projects(), asyncio.Event()
+        logs = TaskLogWriter(tmp_path)
+        class Clone:
+            async def clone(self, value, clone_task):
+                root = tmp_path / "projects" / str(value.id) / "repository"; root.mkdir(parents=True)
+                (root / "main.c").write_text("int main(void) { return 0; }\n")
+                await projects.set_commit_sha(value.id, "a" * 40); await logs.append(clone_task, "clone complete\n")
+        class Toolchain:
+            async def prepare(self, toolchain_task): await logs.append(toolchain_task, "toolchain ready\n")
+        class Analysis:
+            async def analyse(self, identifier, root):
+                path = tmp_path / "projects" / str(identifier) / "analysis"; path.mkdir(parents=True)
+                (path / "repository.md").write_text("repository analysis\n"); completed.set()
+        executor = ExecuteProjectBackbone(projects, tasks, Clone(), Toolchain(), Analysis(), logs, tmp_path)
+        backbone = ProjectBackboneService(projects, executor)
+        services = Services(CreateProjectService(projects, backbone), projects, tasks, logs,
+                            ProjectEventWatcher(tasks, logs), SimpleNamespace(check=lambda: {}), backbone, AnalysisReader(tmp_path))
+        app = create_app(services=services)
+        async def scenario():
+            async with app.router.lifespan_context(app):
+                transport = httpx.ASGITransport(app=app)
+                async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                    response = await client.post("/api/projects", json={"repository_url": "https://github.com/acme/demo.git", "worker_count": 1})
+                    assert response.status_code == 202 and len(tasks.items) == 3
+                    await asyncio.wait_for(completed.wait(), 1)
+                    project_id = response.json()["id"]
+                    listed = await client.get(f"/api/projects/{project_id}/tasks")
+                    assert len(listed.json()) == 3 and all(item["finished_at"] for item in listed.json())
+                    clone_id = next(item.id for item in tasks.items.values() if item.name == "repository clone")
+                    log = await client.get(f"/api/tasks/{clone_id}/log")
+                    assert log.json()["content"] == "clone complete\n" and log.json()["next_offset"] == 15
+                    analysis = await client.get(f"/api/projects/{project_id}/analysis")
+                    assert analysis.json() == {"content": "repository analysis\n"}
+                    events = services.events.stream(int(project_id), poll_interval=0)
+                    assert await anext(events) == "data: updated\n\n"
+                    await logs.append(next(item for item in tasks.items.values() if item.name == "LLVM toolchain preparation"), "updated\n")
+                    assert await asyncio.wait_for(anext(events), 1) == "data: updated\n\n"
+                    await events.aclose()
+        run(scenario())
 
 
 class TestRecovery:
