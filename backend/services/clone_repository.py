@@ -69,8 +69,10 @@ async def run_command(argv: list[str], cwd: Path | None = None, sink=None) -> st
                 truncated = True
                 if sink is not None:
                     sink("Git output exceeded 1048576 bytes and was truncated\n")
+    drains = (asyncio.create_task(drain(process.stdout, True)), asyncio.create_task(drain(process.stderr, False)))
+    wait = asyncio.create_task(process.wait())
     try:
-        await asyncio.gather(drain(process.stdout, True), drain(process.stderr, False), process.wait())
+        await asyncio.gather(*drains, wait)
     except asyncio.CancelledError:
         process.terminate()
         try:
@@ -78,6 +80,20 @@ async def run_command(argv: list[str], cwd: Path | None = None, sink=None) -> st
         except TimeoutError:
             process.kill()
             await process.wait()
+        for drain_task in drains:
+            drain_task.cancel()
+        await asyncio.gather(*drains, return_exceptions=True)
+        raise
+    except BaseException:
+        process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5)
+        except TimeoutError:
+            process.kill()
+            await process.wait()
+        for drain_task in drains:
+            drain_task.cancel()
+        await asyncio.gather(*drains, return_exceptions=True)
         raise
     if truncated:
         raise GitCommandFailed("Git output exceeded 1048576 bytes")

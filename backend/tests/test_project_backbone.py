@@ -242,6 +242,26 @@ class TestCloneRepository:
         assert process.terminated is True
         assert process.waited is True
 
+    def test_stream_sink_failure_terminates_git_and_awaits_readers(self, monkeypatch) -> None:
+        from backend.services.clone_repository import run_command
+        class Reader:
+            def __init__(self, chunks): self.chunks = list(chunks)
+            async def read(self, size): return self.chunks.pop(0) if self.chunks else b""
+        class Process:
+            returncode = 0
+            def __init__(self):
+                self.stdout, self.stderr = Reader([b"stdout\n"]), Reader([b"stderr\n"])
+                self.terminated = self.waited = False
+            def terminate(self): self.terminated = True
+            def kill(self): raise AssertionError("terminate should be enough")
+            async def wait(self): self.waited = True; return 0
+        process = Process()
+        async def create(*args, **kwargs): return process
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+        with pytest.raises(RuntimeError, match="sink failed"):
+            run(run_command(["git", "rev-parse", "HEAD"], sink=lambda text: (_ for _ in ()).throw(RuntimeError("sink failed"))))
+        assert process.terminated and process.waited
+
 
 class TestLogAndSse:
     def test_log_reader_uses_non_negative_offset_and_derived_path(self, tmp_path: Path) -> None:
