@@ -1,10 +1,10 @@
 import asyncio
-import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from agents import Agent, RunContextWrapper
+from agents import Agent
+from agents.items import ToolCallItem
 
 from backend.agents.context import AgentContext
 from backend.agents.manager import build_manager_agent
@@ -29,6 +29,13 @@ def write_repository(tmp_path: Path) -> Path:
     return root
 
 
+def dispatched_result(agent: Agent, content: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        final_output=content,
+        new_items=[ToolCallItem(agent=agent, raw_item={"name": "analyse_repository"})],
+    )
+
+
 def test_navigation_lists_and_reads_contained_text_files(tmp_path: Path) -> None:
     root = write_repository(tmp_path)
 
@@ -39,7 +46,9 @@ def test_navigation_lists_and_reads_contained_text_files(tmp_path: Path) -> None
     ]
 
 
-@pytest.mark.parametrize("path", ["/etc/passwd", "../outside", ".git/config", "src/.git/config", "src/../main.rs", "bad\x00path"])
+@pytest.mark.parametrize(
+    "path", ["/etc/passwd", "../outside", ".git/config", ".GIT/config", "src/.git/config", "src/../main.rs", "bad\x00path"]
+)
 def test_navigation_rejects_unsafe_model_paths(tmp_path: Path, path: str) -> None:
     root = write_repository(tmp_path)
 
@@ -62,6 +71,25 @@ def test_navigation_rejects_symlink_escape_binary_and_bounds(tmp_path: Path) -> 
         read_source_lines(root, "src/main.rs", 1, 201)
     with pytest.raises(CodeNavigationError):
         search_source_text(root, "x" * 201)
+
+
+def test_navigation_rejects_oversized_files_before_reading(tmp_path: Path) -> None:
+    root = write_repository(tmp_path)
+    from backend.agents.tools.code_navigation import MAX_FILE_BYTES
+
+    (root / "large.txt").write_bytes(b"a" * (MAX_FILE_BYTES + 1))
+
+    with pytest.raises(CodeNavigationError):
+        read_source_lines(root, "large.txt", 1, 1)
+
+
+def test_navigation_listing_skips_case_insensitive_git_and_symlinks(tmp_path: Path) -> None:
+    root = write_repository(tmp_path)
+    (root / ".GIT").mkdir()
+    (root / ".GIT" / "config").write_text("hidden\n", encoding="utf-8")
+    (root / "linked.rs").symlink_to(root / "src" / "main.rs")
+
+    assert list_project_files(root) == ["README.md", "src/main.rs"]
 
 
 def test_git_metadata_uses_bounded_argv_and_repository_root(tmp_path: Path) -> None:
@@ -120,6 +148,9 @@ def test_citation_validation_accepts_real_contained_line_ranges(tmp_path: Path) 
         "Bad [.git/config:1-1].",
         "Bad [src/main.rs:1-99].",
         "Bad [src/main.rs:1-].",
+        "Good [src/main.rs:1-1], bad [src/main.rs:2-2.",
+        "Good [src/main.rs:1-1], bad [[src/main.rs:2-2]].",
+        "Good [src/main.rs:1-1], bad [src/main.rs].",
     ],
 )
 def test_citation_validation_rejects_invalid_or_unbounded_evidence(tmp_path: Path, text: str) -> None:
@@ -136,7 +167,7 @@ def test_workflow_publishes_only_valid_output_atomically(tmp_path: Path) -> None
 
     async def runner(agent, prompt, *, context):
         calls.append((agent, prompt, context))
-        return SimpleNamespace(final_output="The entry point is [src/main.rs:1-2].")
+        return dispatched_result(agent, "The entry point is [src/main.rs:1-2].")
 
     path = asyncio.run(RepositoryAnalysisWorkflow(workspace, runner=runner).analyse(7, root))
 
@@ -154,7 +185,7 @@ def test_workflow_retries_once_with_terra_worker_only_after_invalid_citations(tm
 
     async def runner(agent, prompt, *, context):
         calls.append(agent)
-        return SimpleNamespace(final_output=next(outputs))
+        return dispatched_result(agent, next(outputs))
 
     path = asyncio.run(RepositoryAnalysisWorkflow(tmp_path / "workspace", runner=runner).analyse(8, root))
 
@@ -162,6 +193,60 @@ def test_workflow_retries_once_with_terra_worker_only_after_invalid_citations(tm
     assert len(calls) == 2
     assert calls[0].tools[0]._agent_instance.model == "gpt-5.6-luna"
     assert calls[1].tools[0]._agent_instance.model == "gpt-5.6-terra"
+
+
+def test_workflow_retries_and_rejects_outputs_without_dispatch_evidence(tmp_path: Path) -> None:
+    root = write_repository(tmp_path)
+    calls = []
+
+    async def runner(agent, prompt, *, context):
+        calls.append(agent)
+        return SimpleNamespace(final_output="Entry point [src/main.rs:1-1].", new_items=[])
+
+    with pytest.raises(CitationValidationError, match="dispatch"):
+        asyncio.run(RepositoryAnalysisWorkflow(tmp_path / "workspace", runner=runner).analyse(10, root))
+    assert len(calls) == 2
+    assert calls[0].tools[0]._agent_instance.model == "gpt-5.6-luna"
+    assert calls[1].tools[0]._agent_instance.model == "gpt-5.6-terra"
+
+
+def test_workflow_accepts_actual_agent_tool_call_item_evidence(tmp_path: Path) -> None:
+    root = write_repository(tmp_path)
+
+    async def runner(agent, prompt, *, context):
+        return dispatched_result(agent, "Entry point [src/main.rs:1-1].")
+
+    path = asyncio.run(RepositoryAnalysisWorkflow(tmp_path / "workspace", runner=runner).analyse(11, root))
+    assert path.is_file()
+
+
+def test_workflow_rejects_symlinked_publication_parent(tmp_path: Path) -> None:
+    root = write_repository(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (workspace / "projects").symlink_to(outside, target_is_directory=True)
+
+    async def runner(agent, prompt, *, context):
+        return dispatched_result(agent, "Entry point [src/main.rs:1-1].")
+
+    with pytest.raises(CitationValidationError):
+        asyncio.run(RepositoryAnalysisWorkflow(workspace, runner=runner).analyse(12, root))
+
+
+def test_workflow_rejects_symlinked_workspace_root(tmp_path: Path) -> None:
+    root = write_repository(tmp_path)
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    workspace.symlink_to(outside, target_is_directory=True)
+
+    async def runner(agent, prompt, *, context):
+        return dispatched_result(agent, "Entry point [src/main.rs:1-1].")
+
+    with pytest.raises(CitationValidationError):
+        asyncio.run(RepositoryAnalysisWorkflow(workspace, runner=runner).analyse(13, root))
 
 
 def test_workflow_does_not_retry_runner_errors_or_publish_two_invalid_outputs(tmp_path: Path) -> None:

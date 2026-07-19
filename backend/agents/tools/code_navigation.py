@@ -3,7 +3,9 @@
 import os
 from pathlib import Path, PurePosixPath
 import re
+import stat
 import subprocess
+from contextlib import contextmanager
 
 from agents import RunContextWrapper, function_tool
 
@@ -33,28 +35,74 @@ def _repository_root(repository_root: Path) -> Path:
     return root
 
 
-def _contained_file(repository_root: Path, relative_path: str) -> Path:
+def _relative_parts(relative_path: str) -> tuple[str, ...]:
     if not isinstance(relative_path, str) or not relative_path or "\x00" in relative_path:
         raise CodeNavigationError("path must be a non-empty relative path")
     normalised = relative_path.replace("\\", "/")
     path = PurePosixPath(normalised)
-    if path.is_absolute() or any(part in {"", ".", "..", ".git"} for part in path.parts):
+    if path.is_absolute() or any(part in {"", ".", ".."} or part.casefold() == ".git" for part in path.parts):
         raise CodeNavigationError("path is outside the allowed repository files")
+    return path.parts
+
+
+def _open_flags(directory: bool = False) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    if directory:
+        flags |= os.O_DIRECTORY
+    return flags
+
+
+@contextmanager
+def _opened_repository_root(repository_root: Path):
     root = _repository_root(repository_root)
-    candidate = root.joinpath(*path.parts)
     try:
-        resolved = candidate.resolve(strict=True)
-        resolved.relative_to(root)
-    except (OSError, ValueError) as error:
+        descriptor = os.open(root, _open_flags(directory=True))
+    except OSError as error:
+        raise CodeNavigationError("repository root is unavailable") from error
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise CodeNavigationError("repository root must be a directory")
+        yield root, descriptor
+    finally:
+        os.close(descriptor)
+
+
+def _open_contained_file(root_descriptor: int, parts: tuple[str, ...]) -> int:
+    directory_descriptor = os.dup(root_descriptor)
+    try:
+        for part in parts[:-1]:
+            child_descriptor = os.open(part, _open_flags(directory=True), dir_fd=directory_descriptor)
+            os.close(directory_descriptor)
+            directory_descriptor = child_descriptor
+            if not stat.S_ISDIR(os.fstat(directory_descriptor).st_mode):
+                raise CodeNavigationError("path must identify a file")
+        descriptor = os.open(parts[-1], _open_flags(), dir_fd=directory_descriptor)
+    except OSError as error:
         raise CodeNavigationError("path escapes the repository") from error
-    if not resolved.is_file():
-        raise CodeNavigationError("path must identify a file")
-    return resolved
-
-
-def _read_text(path: Path) -> str:
+    finally:
+        os.close(directory_descriptor)
     try:
-        data = path.read_bytes()
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise CodeNavigationError("path must identify a file")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _read_open_text(descriptor: int) -> str:
+    try:
+        if os.fstat(descriptor).st_size > MAX_FILE_BYTES:
+            raise CodeNavigationError("source file exceeds the read limit")
+        chunks: list[bytes] = []
+        remaining = MAX_FILE_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
     except OSError as error:
         raise CodeNavigationError("source file cannot be read") from error
     if len(data) > MAX_FILE_BYTES:
@@ -67,27 +115,53 @@ def _read_text(path: Path) -> str:
         raise CodeNavigationError("source file is not UTF-8 text") from error
 
 
+def _read_relative_text(root_descriptor: int, parts: tuple[str, ...]) -> str:
+    descriptor = _open_contained_file(root_descriptor, parts)
+    try:
+        return _read_open_text(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _list_directory(directory_descriptor: int, prefix: tuple[str, ...], files: list[str], limit: int) -> None:
+    try:
+        names = sorted(os.listdir(directory_descriptor))
+    except OSError as error:
+        raise CodeNavigationError("repository directory cannot be listed") from error
+    for name in names:
+        if name.casefold() == ".git":
+            continue
+        try:
+            child_directory = os.open(name, _open_flags(directory=True), dir_fd=directory_descriptor)
+        except OSError:
+            try:
+                descriptor = os.open(name, _open_flags(), dir_fd=directory_descriptor)
+            except OSError:
+                continue
+            try:
+                if stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    files.append("/".join((*prefix, name)))
+                    if len(files) >= limit:
+                        return
+            finally:
+                os.close(descriptor)
+            continue
+        try:
+            if stat.S_ISDIR(os.fstat(child_directory).st_mode):
+                _list_directory(child_directory, (*prefix, name), files, limit)
+                if len(files) >= limit:
+                    return
+        finally:
+            os.close(child_directory)
+
+
 def list_project_files(repository_root: Path, limit: int = MAX_FILES) -> list[str]:
     """List at most ``limit`` contained, non-Git, text-like repository files."""
     if not isinstance(limit, int) or limit < 1 or limit > MAX_FILES:
         raise CodeNavigationError("file listing limit is outside the allowed range")
-    root = _repository_root(repository_root)
     files: list[str] = []
-    for directory, directories, filenames in os.walk(root, followlinks=False):
-        directories[:] = sorted(name for name in directories if name != ".git")
-        for filename in sorted(filenames):
-            candidate = Path(directory, filename)
-            relative = candidate.relative_to(root)
-            if candidate.is_symlink():
-                continue
-            try:
-                resolved = candidate.resolve(strict=True)
-                resolved.relative_to(root)
-            except (OSError, ValueError):
-                continue
-            files.append(relative.as_posix())
-            if len(files) == limit:
-                return sorted(files)
+    with _opened_repository_root(repository_root) as (_, descriptor):
+        _list_directory(descriptor, (), files, limit)
     return sorted(files)
 
 
@@ -101,7 +175,9 @@ def read_source_lines(repository_root: Path, relative_path: str, start_line: int
         or end_line - start_line + 1 > MAX_LINE_RANGE
     ):
         raise CodeNavigationError("line range is outside the allowed bounds")
-    lines = _read_text(_contained_file(repository_root, relative_path)).splitlines()
+    parts = _relative_parts(relative_path)
+    with _opened_repository_root(repository_root) as (_, descriptor):
+        lines = _read_relative_text(descriptor, parts).splitlines()
     if end_line > len(lines):
         raise CodeNavigationError("line range is outside the source file")
     return "\n".join(lines[start_line - 1 : end_line])
@@ -113,18 +189,20 @@ def search_source_text(repository_root: Path, query: str, limit: int = MAX_SEARC
         raise CodeNavigationError("search query is outside the allowed bounds")
     if not isinstance(limit, int) or limit < 1 or limit > MAX_SEARCH_RESULTS:
         raise CodeNavigationError("search result limit is outside the allowed bounds")
-    root = _repository_root(repository_root)
     matches: list[dict[str, int | str]] = []
-    for relative_path in list_project_files(root):
-        try:
-            content = _read_text(_contained_file(root, relative_path))
-        except CodeNavigationError:
-            continue
-        for line_number, line in enumerate(content.splitlines(), start=1):
-            if query in line:
-                matches.append({"path": relative_path, "line": line_number, "text": line[:MAX_RESULT_LINE_LENGTH]})
-                if len(matches) == limit:
-                    return matches
+    with _opened_repository_root(repository_root) as (_, descriptor):
+        files: list[str] = []
+        _list_directory(descriptor, (), files, MAX_FILES)
+        for relative_path in sorted(files):
+            try:
+                content = _read_relative_text(descriptor, tuple(relative_path.split("/")))
+            except CodeNavigationError:
+                continue
+            for line_number, line in enumerate(content.splitlines(), start=1):
+                if query in line:
+                    matches.append({"path": relative_path, "line": line_number, "text": line[:MAX_RESULT_LINE_LENGTH]})
+                    if len(matches) == limit:
+                        return matches
     return matches
 
 
