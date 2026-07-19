@@ -291,6 +291,22 @@ describe('App journey', () => {
     expect(screen.getByLabelText('Task log output').textContent).toBe(`${firstChunk}tail`);
   });
 
+  it('continues draining when a full byte chunk contains multibyte text', async () => {
+    const firstChunk = `${'€'.repeat(21_845)}x`;
+    const firstOffset = new TextEncoder().encode(firstChunk).length;
+    const api = apiDouble({
+      getTaskLog: vi.fn()
+        .mockResolvedValueOnce({ content: firstChunk, next_offset: firstOffset })
+        .mockResolvedValueOnce({ content: 'tail', next_offset: firstOffset + 4 })
+    });
+    const user = userEvent.setup();
+    render(<App api={api} />);
+    await screen.findByRole('option', { name: secondProject.repository_url });
+    await user.click(screen.getByRole('link', { name: 'Logs' }));
+    await waitFor(() => expect(api.getTaskLog).toHaveBeenLastCalledWith(task.id, firstOffset));
+    expect(screen.getByLabelText('Task log output').textContent).toBe(`${firstChunk}tail`);
+  });
+
   it('preserves the existing log and cursor when an incremental request fails', async () => {
     let notify: (() => void) | undefined;
     const api = apiDouble({

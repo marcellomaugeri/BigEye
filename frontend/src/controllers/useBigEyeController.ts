@@ -81,7 +81,7 @@ export function useBigEyeController(api: BigEyeApi, eventStream: ProjectEventStr
         logOffset.current = log.next_offset;
         if (!log.content) return;
         setLogContent((current) => current + log.content);
-        if (log.content.length < TASK_LOG_CHUNK_BYTES || log.next_offset <= after) return;
+        if (log.next_offset <= after || log.next_offset - after < TASK_LOG_CHUNK_BYTES) return;
         after = log.next_offset;
       }
     } catch (error) {
