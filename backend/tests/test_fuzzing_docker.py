@@ -279,7 +279,7 @@ class TestToolchainBuilder:
         builder = ToolchainBuilder(dockerfile, image_builder, inspector)
 
         first = builder.tag()
-        assert first == builder.tag() and first.startswith("bigeye-llvm:")
+        assert first == builder.tag() and first.startswith("bigeye-toolchain:")
         assert builder.ensure(lambda text: None).image_id == "sha256:ready"
 
     def test_invalid_present_image_is_not_silently_rebuilt(self, tmp_path: Path) -> None:
@@ -343,7 +343,7 @@ class TestToolchainVerifier:
 
         class Runner:
             async def run(self, image, command, timeout, sink): return _result(command, sink)
-        run(ToolchainVerifier(SimpleNamespace(inspect=lambda image: SimpleNamespace(os="linux", architecture="amd64")), Runner()).verify("bigeye-llvm:test", lambda text: None))
+        run(ToolchainVerifier(SimpleNamespace(inspect=lambda image: SimpleNamespace(os="linux", architecture="amd64")), Runner()).verify("bigeye-toolchain:test", lambda text: None))
 
     def test_verifier_raises_logged_failure_text(self) -> None:
         from backend.fuzzing.docker.container_runner import ContainerResult
@@ -363,7 +363,11 @@ class TestToolchainVerifier:
 def _result(command, sink):
     assert command[0:2] == ["bash", "-lc"]
     assert "clang-18 --version" in command[2]
+    assert "llvm-profdata-18 --version" in command[2]
+    assert "llvm-cov-18 --version" in command[2]
     assert "-fsanitize=fuzzer,address,undefined" in command[2]
+    assert "afl-clang-fast" in command[2]
+    assert "afl-showmap" in command[2]
     assert "ASAN_OPTIONS=detect_leaks=0" in command[2]
     assert "-runs=1" in command[2]
     from backend.fuzzing.docker.container_runner import ContainerResult
@@ -407,7 +411,7 @@ class TestToolchainService:
 class TestMaintainedImageDefinition:
     def test_image_is_bigeye_owned_amd64_ubuntu_llvm_without_forbidden_toolchains(self) -> None:
         dockerfile = (Path(__file__).parents[1] / "fuzzing/images/Dockerfile").read_text().lower()
-        assert "from --platform=linux/amd64 ubuntu:24.04" in dockerfile
+        assert "from --platform=linux/amd64 ubuntu@sha256:52df9b1ee71626e0088f7d400d5c6b5f7bb916f8f0c82b474289a4ece6cf3faf" in dockerfile
         for package in ("clang-18", "llvm-18", "lld-18", "libfuzzer-18-dev", "libclang-rt-18-dev", "cmake", "ninja-build", "make", "git", "ca-certificates"):
             assert package in dockerfile
         assert "oss-fuzz" not in dockerfile and "oss fuzz" not in dockerfile

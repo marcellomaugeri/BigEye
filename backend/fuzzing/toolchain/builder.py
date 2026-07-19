@@ -8,6 +8,11 @@ import threading
 from backend.fuzzing.docker.image_inspector import MissingImage
 
 
+PLATFORM = "linux/amd64"
+LLVM_VERSION = "18"
+AFL_VERSION = "v4.40c"
+
+
 class ToolchainBuilder:
     _tag_locks: dict[str, threading.Lock] = {}
     _tag_locks_guard = threading.Lock()
@@ -17,8 +22,17 @@ class ToolchainBuilder:
         self._inspector = inspector
 
     def tag(self) -> str:
-        digest = sha256(b"bigeye-llvm-v1\0linux/amd64\0" + self._dockerfile.read_bytes()).hexdigest()[:20]
-        return f"bigeye-llvm:{digest}"
+        identity = b"\0".join(
+            (
+                b"bigeye-toolchain-v1",
+                PLATFORM.encode(),
+                LLVM_VERSION.encode(),
+                AFL_VERSION.encode(),
+                self._dockerfile.read_bytes(),
+            )
+        )
+        digest = sha256(identity).hexdigest()[:20]
+        return f"bigeye-toolchain:{digest}"
 
     def ensure(self, sink, cancellation_signal=None):
         tag = self.tag()
