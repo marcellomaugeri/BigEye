@@ -20,6 +20,8 @@ from backend.agents.tools.code_navigation import (
     read_source_lines,
     search_source_text,
 )
+from backend.agents.tools.evidence_retrieval import evidence_retrieval_tools
+from backend.fuzzing.discovery.retrieval import EvidenceRetriever
 from backend.agents.workflow import CitationValidationError, RepositoryAnalysisWorkflow, validate_citations
 
 
@@ -147,6 +149,7 @@ def test_agents_have_the_required_models_and_tool_boundary() -> None:
     assert isinstance(worker, Agent)
     assert worker.model == "gpt-5.6-luna"
     assert {tool.name for tool in worker.tools} == {"list_project_files", "read_source_lines", "search_source_text", "inspect_git_metadata"}
+    assert {tool.name for tool in evidence_retrieval_tools()} == {"inspect_build_evidence", "retrieve_repository_evidence"}
     assert worker.handoffs == []
     assert worker_tool.name == "analyse_repository"
     assert isinstance(manager, Agent)
@@ -155,13 +158,29 @@ def test_agents_have_the_required_models_and_tool_boundary() -> None:
     assert manager.handoffs == []
 
 
-def test_context_contains_only_project_id_and_resolved_repository_root(tmp_path: Path) -> None:
+def test_context_owns_only_project_identity_roots_and_retriever(tmp_path: Path) -> None:
     root = write_repository(tmp_path)
-    context = AgentContext(project_id=4, repository_root=root)
+    assets = tmp_path / "assets"
+    context = AgentContext(
+        project_id=4,
+        commit_sha="a" * 40,
+        repository_root=root,
+        generated_assets_root=assets,
+        evidence=EvidenceRetriever(root),
+    )
 
     assert context.project_id == 4
+    assert context.commit_sha == "a" * 40
     assert context.repository_root == root.resolve()
-    assert set(context.__dataclass_fields__) == {"project_id", "repository_root"}
+    assert context.generated_assets_root == assets.resolve()
+    assert context.evidence.repository_root == root.resolve()
+    assert set(context.__dataclass_fields__) == {
+        "project_id",
+        "commit_sha",
+        "repository_root",
+        "generated_assets_root",
+        "evidence",
+    }
 
 
 def test_citation_validation_accepts_real_contained_line_ranges(tmp_path: Path) -> None:

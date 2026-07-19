@@ -18,6 +18,7 @@ MAX_DIRECTORIES = 64
 MAX_DIRECTORY_ENTRIES = 256
 MAX_DIRECTORY_DEPTH = 12
 MAX_FILE_BYTES = 1_000_000
+MAX_TOTAL_READ_BYTES = 4_000_000
 MAX_LINE_RANGE = 200
 MAX_QUERY_LENGTH = 200
 MAX_SEARCH_RESULTS = 50
@@ -123,6 +124,14 @@ def _read_relative_text(root_descriptor: int, parts: tuple[str, ...]) -> str:
     descriptor = _open_contained_file(root_descriptor, parts)
     try:
         return _read_open_text(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _contained_file_size(root_descriptor: int, parts: tuple[str, ...]) -> int:
+    descriptor = _open_contained_file(root_descriptor, parts)
+    try:
+        return os.fstat(descriptor).st_size
     finally:
         os.close(descriptor)
 
@@ -233,12 +242,18 @@ def search_source_text(repository_root: Path, query: str, limit: int = MAX_SEARC
     if not isinstance(limit, int) or limit < 1 or limit > MAX_SEARCH_RESULTS:
         raise CodeNavigationError("search result limit is outside the allowed bounds")
     matches: list[dict[str, int | str]] = []
+    remaining_bytes = MAX_TOTAL_READ_BYTES
     with _opened_repository_root(repository_root) as (_, descriptor):
         for relative_path in _enumerate_project_files(descriptor, MAX_FILES):
+            parts = tuple(relative_path.split("/"))
             try:
-                content = _read_relative_text(descriptor, tuple(relative_path.split("/")))
-            except CodeNavigationError:
+                size = _contained_file_size(descriptor, parts)
+                if size > remaining_bytes:
+                    continue
+                content = _read_relative_text(descriptor, parts)
+            except (CodeNavigationError, OSError):
                 continue
+            remaining_bytes -= len(content.encode("utf-8"))
             for line_number, line in enumerate(content.splitlines(), start=1):
                 if query in line:
                     matches.append({"path": relative_path, "line": line_number, "text": line[:MAX_RESULT_LINE_LENGTH]})
