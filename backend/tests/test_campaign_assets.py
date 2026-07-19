@@ -198,3 +198,53 @@ def test_symlinked_assets_component_never_receives_published_asset(tmp_path: Pat
 
     assert list(external.iterdir()) == []
     assert repository.validated == []
+
+
+def test_assets_directory_swap_after_open_never_redirects_publication(tmp_path: Path) -> None:
+    from backend.fuzzing.assets.store import AssetStore
+
+    workspace = tmp_path / "workspace"
+    source = workspace / "projects/7/drafts/adapter.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("safe\n")
+    assets = workspace / "projects/7/assets"
+    assets.mkdir()
+    external = tmp_path / "external-assets"
+    external.mkdir()
+
+    class SwappingStore(AssetStore):
+        def _after_assets_opened(self, _descriptor):
+            assets.rename(workspace / "projects/7/assets-original")
+            assets.symlink_to(external, target_is_directory=True)
+
+    repository = _Assets()
+    run(SwappingStore(workspace, repository).create(7, "adapter", "adapter.py", {"adapter.py": source}, None))
+
+    assert list(external.iterdir()) == []
+    assert (workspace / "projects/7/assets-original/1/adapter.py").read_text() == "safe\n"
+    assert repository.validated == [1]
+
+
+def test_parent_boolean_is_rejected_before_repository_lookup(tmp_path: Path) -> None:
+    from backend.fuzzing.assets.store import AssetStore
+
+    workspace = tmp_path / "workspace"
+    source = workspace / "projects/7/drafts/adapter.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("safe\n")
+
+    class TrackingAssets(_Assets):
+        def __init__(self):
+            super().__init__()
+            self.lookups = []
+
+        async def get(self, asset_id):
+            self.lookups.append(asset_id)
+            return await super().get(asset_id)
+
+    repository = TrackingAssets()
+    with pytest.raises(ValueError, match="parent ID"):
+        run(AssetStore(workspace, repository).create(7, "adapter", "adapter.py", {"adapter.py": source}, True))
+
+    assert repository.lookups == []
+    assert repository.created == []

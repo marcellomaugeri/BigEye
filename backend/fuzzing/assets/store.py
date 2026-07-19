@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import os
-import shutil
 import stat
 from hashlib import sha256
 from pathlib import Path
 
-from backend.fuzzing.assets.validation import collection_hash, safe_relative_name
+from backend.fuzzing.assets.validation import safe_relative_name
+
+
+_MAX_ASSET_PATH_DEPTH = 32
 
 
 class AssetStore:
@@ -20,6 +22,8 @@ class AssetStore:
 
     async def create(self, project_id: int, kind: str, name: str, files, parent_id: int | None):
         safe_relative_name(name)
+        if parent_id is not None and (isinstance(parent_id, bool) or not isinstance(parent_id, int) or parent_id <= 0):
+            raise ValueError("parent ID must be a positive integer")
         normalised = self._normalise(project_id, kind, files)
         expected = self._hash_sources(project_id, kind, normalised)
         content_hash = self._collection_hash(expected)
@@ -28,41 +32,55 @@ class AssetStore:
             if parent is None or parent.project_id != project_id:
                 raise ValueError("parent asset does not belong to this project")
         asset = await self._repository.create(project_id, kind, name, content_hash, parent_id)
-        staging: Path | None = None
+        assets_descriptor: int | None = None
+        staging_name: str | None = None
+        published = False
         try:
-            root = self._asset_root(project_id)
             assets_descriptor = self._open_assets_directory(project_id, create=True)
-            os.close(assets_descriptor)
-            self._fsync_directory(root)
-            staging = root / f"{asset.id}.staging"
-            destination = root / str(asset.id)
-            if staging.exists() or staging.is_symlink() or destination.exists() or destination.is_symlink():
+            self._after_assets_opened(assets_descriptor)
+            self._fsync_descriptor(assets_descriptor)
+            if isinstance(asset.id, bool) or not isinstance(asset.id, int) or asset.id <= 0:
+                raise ValueError("asset ID must be a positive integer")
+            staging_name = f"{asset.id}.staging"
+            destination_name = str(asset.id)
+            for candidate in (staging_name, destination_name):
+                try:
+                    os.stat(candidate, dir_fd=assets_descriptor, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
                 raise RuntimeError("asset version path already exists")
-            staging.mkdir(mode=0o700)
+            os.mkdir(staging_name, mode=0o700, dir_fd=assets_descriptor)
+            staging_descriptor = os.open(staging_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=assets_descriptor)
             for file_name, source in normalised.items():
-                target = staging / safe_relative_name(file_name)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                copied_hash = self._copy_source(project_id, kind, file_name, source, target)
+                relative = safe_relative_name(file_name)
+                parent_descriptor = self._open_relative_directory(staging_descriptor, relative.parts[:-1], create=True)
+                try:
+                    copied_hash = self._copy_source(project_id, kind, file_name, source, parent_descriptor, relative.name)
+                finally:
+                    os.close(parent_descriptor)
                 if copied_hash != expected[file_name]:
                     raise ValueError("asset source changed after content validation")
-            staged = {
-                name: (staging / safe_relative_name(name), None) for name in normalised
-            }
-            if collection_hash(staged, kind) != asset.content_hash:
-                raise ValueError("copied asset content does not match its persisted hash")
-            self._lock_down(staging, kind)
-            self._fsync_tree(staging)
-            os.replace(staging, destination)
-            self._fsync_directory(root)
+            self._lock_down_staging(staging_descriptor, tuple(normalised), kind)
+            self._fsync_descriptor(staging_descriptor)
+            os.close(staging_descriptor)
+            staging_descriptor = None
+            os.replace(staging_name, destination_name, src_dir_fd=assets_descriptor, dst_dir_fd=assets_descriptor)
+            published = True
+            self._fsync_descriptor(assets_descriptor)
             return await self._repository.mark_validated(asset.id)
         except BaseException as error:
-            if staging is not None and (staging.exists() or staging.is_symlink()):
-                self._remove_staging(staging, self._asset_root(project_id))
+            if staging_name is not None and assets_descriptor is not None and not published:
+                self._remove_staging_at(assets_descriptor, staging_name)
             try:
                 await self._repository.record_error(asset.id, str(error))
             except Exception:
                 pass
             raise
+        finally:
+            if "staging_descriptor" in locals() and staging_descriptor is not None:
+                os.close(staging_descriptor)
+            if assets_descriptor is not None:
+                os.close(assets_descriptor)
 
     def _normalise(self, project_id: int, kind: str, files) -> dict[str, Path]:
         if not isinstance(files, dict) or not files:
@@ -90,10 +108,10 @@ class AssetStore:
                 hashes[name] = self._hash_descriptor(descriptor)
         return hashes
 
-    def _copy_source(self, project_id: int, kind: str, name: str, source: Path, target: Path) -> str:
+    def _copy_source(self, project_id: int, kind: str, name: str, source: Path, parent_descriptor: int, target_name: str) -> str:
         with self._open_source(project_id, source) as input_descriptor:
             self._validate_source_stat(name, kind, os.fstat(input_descriptor.fileno()))
-            output_descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            output_descriptor = os.open(target_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_descriptor)
             digest = sha256()
             try:
                 while block := input_descriptor.read(1024 * 1024):
@@ -103,6 +121,7 @@ class AssetStore:
                         written = os.write(output_descriptor, view)
                         view = view[written:]
                 os.fsync(output_descriptor)
+                os.fchmod(output_descriptor, 0o500 if kind == "script" and name.endswith(".sh") else 0o400)
             finally:
                 os.close(output_descriptor)
         return digest.hexdigest()
@@ -185,6 +204,24 @@ class AssetStore:
         return assets_descriptor
 
     @staticmethod
+    def _after_assets_opened(_descriptor: int) -> None:
+        """Test seam: publication remains anchored to this descriptor after path replacement."""
+
+    def _open_relative_directory(self, root_descriptor: int, parts, create: bool) -> int:
+        if len(parts) > _MAX_ASSET_PATH_DEPTH:
+            raise ValueError("asset path is too deeply nested")
+        descriptor = os.dup(root_descriptor)
+        try:
+            for component in parts:
+                next_descriptor = self._open_directory_component(descriptor, component, create)
+                os.close(descriptor)
+                descriptor = next_descriptor
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    @staticmethod
     def _open_directory_component(parent_descriptor: int, component: str, create: bool) -> int:
         if create:
             try:
@@ -193,14 +230,16 @@ class AssetStore:
                 pass
         return os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_descriptor)
 
-    @classmethod
-    def _lock_down(cls, root: Path, kind: str) -> None:
-        for directory, _, files in os.walk(root, topdown=False):
-            folder = Path(directory)
-            for name in files:
-                path = folder / name
-                path.chmod(0o500 if kind == "script" and path.suffix == ".sh" else 0o400)
-            folder.chmod(0o500)
+    def _lock_down_staging(self, root_descriptor: int, names: tuple[str, ...], kind: str) -> None:
+        directories = {tuple(safe_relative_name(name).parts[:-1]) for name in names}
+        for parts in sorted(directories, key=len, reverse=True):
+            descriptor = self._open_relative_directory(root_descriptor, parts, create=False)
+            try:
+                os.fchmod(descriptor, 0o500)
+                self._fsync_descriptor(descriptor)
+            finally:
+                os.close(descriptor)
+        os.fchmod(root_descriptor, 0o500)
 
     @staticmethod
     def _fsync_tree(root: Path) -> None:
@@ -220,10 +259,24 @@ class AssetStore:
             os.close(descriptor)
 
     @staticmethod
-    def _remove_staging(staging: Path, root: Path) -> None:
-        if staging.parent.resolve(strict=True) != root.resolve(strict=True):
-            raise RuntimeError("asset staging path escaped its project")
-        if staging.is_symlink():
-            staging.unlink()
-        else:
-            shutil.rmtree(staging)
+    def _fsync_descriptor(descriptor: int) -> None:
+        os.fsync(descriptor)
+
+    @staticmethod
+    def _remove_staging_at(parent_descriptor: int, name: str, depth: int = 0) -> None:
+        if depth > _MAX_ASSET_PATH_DEPTH:
+            raise RuntimeError("asset staging cleanup exceeded its nesting limit")
+        try:
+            descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_descriptor)
+        except FileNotFoundError:
+            return
+        try:
+            for child in os.listdir(descriptor):
+                source_stat = os.stat(child, dir_fd=descriptor, follow_symlinks=False)
+                if stat.S_ISDIR(source_stat.st_mode):
+                    AssetStore._remove_staging_at(descriptor, child, depth + 1)
+                else:
+                    os.unlink(child, dir_fd=descriptor)
+        finally:
+            os.close(descriptor)
+        os.rmdir(name, dir_fd=parent_descriptor)
