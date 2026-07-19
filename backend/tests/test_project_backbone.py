@@ -36,6 +36,28 @@ def task(identifier: int = 11, project_id: int = 7, name: str = "repository clon
     return Task(identifier, project_id, name, NOW, None, None)
 
 
+def _record(identifier, project_id, name, finished_at=None, error=None):
+    return SimpleNamespace(id=identifier, project_id=project_id, name=name, finished_at=finished_at, error=error)
+
+
+def _execution_repositories(value, records):
+    class Projects:
+        def __init__(self): self.finished = {}
+        async def get(self, identifier): return value if identifier == value.id else None
+        async def finish(self, identifier, error): self.finished[identifier] = error
+    class Tasks:
+        def __init__(self): self.finished = []
+        async def list_for_project(self, identifier): return [item for item in records if item.project_id == identifier]
+        async def finish(self, identifier, error=None):
+            self.finished.append((identifier, error))
+            item = next(item for item in records if item.id == identifier)
+            item.finished_at, item.error = NOW, error
+    class Logs:
+        def __init__(self): self.entries = []
+        async def append(self, item, content): self.entries.append((item.id, content))
+    return Projects(), Tasks(), Logs()
+
+
 class TestProjectRepository:
     def test_create_with_tasks_uses_one_transaction_and_explicit_columns(self) -> None:
         from backend.repositories.project_repository import ProjectRepository
@@ -356,6 +378,106 @@ class TestRecovery:
         run(scenario())
         services.close.assert_awaited_once_with()
         pool.close.assert_awaited_once_with()
+
+
+class TestProjectExecution:
+    def test_clone_and_toolchain_overlap_and_analysis_waits_only_for_clone(self, tmp_path: Path) -> None:
+        from backend.services.execute_project_backbone import ExecuteProjectBackbone
+
+        clone_started, toolchain_started = asyncio.Event(), asyncio.Event()
+        release_clone, release_toolchain = asyncio.Event(), asyncio.Event()
+        analysed = asyncio.Event()
+        clone_task = task(11, name="repository clone")
+        toolchain_task = task(12, name="LLVM toolchain preparation")
+        analysis_task = task(13, name="repository analysis")
+        projects, tasks = AsyncMock(), AsyncMock()
+        projects.get.return_value = project()
+        tasks.list_for_project.return_value = [clone_task, toolchain_task, analysis_task]
+
+        class Clone:
+            async def clone(self, value, clone_task):
+                clone_started.set()
+                await release_clone.wait()
+                return "a" * 40
+
+        class Toolchain:
+            async def prepare(self, value):
+                toolchain_started.set()
+                await release_toolchain.wait()
+
+        class Analysis:
+            async def analyse(self, project_id, root):
+                assert root == tmp_path / "projects/7/repository"
+                assert toolchain_started.is_set()
+                analysed.set()
+
+        executor = ExecuteProjectBackbone(projects, tasks, Clone(), Toolchain(), Analysis(), AsyncMock(), tmp_path)
+
+        async def scenario():
+            running = asyncio.create_task(executor.schedule(7))
+            await asyncio.wait_for(asyncio.gather(clone_started.wait(), toolchain_started.wait()), 1)
+            assert not analysed.is_set()
+            release_clone.set()
+            await asyncio.wait_for(analysed.wait(), 1)
+            assert not release_toolchain.is_set()
+            release_toolchain.set()
+            await running
+
+        run(scenario())
+        assert tasks.finish.await_args_list == [((11,),), ((13,),), ((12,),)]
+
+    def test_failure_is_logged_and_aggregated_after_all_tasks_are_terminal(self, tmp_path: Path) -> None:
+        from backend.services.execute_project_backbone import ExecuteProjectBackbone
+
+        records = [_record(11, 7, "repository clone"), _record(12, 7, "LLVM toolchain preparation"), _record(13, 7, "repository analysis")]
+        projects, tasks, logs = _execution_repositories(project(), records)
+
+        class Clone:
+            async def clone(self, value, clone_task): raise RuntimeError("remote rejected clone")
+        class Toolchain:
+            async def prepare(self, value): raise RuntimeError("Docker is unavailable")
+        class Analysis: pass
+
+        run(ExecuteProjectBackbone(projects, tasks, Clone(), Toolchain(), Analysis(), logs, tmp_path).schedule(7))
+
+        assert {entry[1] for entry in logs.entries} == {"remote rejected clone\n", "repository clone did not complete\n", "Docker is unavailable\n"}
+        assert all(item.finished_at is not None for item in records)
+        assert records[0].error == "remote rejected clone"
+        assert records[1].error == "Docker is unavailable"
+        assert records[2].error == "repository clone did not complete"
+        assert "repository clone: remote rejected clone" in projects.finished[7]
+
+    def test_cancellation_does_not_finish_tasks_or_project(self, tmp_path: Path) -> None:
+        from backend.services.execute_project_backbone import ExecuteProjectBackbone
+
+        records = [_record(11, 7, "repository clone"), _record(12, 7, "LLVM toolchain preparation"), _record(13, 7, "repository analysis")]
+        projects, tasks, logs = _execution_repositories(project(), records)
+        started = asyncio.Event()
+        class Clone:
+            async def clone(self, value, clone_task):
+                started.set(); await asyncio.Future()
+        class Toolchain:
+            async def prepare(self, value): await asyncio.Future()
+
+        async def scenario():
+            running = asyncio.create_task(ExecuteProjectBackbone(projects, tasks, Clone(), Toolchain(), SimpleNamespace(), logs, tmp_path).schedule(7))
+            await started.wait(); running.cancel()
+            with pytest.raises(asyncio.CancelledError): await running
+        run(scenario())
+        assert not tasks.finished and not projects.finished
+
+    def test_committed_clone_is_recovered_without_recloning(self, tmp_path: Path) -> None:
+        from backend.services.execute_project_backbone import ExecuteProjectBackbone
+
+        recovered = project()
+        recovered = type(recovered)(recovered.id, recovered.repository_url, recovered.worker_count, "a" * 40, recovered.created_at, None, None)
+        records = [_record(11, 7, "repository clone"), _record(12, 7, "LLVM toolchain preparation", finished_at=NOW), _record(13, 7, "repository analysis", finished_at=NOW)]
+        projects, tasks, logs = _execution_repositories(recovered, records)
+        clone = SimpleNamespace(verify_committed=AsyncMock(return_value=True), clone=AsyncMock())
+        run(ExecuteProjectBackbone(projects, tasks, clone, SimpleNamespace(prepare=AsyncMock()), SimpleNamespace(), logs, tmp_path).schedule(7))
+        clone.verify_committed.assert_awaited_once_with(recovered)
+        clone.clone.assert_not_called()
+        assert records[0].finished_at is not None and records[0].error is None
 
 
 async def _empty_command(*args, **kwargs):

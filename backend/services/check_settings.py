@@ -1,6 +1,7 @@
 """Truthful environment availability checks without secret disclosure."""
 
 import os
+import inspect
 
 
 def docker_available() -> bool:
@@ -27,9 +28,15 @@ class SettingsService:
                 database = (await self._pool.fetchval("SELECT 1")) == 1
             except Exception:
                 database = False
+        docker = self._docker_check()
+        toolchain = self._toolchain_check()
+        if inspect.isawaitable(docker):
+            docker = await docker
+        if inspect.isawaitable(toolchain):
+            toolchain = await toolchain
         return {
             "database": database,
-            "docker": bool(self._docker_check()),
+            "docker": bool(docker),
             "openai_api_key_present": bool(os.environ.get("OPENAI_API_KEY")),
-            "toolchain": bool(self._toolchain_check()),
+            "toolchain": bool(toolchain),
         }

@@ -48,3 +48,22 @@ class TaskLogReader:
             return (0, "")
         content = path.read_bytes()
         return (len(content), sha256(content).hexdigest())
+
+
+class TaskLogWriter(TaskLogReader):
+    """Append genuine capability output to the derived task log only."""
+
+    async def append(self, task, content: str) -> None:
+        if not isinstance(content, str):
+            raise TypeError("task log content must be text")
+        path = self.path_for(task)
+        for parent in (path.parent, *path.parent.parents):
+            if parent == self._workspace.parent:
+                break
+            if parent.is_symlink():
+                raise UnsafeWorkspacePath("task log directory must not be a symlink")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_symlink():
+            raise UnsafeWorkspacePath("task log must not be a symlink")
+        with path.open("a", encoding="utf-8", newline="") as log:
+            log.write(content)

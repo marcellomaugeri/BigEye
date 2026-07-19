@@ -47,6 +47,11 @@ class ProjectRepository:
     async def set_commit_sha(self, project_id: int, commit_sha: str) -> None:
         await self._pool.execute("UPDATE projects SET commit_sha = $2 WHERE id = $1", project_id, commit_sha)
 
+    async def finish(self, project_id: int, error: str | None = None) -> None:
+        await self._pool.execute(
+            "UPDATE projects SET finished_at = CURRENT_TIMESTAMP, error = $2 WHERE id = $1", project_id, error
+        )
+
     @staticmethod
     def _project(row) -> Project:
         return Project(row["id"], row["repository_url"], row["worker_count"], row["commit_sha"], row["created_at"], row["finished_at"], row["error"])

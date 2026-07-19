@@ -10,11 +10,11 @@ from backend.services.create_project import CreateProjectService
 from backend.services.read_analysis import AnalysisReader
 from backend.services.run_project_backbone import ProjectBackboneService, ProjectEventWatcher
 from backend.services.stream_task_output import TaskLogReader
-
-
-class UnconfiguredScheduler:
-    async def schedule(self, project_id: int) -> None:
-        return None
+from backend.services.stream_task_output import TaskLogWriter
+from backend.services.clone_repository import CloneRepositoryService
+from backend.services.execute_project_backbone import ExecuteProjectBackbone
+from backend.agents.workflow import RepositoryAnalysisWorkflow
+from backend.fuzzing.toolchain.deferred import DeferredToolchain
 
 
 @dataclass
@@ -37,9 +37,15 @@ class Services:
 def build_services(pool, workspace: Path) -> Services:
     projects = ProjectRepository(pool)
     tasks = TaskRepository(pool)
-    backbone = ProjectBackboneService(projects, UnconfiguredScheduler())
+    logs = TaskLogWriter(workspace)
+    clone = CloneRepositoryService(workspace, projects=projects, logs=logs)
+    toolchain = DeferredToolchain(Path(__file__).parents[1] / "fuzzing/images/Dockerfile", logs)
+    analysis = RepositoryAnalysisWorkflow(workspace)
+    executor = ExecuteProjectBackbone(projects, tasks, clone, toolchain, analysis, logs, workspace)
+    backbone = ProjectBackboneService(projects, executor)
     return Services(
         project_creator=CreateProjectService(projects, backbone), projects=projects, tasks=tasks,
-        logs=TaskLogReader(workspace), events=ProjectEventWatcher(tasks, TaskLogReader(workspace)),
-        settings=SettingsService(pool), recovery=backbone, analysis=AnalysisReader(workspace),
+        logs=logs, events=ProjectEventWatcher(tasks, logs),
+        settings=SettingsService(pool, toolchain.docker_available, toolchain.toolchain_available),
+        recovery=backbone, analysis=AnalysisReader(workspace),
     )
