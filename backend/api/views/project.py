@@ -15,12 +15,24 @@ class CreateProjectRequest(BaseModel):
 class ProjectResponse(BaseModel):
     id: str
     repository_url: str
+    requested_revision: str
     worker_count: int
     commit_sha: str | None
+    token_present: bool
     created_at: datetime
-    finished_at: datetime | None
+    paused_at: datetime | None
     error: str | None
 
     @classmethod
     def from_model(cls, project):
-        return cls(id=str(project.id), repository_url=project.repository_url, worker_count=project.worker_count, commit_sha=project.commit_sha, created_at=project.created_at, finished_at=project.finished_at, error=project.error)
+        return cls(
+            id=str(project.id),
+            repository_url=project.repository_url,
+            requested_revision=project.requested_revision,
+            worker_count=project.worker_count,
+            commit_sha=project.commit_sha,
+            token_present=project.token_present,
+            created_at=project.created_at,
+            paused_at=project.paused_at,
+            error=project.error,
+        )

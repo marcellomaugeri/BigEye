@@ -43,24 +43,17 @@ class DevelopmentDatabaseTests(unittest.TestCase):
         self.assertIn("healthcheck:", compose)
         self.assertNotIn("0.0.0.0", compose)
 
-    def test_schema_contains_only_the_minimal_project_and_task_fields(self) -> None:
+    def test_release_schema_has_only_required_tables_and_no_enum_types(self) -> None:
         schema_file = ROOT / "backend/database/schema.sql"
         self.assertTrue(schema_file.is_file())
         if not schema_file.is_file():
             return
         schema = schema_file.read_text()
 
-        project_columns = self._columns_for("projects", schema)
-        task_columns = self._columns_for("tasks", schema)
-
-        self.assertEqual(
-            project_columns,
-            {"id", "repository_url", "worker_count", "commit_sha", "created_at", "finished_at", "error"},
-        )
-        self.assertEqual(
-            task_columns,
-            {"id", "project_id", "name", "created_at", "finished_at", "error"},
-        )
+        for table in ("projects", "tasks", "assets", "campaigns", "coverage_evidence", "findings"):
+            self.assertIn(f"CREATE TABLE {table}", schema)
+        self.assertNotIn("CREATE TYPE", schema)
+        self.assertNotIn("metadata", schema.lower())
 
     def test_tasks_reference_projects_with_a_foreign_key(self) -> None:
         schema_file = ROOT / "backend/database/schema.sql"

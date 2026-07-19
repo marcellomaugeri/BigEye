@@ -48,7 +48,7 @@ class ExecuteProjectBackbone:
             if not toolchain_job.done():
                 toolchain_job.cancel()
                 await asyncio.gather(toolchain_job, return_exceptions=True)
-        await self._finish_project(project_id)
+        await self._persist_project_error(project_id)
 
     @staticmethod
     def _terminal(task) -> bool:
@@ -105,7 +105,7 @@ class ExecuteProjectBackbone:
             pass
         await self._tasks.finish(task.id, message)
 
-    async def _finish_project(self, project_id: int) -> None:
+    async def _persist_project_error(self, project_id: int) -> None:
         tasks = await self._tasks.list_for_project(project_id)
         if not all(self._terminal(task) for task in tasks):
             return

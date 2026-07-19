@@ -8,8 +8,10 @@ from datetime import datetime
 class Project:
     id: int
     repository_url: str
+    requested_revision: str
     worker_count: int
     commit_sha: str | None
+    token_present: bool
     created_at: datetime
-    finished_at: datetime | None
+    paused_at: datetime | None
     error: str | None

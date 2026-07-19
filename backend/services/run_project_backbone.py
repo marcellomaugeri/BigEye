@@ -52,7 +52,7 @@ class ProjectEventWatcher:
         if self._projects is not None:
             project = await self._projects.get(project_id)
             if project is not None:
-                project_state = (project.commit_sha, project.finished_at, project.error)
+                project_state = (project.commit_sha, project.paused_at, project.error)
         for task in tasks:
             state.append((task.id, task.finished_at, task.error, await self._logs.signature_for(task)))
         return (project_state, tuple(state))
