@@ -15,6 +15,9 @@ from backend.fuzzing.toolchain.verifier import ToolchainVerifier, ToolchainVerif
 from backend.fuzzing.docker.image_inspector import UnsupportedImagePlatform
 
 
+CANCELLATION_CLEANUP_TIMEOUT_SECONDS = DOCKER_REQUEST_TIMEOUT_SECONDS + 1
+
+
 class _NoTaskPersistence:
     async def finish(self, task_id, error=None) -> None:
         return None
@@ -46,7 +49,7 @@ class DeferredToolchain:
         except asyncio.CancelledError as cancellation:
             work.cancel()
             try:
-                await asyncio.wait_for(asyncio.shield(work), timeout=DOCKER_REQUEST_TIMEOUT_SECONDS)
+                await asyncio.wait_for(asyncio.shield(work), timeout=CANCELLATION_CLEANUP_TIMEOUT_SECONDS)
             except BaseException:
                 pass
             raise cancellation

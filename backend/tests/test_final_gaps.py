@@ -87,6 +87,18 @@ class TestBoundedGitAndLogs:
         result = run(TaskLogReader(tmp_path).read(task(), 2))
         assert len(result.content) == TASK_LOG_CHUNK_BYTES and result.next_offset == 2 + TASK_LOG_CHUNK_BYTES
 
+    def test_log_reader_completes_utf8_codepoint_split_at_byte_chunk_boundary(self, tmp_path: Path) -> None:
+        from backend.services.stream_task_output import TASK_LOG_CHUNK_BYTES, TaskLogReader
+        prefix = "a" * (TASK_LOG_CHUNK_BYTES - 1)
+        expected = f"{prefix}€tail"
+        path = tmp_path / "projects/7/logs"; path.mkdir(parents=True); (path / "11.log").write_text(expected)
+        reader = TaskLogReader(tmp_path)
+        first = run(reader.read(task(), 0))
+        second = run(reader.read(task(), first.next_offset))
+        assert first.next_offset > TASK_LOG_CHUNK_BYTES
+        assert first.content + second.content == expected
+        assert "\ufffd" not in first.content + second.content
+
     def test_log_writer_refuses_growth_past_cap(self, tmp_path: Path, monkeypatch) -> None:
         from backend.services.stream_task_output import TaskLogLimitExceeded, TaskLogWriter
         monkeypatch.setattr("backend.services.stream_task_output.TASK_LOG_MAX_BYTES", 4)
@@ -97,7 +109,8 @@ class TestBoundedGitAndLogs:
 
 class TestDockerBounds:
     def test_deferred_cancellation_cancels_owned_operation_before_closing_client(self, tmp_path: Path) -> None:
-        from backend.fuzzing.toolchain.deferred import DeferredToolchain
+        from backend.fuzzing.docker.client import DOCKER_REQUEST_TIMEOUT_SECONDS
+        from backend.fuzzing.toolchain.deferred import CANCELLATION_CLEANUP_TIMEOUT_SECONDS, DeferredToolchain
 
         entered, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
         client = SimpleNamespace(close=lambda: None)
@@ -118,6 +131,7 @@ class TestDockerBounds:
             with pytest.raises(asyncio.CancelledError): await running
         run(scenario())
         assert cancelled.is_set()
+        assert DOCKER_REQUEST_TIMEOUT_SECONDS < CANCELLATION_CLEANUP_TIMEOUT_SECONDS < DOCKER_REQUEST_TIMEOUT_SECONDS + 5
 
     def test_connect_closes_created_client_when_ping_fails_and_uses_timeout(self) -> None:
         from backend.fuzzing.docker.client import DOCKER_REQUEST_TIMEOUT_SECONDS, DockerClient, DockerUnavailable

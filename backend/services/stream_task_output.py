@@ -18,6 +18,7 @@ _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | 
 _FILE_FLAGS = getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 TASK_LOG_MAX_BYTES = 5 * 1024 * 1024
 TASK_LOG_CHUNK_BYTES = 64 * 1024
+TASK_LOG_MAX_RESPONSE_BYTES = TASK_LOG_CHUNK_BYTES + 3
 
 
 class TaskLogLimitExceeded(RuntimeError):
@@ -107,9 +108,29 @@ class TaskLogReader:
             size = os.fstat(descriptor).st_size
             start = min(after, size)
             os.lseek(descriptor, start, os.SEEK_SET)
-            data = os.read(descriptor, TASK_LOG_CHUNK_BYTES)
-            return TaskLog(data.decode("utf-8", errors="replace"), start + len(data))
+            data = os.read(descriptor, TASK_LOG_MAX_RESPONSE_BYTES)
+            consumed = self._utf8_safe_length(data)
+            return TaskLog(data[:consumed].decode("utf-8", errors="replace"), start + consumed)
         finally: os.close(descriptor)
+
+    @staticmethod
+    def _utf8_safe_length(data: bytes) -> int:
+        if len(data) <= TASK_LOG_CHUNK_BYTES:
+            return len(data)
+        consumed = TASK_LOG_CHUNK_BYTES
+        while consumed < len(data):
+            try:
+                data[:consumed].decode("utf-8")
+                return consumed
+            except UnicodeDecodeError as error:
+                if error.end != consumed or error.start < TASK_LOG_CHUNK_BYTES - 3:
+                    return TASK_LOG_CHUNK_BYTES
+                consumed += 1
+        try:
+            data.decode("utf-8")
+        except UnicodeDecodeError:
+            return TASK_LOG_CHUNK_BYTES
+        return len(data)
 
     async def size_for(self, task) -> int:
         descriptor = self._open_file(task)
