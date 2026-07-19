@@ -156,6 +156,8 @@ class CloneRepositoryService:
 
     async def recover_published(self, project, task=None) -> str | None:
         destination = contained_path(self._workspace, "projects", str(project.id), "repository")
+        if not destination.exists() and not destination.is_symlink():
+            return None
         if destination.is_symlink() or not destination.is_dir() or not (destination / ".git").is_dir():
             raise GitCommandFailed("published repository is not a valid Git repository")
         kwargs = {"sink": lambda text: self._logs.append_sync(task, text)} if self._logs is not None and task is not None else {}

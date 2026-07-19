@@ -26,6 +26,12 @@ def task():
 
 
 class TestAtomicClone:
+    def test_absent_published_destination_has_no_recovery_so_initial_clone_can_proceed(self, tmp_path: Path) -> None:
+        from backend.services.clone_repository import CloneRepositoryService
+
+        service = CloneRepositoryService(tmp_path, AsyncMock(), AsyncMock())
+        assert run(service.recover_published(project())) is None
+
     def test_clone_publishes_only_after_staging_head_is_valid(self, tmp_path: Path) -> None:
         from backend.services.clone_repository import CloneRepositoryService
 
