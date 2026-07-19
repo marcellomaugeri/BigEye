@@ -4,6 +4,7 @@ from agents import Agent
 
 from backend.agents.prompts.repository_analysis import REPOSITORY_ANALYSIS_PROMPT
 from backend.agents.tools.code_navigation import code_navigation_tools
+from backend.agents.tools.evidence_retrieval import evidence_retrieval_tools
 
 
 def build_repository_analysis_agent(model: str = "gpt-5.6-luna") -> Agent:
@@ -12,5 +13,5 @@ def build_repository_analysis_agent(model: str = "gpt-5.6-luna") -> Agent:
         name="Repository analysis worker",
         instructions=REPOSITORY_ANALYSIS_PROMPT,
         model=model,
-        tools=code_navigation_tools(),
+        tools=[*code_navigation_tools(), *evidence_retrieval_tools()],
     )

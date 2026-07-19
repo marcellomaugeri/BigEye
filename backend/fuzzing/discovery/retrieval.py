@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from hashlib import sha256
+from itertools import islice
+import io
 import os
 from pathlib import Path
 import re
@@ -22,6 +24,8 @@ from backend.fuzzing.discovery.inventory import Inventory, MAX_EVIDENCE_FILE_BYT
 MAX_QUESTION_LENGTH = 200
 MAX_RESULTS = 12
 MAX_EXCERPT_CHARS = 600
+MAX_MATCHED_LINES = 4_096
+MAX_CANDIDATES = 256
 
 
 @dataclass(frozen=True)
@@ -65,14 +69,27 @@ class EvidenceRetriever:
             raise CodeNavigationError("evidence question is outside the allowed bounds")
         candidates: list[tuple[int, str, int, int, str, str]] = []
         remaining = MAX_EVIDENCE_BYTES
+        remaining_lines = MAX_MATCHED_LINES
+        remaining_candidates = MAX_CANDIDATES
         try:
             with _opened_repository_root(self.repository_root) as (_, descriptor):
                 for relative_path in sorted(self.inventory.text_files)[:256]:
+                    if remaining_lines <= 0 or remaining_candidates <= 0:
+                        break
                     content, consumed = self._bounded_text(descriptor, relative_path, remaining)
                     remaining -= consumed
                     if content is None:
                         continue
-                    candidates.extend(self._matches(relative_path, content, terms))
+                    matched, examined = self._matches(
+                        relative_path,
+                        content,
+                        terms,
+                        remaining_lines,
+                        remaining_candidates,
+                    )
+                    candidates.extend(matched)
+                    remaining_lines -= examined
+                    remaining_candidates -= len(matched)
         except (CodeNavigationError, OSError):
             return []
         candidates.sort(key=lambda candidate: (-candidate[0], candidate[1], candidate[2], candidate[4]))
@@ -95,18 +112,27 @@ class EvidenceRetriever:
             os.close(descriptor)
         return content, len(content.encode("utf-8"))
 
-    def _matches(self, relative_path: str, content: str, terms: tuple[str, ...]) -> list[tuple[int, str, int, int, str, str]]:
+    def _matches(
+        self,
+        relative_path: str,
+        content: str,
+        terms: tuple[str, ...],
+        line_limit: int,
+        candidate_limit: int,
+    ) -> tuple[list[tuple[int, str, int, int, str, str]], int]:
         path_lower = relative_path.casefold()
         path_terms = tuple(term for term in terms if term in path_lower)
-        lines = content.splitlines()
         matches: list[tuple[int, str, int, int, str, str]] = []
-        for index, line in enumerate(lines):
+        examined = 0
+        phrase = " ".join(terms)
+        for line_number, raw_line in enumerate(islice(io.StringIO(content), line_limit), start=1):
+            examined += 1
+            line = raw_line.rstrip("\r\n")
             lowered = line.casefold()
             line_terms = tuple(term for term in terms if term in lowered)
             if not line_terms and not path_terms:
                 continue
             score = 35 * len(path_terms) + 25 * len(line_terms)
-            phrase = " ".join(terms)
             if phrase in lowered:
                 score += 40
             reason_parts: list[str] = []
@@ -120,11 +146,11 @@ class EvidenceRetriever:
             if Path(relative_path).suffix.casefold() in {".c", ".cc", ".cpp", ".cxx", ".rs", ".go", ".java", ".kt", ".swift", ".py"}:
                 score += 10
                 reason_parts.append("component source")
-            start = max(1, index)
-            end = min(len(lines), index + 2)
-            excerpt = "\n".join(lines[start - 1:end])[:MAX_EXCERPT_CHARS]
-            matches.append((score, relative_path, start, end, excerpt, "; ".join(reason_parts)))
-        return matches
+            excerpt = line[:MAX_EXCERPT_CHARS]
+            matches.append((score, relative_path, line_number, line_number, excerpt, "; ".join(reason_parts)))
+            if len(matches) >= candidate_limit:
+                break
+        return matches, examined
 
     @staticmethod
     def _excerpt(candidate: tuple[int, str, int, int, str, str]) -> EvidenceExcerpt:

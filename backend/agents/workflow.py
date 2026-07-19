@@ -14,6 +14,7 @@ from backend.agents.manager import build_manager_agent
 from backend.agents.repository_analysis import build_repository_analysis_agent
 from backend.agents.tools.agent_dispatch import repository_analysis_tool
 from backend.agents.tools.code_navigation import CodeNavigationError, read_source_lines
+from backend.fuzzing.discovery.retrieval import EvidenceRetriever
 
 
 _CITATION = re.compile(r"\[([^\[\]]+):(\d+)-(\d+)\]")
@@ -161,8 +162,15 @@ class RepositoryAnalysisWorkflow:
         self._workspace = workspace
         self._runner = runner
 
-    async def analyse(self, project_id: int, repository_root: Path) -> Path:
-        context = AgentContext(project_id=project_id, repository_root=repository_root)
+    async def analyse(
+        self,
+        project_id: int,
+        commit_sha: str,
+        repository_root: Path,
+        generated_assets_root: Path,
+    ) -> Path:
+        evidence = EvidenceRetriever(repository_root)
+        context = AgentContext(project_id, commit_sha, repository_root, generated_assets_root, evidence)
         for worker_model in ("gpt-5.6-luna", "gpt-5.6-terra"):
             worker = build_repository_analysis_agent(model=worker_model)
             manager = build_manager_agent(repository_analysis_tool(worker))

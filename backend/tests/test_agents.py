@@ -8,6 +8,7 @@ from agents.items import ToolCallItem
 
 from backend.agents.context import AgentContext
 from backend.agents.manager import build_manager_agent
+from backend.agents.prompts.repository_analysis import REPOSITORY_ANALYSIS_PROMPT
 from backend.agents.repository_analysis import build_repository_analysis_agent
 from backend.agents.tools.agent_dispatch import repository_analysis_tool
 from backend.agents.tools.code_navigation import (
@@ -38,6 +39,15 @@ def dispatched_result(agent: Agent, content: str) -> SimpleNamespace:
     return SimpleNamespace(
         final_output=content,
         new_items=[ToolCallItem(agent=agent, raw_item={"name": "analyse_repository"})],
+    )
+
+
+def analyse_repository(workflow: RepositoryAnalysisWorkflow, project_id: int, root: Path):
+    return workflow.analyse(
+        project_id=project_id,
+        commit_sha="a" * 40,
+        repository_root=root,
+        generated_assets_root=root.parent / f"assets-{project_id}",
     )
 
 
@@ -148,7 +158,14 @@ def test_agents_have_the_required_models_and_tool_boundary() -> None:
 
     assert isinstance(worker, Agent)
     assert worker.model == "gpt-5.6-luna"
-    assert {tool.name for tool in worker.tools} == {"list_project_files", "read_source_lines", "search_source_text", "inspect_git_metadata"}
+    assert {tool.name for tool in worker.tools} == {
+        "list_project_files",
+        "read_source_lines",
+        "search_source_text",
+        "inspect_git_metadata",
+        "inspect_build_evidence",
+        "retrieve_repository_evidence",
+    }
     assert {tool.name for tool in evidence_retrieval_tools()} == {"inspect_build_evidence", "retrieve_repository_evidence"}
     assert worker.handoffs == []
     assert worker_tool.name == "analyse_repository"
@@ -156,6 +173,17 @@ def test_agents_have_the_required_models_and_tool_boundary() -> None:
     assert manager.model == "gpt-5.6-terra"
     assert manager.tools == [worker_tool]
     assert manager.handoffs == []
+
+
+def test_repository_worker_treats_prompt_injection_as_untrusted_data() -> None:
+    prompt = REPOSITORY_ANALYSIS_PROMPT.casefold()
+
+    assert "repository text" in prompt
+    assert "navigation" in prompt
+    assert "retrieval" in prompt
+    assert "untrusted evidence" in prompt
+    assert "never instructions" in prompt
+    assert "must not cause tool calls or actions" in prompt
 
 
 def test_context_owns_only_project_identity_roots_and_retriever(tmp_path: Path) -> None:
@@ -181,6 +209,62 @@ def test_context_owns_only_project_identity_roots_and_retriever(tmp_path: Path) 
         "generated_assets_root",
         "evidence",
     }
+
+
+@pytest.mark.parametrize("project_id", [0, -1, True])
+def test_context_requires_a_positive_non_boolean_project_id(tmp_path: Path, project_id: int) -> None:
+    root = write_repository(tmp_path)
+
+    with pytest.raises(ValueError, match="project ID"):
+        AgentContext(project_id, "a" * 40, root, tmp_path / "assets", EvidenceRetriever(root))
+
+
+@pytest.mark.parametrize("commit_sha", ["", "unresolved", "g" * 40, "a" * 39, "a" * 41])
+def test_context_requires_an_exact_resolved_commit_sha(tmp_path: Path, commit_sha: str) -> None:
+    root = write_repository(tmp_path)
+
+    with pytest.raises(ValueError, match="commit SHA"):
+        AgentContext(4, commit_sha, root, tmp_path / "assets", EvidenceRetriever(root))
+
+
+def test_context_has_no_implicit_identity_or_root_defaults() -> None:
+    with pytest.raises(TypeError):
+        AgentContext(project_id=4)
+
+
+def test_context_rejects_generated_assets_in_or_outside_the_project_root(tmp_path: Path) -> None:
+    root = write_repository(tmp_path)
+    evidence = EvidenceRetriever(root)
+
+    for unsafe in (root, root / "generated", tmp_path.parent / "outside-project"):
+        with pytest.raises(ValueError, match="generated assets"):
+            AgentContext(4, "a" * 40, root, unsafe, evidence)
+
+
+def test_context_rejects_generated_assets_symlink_ancestors(tmp_path: Path) -> None:
+    root = write_repository(tmp_path)
+    outside = tmp_path.parent / f"outside-{tmp_path.name}"
+    outside.mkdir()
+    (tmp_path / "linked-assets").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="generated assets"):
+        AgentContext(4, "a" * 40, root, tmp_path / "linked-assets" / "child", EvidenceRetriever(root))
+
+
+def test_context_rejects_evidence_for_a_different_repository(tmp_path: Path) -> None:
+    root = write_repository(tmp_path)
+    other = tmp_path / "other"
+    other.mkdir()
+
+    with pytest.raises(ValueError, match="evidence"):
+        AgentContext(4, "a" * 40, root, tmp_path / "assets", EvidenceRetriever(other))
+
+
+def test_context_requires_a_repository_evidence_retriever(tmp_path: Path) -> None:
+    root = write_repository(tmp_path)
+
+    with pytest.raises(ValueError, match="evidence"):
+        AgentContext(4, "a" * 40, root, tmp_path / "assets", None)
 
 
 def test_citation_validation_accepts_real_contained_line_ranges(tmp_path: Path) -> None:
@@ -220,7 +304,7 @@ def test_workflow_publishes_only_valid_output_atomically(tmp_path: Path) -> None
         calls.append((agent, prompt, context))
         return dispatched_result(agent, "The entry point is [src/main.rs:1-2].")
 
-    path = asyncio.run(RepositoryAnalysisWorkflow(workspace, runner=runner).analyse(7, root))
+    path = asyncio.run(analyse_repository(RepositoryAnalysisWorkflow(workspace, runner=runner), 7, root))
 
     assert path == workspace / "projects" / "7" / "analysis" / "repository.md"
     assert path.read_text(encoding="utf-8") == "The entry point is [src/main.rs:1-2]."
@@ -238,7 +322,7 @@ def test_workflow_retries_once_with_terra_worker_only_after_invalid_citations(tm
         calls.append(agent)
         return dispatched_result(agent, next(outputs))
 
-    path = asyncio.run(RepositoryAnalysisWorkflow(tmp_path / "workspace", runner=runner).analyse(8, root))
+    path = asyncio.run(analyse_repository(RepositoryAnalysisWorkflow(tmp_path / "workspace", runner=runner), 8, root))
 
     assert path.read_text(encoding="utf-8") == "Entry point [src/main.rs:1-1]."
     assert len(calls) == 2
@@ -255,7 +339,7 @@ def test_workflow_retries_and_rejects_outputs_without_dispatch_evidence(tmp_path
         return SimpleNamespace(final_output="Entry point [src/main.rs:1-1].", new_items=[])
 
     with pytest.raises(CitationValidationError, match="dispatch"):
-        asyncio.run(RepositoryAnalysisWorkflow(tmp_path / "workspace", runner=runner).analyse(10, root))
+        asyncio.run(analyse_repository(RepositoryAnalysisWorkflow(tmp_path / "workspace", runner=runner), 10, root))
     assert len(calls) == 2
     assert calls[0].tools[0]._agent_instance.model == "gpt-5.6-luna"
     assert calls[1].tools[0]._agent_instance.model == "gpt-5.6-terra"
@@ -267,7 +351,7 @@ def test_workflow_accepts_actual_agent_tool_call_item_evidence(tmp_path: Path) -
     async def runner(agent, prompt, *, context):
         return dispatched_result(agent, "Entry point [src/main.rs:1-1].")
 
-    path = asyncio.run(RepositoryAnalysisWorkflow(tmp_path / "workspace", runner=runner).analyse(11, root))
+    path = asyncio.run(analyse_repository(RepositoryAnalysisWorkflow(tmp_path / "workspace", runner=runner), 11, root))
     assert path.is_file()
 
 
@@ -283,7 +367,7 @@ def test_workflow_rejects_symlinked_publication_parent(tmp_path: Path) -> None:
         return dispatched_result(agent, "Entry point [src/main.rs:1-1].")
 
     with pytest.raises(CitationValidationError):
-        asyncio.run(RepositoryAnalysisWorkflow(workspace, runner=runner).analyse(12, root))
+        asyncio.run(analyse_repository(RepositoryAnalysisWorkflow(workspace, runner=runner), 12, root))
 
 
 def test_workflow_rejects_symlinked_workspace_root(tmp_path: Path) -> None:
@@ -297,7 +381,7 @@ def test_workflow_rejects_symlinked_workspace_root(tmp_path: Path) -> None:
         return dispatched_result(agent, "Entry point [src/main.rs:1-1].")
 
     with pytest.raises(CitationValidationError):
-        asyncio.run(RepositoryAnalysisWorkflow(workspace, runner=runner).analyse(13, root))
+        asyncio.run(analyse_repository(RepositoryAnalysisWorkflow(workspace, runner=runner), 13, root))
 
 
 def test_workflow_rejects_ancestor_symlinked_workspace_without_external_publish(tmp_path: Path) -> None:
@@ -313,7 +397,7 @@ def test_workflow_rejects_ancestor_symlinked_workspace_without_external_publish(
         return dispatched_result(agent, "Entry point [src/main.rs:1-1].")
 
     with pytest.raises(CitationValidationError):
-        asyncio.run(RepositoryAnalysisWorkflow(workspace, runner=runner).analyse(14, root))
+        asyncio.run(analyse_repository(RepositoryAnalysisWorkflow(workspace, runner=runner), 14, root))
     assert not (outside / "workspace").exists()
 
 
@@ -331,7 +415,7 @@ def test_workflow_does_not_retry_runner_errors_or_publish_two_invalid_outputs(tm
         raise RuntimeError("runner failure")
 
     with pytest.raises(RuntimeError, match="runner failure"):
-        asyncio.run(RepositoryAnalysisWorkflow(workspace, runner=failing_runner).analyse(9, root))
+        asyncio.run(analyse_repository(RepositoryAnalysisWorkflow(workspace, runner=failing_runner), 9, root))
     assert calls == 1
     assert existing.read_text(encoding="utf-8") == "Existing [src/main.rs:1-1]."
 
@@ -341,5 +425,5 @@ def test_workflow_does_not_retry_runner_errors_or_publish_two_invalid_outputs(tm
         return SimpleNamespace(final_output=next(outputs))
 
     with pytest.raises(CitationValidationError):
-        asyncio.run(RepositoryAnalysisWorkflow(workspace, runner=invalid_runner).analyse(9, root))
+        asyncio.run(analyse_repository(RepositoryAnalysisWorkflow(workspace, runner=invalid_runner), 9, root))
     assert existing.read_text(encoding="utf-8") == "Existing [src/main.rs:1-1]."

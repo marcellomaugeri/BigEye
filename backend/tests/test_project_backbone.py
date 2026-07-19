@@ -540,8 +540,11 @@ class TestApi:
         class Toolchain:
             async def prepare(self, toolchain_task): await logs.append(toolchain_task, "toolchain ready\n")
         class Analysis:
-            async def analyse(self, identifier, root):
-                path = tmp_path / "projects" / str(identifier) / "analysis"; path.mkdir(parents=True)
+            async def analyse(self, project_id, commit_sha, repository_root, generated_assets_root):
+                assert commit_sha == "a" * 40
+                assert repository_root == tmp_path / "projects" / str(project_id) / "repository"
+                assert generated_assets_root == tmp_path / "projects" / str(project_id) / "assets"
+                path = tmp_path / "projects" / str(project_id) / "analysis"; path.mkdir(parents=True)
                 (path / "repository.md").write_text("repository analysis\n"); completed.set()
         executor = ExecuteProjectBackbone(projects, tasks, Clone(), Toolchain(), Analysis(), logs, tmp_path)
         backbone = ProjectBackboneService(projects, executor)
@@ -673,6 +676,28 @@ class TestRuntimeContracts:
 
 
 class TestProjectExecution:
+    def test_analysis_receives_resolved_commit_and_generated_assets_root(self, tmp_path: Path) -> None:
+        from backend.services.execute_project_backbone import ExecuteProjectBackbone
+
+        unresolved = project()
+        resolved = replace(unresolved, commit_sha="a" * 40)
+        records = [_record(11, 7, "repository clone"), _record(12, 7, "LLVM toolchain preparation"), _record(13, 7, "repository analysis")]
+        projects, tasks = AsyncMock(), AsyncMock()
+        projects.get.side_effect = [unresolved, resolved]
+        tasks.list_for_project.return_value = records
+        analysis = AsyncMock()
+        clone = SimpleNamespace(clone=AsyncMock(return_value="a" * 40))
+        toolchain = SimpleNamespace(prepare=AsyncMock())
+
+        run(ExecuteProjectBackbone(projects, tasks, clone, toolchain, analysis, AsyncMock(), tmp_path).schedule(7))
+
+        analysis.analyse.assert_awaited_once_with(
+            project_id=7,
+            commit_sha="a" * 40,
+            repository_root=tmp_path / "projects/7/repository",
+            generated_assets_root=tmp_path / "projects/7/assets",
+        )
+
     def test_lifecycle_emits_durable_project_activity_and_debug_without_manual_events(self, tmp_path: Path) -> None:
         from backend.services.execute_project_backbone import ExecuteProjectBackbone
         from backend.services.observability.event_store import ProjectEventStore
@@ -680,7 +705,7 @@ class TestProjectExecution:
         from backend.services.stream_task_output import TaskLogWriter
 
         records = [_record(11, 7, "repository clone"), _record(12, 7, "LLVM toolchain preparation"), _record(13, 7, "repository analysis")]
-        projects, tasks, _ = _execution_repositories(project(), records)
+        projects, tasks, _ = _execution_repositories(replace(project(), commit_sha="a" * 40), records)
         store = ProjectEventStore(tmp_path)
         logs = TaskLogWriter(tmp_path, store)
         clone_logged, release_clone = asyncio.Event(), asyncio.Event()
@@ -694,7 +719,7 @@ class TestProjectExecution:
             async def prepare(self, toolchain_task):
                 await logs.append(toolchain_task, "toolchain is running\n")
         class Analysis:
-            async def analyse(self, project_id, root): return None
+            async def analyse(self, project_id, commit_sha, repository_root, generated_assets_root): return None
 
         executor = ExecuteProjectBackbone(projects, tasks, Clone(), Toolchain(), Analysis(), logs, tmp_path, store)
         stream = ProjectEventStream(store).stream(7, -1)
@@ -723,7 +748,7 @@ class TestProjectExecution:
         toolchain_task = task(12, name="LLVM toolchain preparation")
         analysis_task = task(13, name="repository analysis")
         projects, tasks = AsyncMock(), AsyncMock()
-        projects.get.return_value = project()
+        projects.get.side_effect = [project(), replace(project(), commit_sha="a" * 40)]
         tasks.list_for_project.return_value = [clone_task, toolchain_task, analysis_task]
 
         class Clone:
@@ -738,8 +763,10 @@ class TestProjectExecution:
                 await release_toolchain.wait()
 
         class Analysis:
-            async def analyse(self, project_id, root):
-                assert root == tmp_path / "projects/7/repository"
+            async def analyse(self, project_id, commit_sha, repository_root, generated_assets_root):
+                assert commit_sha == "a" * 40
+                assert repository_root == tmp_path / "projects/7/repository"
+                assert generated_assets_root == tmp_path / "projects/7/assets"
                 assert toolchain_started.is_set()
                 analysed.set()
 
@@ -815,7 +842,7 @@ class TestProjectExecution:
         from backend.services.execute_project_backbone import ExecuteProjectBackbone
 
         first = type(project())(1, "https://github.com/acme/one.git", "HEAD", 1, None, False, NOW, None, None)
-        second = type(project())(2, "https://github.com/acme/two.git", "HEAD", 1, None, False, NOW, None, None)
+        second = type(project())(2, "https://github.com/acme/two.git", "HEAD", 1, "a" * 40, False, NOW, None, None)
         first_records = [_record(11, 1, "repository clone"), _record(12, 1, "LLVM toolchain preparation"), _record(13, 1, "repository analysis")]
         second_records = [_record(21, 2, "repository clone"), _record(22, 2, "LLVM toolchain preparation"), _record(23, 2, "repository analysis")]
         first_projects, first_tasks, first_logs = _execution_repositories(first, first_records)
@@ -828,7 +855,7 @@ class TestProjectExecution:
         class Toolchain:
             async def prepare(self, value): return None
         class Analysis:
-            async def analyse(self, project_id, root): return None
+            async def analyse(self, project_id, commit_sha, repository_root, generated_assets_root): return None
 
         async def scenario():
             failed = asyncio.create_task(ExecuteProjectBackbone(first_projects, first_tasks, FailingClone(), Toolchain(), Analysis(), first_logs, tmp_path).schedule(1))

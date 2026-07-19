@@ -102,8 +102,22 @@ class ExecuteProjectBackbone:
     async def _run_analysis(self, project, task) -> bool:
         if self._terminal(task):
             return task.error is None
-        root = contained_path(self._workspace, "projects", str(project.id), "repository")
-        return await self._run_capability(task, lambda _: self._analysis.analyse(project.id, root))
+        project_root = contained_path(self._workspace, "projects", str(project.id))
+        repository_root = contained_path(project_root, "repository")
+        generated_assets_root = contained_path(project_root, "assets")
+
+        async def analyse(_):
+            resolved = await self._projects.get(project.id)
+            if resolved is None or resolved.commit_sha is None:
+                raise RuntimeError("repository commit is unresolved")
+            return await self._analysis.analyse(
+                project_id=project.id,
+                commit_sha=resolved.commit_sha,
+                repository_root=repository_root,
+                generated_assets_root=generated_assets_root,
+            )
+
+        return await self._run_capability(task, analyse)
 
     async def _fail(self, task, error: Exception | str) -> None:
         message = str(error) or type(error).__name__

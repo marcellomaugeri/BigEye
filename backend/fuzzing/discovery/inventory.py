@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from itertools import islice
+import io
 import json
 import os
 from pathlib import Path
 import re
+import shlex
+import tomllib
 
 from backend.agents.tools.code_navigation import (
     CodeNavigationError,
@@ -21,6 +25,8 @@ MAX_INVENTORY_FILES = 256
 MAX_EVIDENCE_FILE_BYTES = 128_000
 MAX_EVIDENCE_BYTES = 1_000_000
 MAX_COMPILE_COMMANDS = 64
+MAX_TARGETS_PER_KIND = 128
+MAX_MANIFEST_LINES = 4_096
 
 _BUILD_FILE_NAMES = frozenset(
     {
@@ -34,6 +40,8 @@ _BUILD_FILE_NAMES = frozenset(
         "pom.xml",
         "build.gradle",
         "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
         "package.json",
         "pyproject.toml",
         "compile_commands.json",
@@ -96,9 +104,19 @@ class RepositoryInventory:
                         continue
                     buckets["text_files"].add(relative_path)
                     if path.name == "compile_commands.json":
-                        compile_commands.extend(self._compile_commands(content, MAX_COMPILE_COMMANDS - len(compile_commands)))
+                        commands = self._compile_commands(content, MAX_COMPILE_COMMANDS - len(compile_commands))
+                        compile_commands.extend(commands)
+                        self._compile_command_targets(commands, buckets)
                     if path.name == "CMakeLists.txt":
                         self._cmake_targets(content, buckets)
+                    elif path.name == "meson.build":
+                        self._meson_targets(content, buckets)
+                    elif path.name == "Cargo.toml":
+                        self._cargo_targets(content, buckets, set(files))
+                    elif path.name in {"Makefile", "GNUmakefile"}:
+                        self._make_targets(content, buckets)
+                    elif path.name in {"build.gradle", "build.gradle.kts"}:
+                        self._gradle_targets(content, buckets)
                     if self._looks_like_fuzz_harness(path, content):
                         buckets["fuzz_harnesses"].add(relative_path)
         except (CodeNavigationError, OSError):
@@ -144,10 +162,6 @@ class RepositoryInventory:
             buckets["sample_inputs"].add(relative_path)
         if suffix in _HELP_SUFFIXES and ({"doc", "docs"} & lower_parts or name.casefold().startswith(("readme", "usage", "help"))):
             buckets["help_files"].add(relative_path)
-        if suffix in _SOURCE_SUFFIXES and ("bin" in lower_parts or name.casefold().startswith("main.")):
-            buckets["executables"].add(path.stem)
-        if suffix in _SOURCE_SUFFIXES and ("lib" in lower_parts or path.stem.casefold().startswith("lib")):
-            buckets["libraries"].add(path.stem.removeprefix("lib"))
         if suffix in _SOURCE_SUFFIXES:
             buckets["components"].add(path.stem)
         if "fuzz" in relative_path.casefold():
@@ -178,10 +192,98 @@ class RepositoryInventory:
 
     @staticmethod
     def _cmake_targets(content: str, buckets: dict[str, set[str]]) -> None:
-        for target in re.findall(r"(?im)^\s*add_executable\s*\(\s*([^\s)]+)", content):
-            buckets["executables"].add(target)
-        for target in re.findall(r"(?im)^\s*add_library\s*\(\s*([^\s)]+)", content):
-            buckets["libraries"].add(target)
+        for match in re.finditer(r"(?im)^\s*add_executable\s*\(\s*([^\s)]+)", content):
+            RepositoryInventory._add_target(buckets["executables"], match.group(1))
+        for match in re.finditer(r"(?im)^\s*add_library\s*\(\s*([^\s)]+)", content):
+            RepositoryInventory._add_target(buckets["libraries"], match.group(1))
+
+    @staticmethod
+    def _meson_targets(content: str, buckets: dict[str, set[str]]) -> None:
+        pattern = re.compile(r"(?im)\b(executable|library|static_library|shared_library)\s*\(\s*(['\"])([^'\"]+)\2")
+        for match in pattern.finditer(content):
+            kind, target = match.group(1), match.group(3)
+            bucket = buckets["executables"] if kind == "executable" else buckets["libraries"]
+            RepositoryInventory._add_target(bucket, target)
+
+    @staticmethod
+    def _cargo_targets(content: str, buckets: dict[str, set[str]], files: set[str]) -> None:
+        try:
+            manifest = tomllib.loads(content)
+        except (tomllib.TOMLDecodeError, TypeError):
+            return
+        package = manifest.get("package") if isinstance(manifest, dict) else None
+        package_name = package.get("name") if isinstance(package, dict) else None
+        bins = manifest.get("bin", []) if isinstance(manifest, dict) else []
+        if isinstance(bins, list):
+            for target in bins:
+                if isinstance(target, dict):
+                    RepositoryInventory._add_target(buckets["executables"], target.get("name"))
+        library = manifest.get("lib") if isinstance(manifest, dict) else None
+        if isinstance(library, dict):
+            RepositoryInventory._add_target(buckets["libraries"], library.get("name") or package_name)
+        if isinstance(package_name, str) and isinstance(package, dict):
+            if "src/main.rs" in files and package.get("autobins", True):
+                RepositoryInventory._add_target(buckets["executables"], package_name)
+            if "src/lib.rs" in files and package.get("autolib", True) and not isinstance(library, dict):
+                RepositoryInventory._add_target(buckets["libraries"], package_name.replace("-", "_"))
+
+    @staticmethod
+    def _compile_command_targets(commands: list[str], buckets: dict[str, set[str]]) -> None:
+        for command in commands:
+            try:
+                arguments = shlex.split(command)
+            except ValueError:
+                continue
+            if "-c" in arguments:
+                continue
+            try:
+                output = arguments[arguments.index("-o") + 1]
+            except (ValueError, IndexError):
+                continue
+            name = Path(output).name
+            if "-shared" in arguments or re.search(r"\.(?:a|so(?:\.\d+)*|dylib|dll|lib)$", name):
+                RepositoryInventory._add_target(buckets["libraries"], RepositoryInventory._library_name(name))
+            else:
+                RepositoryInventory._add_target(buckets["executables"], name)
+
+    @staticmethod
+    def _make_targets(content: str, buckets: dict[str, set[str]]) -> None:
+        lines = list(islice(io.StringIO(content), MAX_MANIFEST_LINES))
+        ignored = {"all", "clean", "install", "uninstall", "check", "test", "help", ".PHONY"}
+        for index, line in enumerate(lines[:-1]):
+            match = re.fullmatch(r"([A-Za-z0-9_.+-]+)\s*:[^=]*\r?\n?", line)
+            if match is None or match.group(1) in ignored:
+                continue
+            target = match.group(1)
+            recipe = lines[index + 1].strip()
+            if not lines[index + 1].startswith("\t"):
+                continue
+            if re.search(r"\.(?:a|so|dylib|dll|lib)$", target) and re.search(r"(?:\$\((?:AR|CC|CXX)\)|\bar\b|\blibtool\b|\bclang\b|\bgcc\b)", recipe):
+                RepositoryInventory._add_target(buckets["libraries"], RepositoryInventory._library_name(target))
+            elif re.search(r"(?:\$\((?:CC|CXX)\)|\bcc\b|\bgcc\b|\bclang(?:\+\+)?\b|\brustc\b)", recipe) and ("$@" in recipe or re.search(rf"(?:^|\s)-o\s+{re.escape(target)}(?:\s|$)", recipe)):
+                RepositoryInventory._add_target(buckets["executables"], target)
+
+    @staticmethod
+    def _gradle_targets(content: str, buckets: dict[str, set[str]]) -> None:
+        pattern = re.compile(r"tasks\.register\s*\(\s*(['\"])([^'\"]+)\1\s*,\s*(LinkExecutable|LinkSharedLibrary|LinkStaticLibrary)\b")
+        for match in pattern.finditer(content):
+            target, task_type = match.group(2), match.group(3)
+            bucket = buckets["executables"] if task_type == "LinkExecutable" else buckets["libraries"]
+            RepositoryInventory._add_target(bucket, target)
+
+    @staticmethod
+    def _library_name(value: str) -> str:
+        name = re.sub(r"\.(?:a|so(?:\.\d+)*|dylib|dll|lib)$", "", Path(value).name)
+        return name[3:] if name.startswith("lib") else name
+
+    @staticmethod
+    def _add_target(bucket: set[str], value: object) -> None:
+        if (
+            len(bucket) < MAX_TARGETS_PER_KIND
+            and isinstance(value, str)
+            and re.fullmatch(r"[A-Za-z0-9_.:+-]{1,128}", value) is not None
+        ):
+            bucket.add(value)
 
     @staticmethod
     def _looks_like_fuzz_harness(path: Path, content: str) -> bool:
