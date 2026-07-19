@@ -46,7 +46,7 @@ def build_services(pool, workspace: Path) -> Services:
     logs = TaskLogWriter(workspace, observability)
     clone = CloneRepositoryService(workspace, projects=projects, logs=logs)
     toolchain = DeferredToolchain(Path(__file__).parents[1] / "fuzzing/images/Dockerfile", logs)
-    analysis = RepositoryAnalysisWorkflow(workspace)
+    analysis = RepositoryAnalysisWorkflow(workspace, event_store=observability)
     executor = ExecuteProjectBackbone(projects, tasks, clone, toolchain, analysis, logs, workspace, observability)
     backbone = ProjectBackboneService(projects, executor)
     return Services(

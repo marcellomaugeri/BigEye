@@ -628,6 +628,33 @@ class TestRuntimeContracts:
         assert isinstance(executor, ExecuteProjectBackbone)
         assert isinstance(executor._analysis, RepositoryAnalysisWorkflow)
         assert isinstance(executor._toolchain, DeferredToolchain)
+        assert executor._analysis._manager._event_store is services.observability
+
+    def test_production_analysis_wiring_persists_activity_and_debug(self, tmp_path: Path) -> None:
+        from backend.api.dependencies import build_services
+        from backend.agents.outputs.campaign_decision import CampaignDecision
+
+        services = build_services(AsyncMock(), tmp_path)
+        workflow = services.recovery._scheduler._analysis
+        repository = tmp_path / "projects" / "7" / "repository"
+        repository.mkdir(parents=True)
+        (repository / "main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+
+        async def runner(agent, prompt, **kwargs):
+            return SimpleNamespace(
+                final_output=CampaignDecision(
+                    decision="prepare target", motivation="main is a candidate", evidence_ids=[],
+                    bounded_actions=[], next_review_condition="after probe", uncertainty="not probed",
+                ), raw_responses=[], new_items=[],
+            )
+
+        workflow._manager._runner = runner
+        run(workflow.analyse(7, "a" * 40, repository, repository.parent / "generated"))
+        activity = run(services.observability.read(7, "activity", -1, 20))
+        debug = run(services.observability.read(7, "debug", -1, 20))
+
+        assert activity[-1].payload["decision"] == "prepare target"
+        assert any(event.payload.get("event") == "workflow.result" for event in debug)
 
     def test_deferred_docker_checks_close_the_connected_sdk_client(self, tmp_path: Path) -> None:
         from backend.fuzzing.toolchain.deferred import DeferredToolchain

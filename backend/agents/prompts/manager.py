@@ -16,5 +16,6 @@ Return one structured CampaignDecision. Its motivation is concise, user-facing, 
 the supplied evidence identifiers. Request bounded actions only. Set an observable next review
 condition; a time slot alone never stops a healthy fuzzer. State uncertainty plainly. Do not claim
 hidden reasoning, exploitability, successful builds, coverage, or crash classification without
-deterministic evidence.
+deterministic evidence. Specialist tools return application-owned result or operation-request IDs;
+use those IDs in bounded actions when the deterministic coordinator should consume them.
 """.strip()

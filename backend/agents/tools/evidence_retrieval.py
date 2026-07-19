@@ -2,8 +2,10 @@
 
 from itertools import islice
 import re
+from typing import Annotated
 
 from agents import RunContextWrapper, function_tool
+from pydantic import Field
 
 from backend.agents.context import AgentContext
 from backend.agents.tools.code_navigation import CodeNavigationError, list_project_files
@@ -46,6 +48,14 @@ _PATH_CATEGORIES = frozenset(
 )
 _SYMBOL_CATEGORIES = frozenset({"executables", "libraries", "components"})
 _SAFE_SYMBOL = re.compile(r"[A-Za-z0-9_.:+-]{1,128}")
+
+EvidenceQuestion = Annotated[str, Field(min_length=1, max_length=200)]
+EvidenceLimit = Annotated[int, Field(ge=1, le=12)]
+
+
+def evidence_request_error(_context, _error: Exception) -> str:
+    """Give the model a fixed bounded correction contract without reflecting unsafe input."""
+    return "Evidence request rejected: use a non-empty question of at most 200 characters and a limit from 1 to 12."
 
 
 def inspect_build_evidence(evidence: EvidenceRetriever) -> dict[str, object]:
@@ -128,9 +138,9 @@ async def inspect_contained_build_evidence(context: RunContextWrapper[AgentConte
     return inspect_build_evidence(context.context.evidence)
 
 
-@function_tool(name_override="retrieve_repository_evidence")
+@function_tool(name_override="retrieve_repository_evidence", failure_error_function=evidence_request_error)
 async def retrieve_contained_repository_evidence(
-    context: RunContextWrapper[AgentContext], question: str, limit: int = 12
+    context: RunContextWrapper[AgentContext], question: EvidenceQuestion, limit: EvidenceLimit = 12
 ) -> list[dict[str, int | str | bool]]:
     """Retrieve ranked local evidence for one narrow question without executing repository content."""
     return retrieve_repository_evidence(context.context.evidence, question, limit)

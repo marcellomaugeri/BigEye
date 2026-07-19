@@ -11,14 +11,22 @@ from backend.agents.tools.generated_assets import _relative_path
 _OPERATIONS = frozenset({"build", "probe", "replay", "coverage"})
 
 
+def contained_operation_error(_context, _error: Exception) -> str:
+    """Return a bounded correction contract for model-authored operation requests."""
+    return (
+        "Contained operation request rejected. Use build, probe, replay, or coverage; reference 0 to 16 "
+        "existing generated draft paths and provide 1 to 16 concrete assertions."
+    )
+
+
 def contained_operation_request(
     context: AgentContext, operation: str, asset_paths: list[str], assertions: list[str]
 ) -> dict[str, object]:
     """Validate an operation request for a later deterministic coordinator."""
     if operation not in _OPERATIONS:
         raise ValueError("contained operation is not allowed")
-    if not isinstance(asset_paths, list) or not 1 <= len(asset_paths) <= 16:
-        raise ValueError("contained operation requires bounded generated assets")
+    if not isinstance(asset_paths, list) or len(asset_paths) > 16:
+        raise ValueError("contained operation generated assets are outside their bound")
     safe_paths: list[str] = []
     for value in asset_paths:
         path = _relative_path(value)
@@ -41,7 +49,7 @@ def contained_operation_request(
     }
 
 
-@function_tool(name_override="request_contained_operation", failure_error_function=None)
+@function_tool(name_override="request_contained_operation", failure_error_function=contained_operation_error)
 async def request_contained_operation(
     context: RunContextWrapper[AgentContext], operation: str, asset_paths: list[str], assertions: list[str]
 ) -> dict[str, object]:

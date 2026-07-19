@@ -3,47 +3,98 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, is_dataclass
+from dataclasses import fields as dataclass_fields, is_dataclass
 import json
 from uuid import uuid4
 
 from agents import RunConfig
+from agents.items import RunItemBase
 
 from backend.services.observability.redaction import REDACTED, redact
 
 
-MAX_TRACE_STRING_CHARS = 32_000
-MAX_TRACE_COLLECTION_ITEMS = 128
-MAX_TRACE_DEPTH = 16
+MAX_TRACE_COLLECTION_ITEMS = 100_000
+MAX_TRACE_DEPTH = 64
 MAX_TRACE_RECORD_CHARS = 400_000
 
 
-def _json_value(value, depth: int = 0):
+class TraceSerializationError(ValueError):
+    """Raised rather than silently dropping part of a known trace payload."""
+
+
+def _agent_identity(agent) -> dict[str, object] | None:
+    if agent is None:
+        return None
+    return {
+        "name": getattr(agent, "name", None),
+        "model": getattr(agent, "model", None),
+    }
+
+
+def _run_item_payload(item: RunItemBase) -> dict[str, object]:
+    """Preserve SDK run-item data while replacing runtime agent graph references with identity."""
+    payload: dict[str, object] = {
+        "type": getattr(item, "type", type(item).__name__),
+        "agent": _agent_identity(getattr(item, "agent", None)),
+        "raw_item": getattr(item, "raw_item", None),
+    }
+    excluded = {"agent", "raw_item", "type", "_agent_ref", "_source_agent_ref", "_target_agent_ref"}
+    for field in dataclass_fields(item):
+        if field.name in excluded:
+            continue
+        value = getattr(item, field.name)
+        if field.name in {"source_agent", "target_agent"}:
+            payload[field.name] = _agent_identity(value)
+        else:
+            payload[field.name] = value
+    return payload
+
+
+def _json_value(value, depth: int = 0, ancestors: set[int] | None = None):
     if depth >= MAX_TRACE_DEPTH:
-        return "[TRUNCATED]"
+        raise TraceSerializationError("trace payload nesting exceeds its safety limit")
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, str):
-        return value[:MAX_TRACE_STRING_CHARS]
+        return value
     if isinstance(value, bytes):
-        return value[:MAX_TRACE_STRING_CHARS].decode("utf-8", errors="replace")
-    if hasattr(value, "model_dump"):
-        try:
-            return _json_value(value.model_dump(mode="json"), depth + 1)
-        except TypeError:
-            return _json_value(value.model_dump(), depth + 1)
-    if is_dataclass(value) and not isinstance(value, type):
-        return _json_value(asdict(value), depth + 1)
-    if isinstance(value, Mapping):
-        return {
-            str(key)[:200]: _json_value(item, depth + 1)
-            for key, item in list(value.items())[:MAX_TRACE_COLLECTION_ITEMS]
-        }
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return [_json_value(item, depth + 1) for item in list(value)[:MAX_TRACE_COLLECTION_ITEMS]]
-    if hasattr(value, "__dict__"):
-        return _json_value(vars(value), depth + 1)
-    return f"<{type(value).__name__}>"
+        return value.decode("utf-8", errors="replace")
+    ancestors = set() if ancestors is None else ancestors
+    identity = id(value)
+    if identity in ancestors:
+        raise TraceSerializationError("trace payload contains a reference cycle")
+    ancestors.add(identity)
+    try:
+        if isinstance(value, RunItemBase):
+            return _json_value(_run_item_payload(value), depth + 1, ancestors)
+        if hasattr(value, "model_dump"):
+            try:
+                dumped = value.model_dump(mode="json")
+            except TypeError:
+                dumped = value.model_dump()
+            return _json_value(dumped, depth + 1, ancestors)
+        if is_dataclass(value) and not isinstance(value, type):
+            dumped = {field.name: getattr(value, field.name) for field in dataclass_fields(value)}
+            return _json_value(dumped, depth + 1, ancestors)
+        if isinstance(value, Mapping):
+            if len(value) > MAX_TRACE_COLLECTION_ITEMS:
+                raise TraceSerializationError("trace mapping exceeds its safety item limit")
+            result = {}
+            for key, item in value.items():
+                name = str(key)
+                if name in result:
+                    raise TraceSerializationError("trace mapping keys collide after JSON conversion")
+                result[name] = _json_value(item, depth + 1, ancestors)
+            return result
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            if len(value) > MAX_TRACE_COLLECTION_ITEMS:
+                raise TraceSerializationError("trace collection exceeds its safety item limit")
+            return [_json_value(item, depth + 1, ancestors) for item in value]
+        if hasattr(value, "__dict__"):
+            return _json_value(vars(value), depth + 1, ancestors)
+        return f"<{type(value).__name__}>"
+    finally:
+        ancestors.remove(identity)
 
 
 def _replace_secrets(value, secrets: tuple[str, ...]):
@@ -112,11 +163,11 @@ def reasoning_summaries(value) -> list[str]:
 
     def collect_text(item):
         if isinstance(item, str) and item.strip():
-            summaries.append(item[:MAX_TRACE_STRING_CHARS])
+            summaries.append(item)
         elif isinstance(item, dict):
             text = item.get("text")
             if isinstance(text, str) and text.strip():
-                summaries.append(text[:MAX_TRACE_STRING_CHARS])
+                summaries.append(text)
         elif isinstance(item, list):
             for child in item:
                 collect_text(child)
@@ -189,11 +240,34 @@ class LocalTrace:
                 "next_review_condition": next_review_condition,
             }))
 
-    def record_result(self, agent, workflow_input, result, retry_count: int = 0, parent_id: str | None = None) -> None:
+    @staticmethod
+    def _invocation_fields(invocation) -> dict[str, object]:
+        if invocation is None:
+            return {}
+        arguments = getattr(invocation, "tool_arguments", None)
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                pass
+        return {
+            "parent_tool": getattr(invocation, "tool_name", None),
+            "parent_tool_call_id": getattr(invocation, "tool_call_id", None),
+            "parent_tool_arguments": arguments,
+        }
+
+    def record_result(
+        self, agent, workflow_input, result, retry_count: int = 0,
+        invocation=None, parent_id: str | None = None,
+    ) -> None:
         responses = getattr(result, "raw_responses", ()) or ()
         response_id, usage = _response_metadata(responses)
+        invocation = invocation or getattr(result, "agent_tool_invocation", None)
+        invocation_fields = self._invocation_fields(invocation)
+        if parent_id is not None and "parent_tool_call_id" not in invocation_fields:
+            invocation_fields["parent_tool_call_id"] = parent_id
         self.debug(
-            "workflow.result", response_id=response_id, parent_id=parent_id,
+            "workflow.result", response_id=response_id, **invocation_fields,
             agent=getattr(agent, "name", None), model=getattr(agent, "model", None),
             input=workflow_input, output=getattr(result, "final_output", None), usage=usage,
             retry_count=retry_count, new_items=getattr(result, "new_items", ()) or (),
@@ -201,14 +275,16 @@ class LocalTrace:
             web_citations=web_citations(responses),
         )
 
-    def retry(self, agent, error: Exception) -> None:
+    def retry(self, agent, error: Exception, invocation=None) -> None:
         self.debug(
             "specialist.retry", agent=getattr(agent, "name", None), model=getattr(agent, "model", None),
             retry_count=1, error={"type": type(error).__name__, "message": str(error)},
+            **self._invocation_fields(invocation),
         )
 
-    def error(self, agent, error: Exception) -> None:
+    def error(self, agent, error: Exception, invocation=None) -> None:
         self.debug(
             "workflow.error", agent=getattr(agent, "name", None), model=getattr(agent, "model", None),
             error={"type": type(error).__name__, "message": str(error)},
+            **self._invocation_fields(invocation),
         )

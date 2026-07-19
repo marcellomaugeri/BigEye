@@ -10,7 +10,7 @@ class TriageResult(BaseModel):
 
     classification: str = Field(min_length=1, max_length=200)
     description: str = Field(min_length=1, max_length=2_000)
-    evidence_ids: list[str] = Field(max_length=64)
+    evidence_ids: list[str] = Field(min_length=1, max_length=64)
     uncertainty: str = Field(min_length=1, max_length=2_000)
     priority_rationale: str = Field(min_length=1, max_length=2_000)
     repair_intent: str = Field(min_length=1, max_length=2_000)

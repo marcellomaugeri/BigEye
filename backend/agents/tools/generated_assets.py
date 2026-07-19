@@ -16,6 +16,7 @@ from backend.agents.context import AgentContext
 
 
 MAX_GENERATED_ASSET_BYTES = 128_000
+MAX_GENERATED_ASSET_FILES = 256
 MAX_GENERATED_PATH_DEPTH = 16
 MAX_GENERATED_PATH_CHARS = 500
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -24,12 +25,20 @@ _EDIT_LOCKS = tuple(threading.Lock() for _ in range(32))
 _ALLOWED_SUFFIXES = frozenset({
     ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".rs", ".sh", ".patch",
     ".diff", ".dict", ".json", ".yaml", ".yml", ".toml", ".txt", ".proto", ".grammar",
-    ".options", ".cmake", ".mk",
+    ".options", ".cfg", ".cmake", ".mk",
 })
 
 
 class GeneratedAssetError(ValueError):
     """Raised when an agent attempts an unsafe or stale generated draft edit."""
+
+
+def generated_asset_request_error(_context, _error: Exception) -> str:
+    """Return a fixed correction contract without reflecting paths or draft content."""
+    return (
+        "Generated asset request rejected. List and read existing drafts first; use a contained relative path, "
+        "a supported source/config/patch suffix (not .md), and the exact current SHA when editing."
+    )
 
 
 def _relative_path(value: str) -> PurePosixPath:
@@ -135,6 +144,118 @@ def _read_existing(parent: int, name: str) -> tuple[bytes | None, tuple[int, int
         os.close(descriptor)
 
 
+def _read_path(context: AgentContext, path: PurePosixPath) -> bytes:
+    project_descriptor, root_descriptor = _open_root(context)
+    parent_descriptor = os.dup(root_descriptor)
+    try:
+        for part in path.parts[:-1]:
+            try:
+                child = os.open(part, _DIRECTORY_FLAGS, dir_fd=parent_descriptor)
+            except OSError as error:
+                raise GeneratedAssetError("generated asset directory is unsafe") from error
+            os.close(parent_descriptor)
+            parent_descriptor = child
+        content, _identity = _read_existing(parent_descriptor, path.name)
+        if content is None:
+            raise GeneratedAssetError("generated asset does not exist")
+        relative_root = context.generated_assets_root.relative_to(context.repository_root.parent)
+        if not _root_is_canonical(project_descriptor, relative_root, root_descriptor):
+            raise GeneratedAssetError("generated asset root changed while it was read")
+        return content
+    finally:
+        os.close(parent_descriptor)
+        os.close(root_descriptor)
+        os.close(project_descriptor)
+
+
+def read_asset_file(context: AgentContext, relative_path: str) -> dict[str, object]:
+    """Read one generated draft with its complete text and compare-and-swap hash."""
+    path = _relative_path(relative_path)
+    content = _read_path(context, path)
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise GeneratedAssetError("generated asset content is not UTF-8 text") from error
+    return {
+        "relative_path": path.as_posix(), "content": text, "sha256": sha256(content).hexdigest(),
+        "size_bytes": len(content), "provenance": "generated_asset", "trusted_instructions": False,
+    }
+
+
+def list_asset_files(context: AgentContext) -> list[dict[str, object]]:
+    """List every contained generated draft without following links or silently truncating."""
+    project_descriptor, root_descriptor = _open_root(context)
+    results: list[dict[str, object]] = []
+
+    def visit(directory: int, prefix: tuple[str, ...]) -> None:
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError as error:
+            raise GeneratedAssetError("generated asset directory is unsafe") from error
+        for name in names:
+            if name.startswith("."):
+                raise GeneratedAssetError("generated asset directory contains an unsafe entry")
+            try:
+                value = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except OSError as error:
+                raise GeneratedAssetError("generated asset entry is unsafe") from error
+            parts = (*prefix, name)
+            if len(parts) > MAX_GENERATED_PATH_DEPTH:
+                raise GeneratedAssetError("generated asset path is too deep")
+            if stat.S_ISDIR(value.st_mode):
+                try:
+                    child = os.open(name, _DIRECTORY_FLAGS, dir_fd=directory)
+                except OSError as error:
+                    raise GeneratedAssetError("generated asset directory is unsafe") from error
+                try:
+                    visit(child, parts)
+                finally:
+                    os.close(child)
+                continue
+            if not stat.S_ISREG(value.st_mode):
+                raise GeneratedAssetError("generated asset entry is unsafe")
+            if len(results) >= MAX_GENERATED_ASSET_FILES:
+                raise GeneratedAssetError("generated asset listing exceeds its file limit")
+            path = _relative_path(PurePosixPath(*parts).as_posix())
+            content, _identity = _read_existing(directory, name)
+            if content is None:
+                raise GeneratedAssetError("generated asset changed while it was listed")
+            results.append({
+                "relative_path": path.as_posix(), "sha256": sha256(content).hexdigest(),
+                "size_bytes": len(content), "provenance": "generated_asset",
+                "trusted_instructions": False,
+            })
+
+    try:
+        visit(root_descriptor, ())
+        relative_root = context.generated_assets_root.relative_to(context.repository_root.parent)
+        if not _root_is_canonical(project_descriptor, relative_root, root_descriptor):
+            raise GeneratedAssetError("generated asset root changed while it was listed")
+        return results
+    finally:
+        os.close(root_descriptor)
+        os.close(project_descriptor)
+
+
+def _unlink_if_identity(parent: int, name: str, identity: tuple[int, int]) -> bool:
+    _content, current_identity = _read_existing(parent, name)
+    if current_identity != identity:
+        return False
+    os.unlink(name, dir_fd=parent)
+    return True
+
+
+def _restore_backup_without_clobbering(parent: int, backup_name: str, destination: str) -> None:
+    """Restore only into an empty name; a noncooperating writer always keeps its newer path."""
+    try:
+        os.link(
+            backup_name, destination, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False,
+        )
+    except FileExistsError:
+        pass
+    os.unlink(backup_name, dir_fd=parent)
+
+
 def _diff(path: str, previous: bytes | None, current: bytes) -> str:
     before = [] if previous is None else previous.decode("utf-8", errors="replace").splitlines()
     after = current.decode("utf-8").splitlines()
@@ -161,6 +282,7 @@ def write_asset_file(
         created_temporary = False
         backup_created = False
         published = False
+        published_identity: tuple[int, int] | None = None
         try:
             for part in path.parts[:-1]:
                 child = _open_or_create(parent_descriptor, part)
@@ -188,6 +310,8 @@ def write_asset_file(
                         raise OSError("generated asset temporary file could not be written")
                     view = view[written:]
                 os.fsync(descriptor)
+                temporary_stat = os.fstat(descriptor)
+                published_identity = (temporary_stat.st_dev, temporary_stat.st_ino)
             finally:
                 os.close(descriptor)
             current, current_identity = _read_existing(parent_descriptor, path.name)
@@ -202,15 +326,22 @@ def write_asset_file(
                 backup_value, backup_identity = _read_existing(parent_descriptor, backup_name)
                 if backup_value != previous or backup_identity != identity:
                     raise GeneratedAssetError("generated asset changed during publication")
-            os.replace(temporary_name, path.name, src_dir_fd=parent_descriptor, dst_dir_fd=parent_descriptor)
-            created_temporary = False
+            try:
+                os.link(
+                    temporary_name, path.name, src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor, follow_symlinks=False,
+                )
+            except FileExistsError as error:
+                raise GeneratedAssetError("generated asset changed during publication") from error
             published = True
+            os.unlink(temporary_name, dir_fd=parent_descriptor)
+            created_temporary = False
             os.fsync(parent_descriptor)
             if not _root_is_canonical(project_descriptor, relative_root, root_descriptor):
-                os.unlink(path.name, dir_fd=parent_descriptor)
-                published = False
+                if published_identity is not None:
+                    published = not _unlink_if_identity(parent_descriptor, path.name, published_identity)
                 if backup_created:
-                    os.replace(backup_name, path.name, src_dir_fd=parent_descriptor, dst_dir_fd=parent_descriptor)
+                    _restore_backup_without_clobbering(parent_descriptor, backup_name, path.name)
                     backup_created = False
                 os.fsync(parent_descriptor)
                 raise GeneratedAssetError("generated asset root changed during publication")
@@ -232,13 +363,13 @@ def write_asset_file(
                 except OSError:
                     pass
             if backup_created:
-                if published:
+                if published and published_identity is not None:
                     try:
-                        os.unlink(path.name, dir_fd=parent_descriptor)
+                        _unlink_if_identity(parent_descriptor, path.name, published_identity)
                     except OSError:
                         pass
                 try:
-                    os.replace(backup_name, path.name, src_dir_fd=parent_descriptor, dst_dir_fd=parent_descriptor)
+                    _restore_backup_without_clobbering(parent_descriptor, backup_name, path.name)
                     os.fsync(parent_descriptor)
                 except OSError:
                     pass
@@ -247,7 +378,7 @@ def write_asset_file(
             os.close(project_descriptor)
 
 
-@function_tool(name_override="write_generated_asset", failure_error_function=None)
+@function_tool(name_override="write_generated_asset", failure_error_function=generated_asset_request_error)
 async def write_generated_asset(
     context: RunContextWrapper[AgentContext], relative_path: str, content: str,
     expected_sha256: str | None = None,
@@ -256,5 +387,19 @@ async def write_generated_asset(
     return write_asset_file(context.context, relative_path, content, expected_sha256)
 
 
+@function_tool(name_override="list_generated_assets", failure_error_function=generated_asset_request_error)
+async def list_generated_assets(context: RunContextWrapper[AgentContext]) -> list[dict[str, object]]:
+    """List contained generated drafts and their current hashes before incremental repair."""
+    return list_asset_files(context.context)
+
+
+@function_tool(name_override="read_generated_asset", failure_error_function=generated_asset_request_error)
+async def read_generated_asset(
+    context: RunContextWrapper[AgentContext], relative_path: str,
+) -> dict[str, object]:
+    """Read one contained generated draft and its SHA before compare-and-swap editing."""
+    return read_asset_file(context.context, relative_path)
+
+
 def generated_asset_tools() -> list:
-    return [write_generated_asset]
+    return [list_generated_assets, read_generated_asset, write_generated_asset]

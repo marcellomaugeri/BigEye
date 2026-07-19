@@ -86,11 +86,11 @@ class RepositoryAnalysisWorkflow:
         retriever = EvidenceRetriever(repository_root)
         context = AgentContext(project_id, commit_sha, repository_root, generated_assets_root, retriever)
         excerpts = retriever.search("build executable library input parser test example", 12)
-        decision = await self._manager.review(
+        review = await self._manager.review(
             context, [excerpt.as_dict() for excerpt in excerpts],
             "Choose the smallest evidence-backed initial fuzzing target and its deterministic probe.",
         )
         body = "# Initial campaign decision\n\n```json\n" + json.dumps(
-            decision.model_dump(mode="json"), ensure_ascii=False, indent=2,
+            review.model_dump(mode="json"), ensure_ascii=False, indent=2,
         ) + "\n```\n"
         return _publish_initial_decision(self._workspace, context, body)
