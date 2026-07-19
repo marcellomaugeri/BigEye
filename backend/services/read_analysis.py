@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from backend.services.clone_repository import contained_path
+from backend.services.projects.clone_repository import contained_path
 from backend.services.run_project_backbone import AnalysisNotReady
 
 

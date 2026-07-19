@@ -6,7 +6,7 @@ import re
 import shutil
 from pathlib import Path
 
-from backend.services.create_project import validate_repository_url
+from backend.services.projects.create_project import validate_repository_url
 
 
 class UnsafeWorkspacePath(ValueError):
@@ -49,7 +49,7 @@ async def _stop_process(process, drains=()) -> None:
         await asyncio.gather(*drains, return_exceptions=True)
 
 
-async def run_command(argv: list[str], cwd: Path | None = None, sink=None) -> str:
+async def run_command(argv: list[str], cwd: Path | None = None, sink=None, env: dict[str, str] | None = None) -> str:
     """Run a Git argv list and clean up the child process on cancellation."""
     process = await asyncio.create_subprocess_exec(
         *argv,
@@ -57,7 +57,7 @@ async def run_command(argv: list[str], cwd: Path | None = None, sink=None) -> st
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         stdin=asyncio.subprocess.DEVNULL,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/false"},
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/false", **(env or {})},
     )
     if not hasattr(process, "stdout"):
         try:
@@ -130,8 +130,17 @@ class CloneRepositoryService:
             raise UnsafeWorkspacePath("repository destination already exists")
         self._remove_staging(staging, project_root)
         kwargs = {"sink": lambda text: self._logs.append_sync(task, text)} if self._logs is not None and task is not None else {}
+        if project.token_present:
+            token = await self._projects.get_repository_token(project.id)
+            if token:
+                kwargs["env"] = {
+                    "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": "http.extraHeader",
+                    "GIT_CONFIG_VALUE_0": f"Authorization: Bearer {token}",
+                }
         try:
             await self._command(["git", "clone", "--", repository_url, str(staging)], **kwargs)
+            await self._command(["git", "checkout", "--detach", project.requested_revision], cwd=staging, **kwargs)
             commit_sha = await self._head(staging, kwargs)
             os.replace(staging, destination)
             await self._projects.set_commit_sha(project.id, commit_sha)

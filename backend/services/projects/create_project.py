@@ -30,8 +30,10 @@ class CreateProjectService:
         self._backbone = backbone
         self._initial_tasks = initial_tasks or InitialTaskService()
 
-    async def create(self, repository_url: str, worker_count: int):
+    async def create(self, repository_url: str, revision: str, worker_count: int, repository_token: str | None):
         validated_url = validate_repository_url(repository_url)
-        created = await self._projects.create_with_tasks(validated_url, worker_count, self._initial_tasks.names())
+        created = await self._projects.create_with_tasks(
+            validated_url, worker_count, self._initial_tasks.names(), revision, repository_token
+        )
         self._backbone.schedule(created.id)
         return created

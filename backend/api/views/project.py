@@ -9,7 +9,9 @@ class CreateProjectRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     repository_url: str = Field(min_length=1, max_length=2048)
+    revision: str = Field(default="HEAD", min_length=1, max_length=255)
     worker_count: int = Field(gt=0, le=2_147_483_647)
+    repository_token: str | None = Field(default=None, max_length=4096)
 
 
 class ProjectResponse(BaseModel):

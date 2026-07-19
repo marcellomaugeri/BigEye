@@ -28,13 +28,13 @@ def task():
 
 class TestAtomicClone:
     def test_absent_published_destination_has_no_recovery_so_initial_clone_can_proceed(self, tmp_path: Path) -> None:
-        from backend.services.clone_repository import CloneRepositoryService
+        from backend.services.projects.clone_repository import CloneRepositoryService
 
         service = CloneRepositoryService(tmp_path, AsyncMock(), AsyncMock())
         assert run(service.recover_published(project())) is None
 
     def test_clone_publishes_only_after_staging_head_is_valid(self, tmp_path: Path) -> None:
-        from backend.services.clone_repository import CloneRepositoryService
+        from backend.services.projects.clone_repository import CloneRepositoryService
 
         calls = []
         async def command(argv, cwd=None, sink=None):
@@ -50,7 +50,7 @@ class TestAtomicClone:
         projects.set_commit_sha.assert_awaited_once_with(7, "a" * 40)
 
     def test_clone_failure_cleans_only_internal_staging_and_preserves_final(self, tmp_path: Path) -> None:
-        from backend.services.clone_repository import CloneRepositoryService, GitCommandFailed
+        from backend.services.projects.clone_repository import CloneRepositoryService, GitCommandFailed
 
         final = tmp_path / "projects/7/repository"; final.mkdir(parents=True); (final / "keep").write_text("keep")
         with pytest.raises(GitCommandFailed):
@@ -59,7 +59,7 @@ class TestAtomicClone:
         assert not (tmp_path / "projects/7/repository.clone").exists()
 
     def test_recovery_adopts_published_git_when_commit_was_not_persisted(self, tmp_path: Path) -> None:
-        from backend.services.clone_repository import CloneRepositoryService
+        from backend.services.projects.clone_repository import CloneRepositoryService
         final = tmp_path / "projects/7/repository"; (final / ".git").mkdir(parents=True)
         projects = AsyncMock()
         async def command(argv, cwd=None, sink=None): return "b" * 40
@@ -70,7 +70,7 @@ class TestAtomicClone:
 
 class TestBoundedGitAndLogs:
     def test_git_spawns_noninteractive_with_finite_timeout(self, monkeypatch) -> None:
-        from backend.services.clone_repository import GIT_COMMAND_TIMEOUT_SECONDS, run_command
+        from backend.services.projects.clone_repository import GIT_COMMAND_TIMEOUT_SECONDS, run_command
         seen = {}
         class Process:
             returncode = 0

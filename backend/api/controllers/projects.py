@@ -5,7 +5,7 @@ from starlette.responses import StreamingResponse
 
 from backend.api.views.project import CreateProjectRequest, ProjectResponse
 from backend.api.views.task import TaskResponse
-from backend.services.create_project import InvalidRepositoryUrl
+from backend.services.projects.create_project import InvalidRepositoryUrl
 from backend.services.run_project_backbone import AnalysisNotReady
 
 
@@ -19,7 +19,9 @@ def services(request: Request):
 @router.post("/projects", response_model=ProjectResponse, status_code=status.HTTP_202_ACCEPTED)
 async def create_project(body: CreateProjectRequest, request: Request):
     try:
-        project = await services(request).project_creator.create(body.repository_url, body.worker_count)
+        project = await services(request).project_creator.create(
+            body.repository_url, body.revision, body.worker_count, body.repository_token
+        )
     except InvalidRepositoryUrl as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     return ProjectResponse.from_model(project)

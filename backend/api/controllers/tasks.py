@@ -3,7 +3,7 @@
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from backend.api.views.task import TaskLogResponse
-from backend.services.clone_repository import UnsafeWorkspacePath
+from backend.services.projects.clone_repository import UnsafeWorkspacePath
 
 
 router = APIRouter()

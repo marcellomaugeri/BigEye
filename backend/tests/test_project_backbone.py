@@ -115,24 +115,24 @@ class _Acquire:
 
 class TestProjectCreation:
     def test_creation_validates_url_creates_expected_tasks_and_schedules_backbone(self) -> None:
-        from backend.services.create_project import CreateProjectService
+        from backend.services.projects.create_project import CreateProjectService
 
         repository = AsyncMock()
         repository.create_with_tasks.return_value = project()
         backbone = MagicMock()
         service = CreateProjectService(repository, backbone)
 
-        created = run(service.create("https://github.com/acme/demo.git", 2))
+        created = run(service.create("https://github.com/acme/demo.git", "stable", 2, "secret-read-token"))
 
         assert created.id == 7
         repository.create_with_tasks.assert_awaited_once_with(
             "https://github.com/acme/demo.git", 2,
-            ["repository clone", "LLVM toolchain preparation", "repository analysis"],
+            ["repository clone", "LLVM toolchain preparation", "repository analysis"], "stable", "secret-read-token",
         )
         backbone.schedule.assert_called_once_with(7)
 
     def test_creation_returns_after_scheduler_failure_is_isolated(self) -> None:
-        from backend.services.create_project import CreateProjectService
+        from backend.services.projects.create_project import CreateProjectService
         from backend.services.run_project_backbone import ProjectBackboneService
 
         async def scenario():
@@ -142,7 +142,9 @@ class TestProjectCreation:
             scheduler.schedule.side_effect = RuntimeError("worker unavailable")
             backbone = ProjectBackboneService(AsyncMock(), scheduler)
 
-            created = await CreateProjectService(repository, backbone).create("https://github.com/acme/demo.git", 2)
+            created = await CreateProjectService(repository, backbone).create(
+                "https://github.com/acme/demo.git", "HEAD", 2, None
+            )
             await asyncio.sleep(0)
 
             assert created.id == 7
@@ -156,16 +158,16 @@ class TestProjectCreation:
         "ssh://git@example.com/acme/repository.git", "/tmp/repository",
     ])
     def test_creation_rejects_unsafe_repository_urls(self, url: str) -> None:
-        from backend.services.create_project import CreateProjectService, InvalidRepositoryUrl
+        from backend.services.projects.create_project import CreateProjectService, InvalidRepositoryUrl
 
         with pytest.raises(InvalidRepositoryUrl):
-            run(CreateProjectService(AsyncMock(), AsyncMock()).create(url, 1))
+            run(CreateProjectService(AsyncMock(), AsyncMock()).create(url, "HEAD", 1, None))
 
 
 class TestCloneRepository:
     @pytest.mark.parametrize("commit_sha", ["a" * 40, "B" * 64])
     def test_clone_uses_argv_and_records_resolved_commit(self, tmp_path: Path, commit_sha: str) -> None:
-        from backend.services.clone_repository import CloneRepositoryService
+        from backend.services.projects.clone_repository import CloneRepositoryService
 
         calls: list[list[str]] = []
 
@@ -183,17 +185,39 @@ class TestCloneRepository:
         run(service.clone(project()))
 
         assert calls[0] == ["git", "clone", "--", "https://github.com/acme/demo.git", str(tmp_path / "projects/7/repository.clone")]
+        assert calls[1] == ["git", "checkout", "--detach", "HEAD"]
         project_repository.set_commit_sha.assert_awaited_once_with(7, commit_sha)
 
+    def test_clone_checks_out_requested_revision_and_keeps_token_out_of_argv(self, tmp_path: Path) -> None:
+        from backend.services.projects.clone_repository import CloneRepositoryService
+
+        calls = []
+
+        async def command(argv, cwd=None, env=None):
+            calls.append((argv, env))
+            if argv[1] == "clone":
+                Path(argv[-1]).mkdir(parents=True)
+            return "a" * 40 if argv[1] == "rev-parse" else ""
+
+        project_repository = AsyncMock()
+        project_repository.get_repository_token.return_value = "secret-read-token"
+        value = replace(project(), requested_revision="stable", token_present=True)
+
+        run(CloneRepositoryService(tmp_path, command, project_repository).clone(value))
+
+        assert calls[1][0] == ["git", "checkout", "--detach", "stable"]
+        assert all("secret-read-token" not in " ".join(argv) for argv, _ in calls)
+        assert calls[0][1]["GIT_CONFIG_VALUE_0"] == "Authorization: Bearer secret-read-token"
+
     def test_clone_rejects_workspace_symlink_escape(self, tmp_path: Path) -> None:
-        from backend.services.clone_repository import CloneRepositoryService, UnsafeWorkspacePath
+        from backend.services.projects.clone_repository import CloneRepositoryService, UnsafeWorkspacePath
 
         (tmp_path / "projects").symlink_to(tmp_path.parent)
         with pytest.raises(UnsafeWorkspacePath):
             run(CloneRepositoryService(tmp_path, _empty_command, AsyncMock()).clone(project()))
 
     def test_clone_rejects_an_invalid_object_id_length(self, tmp_path: Path) -> None:
-        from backend.services.clone_repository import CloneRepositoryService, GitCommandFailed
+        from backend.services.projects.clone_repository import CloneRepositoryService, GitCommandFailed
 
         async def command(argv, cwd=None):
             return "a" * 39 if argv[1] == "rev-parse" else ""
@@ -202,7 +226,7 @@ class TestCloneRepository:
             run(CloneRepositoryService(tmp_path, command, AsyncMock()).clone(project()))
 
     def test_default_command_terminates_and_waits_when_cancelled(self, monkeypatch) -> None:
-        from backend.services.clone_repository import run_command
+        from backend.services.projects.clone_repository import run_command
 
         class Process:
             returncode = None
@@ -245,7 +269,7 @@ class TestCloneRepository:
         assert process.waited is True
 
     def test_stream_sink_failure_terminates_git_and_awaits_readers(self, monkeypatch) -> None:
-        from backend.services.clone_repository import run_command
+        from backend.services.projects.clone_repository import run_command
         class Reader:
             def __init__(self, chunks): self.chunks = list(chunks)
             async def read(self, size): return self.chunks.pop(0) if self.chunks else b""
@@ -290,7 +314,7 @@ class TestLogAndSse:
 
     def test_log_writer_rejects_ancestor_and_leaf_symlink_redirection(self, tmp_path: Path) -> None:
         from backend.services.stream_task_output import TaskLogWriter
-        from backend.services.clone_repository import UnsafeWorkspacePath
+        from backend.services.projects.clone_repository import UnsafeWorkspacePath
 
         outside = tmp_path.parent / "outside.log"
         (tmp_path / "projects").symlink_to(tmp_path.parent)
@@ -343,7 +367,7 @@ class TestApi:
 
         assert response.status_code == 202
         assert response.json()["id"] == "7"
-        creator.create.assert_awaited_once_with("https://github.com/acme/demo.git", 2)
+        creator.create.assert_awaited_once_with("https://github.com/acme/demo.git", "HEAD", 2, None)
 
     def test_post_projects_rejects_unrecognised_fields(self) -> None:
         from backend.api.app import create_app
@@ -388,7 +412,7 @@ class TestApi:
         from backend.api.dependencies import Services
         from backend.models.project import Project
         from backend.models.task import Task
-        from backend.services.create_project import CreateProjectService
+        from backend.services.projects.create_project import CreateProjectService
         from backend.services.execute_project_backbone import ExecuteProjectBackbone
         from backend.services.read_analysis import AnalysisReader
         from backend.services.run_project_backbone import ProjectBackboneService, ProjectEventWatcher
@@ -396,9 +420,9 @@ class TestApi:
 
         class Projects:
             def __init__(self): self.items, self.next_id = {}, 1
-            async def create_with_tasks(self, url, workers, names):
+            async def create_with_tasks(self, url, workers, names, revision="HEAD", repository_token=None):
                 identifier = self.next_id; self.next_id += 1
-                item = Project(identifier, url, "HEAD", workers, None, False, NOW, None, None); self.items[identifier] = item
+                item = Project(identifier, url, revision, workers, None, bool(repository_token), NOW, None, None); self.items[identifier] = item
                 await tasks.add(identifier, names); return item
             async def get(self, identifier): return self.items.get(identifier)
             async def list(self): return list(self.items.values())

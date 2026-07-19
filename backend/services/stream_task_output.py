@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import stat
 
-from backend.services.clone_repository import UnsafeWorkspacePath, contained_path
+from backend.services.projects.clone_repository import UnsafeWorkspacePath, contained_path
 
 
 @dataclass(frozen=True)

@@ -3,7 +3,7 @@
 import asyncio
 from pathlib import Path
 
-from backend.services.clone_repository import GitCommandFailed, contained_path
+from backend.services.projects.clone_repository import GitCommandFailed, contained_path
 from backend.services.stream_task_output import TaskLogLimitExceeded
 
 
