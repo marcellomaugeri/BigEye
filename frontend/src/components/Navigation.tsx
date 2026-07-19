@@ -1,0 +1,29 @@
+import type { Page } from '../controllers/useBigEyeController';
+
+const pages: { id: Page; label: string }[] = [
+  { id: 'projects', label: 'Projects' },
+  { id: 'tasks', label: 'Tasks' },
+  { id: 'findings', label: 'Findings' },
+  { id: 'logs', label: 'Logs' },
+  { id: 'settings', label: 'Settings' }
+];
+
+export function Navigation({ activePage, onNavigate }: { activePage: Page; onNavigate: (page: Page) => void }) {
+  return (
+    <nav className="navigation" aria-label="Main navigation">
+      {pages.map(({ id, label }) => (
+        <a
+          aria-current={activePage === id ? 'page' : undefined}
+          href={`#${id}`}
+          key={id}
+          onClick={(event) => {
+            event.preventDefault();
+            onNavigate(id);
+          }}
+        >
+          {label}
+        </a>
+      ))}
+    </nav>
+  );
+}
