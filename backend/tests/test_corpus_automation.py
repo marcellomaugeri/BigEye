@@ -429,6 +429,83 @@ def test_minimisation_serialises_operations_for_one_corpus(tmp_path: Path) -> No
     assert runner.maximum == 1
 
 
+@pytest.mark.parametrize("change", ["added", "changed", "removed"])
+def test_minimisation_preserves_live_corpus_changes_made_during_native_runner(tmp_path: Path, change: str) -> None:
+    from backend.fuzzing.corpus.minimisation import CorpusCampaign, CorpusMinimiser
+
+    corpus = tmp_path / "campaign/corpus"
+    corpus.mkdir(parents=True)
+    keep = corpus / "keep"
+    keep.write_bytes(b"original")
+    campaign = CorpusCampaign("libfuzzer", corpus, ("/target",))
+
+    class ChangingRunner(_NativeRunner):
+        def run(self, campaign, command, output):
+            super().run(campaign, command, output)
+            if change == "added":
+                (corpus / "late").write_bytes(b"late")
+            elif change == "changed":
+                keep.write_bytes(b"changed")
+            else:
+                keep.unlink()
+
+    with pytest.raises(ValueError, match="live corpus changed during minimisation"):
+        CorpusMinimiser(ChangingRunner(), lambda _campaign, _path: frozenset({"a.c:1"})).minimise(campaign)
+
+    if change == "added":
+        assert keep.read_bytes() == b"original"
+        assert (corpus / "late").read_bytes() == b"late"
+    elif change == "changed":
+        assert keep.read_bytes() == b"changed"
+    else:
+        assert not keep.exists()
+
+
+def test_minimisation_preserves_live_input_added_during_candidate_coverage_probe(tmp_path: Path) -> None:
+    from backend.fuzzing.corpus.minimisation import CorpusCampaign, CorpusMinimiser
+
+    corpus = tmp_path / "campaign/corpus"
+    corpus.mkdir(parents=True)
+    (corpus / "keep").write_bytes(b"original")
+    calls = 0
+
+    def coverage(_campaign, _path):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            (corpus / "late-during-probe").write_bytes(b"late")
+        return frozenset({"a.c:1"})
+
+    with pytest.raises(ValueError, match="live corpus changed during minimisation"):
+        CorpusMinimiser(_NativeRunner(), coverage).minimise(CorpusCampaign("libfuzzer", corpus, ("/target",)))
+
+    assert (corpus / "keep").read_bytes() == b"original"
+    assert (corpus / "late-during-probe").read_bytes() == b"late"
+
+
+def test_minimisation_rejects_candidate_content_swap_after_coverage_probe(tmp_path: Path) -> None:
+    from backend.fuzzing.corpus.minimisation import CorpusCampaign, CorpusMinimiser
+
+    corpus = tmp_path / "campaign/corpus"
+    corpus.mkdir(parents=True)
+    (corpus / "keep").write_bytes(b"original")
+    calls = 0
+
+    def coverage(_campaign, path):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            candidate = path / "keep"
+            candidate.rename(path / "held-candidate")
+            candidate.write_bytes(b"original")
+        return frozenset({"a.c:1"})
+
+    with pytest.raises(ValueError, match="candidate corpus changed during minimisation"):
+        CorpusMinimiser(_NativeRunner(), coverage).minimise(CorpusCampaign("libfuzzer", corpus, ("/target",)))
+
+    assert (corpus / "keep").read_bytes() == b"original"
+
+
 def test_corpus_sync_requires_exact_contract_and_revalidates_each_input(tmp_path: Path) -> None:
     from backend.fuzzing.corpus.synchronisation import CorpusContract, CorpusSynchroniser
 

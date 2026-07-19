@@ -6,11 +6,17 @@ import fcntl
 import os
 import stat
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Callable, Protocol
 from uuid import uuid4
 
-from backend.fuzzing.corpus.admission import _directory_identity, _same_directory_path
+from backend.fuzzing.corpus.admission import (
+    _directory_identity,
+    _file_identity,
+    _read_descriptor,
+    _same_directory_path,
+)
 
 
 @dataclass(frozen=True)
@@ -27,6 +33,13 @@ class CorpusResult:
     before_count: int
     after_count: int
     commands: tuple[tuple[str, ...], ...]
+
+
+@dataclass(frozen=True)
+class CorpusFile:
+    relative_path: tuple[str, ...]
+    identity: tuple[int, int, int, int]
+    content_sha256: str
 
 
 class NativeCorpusRunner(Protocol):
@@ -107,9 +120,10 @@ class CorpusMinimiser:
         candidate_name = staging_name
         candidate_descriptor: int | None = None
         try:
-            before_files = self._bounded_files(corpus_descriptor)
+            live_manifest = self._manifest(corpus_descriptor)
             before_coverage = self._clean_coverage_probe(campaign, corpus)
             self._require_held_directory(corpus, corpus_descriptor, corpus_identity, "corpus")
+            self._require_manifest(corpus_descriptor, live_manifest, "live corpus")
             self._create_directory(parent_descriptor, staging_name)
             staging_descriptor = os.open(
                 staging_name,
@@ -127,7 +141,7 @@ class CorpusMinimiser:
                     commands.append(cmin)
                     self._runner.run(campaign, cmin, staging_path)
                     self._require_held_directory(staging_path, staging_descriptor, staging_identity, "native output")
-                    selected = self._bounded_files(staging_descriptor)
+                    selected = tuple(item.relative_path for item in self._manifest(staging_descriptor))
                     self._create_directory(parent_descriptor, tmin_name)
                     tmin_descriptor = os.open(
                         tmin_name,
@@ -162,23 +176,26 @@ class CorpusMinimiser:
                 os.close(staging_descriptor)
 
             self._require_held_directory(corpus, corpus_descriptor, corpus_identity, "corpus")
+            self._require_manifest(corpus_descriptor, live_manifest, "live corpus")
             if candidate_descriptor is None:
                 raise RuntimeError("native minimiser produced no candidate corpus")
             candidate_path = parent_path / candidate_name
             candidate_identity = _directory_identity(candidate_descriptor)
             self._require_held_directory(candidate_path, candidate_descriptor, candidate_identity, "native output")
-            candidate_files = self._bounded_files(candidate_descriptor)
-            if not candidate_files:
-                return CorpusResult(False, "native minimiser produced an empty corpus", len(before_files), 0, tuple(commands))
+            candidate_manifest = self._manifest(candidate_descriptor)
+            if not candidate_manifest:
+                return CorpusResult(False, "native minimiser produced an empty corpus", len(live_manifest), 0, tuple(commands))
             candidate_coverage = self._clean_coverage_probe(campaign, candidate_path)
             self._require_held_directory(candidate_path, candidate_descriptor, candidate_identity, "native output")
             self._require_held_directory(corpus, corpus_descriptor, corpus_identity, "corpus")
+            self._require_manifest(candidate_descriptor, candidate_manifest, "candidate corpus")
+            self._require_manifest(corpus_descriptor, live_manifest, "live corpus")
             if not before_coverage.issubset(candidate_coverage):
                 return CorpusResult(
                     False,
                     "minimised corpus did not preserve clean coverage",
-                    len(before_files),
-                    len(candidate_files),
+                    len(live_manifest),
+                    len(candidate_manifest),
                     tuple(commands),
                 )
             self._publish_candidate(
@@ -191,6 +208,8 @@ class CorpusMinimiser:
                 candidate_name,
                 candidate_descriptor,
                 candidate_identity,
+                live_manifest,
+                candidate_manifest,
             )
             published_descriptor = os.open(
                 corpus.name,
@@ -198,10 +217,10 @@ class CorpusMinimiser:
                 dir_fd=parent_descriptor,
             )
             try:
-                after_count = len(self._bounded_files(published_descriptor))
+                after_count = len(self._manifest(published_descriptor))
             finally:
                 os.close(published_descriptor)
-            return CorpusResult(True, "clean coverage preserved", len(before_files), after_count, tuple(commands))
+            return CorpusResult(True, "clean coverage preserved", len(live_manifest), after_count, tuple(commands))
         finally:
             if candidate_descriptor is not None:
                 os.close(candidate_descriptor)
@@ -220,6 +239,8 @@ class CorpusMinimiser:
         candidate_name,
         candidate_descriptor,
         candidate_identity,
+        live_manifest,
+        candidate_manifest,
     ) -> None:
         self._require_parent(parent_path, parent_identity)
         self._require_named_directory(parent_descriptor, corpus_name, corpus_descriptor, corpus_identity, "corpus")
@@ -231,6 +252,9 @@ class CorpusMinimiser:
             pass
         else:
             raise ValueError("stale corpus backup must be recovered before minimisation")
+
+        self._require_manifest(corpus_descriptor, live_manifest, "live corpus")
+        self._require_manifest(candidate_descriptor, candidate_manifest, "candidate corpus")
 
         os.replace(corpus_name, backup_name, src_dir_fd=parent_descriptor, dst_dir_fd=parent_descriptor)
         os.fsync(parent_descriptor)
@@ -292,9 +316,9 @@ class CorpusMinimiser:
             os.fsync(parent_descriptor)
             self._remove_entry_at(parent_descriptor, interrupted)
 
-    def _bounded_files(self, root_descriptor: int) -> tuple[tuple[str, ...], ...]:
+    def _manifest(self, root_descriptor: int) -> tuple[CorpusFile, ...]:
         budget = {"entries": 0, "directories": 0, "bytes": 0}
-        files: list[tuple[str, ...]] = []
+        files: list[CorpusFile] = []
 
         def walk(descriptor: int, parts: tuple[str, ...], depth: int) -> None:
             budget["directories"] += 1
@@ -323,15 +347,30 @@ class CorpusMinimiser:
                 elif stat.S_ISREG(source_stat.st_mode):
                     if source_stat.st_size > self._max_file_bytes:
                         raise ValueError("corpus file byte limit exceeded")
-                    budget["bytes"] += source_stat.st_size
+                    file_descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptor)
+                    try:
+                        before = os.fstat(file_descriptor)
+                        if not stat.S_ISREG(before.st_mode) or _file_identity(before) != _file_identity(source_stat):
+                            raise ValueError("corpus entry changed while creating manifest")
+                        content = _read_descriptor(file_descriptor, self._max_file_bytes)
+                        after = os.fstat(file_descriptor)
+                        if _file_identity(after) != _file_identity(before):
+                            raise ValueError("corpus entry changed while creating manifest")
+                    finally:
+                        os.close(file_descriptor)
+                    budget["bytes"] += len(content)
                     if budget["bytes"] > self._max_total_bytes:
                         raise ValueError("corpus aggregate byte limit exceeded")
-                    files.append(relative)
+                    files.append(CorpusFile(relative, _file_identity(after), sha256(content).hexdigest()))
                 else:
                     raise ValueError("corpus entries must be regular files or directories")
 
         walk(root_descriptor, (), 0)
         return tuple(files)
+
+    def _require_manifest(self, descriptor: int, expected: tuple[CorpusFile, ...], label: str) -> None:
+        if self._manifest(descriptor) != expected:
+            raise ValueError(f"{label} changed during minimisation")
 
     @staticmethod
     def _create_directory(parent_descriptor: int, name: str) -> None:
