@@ -387,7 +387,8 @@ def test_luna_specialist_retries_once_with_terra_only_after_validation_failure(
     ))
 
     assert calls == ["gpt-5.6-luna", "gpt-5.6-terra"]
-    assert set(output) == {"result_id", "operation_request_ids"}
+    assert set(output) == {"result_id", "result", "operation_request_ids"}
+    assert output["result"] == _target_proposal("known").model_dump(mode="json")
     assert output["operation_request_ids"] == []
     review = collection.result(CampaignDecision(
         decision="prepare", motivation="validated retry", evidence_ids=["known"],
@@ -423,9 +424,15 @@ def test_retry_quarantines_luna_requests_and_returns_only_terra_invocation_ids(
         input = "nested"
 
         def __init__(self, agent, outer_context):
-            self.final_output = _target_proposal(
+            proposal = _target_proposal(
                 "unknown" if agent.model == "gpt-5.6-luna" else "known"
             )
+            self.final_output = proposal.model_copy(update={
+                "target_name": (
+                    "failed-luna-target" if agent.model == "gpt-5.6-luna"
+                    else "validated-terra-target"
+                ),
+            })
             self.agent_tool_invocation = (
                 SimpleNamespace(
                     tool_name=outer_context.tool_name,
@@ -466,6 +473,8 @@ def test_retry_quarantines_luna_requests_and_returns_only_terra_invocation_ids(
     ), arguments))
 
     assert calls == ["gpt-5.6-luna", "gpt-5.6-terra"]
+    assert output["result"]["target_name"] == "validated-terra-target"
+    assert "failed-luna-target" not in str(output)
     assert len(output["operation_request_ids"]) == 1
     review = collection.result(CampaignDecision(
         decision="select retry", motivation="Terra corrected evidence", evidence_ids=["known"],
@@ -579,7 +588,7 @@ def test_specialist_accepts_only_source_evidence_returned_by_its_retrieval_tool(
     ))
 
     assert calls == ["gpt-5.6-luna"]
-    assert set(output) == {"result_id", "operation_request_ids"}
+    assert set(output) == {"result_id", "result", "operation_request_ids"}
 
 
 def test_specialist_accepts_only_web_citation_returned_by_its_model_response(
@@ -626,7 +635,7 @@ def test_specialist_accepts_only_web_citation_returned_by_its_model_response(
     ))
 
     assert calls == ["gpt-5.6-luna"]
-    assert set(output) == {"result_id", "operation_request_ids"}
+    assert set(output) == {"result_id", "result", "operation_request_ids"}
 
 
 def test_nonofficial_web_citation_triggers_one_terra_validation_retry(
@@ -677,7 +686,7 @@ def test_nonofficial_web_citation_triggers_one_terra_validation_retry(
     ))
 
     assert calls == ["gpt-5.6-luna", "gpt-5.6-terra"]
-    assert set(output) == {"result_id", "operation_request_ids"}
+    assert set(output) == {"result_id", "result", "operation_request_ids"}
     web = next(item for item in tool._agent_instance.tools if item.name == "web_search")
     assert "llvm.org" in web.filters.allowed_domains
     assert "aflplus.plus" in web.filters.allowed_domains
@@ -761,9 +770,11 @@ def test_parallel_agent_tool_results_and_requests_never_cross_invocations(
 
     context = agent_context(tmp_path)
     collection = CampaignReviewCollection()
-    tool = next(item for item in dispatch_tools(
+    tools = dispatch_tools(
         context, evidence_ids={"known"}, collection=collection,
-    ) if item.name == "prepare_system_target")
+    )
+    target_tool = next(item for item in tools if item.name == "prepare_system_target")
+    triage_tool = next(item for item in tools if item.name == "triage_crash_group")
 
     class Result:
         interruptions = []
@@ -771,8 +782,20 @@ def test_parallel_agent_tool_results_and_requests_never_cross_invocations(
         raw_responses = []
         input = "nested"
 
-        def __init__(self, invocation):
-            self.final_output = _target_proposal("known")
+        def __init__(self, agent, invocation):
+            if agent.output_type is TriageResult:
+                self.final_output = TriageResult(
+                    classification="true vulnerability",
+                    description="replay reaches a bounds violation in parser.c",
+                    evidence_ids=["known"], uncertainty="exploitability not assessed",
+                    priority_rationale="reproducible memory-safety failure",
+                    repair_intent="preserve testcase and report the source location",
+                )
+            else:
+                self.final_output = _target_proposal("known").model_copy(update={
+                    "target_name": "parser-" + invocation.tool_call_id,
+                    "byte_path": "stdin -> parser -> " + invocation.tool_call_id,
+                })
             self.agent_tool_invocation = SimpleNamespace(
                 tool_name=invocation.tool_name, tool_call_id=invocation.tool_call_id,
                 tool_arguments=invocation.tool_arguments,
@@ -793,11 +816,11 @@ def test_parallel_agent_tool_results_and_requests_never_cross_invocations(
             ), run_config=RunConfig(), agent=starting_agent,
         )
         await operation.on_invoke_tool(inner, inner.tool_arguments)
-        return Result(context)
+        return Result(starting_agent, context)
 
     monkeypatch.setattr(Runner, "run", runner)
 
-    async def invoke(call_id: str):
+    async def invoke(tool, call_id: str):
         arguments = '{"assignment":"parser","evidence_ids":["known"]}'
         return await tool.on_invoke_tool(ToolContext(
             context, tool_name=tool.name, tool_call_id=call_id,
@@ -805,14 +828,28 @@ def test_parallel_agent_tool_results_and_requests_never_cross_invocations(
         ), arguments)
 
     async def scenario():
-        return await asyncio.gather(invoke("call-a"), invoke("call-b"))
+        return await asyncio.gather(
+            invoke(target_tool, "call-a"), invoke(target_tool, "call-b"),
+            invoke(triage_tool, "call-triage"),
+        )
 
-    first, second = asyncio.run(scenario())
+    first, second, triage = asyncio.run(scenario())
 
     assert first["result_id"] != second["result_id"]
+    assert first["result"]["target_name"] == "parser-call-a"
+    assert second["result"]["target_name"] == "parser-call-b"
+    assert first["result"]["byte_path"] != second["result"]["byte_path"]
+    assert triage["result"]["classification"] == "true vulnerability"
+    assert triage["result"]["description"] == "replay reaches a bounds violation in parser.c"
+    assert triage["result"]["priority_rationale"] == "reproducible memory-safety failure"
+    assert triage["result"]["evidence_ids"] == ["known"]
+    assert set(triage["result"]) == set(TriageResult.model_fields)
     assert len(first["operation_request_ids"]) == len(second["operation_request_ids"]) == 1
+    assert len(triage["operation_request_ids"]) == 1
     assert first["operation_request_ids"][0] != second["operation_request_ids"][0]
     assert set(first["operation_request_ids"]).isdisjoint(second["operation_request_ids"])
+    assert set(first["operation_request_ids"]).isdisjoint(triage["operation_request_ids"])
+    assert set(second["operation_request_ids"]).isdisjoint(triage["operation_request_ids"])
     decision = CampaignDecision(
         decision="select first", motivation="first proposal", evidence_ids=["known"],
         bounded_actions=[first["result_id"], *first["operation_request_ids"]],
@@ -820,7 +857,10 @@ def test_parallel_agent_tool_results_and_requests_never_cross_invocations(
     )
     review = collection.result(decision)
     assert {record.tool_call_id for record in review.known_target_proposals} == {"call-a", "call-b"}
-    assert {record.tool_call_id for record in review.known_operation_requests} == {"call-a", "call-b"}
+    assert {record.tool_call_id for record in review.known_triage_results} == {"call-triage"}
+    assert {record.tool_call_id for record in review.known_operation_requests} == {
+        "call-a", "call-b", "call-triage",
+    }
     assert {record.result_id for record in review.selected_target_proposals} == {first["result_id"]}
     assert {record.request_id for record in review.selected_operation_requests} == set(first["operation_request_ids"])
 

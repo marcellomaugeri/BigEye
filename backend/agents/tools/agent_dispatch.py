@@ -287,6 +287,7 @@ def _tool(
         collection.complete_attempt(successful_invocation, actionable=True)
         return {
             "result_id": record.result_id,
+            "result": output.model_dump(mode="json"),
             "operation_request_ids": list(collection.operation_ids(successful_invocation)),
         }
 
