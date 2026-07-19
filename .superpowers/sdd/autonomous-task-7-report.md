@@ -17,9 +17,12 @@ backend/.venv/bin/python -m pytest backend/tests/test_campaign_assets.py backend
 backend/.venv/bin/python -m compileall -q backend/fuzzing/assets backend/fuzzing/layers backend/repositories/asset_repository.py backend/fuzzing/docker/image_builder.py
 git diff --check
 both passed
+
+backend/.venv/bin/python -m pytest backend/tests -q
+208 passed in 2.45s
 ```
 
-The current full backend command stops during collection because shared Task 8 tests import the not-yet-present `backend.fuzzing.discovery` and `backend.agents.tools.evidence_retrieval` modules. This is outside Task 7's files.
+The complete backend suite was rerun after Task 8 supplied its discovery and evidence modules.
 
 ## Live Docker smoke evidence
 
