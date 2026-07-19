@@ -26,6 +26,9 @@ class GitCommandFailed(RuntimeError):
     """Raised when Git fails without exposing command output to callers."""
 
 
+MAX_GIT_OUTPUT_BYTES = 1_048_576
+
+
 async def run_command(argv: list[str], cwd: Path | None = None, sink=None) -> str:
     """Run a Git argv list and clean up the child process on cancellation."""
     process = await asyncio.create_subprocess_exec(
@@ -34,8 +37,40 @@ async def run_command(argv: list[str], cwd: Path | None = None, sink=None) -> st
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+    if not hasattr(process, "stdout"):
+        try:
+            stdout, _ = await process.communicate()
+        except asyncio.CancelledError:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except TimeoutError:
+                process.kill()
+                await process.wait()
+            raise
+        if process.returncode != 0:
+            raise GitCommandFailed("Git command failed")
+        return stdout.decode("utf-8", errors="replace").strip()
+    stdout = bytearray()
+    output_size = 0
+    truncated = False
+
+    async def drain(reader, keep_stdout: bool) -> None:
+        nonlocal output_size, truncated
+        while chunk := await reader.read(65536):
+            remaining = MAX_GIT_OUTPUT_BYTES - output_size
+            allowed = chunk[:max(remaining, 0)]
+            output_size += len(allowed)
+            if keep_stdout:
+                stdout.extend(allowed)
+            if sink is not None and allowed:
+                sink(allowed.decode("utf-8", errors="replace"))
+            if len(allowed) != len(chunk) and not truncated:
+                truncated = True
+                if sink is not None:
+                    sink("Git output exceeded 1048576 bytes and was truncated\n")
     try:
-        stdout, stderr = await process.communicate()
+        await asyncio.gather(drain(process.stdout, True), drain(process.stderr, False), process.wait())
     except asyncio.CancelledError:
         process.terminate()
         try:
@@ -44,13 +79,11 @@ async def run_command(argv: list[str], cwd: Path | None = None, sink=None) -> st
             process.kill()
             await process.wait()
         raise
-    if sink is not None:
-        for output in (stdout, stderr):
-            if output:
-                sink(output.decode("utf-8", errors="replace"))
+    if truncated:
+        raise GitCommandFailed("Git output exceeded 1048576 bytes")
     if process.returncode != 0:
         raise GitCommandFailed("Git command failed")
-    return stdout.decode("utf-8", errors="replace").strip()
+    return bytes(stdout).decode("utf-8", errors="replace").strip()
 
 
 class CloneRepositoryService:
@@ -67,14 +100,9 @@ class CloneRepositoryService:
         project_root.mkdir(parents=True, exist_ok=True)
         if destination.exists() or destination.is_symlink():
             raise UnsafeWorkspacePath("repository destination already exists")
-        captured: list[str] = []
-        kwargs = {"sink": captured.append} if self._logs is not None and task is not None else {}
-        try:
-            await self._command(["git", "clone", "--", repository_url, str(destination)], **kwargs)
-            commit_sha = await self._command(["git", "rev-parse", "HEAD"], cwd=destination, **kwargs)
-        finally:
-            if captured:
-                await self._logs.append(task, "".join(captured))
+        kwargs = {"sink": lambda text: self._logs.append_sync(task, text)} if self._logs is not None and task is not None else {}
+        await self._command(["git", "clone", "--", repository_url, str(destination)], **kwargs)
+        commit_sha = await self._command(["git", "rev-parse", "HEAD"], cwd=destination, **kwargs)
         if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", commit_sha) is None:
             raise GitCommandFailed("Git did not return a full object ID")
         await self._projects.set_commit_sha(project.id, commit_sha)

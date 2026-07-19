@@ -25,22 +25,32 @@ class DeferredToolchain:
         self._logs = logs
         self._docker_client = docker_client or DockerClient()
 
-    async def prepare(self, task) -> None:
+    async def _with_client(self, operation):
         connection = asyncio.create_task(asyncio.to_thread(self._docker_client.connect))
         try:
             client = await asyncio.shield(connection)
         except asyncio.CancelledError:
-            def close_when_connected(operation):
-                if operation.cancelled():
-                    return
-                try:
-                    connected = operation.result()
-                except Exception:
-                    return
+            def close_when_connected(future):
+                if future.cancelled(): return
+                try: connected = future.result()
+                except Exception: return
                 asyncio.create_task(asyncio.to_thread(connected.close))
             connection.add_done_callback(close_when_connected)
             raise
+        work = asyncio.create_task(operation(client))
         try:
+            return await asyncio.shield(work)
+        except asyncio.CancelledError as cancellation:
+            try:
+                await asyncio.shield(work)
+            except BaseException:
+                pass
+            raise cancellation
+        finally:
+            await asyncio.to_thread(client.close)
+
+    async def prepare(self, task) -> None:
+        async def prepare_connected(client):
             inspector = ImageInspector(client)
             service = ToolchainService(
                 _NoTaskPersistence(), self._logs,
@@ -48,32 +58,28 @@ class DeferredToolchain:
                 ToolchainVerifier(inspector, ContainerRunner(client)),
             )
             await service.prepare(task)
-        finally:
-            await asyncio.to_thread(client.close)
+        await self._with_client(prepare_connected)
 
     async def docker_available(self) -> bool:
         try:
-            client = await asyncio.to_thread(self._docker_client.connect)
+            return await self._with_client(lambda client: _true())
         except DockerUnavailable:
             return False
-        try:
-            return True
-        finally:
-            await asyncio.to_thread(client.close)
 
     async def toolchain_available(self) -> bool:
         try:
-            client = await asyncio.to_thread(self._docker_client.connect)
+            return await self._with_client(self._inspect_toolchain)
         except DockerUnavailable:
             return False
+
+    async def _inspect_toolchain(self, client) -> bool:
+        builder = ToolchainBuilder(self._dockerfile, ImageBuilder(client), ImageInspector(client))
         try:
-            builder = ToolchainBuilder(self._dockerfile, ImageBuilder(client), ImageInspector(client))
-            try:
-                ImageInspector(client).inspect(builder.tag())
-            except MissingImage:
-                return False
-            except Exception:
-                return False
-            return True
-        finally:
-            await asyncio.to_thread(client.close)
+            await asyncio.to_thread(ImageInspector(client).inspect, builder.tag())
+        except (MissingImage, Exception):
+            return False
+        return True
+
+
+async def _true() -> bool:
+    return True

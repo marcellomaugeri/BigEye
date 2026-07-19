@@ -384,6 +384,23 @@ class TestToolchainService:
         assert tasks.finish.calls == [(11, "clang probe failed")]
         assert (tmp_path / "11.log").read_text() == "clang probe failed\n"
 
+    def test_cancelled_build_keeps_cancellation_when_worker_later_fails(self) -> None:
+        from backend.fuzzing.toolchain.service import ToolchainService
+        entered, release = threading.Event(), threading.Event()
+        task = SimpleNamespace(id=11, project_id=7)
+        tasks = SimpleNamespace(finish=_async_spy())
+        logs = SimpleNamespace(append_sync=lambda task, text: None)
+        def fail_after_release(sink):
+            entered.set(); release.wait(1); raise RuntimeError("late build failure")
+        service = ToolchainService(tasks, logs, SimpleNamespace(ensure=fail_after_release), SimpleNamespace())
+        async def scenario():
+            running = asyncio.create_task(service.prepare(task))
+            assert await asyncio.to_thread(entered.wait, 1)
+            running.cancel(); release.set()
+            with pytest.raises(asyncio.CancelledError): await running
+        run(scenario())
+        assert tasks.finish.calls == []
+
 
 class TestMaintainedImageDefinition:
     def test_image_is_bigeye_owned_amd64_ubuntu_llvm_without_forbidden_toolchains(self) -> None:

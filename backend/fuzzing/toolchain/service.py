@@ -20,9 +20,12 @@ class ToolchainService:
             build = asyncio.create_task(asyncio.to_thread(self._builder.ensure, sink))
             try:
                 image = await asyncio.shield(build)
-            except asyncio.CancelledError:
-                await asyncio.shield(build)
-                raise
+            except asyncio.CancelledError as cancellation:
+                try:
+                    await asyncio.shield(build)
+                except BaseException:
+                    pass
+                raise cancellation
             await self._verifier.verify(image.image_id, sink)
         except BaseException as error:
             if not isinstance(error, asyncio.CancelledError):
