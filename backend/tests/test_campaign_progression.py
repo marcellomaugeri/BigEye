@@ -83,6 +83,16 @@ def test_special_sanitizers_require_their_exact_target_evidence_and_run_as_separ
     assert plan.leak_classification == "quality evidence"
 
 
+def test_sanitizer_eligibility_is_not_dropped_when_no_worker_is_currently_free() -> None:
+    from backend.fuzzing.campaigns.sanitizers import SanitizerPlanner, SanitizerTarget
+
+    target = SanitizerTarget(True, True, "c++", True)
+    plan = SanitizerPlanner.plan(target, worker_count=1)
+
+    assert plan.replay_variants == ("memory", "thread", "cfi")
+    assert plan.concurrent_replay_variants == ()
+
+
 def test_progression_starts_with_build_sanitizer_seed_health_and_basic_fuzzer_in_order() -> None:
     from backend.fuzzing.campaigns.progression import CampaignProgression, ProgressionEvidence
 
@@ -194,3 +204,26 @@ def test_optional_progression_uses_one_evidence_backed_improvement_at_a_time() -
     assert second.name == "enable CmpLog"
     assert len(first.evidence_ids) == 1
     assert len(second.evidence_ids) == 1
+
+
+def test_progression_rejects_blank_optional_evidence() -> None:
+    from backend.fuzzing.campaigns.configuration import ConfigurationCandidate
+    from backend.fuzzing.campaigns.progression import CampaignProgression, ProgressionEvidence
+
+    evidence = ProgressionEvidence(
+        normal_build_ready=True,
+        baseline_sanitizers_validated=True,
+        seed_coverage_healthy=True,
+        basic_fuzzer_running=True,
+        basic_campaign_healthy=True,
+        dictionary_evidence_ids=(" ",),
+        cmplog_evidence_ids=("",),
+        configuration=ConfigurationCandidate("guess", (), (), (" ",)),
+        component_gap_evidence_ids=("",),
+        special_sanitizer="thread",
+        special_sanitizer_evidence_ids=(" ",),
+        grammar_library="/mutator.so",
+        grammar_evidence_ids=("",),
+    )
+
+    assert CampaignProgression.next_step(evidence) is None

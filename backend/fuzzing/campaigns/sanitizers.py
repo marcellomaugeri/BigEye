@@ -17,6 +17,7 @@ class SanitizerTarget:
 class SanitizerPlan:
     primary: tuple[str, ...]
     replay_variants: tuple[str, ...]
+    concurrent_replay_variants: tuple[str, ...]
     quality_signals: tuple[str, ...]
     leak_classification: str
 
@@ -35,7 +36,8 @@ class SanitizerPlanner:
             candidates.append("cfi")
         return SanitizerPlan(
             primary=("address", "undefined"),
-            replay_variants=tuple(candidates[: max(0, worker_count - 1)]),
+            replay_variants=tuple(candidates),
+            concurrent_replay_variants=tuple(candidates[: max(0, worker_count - 1)]),
             quality_signals=("leak",),
             leak_classification="quality evidence",
         )

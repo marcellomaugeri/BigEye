@@ -55,11 +55,11 @@ class CampaignProgression:
 
         completed = set(evidence.completed_actions)
         candidates: list[ProgressionAction] = []
-        if evidence.dictionary_evidence_ids:
+        if CampaignProgression._usable(evidence.dictionary_evidence_ids):
             candidates.append(ProgressionAction("enable dictionary", evidence.dictionary_evidence_ids))
-        if evidence.engine == "afl++" and evidence.cmplog_evidence_ids:
+        if evidence.engine == "afl++" and CampaignProgression._usable(evidence.cmplog_evidence_ids):
             candidates.append(ProgressionAction("enable CmpLog", evidence.cmplog_evidence_ids))
-        if evidence.configuration is not None and evidence.configuration.evidence_ids:
+        if evidence.configuration is not None and CampaignProgression._usable(evidence.configuration.evidence_ids):
             candidates.append(ProgressionAction(
                 "try configuration",
                 evidence.configuration.evidence_ids,
@@ -67,18 +67,31 @@ class CampaignProgression:
                 evidence.configuration.environment,
                 evidence.configuration.name,
             ))
-        if evidence.component_gap_evidence_ids:
+        if CampaignProgression._usable(evidence.component_gap_evidence_ids):
             candidates.append(ProgressionAction("prepare component gap target", evidence.component_gap_evidence_ids))
-        if evidence.special_sanitizer and evidence.special_sanitizer_evidence_ids:
+        if (
+            evidence.special_sanitizer
+            and evidence.special_sanitizer.strip()
+            and CampaignProgression._usable(evidence.special_sanitizer_evidence_ids)
+        ):
             candidates.append(ProgressionAction(
                 "run specialised sanitizer replay",
                 evidence.special_sanitizer_evidence_ids,
                 detail=evidence.special_sanitizer,
             ))
-        if evidence.engine == "afl++" and evidence.grammar_library and evidence.grammar_evidence_ids:
+        if (
+            evidence.engine == "afl++"
+            and evidence.grammar_library
+            and evidence.grammar_library.strip()
+            and CampaignProgression._usable(evidence.grammar_evidence_ids)
+        ):
             candidates.append(ProgressionAction(
                 "enable grammar mutator",
                 evidence.grammar_evidence_ids,
                 environment=(("AFL_CUSTOM_MUTATOR_LIBRARY", evidence.grammar_library),),
             ))
         return next((candidate for candidate in candidates if candidate.key not in completed), None)
+
+    @staticmethod
+    def _usable(evidence_ids: tuple[str, ...]) -> bool:
+        return bool(evidence_ids) and all(isinstance(item, str) and bool(item.strip()) for item in evidence_ids)

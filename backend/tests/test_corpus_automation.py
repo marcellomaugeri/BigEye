@@ -1,8 +1,36 @@
 from __future__ import annotations
 
+import hashlib
+import os
 import shutil
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
+
+def _clean_execution(prepared, target, *, lines=frozenset({"parser.c:12"})):
+    from backend.fuzzing.corpus.admission import ExecutionEvidence
+
+    return ExecutionEvidence(
+        executed=True,
+        ok=True,
+        clean=True,
+        clean_line_delta=lines,
+        content_sha256=prepared.content_sha256,
+        target_contract=target,
+    )
+
+
+def _durable_admission(path, contract, *, useful=True):
+    from backend.fuzzing.corpus.admission import CorpusAdmission, CorpusCandidate
+
+    lines = frozenset({"parser.c:12"}) if useful else frozenset()
+    return CorpusAdmission(
+        lambda prepared, target: _clean_execution(prepared, target, lines=lines),
+    ).validate(CorpusCandidate(path, path.name), contract.identifier)
 
 def test_seed_is_admitted_only_after_execution_and_useful_clean_evidence(tmp_path: Path) -> None:
     from backend.fuzzing.corpus.admission import CorpusAdmission, CorpusCandidate, ExecutionEvidence
@@ -11,15 +39,10 @@ def test_seed_is_admitted_only_after_execution_and_useful_clean_evidence(tmp_pat
     seed.parent.mkdir()
     seed.write_bytes(b"sample")
     candidate = CorpusCandidate(seed, "tests/sample.bin")
-
-    admitted = CorpusAdmission().admit(
-        candidate,
-        ExecutionEvidence(executed=True, ok=True, clean=True, clean_line_delta=frozenset({"parser.c:12"})),
-    )
-    redundant = CorpusAdmission().admit(
-        candidate,
-        ExecutionEvidence(executed=True, ok=True, clean=True),
-    )
+    admitted = CorpusAdmission(_clean_execution).validate(candidate, "target-contract")
+    redundant = CorpusAdmission(
+        lambda prepared, target: _clean_execution(prepared, target, lines=frozenset()),
+    ).validate(candidate, "target-contract")
 
     assert admitted.admitted is True
     assert admitted.provenance == "tests/sample.bin"
@@ -28,18 +51,28 @@ def test_seed_is_admitted_only_after_execution_and_useful_clean_evidence(tmp_pat
     assert redundant.reason == "candidate adds no clean coverage or behaviour"
 
 
-def test_admission_rejects_unexecuted_invalid_unclean_and_unprovenanced_candidates(tmp_path: Path) -> None:
+def test_public_admit_never_claims_durable_admission_from_caller_evidence(tmp_path: Path) -> None:
     from backend.fuzzing.corpus.admission import CorpusAdmission, CorpusCandidate, ExecutionEvidence
 
     seed = tmp_path / "seed"
     seed.write_bytes(b"seed")
-    policy = CorpusAdmission()
-    useful = {"clean_line_delta": frozenset({"target.c:1"})}
+    result = CorpusAdmission().admit(
+        CorpusCandidate(seed, "seed"),
+        ExecutionEvidence(True, True, True, frozenset({"target.c:1"}), content_sha256="claimed", target_contract="claimed"),
+    )
 
-    assert not policy.admit(CorpusCandidate(seed, ""), ExecutionEvidence(True, True, True, **useful)).admitted
-    assert not policy.admit(CorpusCandidate(seed, "seed"), ExecutionEvidence(False, True, True, **useful)).admitted
-    assert not policy.admit(CorpusCandidate(seed, "seed"), ExecutionEvidence(True, False, True, **useful)).admitted
-    assert not policy.admit(CorpusCandidate(seed, "seed"), ExecutionEvidence(True, True, False, **useful)).admitted
+    assert result.admitted is False
+    assert result.reason == "caller-supplied evidence is not durable; use validate"
+
+    secret = tmp_path / "secret"
+    secret.write_bytes(b"do-not-read")
+    linked = tmp_path / "linked"
+    linked.symlink_to(secret)
+    linked_result = CorpusAdmission().admit(
+        CorpusCandidate(linked, "linked"),
+        ExecutionEvidence(True, True, True),
+    )
+    assert linked_result.content_sha256 == ""
 
 
 def test_validate_executes_candidate_and_rejects_a_known_content_hash(tmp_path: Path) -> None:
@@ -49,19 +82,97 @@ def test_validate_executes_candidate_and_rejects_a_known_content_hash(tmp_path: 
     seed.write_bytes(b"same")
     calls = []
 
-    def execute(candidate, target):
-        calls.append((candidate, target))
-        return ExecutionEvidence(True, True, True, frozenset({"target.c:2"}))
+    def execute(prepared, target):
+        calls.append((prepared, target))
+        return _clean_execution(prepared, target, lines=frozenset({"target.c:2"}))
 
     policy = CorpusAdmission(execute)
     candidate = CorpusCandidate(seed, "examples/sample")
     first = policy.validate(candidate, "target")
     duplicate = policy.validate(candidate, "target", known_hashes={first.content_sha256})
 
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert first.admitted is True
     assert duplicate.admitted is False
     assert duplicate.reason == "candidate content is already present"
+    assert calls[0][0].content == b"same"
+
+
+def test_admission_binds_execution_to_candidate_digest_identity_and_target_contract(tmp_path: Path) -> None:
+    from backend.fuzzing.corpus.admission import CorpusAdmission, CorpusCandidate, ExecutionEvidence
+
+    seed = tmp_path / "seed"
+    seed.write_bytes(b"original")
+
+    def wrong_digest(prepared, target):
+        return ExecutionEvidence(True, True, True, frozenset({"a.c:1"}), content_sha256="0" * 64, target_contract=target)
+
+    def wrong_target(prepared, _target):
+        return ExecutionEvidence(True, True, True, frozenset({"a.c:1"}), content_sha256=prepared.content_sha256, target_contract="other")
+
+    assert CorpusAdmission(wrong_digest).validate(CorpusCandidate(seed, "seed"), "target").admitted is False
+    assert CorpusAdmission(wrong_target).validate(CorpusCandidate(seed, "seed"), "target").admitted is False
+
+
+@pytest.mark.parametrize(
+    ("executed", "ok", "clean", "lines", "reason"),
+    [
+        (False, True, True, frozenset({"a.c:1"}), "candidate was not executed"),
+        (True, False, True, frozenset({"a.c:1"}), "candidate is invalid for the target"),
+        (True, True, False, frozenset({"a.c:1"}), "candidate has no clean execution evidence"),
+        (True, True, True, frozenset({" "}), "execution evidence contains blank identifiers"),
+    ],
+)
+def test_validate_rejects_non_durable_or_blank_execution_evidence(
+    tmp_path: Path,
+    executed: bool,
+    ok: bool,
+    clean: bool,
+    lines,
+    reason: str,
+) -> None:
+    from backend.fuzzing.corpus.admission import CorpusAdmission, CorpusCandidate, ExecutionEvidence
+
+    seed = tmp_path / "seed"
+    seed.write_bytes(b"seed")
+
+    def execute(prepared, target):
+        return ExecutionEvidence(executed, ok, clean, lines, content_sha256=prepared.content_sha256, target_contract=target)
+
+    result = CorpusAdmission(execute).validate(CorpusCandidate(seed, "seed"), "target")
+
+    assert result.admitted is False
+    assert result.reason == reason
+
+
+def test_admission_rejects_candidate_path_swap_during_execution(tmp_path: Path) -> None:
+    from backend.fuzzing.corpus.admission import CorpusAdmission, CorpusCandidate
+
+    seed = tmp_path / "seed"
+    seed.write_bytes(b"original")
+
+    def swap(prepared, target):
+        seed.rename(tmp_path / "held-original")
+        seed.write_bytes(b"replacement")
+        return _clean_execution(prepared, target)
+
+    with pytest.raises(ValueError, match="changed during execution"):
+        CorpusAdmission(swap).validate(CorpusCandidate(seed, "seed"), "target")
+
+
+def test_admission_rejects_candidate_replaced_after_discovery_even_with_same_bytes(tmp_path: Path) -> None:
+    from backend.fuzzing.corpus.admission import CorpusAdmission, SeedCollector
+
+    repository = tmp_path / "repository"
+    seed = repository / "tests" / "seed"
+    seed.parent.mkdir(parents=True)
+    seed.write_bytes(b"same")
+    candidate = SeedCollector().collect(repository)[0]
+    seed.unlink()
+    seed.write_bytes(b"same")
+
+    with pytest.raises(ValueError, match="changed since discovery"):
+        CorpusAdmission(_clean_execution).validate(candidate, "target")
 
 
 def test_seed_collection_is_bounded_contained_and_requires_citations_for_agent_proposals(tmp_path: Path) -> None:
@@ -85,6 +196,35 @@ def test_seed_collection_is_bounded_contained_and_requires_citations_for_agent_p
     assert all(candidate.path.is_relative_to(repository) for candidate in collected)
     assert all(not candidate.path.is_symlink() for candidate in collected)
     assert any(candidate.evidence_ids for candidate in collected)
+
+
+def test_seed_collection_stops_early_without_following_git_symlinks_or_deep_trees(tmp_path: Path) -> None:
+    from backend.fuzzing.corpus.admission import CorpusCandidate, SeedCollector
+
+    repository = tmp_path / "repository"
+    (repository / ".git/tests").mkdir(parents=True)
+    (repository / ".git/tests/secret").write_bytes(b"secret")
+    (repository / "tests").mkdir()
+    for index in range(12):
+        (repository / "tests" / f"{index:02}.bin").write_bytes(b"1234")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "host").write_bytes(b"host")
+    (repository / "tests/linked").symlink_to(outside, target_is_directory=True)
+    blank = CorpusCandidate(repository / "tests/00.bin", "tests/00.bin", (" ",))
+
+    collected = SeedCollector(
+        max_candidates=10,
+        max_entries=5,
+        max_directories=4,
+        max_depth=2,
+        max_total_bytes=8,
+    ).collect(repository, (blank,))
+
+    assert len(collected) <= 2
+    assert all(".git" not in candidate.path.parts for candidate in collected)
+    assert all("linked" not in candidate.path.parts for candidate in collected)
+    assert all(candidate.evidence_ids != (" ",) for candidate in collected)
 
 
 class _NativeRunner:
@@ -160,8 +300,136 @@ def test_libfuzzer_minimisation_preserves_target_arguments_before_merge_flags(tm
     )
 
 
+def test_minimisation_rejects_symlinked_native_output_without_touching_its_target(tmp_path: Path) -> None:
+    from backend.fuzzing.corpus.minimisation import CorpusCampaign, CorpusMinimiser
+
+    corpus = tmp_path / "campaign/corpus"
+    corpus.mkdir(parents=True)
+    (corpus / "keep").write_bytes(b"keep")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "sentinel").write_bytes(b"safe")
+
+    class SymlinkRunner:
+        def run(self, _campaign, _command, output):
+            output.rmdir()
+            output.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="native output directory changed"):
+        CorpusMinimiser(SymlinkRunner(), lambda _campaign, _path: frozenset({"a.c:1"})).minimise(
+            CorpusCampaign("libfuzzer", corpus, ("/target",)),
+        )
+
+    assert (corpus / "keep").read_bytes() == b"keep"
+    assert (outside / "sentinel").read_bytes() == b"safe"
+    assert not any(path.is_symlink() for path in corpus.parent.iterdir())
+
+
+def test_minimisation_rejects_corpus_directory_swap_across_clean_probe(tmp_path: Path) -> None:
+    from backend.fuzzing.corpus.minimisation import CorpusCampaign, CorpusMinimiser
+
+    corpus = tmp_path / "campaign/corpus"
+    corpus.mkdir(parents=True)
+    (corpus / "keep").write_bytes(b"keep")
+    moved = corpus.with_name("held-original")
+    calls = 0
+
+    def coverage(_campaign, path):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            path.rename(moved)
+            path.mkdir()
+            (path / "attacker").write_bytes(b"attacker")
+        return frozenset({"a.c:1"})
+
+    with pytest.raises(ValueError, match="corpus directory changed"):
+        CorpusMinimiser(_NativeRunner(), coverage).minimise(CorpusCampaign("libfuzzer", corpus, ("/target",)))
+
+    assert (moved / "keep").read_bytes() == b"keep"
+    assert (corpus / "attacker").read_bytes() == b"attacker"
+
+
+def test_minimisation_restores_original_when_candidate_publication_fails(tmp_path: Path, monkeypatch) -> None:
+    import backend.fuzzing.corpus.minimisation as module
+
+    corpus = tmp_path / "campaign/corpus"
+    corpus.mkdir(parents=True)
+    (corpus / "keep").write_bytes(b"original")
+    campaign = module.CorpusCampaign("libfuzzer", corpus, ("/target",))
+    real_replace = module.os.replace
+    failed = False
+
+    def fail_candidate(source, destination, *args, **kwargs):
+        nonlocal failed
+        if not failed and str(source).startswith(".corpus.minimising-") and destination == "corpus":
+            failed = True
+            raise OSError("forced publication failure")
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(module.os, "replace", fail_candidate)
+    with pytest.raises(OSError, match="forced publication failure"):
+        module.CorpusMinimiser(_NativeRunner(), lambda _campaign, _path: frozenset({"a.c:1"})).minimise(campaign)
+
+    assert (corpus / "keep").read_bytes() == b"original"
+
+
+def test_minimisation_recovers_original_after_interrupted_post_publish_cleanup(tmp_path: Path) -> None:
+    from backend.fuzzing.corpus.minimisation import CorpusCampaign, CorpusMinimiser
+
+    campaign_root = tmp_path / "campaign"
+    corpus = campaign_root / "corpus"
+    backup = campaign_root / ".corpus.before-minimisation"
+    corpus.mkdir(parents=True)
+    backup.mkdir()
+    (corpus / "keep").write_bytes(b"unverified-candidate")
+    (backup / "keep").write_bytes(b"original")
+
+    result = CorpusMinimiser(_NativeRunner(), lambda _campaign, _path: frozenset({"a.c:1"})).minimise(
+        CorpusCampaign("libfuzzer", corpus, ("/target",)),
+    )
+
+    assert result.replaced is True
+    assert (corpus / "keep").read_bytes() == b"original"
+    assert not backup.exists()
+
+
+def test_minimisation_serialises_operations_for_one_corpus(tmp_path: Path) -> None:
+    from backend.fuzzing.corpus.minimisation import CorpusCampaign, CorpusMinimiser
+
+    corpus = tmp_path / "campaign/corpus"
+    corpus.mkdir(parents=True)
+    (corpus / "keep").write_bytes(b"keep")
+    campaign = CorpusCampaign("libfuzzer", corpus, ("/target",))
+
+    class ConcurrentRunner(_NativeRunner):
+        def __init__(self):
+            super().__init__()
+            self.active = 0
+            self.maximum = 0
+            self.guard = threading.Lock()
+
+        def run(self, campaign, command, output):
+            with self.guard:
+                self.active += 1
+                self.maximum = max(self.maximum, self.active)
+            time.sleep(0.03)
+            try:
+                super().run(campaign, command, output)
+            finally:
+                with self.guard:
+                    self.active -= 1
+
+    runner = ConcurrentRunner()
+    minimiser = CorpusMinimiser(runner, lambda _campaign, _path: frozenset({"a.c:1"}))
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(lambda _index: minimiser.minimise(campaign), range(2)))
+
+    assert all(result.replaced for result in results)
+    assert runner.maximum == 1
+
+
 def test_corpus_sync_requires_exact_contract_and_revalidates_each_input(tmp_path: Path) -> None:
-    from backend.fuzzing.corpus.admission import AdmissionResult
     from backend.fuzzing.corpus.synchronisation import CorpusContract, CorpusSynchroniser
 
     source = tmp_path / "source"
@@ -174,8 +442,7 @@ def test_corpus_sync_requires_exact_contract_and_revalidates_each_input(tmp_path
 
     def validate(path):
         calls.append(path.name)
-        digest = __import__("hashlib").sha256(path.read_bytes()).hexdigest()
-        return AdmissionResult(path.name == "accepted", "useful" if path.name == "accepted" else "redundant", path.name, digest, ())
+        return _durable_admission(path, contract, useful=path.name == "accepted")
 
     result = CorpusSynchroniser().synchronise(source, destination, contract, contract, validate)
 
@@ -188,3 +455,134 @@ def test_corpus_sync_requires_exact_contract_and_revalidates_each_input(tmp_path
     assert no_sync.transferred_hashes == ()
     assert no_sync.reason == "campaign contracts are incompatible"
     assert calls == ["accepted", "rejected"]
+
+
+def test_sync_rejects_forged_admission_result_even_when_digest_and_identity_match(tmp_path: Path) -> None:
+    from backend.fuzzing.corpus.admission import AdmissionResult
+    from backend.fuzzing.corpus.synchronisation import CorpusContract, CorpusSynchroniser
+
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    seed = source / "seed"
+    seed.write_bytes(b"seed")
+    contract = CorpusContract("target", "stdin", "default")
+
+    def forge(path):
+        source_stat = path.stat(follow_symlinks=False)
+        return AdmissionResult(
+            True,
+            "claimed",
+            "seed",
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+            ("line:a.c:1",),
+            source_identity=(source_stat.st_dev, source_stat.st_ino, source_stat.st_size, source_stat.st_mtime_ns),
+            target_contract=contract.identifier,
+        )
+
+    result = CorpusSynchroniser().synchronise(source, destination, contract, contract, forge)
+
+    assert result.transferred_hashes == ()
+    assert len(result.rejected_hashes) == 1
+    assert not any(destination.iterdir())
+
+
+def test_sync_rejects_unsafe_existing_hash_entry_and_staging_symlink(tmp_path: Path) -> None:
+    from backend.fuzzing.corpus.synchronisation import CorpusContract, CorpusSynchroniser
+
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+    candidate = source / "seed"
+    candidate.write_bytes(b"seed")
+    digest = hashlib.sha256(b"seed").hexdigest()
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"outside")
+    (destination / digest).symlink_to(outside)
+    contract = CorpusContract("target", "stdin", "default")
+
+    def validate(path):
+        return _durable_admission(path, contract)
+
+    with pytest.raises(ValueError, match="unsafe existing corpus entry"):
+        CorpusSynchroniser().synchronise(source, destination, contract, contract, validate)
+    assert outside.read_bytes() == b"outside"
+
+    (destination / digest).unlink()
+
+    class SwapStaging(CorpusSynchroniser):
+        def _after_staging_written(self, descriptor, staging_name):
+            os.unlink(staging_name, dir_fd=descriptor)
+            os.symlink(outside, staging_name, dir_fd=descriptor)
+
+    with pytest.raises(ValueError, match="staging entry changed"):
+        SwapStaging().synchronise(source, destination, contract, contract, validate)
+    assert outside.read_bytes() == b"outside"
+    assert not (destination / digest).exists()
+
+
+@pytest.mark.parametrize("swap", ["source", "destination"])
+def test_sync_rejects_source_or_destination_directory_swap(tmp_path: Path, swap: str) -> None:
+    from backend.fuzzing.corpus.synchronisation import CorpusContract, CorpusSynchroniser
+
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+    (source / "seed").write_bytes(b"seed")
+    contract = CorpusContract("target", "stdin", "default")
+
+    def validate(path):
+        return _durable_admission(path, contract)
+
+    class SwapDirectory(CorpusSynchroniser):
+        def _after_directories_opened(self, _source_descriptor, _destination_descriptor):
+            selected = source if swap == "source" else destination
+            selected.rename(selected.with_name(f"held-{selected.name}"))
+            selected.mkdir()
+
+    with pytest.raises(ValueError, match=f"{swap} corpus directory changed"):
+        SwapDirectory().synchronise(source, destination, contract, contract, validate)
+
+    assert not any(destination.iterdir())
+
+
+def test_sync_rejects_source_entry_swap_after_bounded_traversal(tmp_path: Path) -> None:
+    from backend.fuzzing.corpus.synchronisation import CorpusContract, CorpusSynchroniser
+
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    seed = source / "seed"
+    seed.write_bytes(b"same")
+    contract = CorpusContract("target", "stdin", "default")
+
+    def validate(path):
+        return _durable_admission(path, contract)
+
+    class SwapEntry(CorpusSynchroniser):
+        def _after_traversal(self, _source_descriptor):
+            seed.rename(source / "original")
+            seed.write_bytes(b"same")
+
+    with pytest.raises(ValueError, match="source corpus entry changed"):
+        SwapEntry().synchronise(source, destination, contract, contract, validate)
+
+    assert not any(destination.iterdir())
+
+
+def test_sync_stops_before_publication_when_traversal_budget_is_exceeded(tmp_path: Path) -> None:
+    from backend.fuzzing.corpus.synchronisation import CorpusContract, CorpusSynchroniser
+
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    for index in range(4):
+        (source / str(index)).write_bytes(b"seed")
+    contract = CorpusContract("target", "stdin", "default")
+
+    with pytest.raises(ValueError, match="entry limit"):
+        CorpusSynchroniser(max_entries=2).synchronise(source, destination, contract, contract, lambda _path: None)
+
+    assert not destination.exists() or not any(destination.iterdir())
