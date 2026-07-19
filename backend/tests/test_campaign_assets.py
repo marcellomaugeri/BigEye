@@ -218,11 +218,13 @@ def test_assets_directory_swap_after_open_never_redirects_publication(tmp_path: 
             assets.symlink_to(external, target_is_directory=True)
 
     repository = _Assets()
-    run(SwappingStore(workspace, repository).create(7, "adapter", "adapter.py", {"adapter.py": source}, None))
+    with pytest.raises(ValueError, match="canonical"):
+        run(SwappingStore(workspace, repository).create(7, "adapter", "adapter.py", {"adapter.py": source}, None))
 
     assert list(external.iterdir()) == []
-    assert (workspace / "projects/7/assets-original/1/adapter.py").read_text() == "safe\n"
-    assert repository.validated == [1]
+    assert not (workspace / "projects/7/assets-original/1").exists()
+    assert repository.validated == []
+    assert repository.errors
 
 
 def test_parent_boolean_is_rejected_before_repository_lookup(tmp_path: Path) -> None:
@@ -248,3 +250,56 @@ def test_parent_boolean_is_rejected_before_repository_lookup(tmp_path: Path) -> 
 
     assert repository.lookups == []
     assert repository.created == []
+
+
+def test_rename_failure_after_lockdown_cleans_staging_and_records_primary_error(tmp_path: Path, monkeypatch) -> None:
+    from backend.fuzzing.assets.store import AssetStore
+
+    workspace = tmp_path / "workspace"
+    source = workspace / "projects/7/drafts/nested/adapter.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("safe\n")
+    repository = _Assets()
+
+    def fail_rename(*args, **kwargs):
+        raise RuntimeError("forced rename failure")
+
+    monkeypatch.setattr("backend.fuzzing.assets.store.os.replace", fail_rename)
+    with pytest.raises(RuntimeError, match="forced rename failure"):
+        run(AssetStore(workspace, repository).create(
+            7, "adapter", "adapter.py", {"nested/adapter.py": source}, None,
+        ))
+
+    assets = workspace / "projects/7/assets"
+    assert not (assets / "1.staging").exists()
+    assert not (assets / "1").exists()
+    assert repository.errors == [(1, "forced rename failure")]
+
+
+def test_every_final_mode_change_is_fsynced_on_the_same_descriptor(tmp_path: Path, monkeypatch) -> None:
+    from backend.fuzzing.assets.store import AssetStore
+    import backend.fuzzing.assets.store as store_module
+
+    workspace = tmp_path / "workspace"
+    source = workspace / "projects/7/drafts/run.sh"
+    source.parent.mkdir(parents=True)
+    source.write_text("#!/bin/sh\nexit 0\n")
+    events = []
+    real_fchmod = store_module.os.fchmod
+    real_fsync = store_module.os.fsync
+
+    def tracked_fchmod(descriptor, mode):
+        real_fchmod(descriptor, mode)
+        events.append(("fchmod", descriptor, mode))
+
+    def tracked_fsync(descriptor):
+        real_fsync(descriptor)
+        events.append(("fsync", descriptor))
+
+    monkeypatch.setattr(store_module.os, "fchmod", tracked_fchmod)
+    monkeypatch.setattr(store_module.os, "fsync", tracked_fsync)
+    run(AssetStore(workspace, _Assets()).create(7, "script", "run.sh", {"run.sh": source}, None))
+
+    for index, event in enumerate(events):
+        if event[0] == "fchmod":
+            assert events[index + 1] == ("fsync", event[1])

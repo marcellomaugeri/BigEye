@@ -67,10 +67,17 @@ class AssetStore:
             os.replace(staging_name, destination_name, src_dir_fd=assets_descriptor, dst_dir_fd=assets_descriptor)
             published = True
             self._fsync_descriptor(assets_descriptor)
+            if not self._is_canonical_assets_directory(project_id, assets_descriptor):
+                self._remove_staging_at(assets_descriptor, destination_name)
+                self._fsync_descriptor(assets_descriptor)
+                raise ValueError("canonical assets directory changed during publication")
             return await self._repository.mark_validated(asset.id)
         except BaseException as error:
             if staging_name is not None and assets_descriptor is not None and not published:
-                self._remove_staging_at(assets_descriptor, staging_name)
+                try:
+                    self._remove_staging_at(assets_descriptor, staging_name)
+                except BaseException:
+                    pass
             try:
                 await self._repository.record_error(asset.id, str(error))
             except Exception:
@@ -120,8 +127,8 @@ class AssetStore:
                     while view:
                         written = os.write(output_descriptor, view)
                         view = view[written:]
-                os.fsync(output_descriptor)
                 os.fchmod(output_descriptor, 0o500 if kind == "script" and name.endswith(".sh") else 0o400)
+                os.fsync(output_descriptor)
             finally:
                 os.close(output_descriptor)
         return digest.hexdigest()
@@ -203,6 +210,18 @@ class AssetStore:
             os.close(descriptor)
         return assets_descriptor
 
+    def _is_canonical_assets_directory(self, project_id: int, publication_descriptor: int) -> bool:
+        try:
+            canonical_descriptor = self._open_assets_directory(project_id, create=False)
+        except OSError:
+            return False
+        try:
+            canonical = os.fstat(canonical_descriptor)
+            published = os.fstat(publication_descriptor)
+            return (canonical.st_dev, canonical.st_ino) == (published.st_dev, published.st_ino)
+        finally:
+            os.close(canonical_descriptor)
+
     @staticmethod
     def _after_assets_opened(_descriptor: int) -> None:
         """Test seam: publication remains anchored to this descriptor after path replacement."""
@@ -271,6 +290,7 @@ class AssetStore:
         except FileNotFoundError:
             return
         try:
+            os.fchmod(descriptor, 0o700)
             for child in os.listdir(descriptor):
                 source_stat = os.stat(child, dir_fd=descriptor, follow_symlinks=False)
                 if stat.S_ISDIR(source_stat.st_mode):
