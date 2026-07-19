@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Project } from '../models/project';
 import type { Settings } from '../models/settings';
 import type { Task } from '../models/task';
@@ -30,42 +30,71 @@ export function useBigEyeController(api: BigEyeApi, eventStream: ProjectEventStr
   const [settings, setSettings] = useState<Settings | null>(null);
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
+  const selectedProjectIdRef = useRef<string | null>(null);
+  const selectedTaskIdRef = useRef<string | null>(null);
+  const taskRequestGeneration = useRef(0);
+  const logRequestGeneration = useRef(0);
+  const createdProjectIds = useRef(new Set<string>());
 
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
 
   const loadTasks = useCallback(async (projectId: string) => {
+    const requestGeneration = ++taskRequestGeneration.current;
     setTasksLoading(true);
     setTasksError(null);
     try {
       const nextTasks = await api.listTasks(projectId);
+      if (requestGeneration !== taskRequestGeneration.current || selectedProjectIdRef.current !== projectId) return;
       setTasks(nextTasks);
-      setSelectedTaskId((current) => nextTasks.some((task) => task.id === current) ? current : (nextTasks[0]?.id ?? null));
+      const nextTaskId = nextTasks.some((task) => task.id === selectedTaskIdRef.current)
+        ? selectedTaskIdRef.current
+        : (nextTasks[0]?.id ?? null);
+      if (nextTaskId !== selectedTaskIdRef.current) {
+        selectedTaskIdRef.current = nextTaskId;
+        setSelectedTaskId(nextTaskId);
+        ++logRequestGeneration.current;
+        setLogContent('');
+        setLogError(null);
+      }
     } catch (error) {
+      if (requestGeneration !== taskRequestGeneration.current || selectedProjectIdRef.current !== projectId) return;
       setTasks([]);
       setTasksError(message(error, 'Could not load tasks.'));
     } finally {
-      setTasksLoading(false);
+      if (requestGeneration === taskRequestGeneration.current && selectedProjectIdRef.current === projectId) setTasksLoading(false);
     }
   }, [api]);
 
   const loadLog = useCallback(async (taskId: string) => {
+    const requestGeneration = ++logRequestGeneration.current;
     setLogLoading(true);
     setLogError(null);
     try {
       const log = await api.getTaskLog(taskId, 0);
+      if (requestGeneration !== logRequestGeneration.current || selectedTaskIdRef.current !== taskId) return;
       setLogContent(log.content);
     } catch (error) {
+      if (requestGeneration !== logRequestGeneration.current || selectedTaskIdRef.current !== taskId) return;
       setLogContent('');
       setLogError(message(error, 'Could not load the task log.'));
     } finally {
-      setLogLoading(false);
+      if (requestGeneration === logRequestGeneration.current && selectedTaskIdRef.current === taskId) setLogLoading(false);
     }
   }, [api]);
 
   const selectProject = useCallback((projectId: string) => {
+    selectedProjectIdRef.current = projectId;
     setSelectedProjectId(projectId);
+    ++taskRequestGeneration.current;
+    ++logRequestGeneration.current;
+    setTasks([]);
+    setTasksError(null);
+    setTasksLoading(false);
+    selectedTaskIdRef.current = null;
     setSelectedTaskId(null);
     setLogContent('');
+    setLogError(null);
+    setLogLoading(false);
     void loadTasks(projectId);
   }, [loadTasks]);
 
@@ -93,8 +122,18 @@ export function useBigEyeController(api: BigEyeApi, eventStream: ProjectEventStr
     setProjectError(null);
     try {
       const project = await api.createProject({ repository_url: repositoryUrl.trim(), worker_count: workerCountValue });
+      createdProjectIds.current.add(project.id);
       setProjects((current) => current.some((item) => item.id === project.id) ? current : [...current, project]);
+      selectedProjectIdRef.current = project.id;
       setSelectedProjectId(project.id);
+      ++taskRequestGeneration.current;
+      ++logRequestGeneration.current;
+      setTasks([]);
+      setTasksError(null);
+      selectedTaskIdRef.current = null;
+      setSelectedTaskId(null);
+      setLogContent('');
+      setLogError(null);
       setRepositoryUrl('');
       setPage('tasks');
       await loadTasks(project.id);
@@ -106,7 +145,12 @@ export function useBigEyeController(api: BigEyeApi, eventStream: ProjectEventStr
   }, [api, loadTasks, repositoryUrl, workerCount]);
 
   const selectTask = useCallback((taskId: string) => {
+    selectedTaskIdRef.current = taskId;
     setSelectedTaskId(taskId);
+    ++logRequestGeneration.current;
+    setLogContent('');
+    setLogError(null);
+    setLogLoading(false);
     void loadLog(taskId);
   }, [loadLog]);
 
@@ -114,8 +158,17 @@ export function useBigEyeController(api: BigEyeApi, eventStream: ProjectEventStr
     let active = true;
     void api.listProjects().then((nextProjects) => {
       if (!active) return;
-      setProjects(nextProjects);
-      setSelectedProjectId((current) => current && nextProjects.some((project) => project.id === current) ? current : (nextProjects[0]?.id ?? null));
+      const createdProjects = (current: Project[]) => current.filter((project) =>
+        createdProjectIds.current.has(project.id) && !nextProjects.some((item) => item.id === project.id)
+      );
+      setProjects((current) => [...nextProjects, ...createdProjects(current)]);
+      const selectedProjectStillExists = nextProjects.some((project) => project.id === selectedProjectIdRef.current)
+        || createdProjectIds.current.has(selectedProjectIdRef.current ?? '');
+      if (!selectedProjectStillExists) {
+        const nextProjectId = nextProjects[0]?.id ?? null;
+        selectedProjectIdRef.current = nextProjectId;
+        setSelectedProjectId(nextProjectId);
+      }
     }).catch((error: unknown) => {
       if (active) setProjectError(message(error, 'Could not load projects.'));
     }).finally(() => { if (active) setProjectsLoading(false); });
@@ -127,7 +180,9 @@ export function useBigEyeController(api: BigEyeApi, eventStream: ProjectEventStr
     return eventStream.subscribe(selectedProjectId, () => {
       void loadTasks(selectedProjectId);
       if (selectedTaskId) void loadLog(selectedTaskId);
-    }, () => undefined);
+    }, (eventError) => {
+      if (selectedProjectIdRef.current === selectedProjectId) setTasksError(eventError);
+    });
   }, [eventStream, loadLog, loadTasks, selectedProjectId, selectedTaskId]);
 
   useEffect(() => {
