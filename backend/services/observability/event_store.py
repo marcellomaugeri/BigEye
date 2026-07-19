@@ -1,0 +1,203 @@
+"""Descriptor-contained JSONL storage for project observability."""
+
+import asyncio
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
+import json
+import os
+from pathlib import Path
+import stat
+
+from backend.models.event import StoredEvent
+from backend.services.observability.redaction import redact
+from backend.services.projects.clone_repository import UnsafeWorkspacePath, contained_path
+
+
+STREAMS = frozenset({"activity", "debug", "events"})
+PUBLIC_STREAMS = frozenset({"activity", "debug"})
+INVALIDATION_NAMES = frozenset({"project", "campaigns", "coverage", "findings", "activity", "debug"})
+EVENT_RESPONSE_MAX_BYTES = 8 * 1024 * 1024
+EVENT_RECORD_MAX_BYTES = 1024 * 1024
+
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+_FILE_FLAGS = getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+class ProjectEventStore:
+    """Append-only activity/debug records plus a compact SSE invalidation log."""
+
+    def __init__(self, workspace: Path):
+        self._workspace = Path(workspace)
+        self._locks: dict[int, asyncio.Lock] = {}
+        self._listeners: set[Callable[[int], None]] = set()
+
+    def subscribe(self, listener: Callable[[int], None]) -> None:
+        self._listeners.add(listener)
+
+    def path_for(self, project_id: int, stream: str) -> Path:
+        self._validate_project_id(project_id)
+        self._validate_stream(stream)
+        return contained_path(self._workspace, "projects", str(project_id), "logs", f"{stream}.jsonl")
+
+    async def append(self, project_id: int, stream: str, payload) -> StoredEvent:
+        self._validate_project_id(project_id)
+        self._validate_stream(stream)
+        lock = self._locks.setdefault(project_id, asyncio.Lock())
+        async with lock:
+            if stream == "events":
+                event = self._append(project_id, stream, self._invalidation_payload(payload))
+            else:
+                event = self._append(project_id, stream, redact(payload))
+                self._append(project_id, "events", {"name": stream})
+        for listener in tuple(self._listeners):
+            listener(project_id)
+        return event
+
+    async def read(self, project_id: int, stream: str, after: int, limit: int) -> list[StoredEvent]:
+        self._validate_project_id(project_id)
+        self._validate_stream(stream)
+        if not isinstance(after, int) or isinstance(after, bool) or after < -1:
+            raise ValueError("event offset is invalid")
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ValueError("event limit is invalid")
+        descriptor = self._open_file(project_id, stream, create=False, write=False)
+        if descriptor is None:
+            return []
+        try:
+            return self._read_records(descriptor, stream, after, limit)
+        finally:
+            os.close(descriptor)
+
+    def _append(self, project_id: int, stream: str, payload) -> StoredEvent:
+        created_at = datetime.now(UTC)
+        descriptor = self._open_file(project_id, stream, create=True, write=True)
+        try:
+            offset = os.lseek(descriptor, 0, os.SEEK_END)
+            record = {
+                "id": offset,
+                "created_at": created_at.isoformat(),
+                "stream": stream,
+                "payload": payload,
+            }
+            encoded = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+            if len(encoded) > EVENT_RECORD_MAX_BYTES:
+                raise ValueError("event record exceeds its byte limit")
+            written = 0
+            while written < len(encoded):
+                count = os.write(descriptor, encoded[written:])
+                if count <= 0:
+                    raise OSError("event record could not be written")
+                written += count
+            os.fsync(descriptor)
+            return StoredEvent(offset, created_at, stream, payload)
+        finally:
+            os.close(descriptor)
+
+    def _read_records(self, descriptor: int, stream: str, after: int, limit: int) -> list[StoredEvent]:
+        size = os.fstat(descriptor).st_size
+        if after >= size:
+            return []
+        records: list[StoredEvent] = []
+        consumed = 0
+        with os.fdopen(os.dup(descriptor), "rb", closefd=True) as file:
+            if after >= 0:
+                file.seek(after)
+                file.readline(EVENT_RECORD_MAX_BYTES + 1)
+            while len(records) < limit:
+                offset = file.tell()
+                raw = file.readline(EVENT_RECORD_MAX_BYTES + 1)
+                if not raw:
+                    break
+                if not raw.endswith(b"\n"):
+                    file.readline()
+                    continue
+                if len(raw) > EVENT_RECORD_MAX_BYTES or consumed + len(raw) > EVENT_RESPONSE_MAX_BYTES:
+                    break
+                try:
+                    value = json.loads(raw.decode("utf-8"))
+                    created_at = datetime.fromisoformat(value["created_at"])
+                    if value["stream"] != stream:
+                        continue
+                    records.append(StoredEvent(offset, created_at, value["stream"], value["payload"]))
+                    consumed += len(raw)
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+        return records
+
+    def _open_file(self, project_id: int, stream: str, create: bool, write: bool) -> int | None:
+        try:
+            directory = self._log_directory(project_id, create)
+        except FileNotFoundError:
+            return None
+        try:
+            flags = (os.O_APPEND | os.O_WRONLY | os.O_CREAT if write else os.O_RDONLY) | _FILE_FLAGS
+            try:
+                descriptor = os.open(f"{stream}.jsonl", flags, 0o600, dir_fd=directory)
+            except FileNotFoundError:
+                return None
+            except OSError as error:
+                raise UnsafeWorkspacePath("project event log is unsafe") from error
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise UnsafeWorkspacePath("project event log must be a regular file")
+                return descriptor
+            except BaseException:
+                os.close(descriptor)
+                raise
+        finally:
+            os.close(directory)
+
+    def _log_directory(self, project_id: int, create: bool) -> int:
+        descriptor = self._workspace_fd()
+        try:
+            for name in ("projects", str(project_id), "logs"):
+                child = self._child_directory(descriptor, name, create)
+                os.close(descriptor)
+                descriptor = child
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def _workspace_fd(self) -> int:
+        absolute = Path(os.path.abspath(os.fspath(self._workspace)))
+        descriptor = os.open("/", _DIRECTORY_FLAGS)
+        try:
+            for part in absolute.parts[1:]:
+                child = os.open(part, _DIRECTORY_FLAGS, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+            return descriptor
+        except OSError as error:
+            os.close(descriptor)
+            raise UnsafeWorkspacePath("workspace directory is unsafe") from error
+
+    @staticmethod
+    def _child_directory(parent: int, name: str, create: bool) -> int:
+        try:
+            if create:
+                try:
+                    os.mkdir(name, mode=0o700, dir_fd=parent)
+                except FileExistsError:
+                    pass
+            return os.open(name, _DIRECTORY_FLAGS, dir_fd=parent)
+        except FileNotFoundError:
+            raise
+        except OSError as error:
+            raise UnsafeWorkspacePath("project event directory is unsafe") from error
+
+    @staticmethod
+    def _validate_project_id(project_id: int) -> None:
+        if not isinstance(project_id, int) or isinstance(project_id, bool) or project_id < 1:
+            raise ValueError("project ID is invalid")
+
+    @staticmethod
+    def _validate_stream(stream: str) -> None:
+        if stream not in STREAMS:
+            raise ValueError("event stream is invalid")
+
+    @staticmethod
+    def _invalidation_payload(payload) -> dict[str, str]:
+        if not isinstance(payload, Mapping) or set(payload) != {"name"} or payload["name"] not in INVALIDATION_NAMES:
+            raise ValueError("event invalidation is invalid")
+        return {"name": payload["name"]}

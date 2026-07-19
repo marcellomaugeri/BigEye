@@ -186,12 +186,13 @@ class TestDockerBounds:
 
 
 class TestProjectEventState:
-    def test_snapshot_includes_project_fields_even_without_task_change(self, tmp_path: Path) -> None:
-        from backend.services.run_project_backbone import ProjectEventWatcher
-        projects = AsyncMock(); projects.get.return_value = project()
-        tasks = AsyncMock(); tasks.list_for_project.return_value = []
-        snapshot = run(ProjectEventWatcher(tasks, SimpleNamespace(), projects).snapshot(7))
-        assert snapshot[0] == (None, None, None)
+    def test_internal_event_log_accepts_compact_project_invalidations(self, tmp_path: Path) -> None:
+        from backend.services.observability.event_store import ProjectEventStore
+
+        store = ProjectEventStore(tmp_path)
+        run(store.append(7, "events", {"name": "project"}))
+
+        assert run(store.read(7, "events", -1, 10))[0].payload == {"name": "project"}
 
 
 class TestTerminalPersistence:

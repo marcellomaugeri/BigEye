@@ -393,24 +393,21 @@ class TestLogAndSse:
         assert not outside.exists()
 
     def test_sse_streams_do_not_consume_each_others_changes(self, tmp_path: Path) -> None:
-        from backend.services.run_project_backbone import ProjectEventWatcher
-        from backend.services.stream_task_output import TaskLogReader
+        from backend.services.observability.event_store import ProjectEventStore
+        from backend.services.observability.event_stream import ProjectEventStream
 
-        task_repository = AsyncMock()
-        task_repository.list_for_project.return_value = [task()]
-        logs = tmp_path / "projects/7/logs"
-        logs.mkdir(parents=True)
-        (logs / "11.log").write_text("one")
-        watcher = ProjectEventWatcher(task_repository, TaskLogReader(tmp_path))
+        store = ProjectEventStore(tmp_path)
+        watcher = ProjectEventStream(store)
 
         async def scenario():
-            first_subscriber = watcher.stream(7, poll_interval=0)
-            second_subscriber = watcher.stream(7, poll_interval=0)
-            assert await anext(first_subscriber) == "data: updated\n\n"
-            assert await anext(second_subscriber) == "data: updated\n\n"
-            (logs / "11.log").write_text("two")
-            assert await anext(first_subscriber) == "data: updated\n\n"
-            assert await anext(second_subscriber) == "data: updated\n\n"
+            await store.append(7, "activity", {"message": "one"})
+            first_subscriber = watcher.stream(7, -1)
+            second_subscriber = watcher.stream(7, -1)
+            assert "event: activity" in await anext(first_subscriber)
+            assert "event: activity" in await anext(second_subscriber)
+            await store.append(7, "debug", {"message": "two"})
+            assert "event: debug" in await anext(first_subscriber)
+            assert "event: debug" in await anext(second_subscriber)
             await first_subscriber.aclose()
             await second_subscriber.aclose()
 
@@ -469,7 +466,7 @@ class TestApi:
         assert response.json() == {"database": True, "docker": False, "openai_api_key_present": True, "toolchain": False}
 
     def test_asgi_repository_journey_uses_real_scheduler_logs_analysis_and_events(self, tmp_path: Path) -> None:
-        """HTTP SSE is infinite, so this journey reads its real watcher directly."""
+        """HTTP SSE is infinite, so this journey reads its durable stream directly."""
         import httpx
         from backend.api.app import create_app
         from backend.api.dependencies import Services
@@ -478,7 +475,9 @@ class TestApi:
         from backend.services.projects.create_project import CreateProjectService
         from backend.services.execute_project_backbone import ExecuteProjectBackbone
         from backend.services.read_analysis import AnalysisReader
-        from backend.services.run_project_backbone import ProjectBackboneService, ProjectEventWatcher
+        from backend.services.run_project_backbone import ProjectBackboneService
+        from backend.services.observability.event_store import ProjectEventStore
+        from backend.services.observability.event_stream import ProjectEventStream
         from backend.services.stream_task_output import TaskLogWriter
 
         class Projects:
@@ -516,8 +515,10 @@ class TestApi:
                 (path / "repository.md").write_text("repository analysis\n"); completed.set()
         executor = ExecuteProjectBackbone(projects, tasks, Clone(), Toolchain(), Analysis(), logs, tmp_path)
         backbone = ProjectBackboneService(projects, executor)
+        observability = ProjectEventStore(tmp_path)
         services = Services(CreateProjectService(projects, backbone), projects, tasks, logs,
-                            ProjectEventWatcher(tasks, logs), SimpleNamespace(check=lambda: {}), backbone, AnalysisReader(tmp_path))
+                            ProjectEventStream(observability), SimpleNamespace(check=lambda: {}), backbone,
+                            AnalysisReader(tmp_path), observability=observability)
         app = create_app(services=services)
         async def scenario():
             async with app.router.lifespan_context(app):
@@ -534,10 +535,11 @@ class TestApi:
                     assert log.json()["content"] == "clone complete\n" and log.json()["next_offset"] == 15
                     analysis = await client.get(f"/api/projects/{project_id}/analysis")
                     assert analysis.json() == {"content": "repository analysis\n"}
-                    events = services.events.stream(int(project_id), poll_interval=0)
-                    assert await anext(events) == "data: updated\n\n"
-                    await logs.append(next(item for item in tasks.items.values() if item.name == "LLVM toolchain preparation"), "updated\n")
-                    assert await asyncio.wait_for(anext(events), 1) == "data: updated\n\n"
+                    await observability.append(int(project_id), "activity", {"message": "created"})
+                    events = services.events.stream(int(project_id), -1)
+                    assert "event: activity" in await anext(events)
+                    await observability.append(int(project_id), "debug", {"message": "updated"})
+                    assert "event: debug" in await asyncio.wait_for(anext(events), 1)
                     await events.aclose()
         run(scenario())
 

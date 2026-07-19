@@ -64,4 +64,18 @@ async def get_analysis(project_id: int, request: Request):
 async def project_events(project_id: int, request: Request):
     if await services(request).projects.get(project_id) is None:
         raise HTTPException(status_code=404, detail="project not found")
-    return StreamingResponse(services(request).events.stream(project_id), media_type="text/event-stream")
+    after = request.headers.get("last-event-id")
+    if after is None:
+        cursor = -1
+    elif not after.isascii() or not after.isdecimal():
+        raise HTTPException(status_code=422, detail="Last-Event-ID must be a non-negative byte offset")
+    else:
+        try:
+            cursor = int(after)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail="Last-Event-ID must be a non-negative byte offset") from error
+    return StreamingResponse(
+        services(request).events.stream(project_id, cursor),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache"},
+    )

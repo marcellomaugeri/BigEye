@@ -10,7 +10,9 @@ from backend.services.projects.create_project import CreateProjectService
 from backend.services.projects.clone_repository import CloneRepositoryService
 from backend.services.projects.project_settings import ProjectSettingsService
 from backend.services.read_analysis import AnalysisReader
-from backend.services.run_project_backbone import ProjectBackboneService, ProjectEventWatcher
+from backend.services.run_project_backbone import ProjectBackboneService
+from backend.services.observability.event_store import ProjectEventStore
+from backend.services.observability.event_stream import ProjectEventStream
 from backend.services.stream_task_output import TaskLogReader
 from backend.services.stream_task_output import TaskLogWriter
 from backend.services.execute_project_backbone import ExecuteProjectBackbone
@@ -29,6 +31,7 @@ class Services:
     recovery: object
     analysis: object | None = None
     project_settings: object | None = None
+    observability: object | None = None
 
     async def close(self) -> None:
         close = getattr(self.recovery, "close", None)
@@ -45,10 +48,11 @@ def build_services(pool, workspace: Path) -> Services:
     analysis = RepositoryAnalysisWorkflow(workspace)
     executor = ExecuteProjectBackbone(projects, tasks, clone, toolchain, analysis, logs, workspace)
     backbone = ProjectBackboneService(projects, executor)
+    observability = ProjectEventStore(workspace)
     return Services(
         project_creator=CreateProjectService(projects, backbone), projects=projects, tasks=tasks,
-        logs=logs, events=ProjectEventWatcher(tasks, logs, projects),
+        logs=logs, events=ProjectEventStream(observability),
         settings=SettingsService(pool, toolchain.docker_available, toolchain.toolchain_available),
         recovery=backbone, analysis=AnalysisReader(workspace),
-        project_settings=ProjectSettingsService(projects),
+        project_settings=ProjectSettingsService(projects), observability=observability,
     )
