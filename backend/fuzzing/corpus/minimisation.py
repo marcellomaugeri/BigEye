@@ -5,11 +5,10 @@ from __future__ import annotations
 import fcntl
 import os
 import stat
-import threading
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Callable, ContextManager, Protocol
+from typing import Callable, Protocol
 from uuid import uuid4
 
 from backend.fuzzing.corpus.admission import (
@@ -17,6 +16,10 @@ from backend.fuzzing.corpus.admission import (
     _file_identity,
     _read_descriptor,
     _same_directory_path,
+)
+from backend.fuzzing.corpus.quiescence import (
+    CampaignQuiescenceService,
+    CampaignWriterIdentity,
 )
 
 
@@ -43,61 +46,24 @@ class CorpusFile:
     content_sha256: str
 
 
-_QUIESCENCE_SEAL = object()
-
-
-class _QuiescenceState:
-    def __init__(self, is_active: Callable[[], bool]):
-        self.is_active = is_active
-        self.used = False
-        self.lock = threading.Lock()
-
-
-@dataclass(frozen=True)
-class QuiescenceToken:
-    """One-use proof that the campaign controller has paused corpus writers."""
-
-    corpus_path: Path
-    _state: _QuiescenceState
-    _seal: object
-
-    @classmethod
-    def issue(cls, corpus_path: Path, is_active: Callable[[], bool]) -> QuiescenceToken:
-        if not callable(is_active):
-            raise ValueError("quiescence activity check must be callable")
-        return cls(
-            Path(os.path.abspath(corpus_path)),
-            _QuiescenceState(is_active),
-            _QUIESCENCE_SEAL,
-        )
-
-    def claim(self, corpus_path: Path) -> None:
-        self._require_valid_for(corpus_path)
-        with self._state.lock:
-            if self._state.used:
-                raise ValueError("quiescence token was already used")
-            if not self._state.is_active():
-                raise ValueError("quiescence token is not active")
-            self._state.used = True
-
-    def require_active(self, corpus_path: Path) -> None:
-        self._require_valid_for(corpus_path)
-        if not self._state.is_active():
-            raise ValueError("quiescence token is not active")
-
-    def _require_valid_for(self, corpus_path: Path) -> None:
-        if self._seal is not _QUIESCENCE_SEAL:
-            raise ValueError("invalid quiescence token")
-        if self.corpus_path != Path(os.path.abspath(corpus_path)):
-            raise ValueError("invalid quiescence token")
-
-
 class NativeCorpusRunner(Protocol):
     def run(self, campaign: CorpusCampaign, command: tuple[str, ...], output: Path) -> None: ...
 
 
-class CorpusQuiesceProvider(Protocol):
-    def hold(self, campaign: CorpusCampaign) -> ContextManager[QuiescenceToken]: ...
+@dataclass
+class _PublicationOperation:
+    run_callback: Callable[[], int]
+    commit_callback: Callable[[], None]
+    rollback_callback: Callable[[], None]
+
+    def run(self) -> int:
+        return self.run_callback()
+
+    def commit(self) -> None:
+        self.commit_callback()
+
+    def rollback(self) -> None:
+        self.rollback_callback()
 
 
 class CorpusMinimiser:
@@ -110,7 +76,8 @@ class CorpusMinimiser:
         max_depth: int = 32,
         max_file_bytes: int = 1_048_576,
         max_total_bytes: int = 256 * 1_048_576,
-        quiesce_provider: CorpusQuiesceProvider | None = None,
+        quiescence_service: CampaignQuiescenceService | None = None,
+        campaign_identity: CampaignWriterIdentity | None = None,
     ):
         limits = (max_entries, max_directories, max_depth, max_file_bytes, max_total_bytes)
         if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in limits):
@@ -122,7 +89,8 @@ class CorpusMinimiser:
         self._max_depth = max_depth
         self._max_file_bytes = max_file_bytes
         self._max_total_bytes = max_total_bytes
-        self._quiesce_provider = quiesce_provider
+        self._quiescence_service = quiescence_service
+        self._campaign_identity = campaign_identity
 
     def minimise(self, campaign: CorpusCampaign) -> CorpusResult:
         corpus = Path(os.path.abspath(campaign.corpus_dir))
@@ -254,7 +222,7 @@ class CorpusMinimiser:
                     len(candidate_manifest),
                     tuple(commands),
                 )
-            if self._quiesce_provider is None:
+            if self._quiescence_service is None or self._campaign_identity is None:
                 return CorpusResult(
                     False,
                     "corpus publication requires external-writer quiescence",
@@ -262,15 +230,9 @@ class CorpusMinimiser:
                     len(candidate_manifest),
                     tuple(commands),
                 )
-            with self._quiesce_provider.hold(campaign) as quiescence_token:
-                if not isinstance(quiescence_token, QuiescenceToken):
-                    raise ValueError("invalid quiescence token")
-                quiescence_token.claim(corpus)
-                self._before_quiesced_validation(corpus)
-                quiescence_token.require_active(corpus)
-                self._require_manifest(corpus_descriptor, live_manifest, "live corpus")
-                self._require_manifest(candidate_descriptor, candidate_manifest, "candidate corpus")
-                self._publish_candidate(
+            retired_name = f".{corpus.name}.retired-{uuid4().hex}"
+            publication = _PublicationOperation(
+                lambda: self._publish_candidate(
                     parent_path,
                     parent_descriptor,
                     parent_identity,
@@ -282,26 +244,30 @@ class CorpusMinimiser:
                     candidate_identity,
                     live_manifest,
                     candidate_manifest,
-                    quiescence_token,
-                )
-                published_descriptor = os.open(
+                ),
+                lambda: self._commit_candidate(
+                    parent_descriptor,
                     corpus.name,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                    dir_fd=parent_descriptor,
-                )
-                try:
-                    after_count = len(self._manifest(published_descriptor))
-                finally:
-                    os.close(published_descriptor)
-                quiescence_token.require_active(corpus)
-                result = CorpusResult(
-                    True,
-                    "clean coverage preserved",
-                    len(live_manifest),
-                    after_count,
-                    tuple(commands),
-                )
-            return result
+                    corpus_descriptor,
+                    corpus_identity,
+                    retired_name,
+                ),
+                lambda: self._rollback_candidate(
+                    parent_descriptor,
+                    corpus.name,
+                    corpus_descriptor,
+                    corpus_identity,
+                    retired_name,
+                ),
+            )
+            after_count = self._quiescence_service.execute(self._campaign_identity, publication)
+            return CorpusResult(
+                True,
+                "clean coverage preserved",
+                len(live_manifest),
+                after_count,
+                tuple(commands),
+            )
         finally:
             if candidate_descriptor is not None:
                 os.close(candidate_descriptor)
@@ -322,9 +288,8 @@ class CorpusMinimiser:
         candidate_identity,
         live_manifest,
         candidate_manifest,
-        quiescence_token,
-    ) -> None:
-        quiescence_token.require_active(parent_path / corpus_name)
+    ) -> int:
+        self._before_quiesced_validation(parent_path / corpus_name)
         self._require_parent(parent_path, parent_identity)
         self._require_named_directory(parent_descriptor, corpus_name, corpus_descriptor, corpus_identity, "corpus")
         self._require_named_directory(parent_descriptor, candidate_name, candidate_descriptor, candidate_identity, "native output")
@@ -337,51 +302,82 @@ class CorpusMinimiser:
             raise ValueError("stale corpus backup must be recovered before minimisation")
 
         self._before_atomic_replace(parent_path / corpus_name)
-        quiescence_token.require_active(parent_path / corpus_name)
         self._require_manifest(corpus_descriptor, live_manifest, "live corpus")
         self._require_manifest(candidate_descriptor, candidate_manifest, "candidate corpus")
-        quiescence_token.require_active(parent_path / corpus_name)
+        self._require_manifest(corpus_descriptor, live_manifest, "live corpus")
 
         os.replace(corpus_name, backup_name, src_dir_fd=parent_descriptor, dst_dir_fd=parent_descriptor)
         os.fsync(parent_descriptor)
-        try:
-            os.replace(candidate_name, corpus_name, src_dir_fd=parent_descriptor, dst_dir_fd=parent_descriptor)
-            os.fsync(parent_descriptor)
-        except BaseException:
-            os.replace(backup_name, corpus_name, src_dir_fd=parent_descriptor, dst_dir_fd=parent_descriptor)
-            os.fsync(parent_descriptor)
-            raise
+        os.replace(candidate_name, corpus_name, src_dir_fd=parent_descriptor, dst_dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
 
-        verified = False
+        published = os.open(
+            corpus_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_descriptor,
+        )
         try:
-            published = os.open(
-                corpus_name,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=parent_descriptor,
-            )
-            try:
-                verified = _directory_identity(published) == candidate_identity
-            finally:
-                os.close(published)
-            verified = verified and _same_directory_path(parent_path / corpus_name, candidate_identity)
-            verified = verified and _same_directory_path(parent_path, parent_identity)
+            verified = _directory_identity(published) == candidate_identity
+            verified = verified and self._manifest(published) == candidate_manifest
+            after_count = len(candidate_manifest)
         finally:
-            if not verified:
-                failed_name = f".{corpus_name}.failed-{uuid4().hex}"
-                try:
-                    os.replace(corpus_name, failed_name, src_dir_fd=parent_descriptor, dst_dir_fd=parent_descriptor)
-                finally:
-                    os.replace(backup_name, corpus_name, src_dir_fd=parent_descriptor, dst_dir_fd=parent_descriptor)
-                    os.fsync(parent_descriptor)
-                self._remove_entry_at(parent_descriptor, failed_name)
+            os.close(published)
+        verified = verified and _same_directory_path(parent_path / corpus_name, candidate_identity)
+        verified = verified and _same_directory_path(parent_path, parent_identity)
         if not verified:
             raise ValueError("candidate corpus publication could not be verified")
-        retired_name = f".{corpus_name}.retired-{uuid4().hex}"
+        self._after_candidate_publication(parent_path / corpus_name)
+        return after_count
+
+    def _commit_candidate(
+        self,
+        parent_descriptor: int,
+        corpus_name: str,
+        original_descriptor: int,
+        original_identity: tuple[int, int],
+        retired_name: str,
+    ) -> None:
+        backup_name = f".{corpus_name}.before-minimisation"
+        self._require_named_directory(
+            parent_descriptor,
+            backup_name,
+            original_descriptor,
+            original_identity,
+            "corpus backup",
+        )
         os.replace(backup_name, retired_name, src_dir_fd=parent_descriptor, dst_dir_fd=parent_descriptor)
         os.fsync(parent_descriptor)
-        self._remove_entry_at(parent_descriptor, retired_name)
+
+    def _rollback_candidate(
+        self,
+        parent_descriptor: int,
+        corpus_name: str,
+        original_descriptor: int,
+        original_identity: tuple[int, int],
+        retired_name: str,
+    ) -> None:
+        backup_name = f".{corpus_name}.before-minimisation"
+        rollback_name = backup_name
+        if not self._entry_exists(parent_descriptor, rollback_name):
+            rollback_name = retired_name
+        if not self._entry_exists(parent_descriptor, rollback_name):
+            return
+        self._require_named_directory(
+            parent_descriptor,
+            rollback_name,
+            original_descriptor,
+            original_identity,
+            "corpus backup",
+        )
+        failed_name: str | None = None
+        if self._entry_exists(parent_descriptor, corpus_name):
+            failed_name = f".{corpus_name}.failed-{uuid4().hex}"
+            os.replace(corpus_name, failed_name, src_dir_fd=parent_descriptor, dst_dir_fd=parent_descriptor)
+        os.replace(rollback_name, corpus_name, src_dir_fd=parent_descriptor, dst_dir_fd=parent_descriptor)
         os.fsync(parent_descriptor)
-        quiescence_token.require_active(parent_path / corpus_name)
+        if failed_name is not None:
+            self._remove_entry_at(parent_descriptor, failed_name)
+            os.fsync(parent_descriptor)
 
     def _recover_interrupted_publication(self, parent_descriptor: int, corpus_name: str) -> None:
         backup = f".{corpus_name}.before-minimisation"
@@ -464,6 +460,9 @@ class CorpusMinimiser:
         pass
 
     def _before_atomic_replace(self, corpus: Path) -> None:
+        pass
+
+    def _after_candidate_publication(self, corpus: Path) -> None:
         pass
 
     def _after_manifest_file(self, root_descriptor: int, relative_path: tuple[str, ...]) -> None:
