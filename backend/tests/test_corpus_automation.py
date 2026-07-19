@@ -6,6 +6,7 @@ import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -242,6 +243,32 @@ class _NativeRunner:
             output.write_bytes(b"k")
 
 
+class _FakeQuiescence:
+    def __init__(self, writer_lock=None, reuse_token=False):
+        self.writer_lock = writer_lock or threading.Lock()
+        self.reuse_token = reuse_token
+        self.token = None
+
+    @contextmanager
+    def hold(self, campaign):
+        from backend.fuzzing.corpus.minimisation import QuiescenceToken
+
+        with self.writer_lock:
+            active = [True]
+            if self.token is None or not self.reuse_token:
+                self.token = QuiescenceToken.issue(campaign.corpus_dir, lambda: active[0])
+            try:
+                yield self.token
+            finally:
+                active[0] = False
+
+
+def _quiesced_minimiser(runner, coverage, provider=None):
+    from backend.fuzzing.corpus.minimisation import CorpusMinimiser
+
+    return CorpusMinimiser(runner, coverage, quiesce_provider=provider or _FakeQuiescence())
+
+
 def test_afl_minimisation_uses_native_tools_and_replaces_only_after_coverage_preservation(tmp_path: Path) -> None:
     from backend.fuzzing.corpus.minimisation import CorpusCampaign, CorpusMinimiser
 
@@ -251,7 +278,7 @@ def test_afl_minimisation_uses_native_tools_and_replaces_only_after_coverage_pre
     (corpus / "drop").write_bytes(b"drop")
     campaign = CorpusCampaign("afl++", corpus, ("/opt/bigeye/target", "@@"))
     runner = _NativeRunner()
-    minimiser = CorpusMinimiser(runner, lambda _campaign, _corpus: frozenset({"parser.c:12"}))
+    minimiser = _quiesced_minimiser(runner, lambda _campaign, _corpus: frozenset({"parser.c:12"}))
 
     result = minimiser.minimise(campaign)
 
@@ -369,7 +396,11 @@ def test_minimisation_restores_original_when_candidate_publication_fails(tmp_pat
 
     monkeypatch.setattr(module.os, "replace", fail_candidate)
     with pytest.raises(OSError, match="forced publication failure"):
-        module.CorpusMinimiser(_NativeRunner(), lambda _campaign, _path: frozenset({"a.c:1"})).minimise(campaign)
+        module.CorpusMinimiser(
+            _NativeRunner(),
+            lambda _campaign, _path: frozenset({"a.c:1"}),
+            quiesce_provider=_FakeQuiescence(),
+        ).minimise(campaign)
 
     assert (corpus / "keep").read_bytes() == b"original"
 
@@ -385,7 +416,7 @@ def test_minimisation_recovers_original_after_interrupted_post_publish_cleanup(t
     (corpus / "keep").write_bytes(b"unverified-candidate")
     (backup / "keep").write_bytes(b"original")
 
-    result = CorpusMinimiser(_NativeRunner(), lambda _campaign, _path: frozenset({"a.c:1"})).minimise(
+    result = _quiesced_minimiser(_NativeRunner(), lambda _campaign, _path: frozenset({"a.c:1"})).minimise(
         CorpusCampaign("libfuzzer", corpus, ("/target",)),
     )
 
@@ -421,7 +452,7 @@ def test_minimisation_serialises_operations_for_one_corpus(tmp_path: Path) -> No
                     self.active -= 1
 
     runner = ConcurrentRunner()
-    minimiser = CorpusMinimiser(runner, lambda _campaign, _path: frozenset({"a.c:1"}))
+    minimiser = _quiesced_minimiser(runner, lambda _campaign, _path: frozenset({"a.c:1"}))
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = tuple(executor.map(lambda _index: minimiser.minimise(campaign), range(2)))
 
@@ -504,6 +535,136 @@ def test_minimisation_rejects_candidate_content_swap_after_coverage_probe(tmp_pa
         CorpusMinimiser(_NativeRunner(), coverage).minimise(CorpusCampaign("libfuzzer", corpus, ("/target",)))
 
     assert (corpus / "keep").read_bytes() == b"original"
+
+
+def test_minimisation_without_quiesce_provider_evaluates_but_never_replaces(tmp_path: Path) -> None:
+    from backend.fuzzing.corpus.minimisation import CorpusCampaign, CorpusMinimiser
+
+    corpus = tmp_path / "campaign/corpus"
+    corpus.mkdir(parents=True)
+    (corpus / "keep").write_bytes(b"original")
+
+    result = CorpusMinimiser(_NativeRunner(), lambda _campaign, _path: frozenset({"a.c:1"})).minimise(
+        CorpusCampaign("libfuzzer", corpus, ("/target",)),
+    )
+
+    assert result.replaced is False
+    assert result.reason == "corpus publication requires external-writer quiescence"
+    assert (corpus / "keep").read_bytes() == b"original"
+
+
+def test_minimisation_rejects_invalid_and_reused_quiescence_tokens(tmp_path: Path) -> None:
+    from backend.fuzzing.corpus.minimisation import CorpusCampaign, CorpusMinimiser
+
+    corpus = tmp_path / "campaign/corpus"
+    corpus.mkdir(parents=True)
+    (corpus / "keep").write_bytes(b"original")
+    campaign = CorpusCampaign("libfuzzer", corpus, ("/target",))
+
+    class InvalidProvider:
+        @contextmanager
+        def hold(self, _campaign):
+            yield object()
+
+    with pytest.raises(ValueError, match="invalid quiescence token"):
+        CorpusMinimiser(
+            _NativeRunner(),
+            lambda _campaign, _path: frozenset({"a.c:1"}),
+            quiesce_provider=InvalidProvider(),
+        ).minimise(campaign)
+    assert (corpus / "keep").read_bytes() == b"original"
+
+    reused = _FakeQuiescence(reuse_token=True)
+    minimiser = _quiesced_minimiser(_NativeRunner(), lambda _campaign, _path: frozenset({"a.c:1"}), reused)
+    assert minimiser.minimise(campaign).replaced is True
+    with pytest.raises(ValueError, match="quiescence token was already used"):
+        minimiser.minimise(campaign)
+
+
+@pytest.mark.parametrize("injection", ["during_manifest", "before_replace"])
+def test_minimisation_detects_writer_when_provider_does_not_actually_quiesce(tmp_path: Path, injection: str) -> None:
+    from backend.fuzzing.corpus.minimisation import CorpusCampaign, CorpusMinimiser
+
+    corpus = tmp_path / "campaign/corpus"
+    corpus.mkdir(parents=True)
+    keep = corpus / "keep"
+    keep.write_bytes(b"original")
+
+    class InjectingMinimiser(CorpusMinimiser):
+        armed = False
+
+        def _before_quiesced_validation(self, _corpus):
+            self.armed = True
+
+        def _after_manifest_file(self, _descriptor, _relative_path):
+            if self.armed and injection == "during_manifest":
+                self.armed = False
+                (corpus / "late-during-manifest").write_bytes(b"late")
+
+        def _before_atomic_replace(self, _corpus):
+            if injection == "before_replace":
+                keep.write_bytes(b"changed-before-replace")
+
+    with pytest.raises(ValueError, match="live corpus changed during minimisation"):
+        InjectingMinimiser(
+            _NativeRunner(),
+            lambda _campaign, _path: frozenset({"a.c:1"}),
+            quiesce_provider=_FakeQuiescence(),
+        ).minimise(CorpusCampaign("libfuzzer", corpus, ("/target",)))
+
+    if injection == "during_manifest":
+        assert (corpus / "late-during-manifest").read_bytes() == b"late"
+    else:
+        assert keep.read_bytes() == b"changed-before-replace"
+
+
+def test_quiescence_provider_blocks_external_writer_until_atomic_replacement_finishes(tmp_path: Path) -> None:
+    from backend.fuzzing.corpus.minimisation import CorpusCampaign, CorpusMinimiser
+
+    corpus = tmp_path / "campaign/corpus"
+    corpus.mkdir(parents=True)
+    keep = corpus / "keep"
+    keep.write_bytes(b"original")
+    writer_lock = threading.Lock()
+    provider = _FakeQuiescence(writer_lock=writer_lock)
+
+    class BlockingWriterMinimiser(CorpusMinimiser):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.writers = []
+
+        def _attempt_write(self, action):
+            attempted = threading.Event()
+
+            def write():
+                attempted.set()
+                with writer_lock:
+                    action()
+
+            worker = threading.Thread(target=write)
+            worker.start()
+            assert attempted.wait(1)
+            self.writers.append(worker)
+
+        def _before_quiesced_validation(self, _corpus):
+            self._attempt_write(lambda: (corpus / "late-after-release").write_bytes(b"late"))
+
+        def _before_atomic_replace(self, _corpus):
+            self._attempt_write(lambda: keep.write_bytes(b"changed-after-release"))
+
+    minimiser = BlockingWriterMinimiser(
+        _NativeRunner(),
+        lambda _campaign, _path: frozenset({"a.c:1"}),
+        quiesce_provider=provider,
+    )
+    result = minimiser.minimise(CorpusCampaign("libfuzzer", corpus, ("/target",)))
+    for writer in minimiser.writers:
+        writer.join(1)
+
+    assert result.replaced is True
+    assert all(not writer.is_alive() for writer in minimiser.writers)
+    assert (corpus / "late-after-release").read_bytes() == b"late"
+    assert keep.read_bytes() == b"changed-after-release"
 
 
 def test_corpus_sync_requires_exact_contract_and_revalidates_each_input(tmp_path: Path) -> None:
