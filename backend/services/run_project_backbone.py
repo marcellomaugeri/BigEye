@@ -2,6 +2,8 @@
 
 import asyncio
 
+from backend.fuzzing.docker.client import DOCKER_REQUEST_TIMEOUT_SECONDS
+
 
 class AnalysisNotReady(RuntimeError):
     """Raised while repository analysis has not produced its artifact."""
@@ -32,19 +34,28 @@ class ProjectBackboneService:
         for task in tasks:
             task.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=DOCKER_REQUEST_TIMEOUT_SECONDS + 5)
+            except TimeoutError:
+                return
 
 
 class ProjectEventWatcher:
-    def __init__(self, tasks, logs):
+    def __init__(self, tasks, logs, projects=None):
         self._tasks = tasks
         self._logs = logs
+        self._projects = projects
     async def snapshot(self, project_id: int) -> tuple:
         tasks = await self._tasks.list_for_project(project_id)
         state = []
+        project_state = (None, None, None)
+        if self._projects is not None:
+            project = await self._projects.get(project_id)
+            if project is not None:
+                project_state = (project.commit_sha, project.finished_at, project.error)
         for task in tasks:
             state.append((task.id, task.finished_at, task.error, await self._logs.signature_for(task)))
-        return tuple(state)
+        return (project_state, tuple(state))
 
     async def stream(self, project_id: int, poll_interval: float = 1):
         previous = object()

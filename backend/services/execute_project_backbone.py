@@ -61,6 +61,13 @@ class ExecuteProjectBackbone:
             if project.commit_sha and verify is not None and await verify(project):
                 await self._tasks.finish(task.id)
                 return True
+            if project.commit_sha is None:
+                recover = getattr(self._clone, "recover_published", None)
+                if recover is not None:
+                    recovered = await recover(project, task)
+                    if recovered is not None:
+                        await self._tasks.finish(task.id)
+                        return True
             await self._clone.clone(project, task)
             await self._tasks.finish(task.id)
             return True

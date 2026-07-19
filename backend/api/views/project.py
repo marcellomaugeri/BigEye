@@ -9,7 +9,7 @@ class CreateProjectRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     repository_url: str = Field(min_length=1, max_length=2048)
-    worker_count: int = Field(gt=0)
+    worker_count: int = Field(gt=0, le=2_147_483_647)
 
 
 class ProjectResponse(BaseModel):

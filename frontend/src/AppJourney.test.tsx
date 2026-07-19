@@ -54,7 +54,7 @@ function apiDouble(overrides: Partial<BigEyeApi> = {}): BigEyeApi {
   return {
     createProject: vi.fn().mockResolvedValue(firstProject),
     listProjects: vi.fn().mockResolvedValue([firstProject, secondProject]),
-    getProject: vi.fn(),
+    getProject: vi.fn().mockResolvedValue(firstProject),
     listTasks: vi.fn().mockResolvedValue([task]),
     getTaskLog: vi.fn().mockResolvedValue({ content: 'analysis started\n', next_offset: 17 }),
     getSettings: vi.fn().mockResolvedValue({
@@ -244,5 +244,35 @@ describe('App journey', () => {
     reportError?.('Live updates are temporarily unavailable.');
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Live updates are temporarily unavailable.');
+  });
+
+  it('refreshes the selected project on a live event and renders its genuine completion state', async () => {
+    let notify: (() => void) | undefined;
+    const completed = { ...firstProject, commit_sha: 'a'.repeat(40), finished_at: '2026-07-19T12:00:00Z' };
+    const api = apiDouble({ getProject: vi.fn().mockResolvedValue(completed) });
+    const eventStream: ProjectEventStream = { subscribe: vi.fn((_id, onEvent) => { notify = onEvent; return () => undefined; }) };
+    render(<App api={api} eventStream={eventStream} />);
+    await screen.findByRole('option', { name: secondProject.repository_url });
+    await waitFor(() => expect(eventStream.subscribe).toHaveBeenCalled());
+    notify?.();
+    await waitFor(() => expect(api.getProject).toHaveBeenCalledWith(firstProject.id));
+    expect(await screen.findByText(/Complete/)).toBeInTheDocument();
+    expect(screen.getByText(completed.commit_sha)).toBeInTheDocument();
+  });
+
+  it('appends only new log bytes after a live event', async () => {
+    let notify: (() => void) | undefined;
+    const api = apiDouble({ getTaskLog: vi.fn().mockResolvedValueOnce({ content: 'one\n', next_offset: 4 }).mockResolvedValueOnce({ content: 'two\n', next_offset: 8 }) });
+    const eventStream: ProjectEventStream = { subscribe: vi.fn((_id, onEvent) => { notify = onEvent; return () => undefined; }) };
+    const user = userEvent.setup();
+    render(<App api={api} eventStream={eventStream} />);
+    await screen.findByRole('option', { name: secondProject.repository_url });
+    await waitFor(() => expect(eventStream.subscribe).toHaveBeenCalled());
+    await user.click(screen.getByRole('link', { name: 'Logs' }));
+    expect(await screen.findByText('one')).toBeInTheDocument();
+    notify?.();
+    await waitFor(() => expect(screen.getByLabelText('Task log output')).toHaveTextContent('two'));
+    expect(api.getTaskLog).toHaveBeenLastCalledWith(task.id, 4);
+    expect(screen.getByLabelText('Task log output').textContent).toBe('one\ntwo\n');
   });
 });

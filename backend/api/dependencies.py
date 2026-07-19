@@ -45,7 +45,7 @@ def build_services(pool, workspace: Path) -> Services:
     backbone = ProjectBackboneService(projects, executor)
     return Services(
         project_creator=CreateProjectService(projects, backbone), projects=projects, tasks=tasks,
-        logs=logs, events=ProjectEventWatcher(tasks, logs),
+        logs=logs, events=ProjectEventWatcher(tasks, logs, projects),
         settings=SettingsService(pool, toolchain.docker_available, toolchain.toolchain_available),
         recovery=backbone, analysis=AnalysisReader(workspace),
     )

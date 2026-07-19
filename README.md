@@ -6,6 +6,8 @@ and publishes a cited repository analysis when an OpenAI key is configured.
 
 ## First run
 
+Terminal 1:
+
 ```sh
 cp .env.example .env
 docker compose up -d postgres
@@ -16,6 +18,11 @@ python3.14 -m venv backend/.venv
 backend/.venv/bin/python -m pip install -r backend/requirements.txt
 set -a; . ./.env; set +a
 backend/.venv/bin/uvicorn backend.api.app:app --reload
+```
+
+Terminal 2:
+
+```sh
 cd frontend && npm install && npm run dev
 ```
 

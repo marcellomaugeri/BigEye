@@ -12,3 +12,5 @@ export interface CreateProjectRequest {
   repository_url: string;
   worker_count: number;
 }
+
+export const MAX_WORKER_COUNT = 2_147_483_647;

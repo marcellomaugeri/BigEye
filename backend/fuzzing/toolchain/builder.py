@@ -1,6 +1,7 @@
 """Build or safely reuse BigEye's maintained LLVM image."""
 
 from hashlib import sha256
+import inspect
 from pathlib import Path
 import threading
 
@@ -19,7 +20,7 @@ class ToolchainBuilder:
         digest = sha256(b"bigeye-llvm-v1\0linux/amd64\0" + self._dockerfile.read_bytes()).hexdigest()[:20]
         return f"bigeye-llvm:{digest}"
 
-    def ensure(self, sink):
+    def ensure(self, sink, cancellation_signal=None):
         tag = self.tag()
         try:
             return self._inspector.inspect(tag)
@@ -28,7 +29,11 @@ class ToolchainBuilder:
                 try:
                     return self._inspector.inspect(tag)
                 except MissingImage:
-                    self._image_builder.build(self._dockerfile, tag, sink)
+                    build = self._image_builder.build
+                    if "cancellation_signal" in inspect.signature(build).parameters:
+                        build(self._dockerfile, tag, sink, cancellation_signal=cancellation_signal)
+                    else:
+                        build(self._dockerfile, tag, sink)
                     return self._inspector.inspect(tag)
 
     @classmethod

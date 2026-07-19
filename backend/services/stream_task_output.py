@@ -1,7 +1,6 @@
 """Read and append task logs through a descriptor-contained workspace boundary."""
 
 from dataclasses import dataclass
-from hashlib import sha256
 import os
 from pathlib import Path
 import stat
@@ -17,6 +16,12 @@ class TaskLog:
 
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 _FILE_FLAGS = getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+TASK_LOG_MAX_BYTES = 5 * 1024 * 1024
+TASK_LOG_CHUNK_BYTES = 64 * 1024
+
+
+class TaskLogLimitExceeded(RuntimeError):
+    """Raised before a bounded task log would grow beyond its ceiling."""
 
 
 class TaskLogReader:
@@ -71,7 +76,7 @@ class TaskLogReader:
             raise UnsafeWorkspacePath("task log ID is unsafe")
         return f"{task.id}.log"
 
-    def _read_bytes(self, task) -> bytes | None:
+    def _open_file(self, task):
         try:
             directory = self._log_directory(task, create=False)
         except FileNotFoundError:
@@ -84,12 +89,10 @@ class TaskLogReader:
             try:
                 if not stat.S_ISREG(os.fstat(descriptor).st_mode):
                     raise UnsafeWorkspacePath("task log must be a regular file")
-                chunks = []
-                while chunk := os.read(descriptor, 65536):
-                    chunks.append(chunk)
-                return b"".join(chunks)
-            finally:
+                return descriptor
+            except BaseException:
                 os.close(descriptor)
+                raise
         except OSError as error:
             raise UnsafeWorkspacePath("task log is unsafe") from error
         finally:
@@ -98,18 +101,29 @@ class TaskLogReader:
     async def read(self, task, after: int) -> TaskLog:
         if after < 0:
             raise ValueError("after must be a non-negative byte offset")
-        data = self._read_bytes(task)
-        if data is None:
-            return TaskLog("", after)
-        after = min(after, len(data))
-        return TaskLog(data[after:].decode("utf-8", errors="replace"), len(data))
+        descriptor = self._open_file(task)
+        if descriptor is None: return TaskLog("", after)
+        try:
+            size = os.fstat(descriptor).st_size
+            start = min(after, size)
+            os.lseek(descriptor, start, os.SEEK_SET)
+            data = os.read(descriptor, TASK_LOG_CHUNK_BYTES)
+            return TaskLog(data.decode("utf-8", errors="replace"), start + len(data))
+        finally: os.close(descriptor)
 
     async def size_for(self, task) -> int:
-        return len(self._read_bytes(task) or b"")
+        descriptor = self._open_file(task)
+        if descriptor is None: return 0
+        try: return os.fstat(descriptor).st_size
+        finally: os.close(descriptor)
 
-    async def signature_for(self, task) -> tuple[int, str]:
-        data = self._read_bytes(task)
-        return (0, "") if data is None else (len(data), sha256(data).hexdigest())
+    async def signature_for(self, task) -> tuple[int, int]:
+        descriptor = self._open_file(task)
+        if descriptor is None: return (0, 0)
+        try:
+            info = os.fstat(descriptor)
+            return (info.st_size, info.st_mtime_ns)
+        finally: os.close(descriptor)
 
 
 class TaskLogWriter(TaskLogReader):
@@ -131,6 +145,8 @@ class TaskLogWriter(TaskLogReader):
             try:
                 if not stat.S_ISREG(os.fstat(descriptor).st_mode):
                     raise UnsafeWorkspacePath("task log must be a regular file")
+                if os.fstat(descriptor).st_size + len(encoded) > TASK_LOG_MAX_BYTES:
+                    raise TaskLogLimitExceeded("task log exceeded its byte limit")
                 written = 0
                 while written < len(encoded):
                     count = os.write(descriptor, encoded[written:])

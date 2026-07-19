@@ -171,6 +171,8 @@ class TestCloneRepository:
 
         async def command(argv, cwd=None):
             calls.append(argv)
+            if argv[1] == "clone":
+                Path(argv[-1]).mkdir(parents=True)
             if argv[1] == "rev-parse":
                 return commit_sha
             return ""
@@ -180,7 +182,7 @@ class TestCloneRepository:
 
         run(service.clone(project()))
 
-        assert calls[0] == ["git", "clone", "--", "https://github.com/acme/demo.git", str(tmp_path / "projects/7/repository")]
+        assert calls[0] == ["git", "clone", "--", "https://github.com/acme/demo.git", str(tmp_path / "projects/7/repository.clone")]
         project_repository.set_commit_sha.assert_awaited_once_with(7, commit_sha)
 
     def test_clone_rejects_workspace_symlink_escape(self, tmp_path: Path) -> None:
@@ -512,6 +514,12 @@ class TestRuntimeContracts:
             def __init__(self):
                 self.closed = 0
                 self.api = SimpleNamespace(inspect_image=lambda tag: {"Id": "sha256:ready", "Os": "linux", "Architecture": "amd64"})
+                class Container:
+                    def start(self): pass
+                    def wait(self, timeout): return {"StatusCode": 0}
+                    def logs(self, **kwargs): return iter((b"verified\n",))
+                    def remove(self, force=False): pass
+                self.containers = SimpleNamespace(create=lambda *args, **kwargs: Container())
             def close(self): self.closed += 1
         client = Client()
         docker = SimpleNamespace(connect=lambda: client)

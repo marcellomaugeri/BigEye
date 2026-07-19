@@ -114,7 +114,7 @@ class TestDockerClient:
         class DockerException(Exception):
             pass
         client = SimpleNamespace(ping=lambda: (_ for _ in ()).throw(DockerException("cannot connect")))
-        docker_module = SimpleNamespace(from_env=lambda: client, errors=SimpleNamespace(DockerException=DockerException))
+        docker_module = SimpleNamespace(from_env=lambda **kwargs: client, errors=SimpleNamespace(DockerException=DockerException))
         with pytest.raises(DockerUnavailable, match="Docker is unavailable"):
             DockerClient(docker_module).connect()
 

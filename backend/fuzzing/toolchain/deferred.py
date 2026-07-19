@@ -3,13 +3,16 @@
 import asyncio
 from pathlib import Path
 
+from docker.errors import DockerException
+
 from backend.fuzzing.docker.client import DockerClient, DockerUnavailable
 from backend.fuzzing.docker.container_runner import ContainerRunner
 from backend.fuzzing.docker.image_builder import ImageBuilder
 from backend.fuzzing.docker.image_inspector import ImageInspector, MissingImage
 from backend.fuzzing.toolchain.builder import ToolchainBuilder
 from backend.fuzzing.toolchain.service import ToolchainService
-from backend.fuzzing.toolchain.verifier import ToolchainVerifier
+from backend.fuzzing.toolchain.verifier import ToolchainVerifier, ToolchainVerificationFailed
+from backend.fuzzing.docker.image_inspector import UnsupportedImagePlatform
 
 
 class _NoTaskPersistence:
@@ -56,6 +59,7 @@ class DeferredToolchain:
                 _NoTaskPersistence(), self._logs,
                 ToolchainBuilder(self._dockerfile, ImageBuilder(client), inspector),
                 ToolchainVerifier(inspector, ContainerRunner(client)),
+                persist_terminal=False,
             )
             await service.prepare(task)
         await self._with_client(prepare_connected)
@@ -63,7 +67,7 @@ class DeferredToolchain:
     async def docker_available(self) -> bool:
         try:
             return await self._with_client(lambda client: _true())
-        except DockerUnavailable:
+        except (DockerUnavailable, DockerException, MissingImage, UnsupportedImagePlatform, ToolchainVerificationFailed):
             return False
 
     async def toolchain_available(self) -> bool:
@@ -73,10 +77,12 @@ class DeferredToolchain:
             return False
 
     async def _inspect_toolchain(self, client) -> bool:
-        builder = ToolchainBuilder(self._dockerfile, ImageBuilder(client), ImageInspector(client))
+        inspector = ImageInspector(client)
+        builder = ToolchainBuilder(self._dockerfile, ImageBuilder(client), inspector)
         try:
-            await asyncio.to_thread(ImageInspector(client).inspect, builder.tag())
-        except (MissingImage, Exception):
+            image = await asyncio.to_thread(inspector.inspect, builder.tag())
+            await ToolchainVerifier(inspector, ContainerRunner(client)).verify(image.image_id, lambda text: None)
+        except (MissingImage, UnsupportedImagePlatform, ToolchainVerificationFailed):
             return False
         return True
 

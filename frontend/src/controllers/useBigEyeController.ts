@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { Project } from '../models/project';
+import { MAX_WORKER_COUNT, type Project } from '../models/project';
 import type { Settings } from '../models/settings';
 import type { Task } from '../models/task';
 import type { BigEyeApi } from '../services/apiClient';
@@ -34,6 +34,8 @@ export function useBigEyeController(api: BigEyeApi, eventStream: ProjectEventStr
   const selectedTaskIdRef = useRef<string | null>(null);
   const taskRequestGeneration = useRef(0);
   const logRequestGeneration = useRef(0);
+  const projectRequestGeneration = useRef(0);
+  const logOffset = useRef(0);
   const createdProjectIds = useRef(new Set<string>());
 
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
@@ -53,6 +55,7 @@ export function useBigEyeController(api: BigEyeApi, eventStream: ProjectEventStr
         selectedTaskIdRef.current = nextTaskId;
         setSelectedTaskId(nextTaskId);
         ++logRequestGeneration.current;
+        logOffset.current = 0;
         setLogContent('');
         setLogError(null);
       }
@@ -70,9 +73,11 @@ export function useBigEyeController(api: BigEyeApi, eventStream: ProjectEventStr
     setLogLoading(true);
     setLogError(null);
     try {
-      const log = await api.getTaskLog(taskId, 0);
+      const after = logOffset.current;
+      const log = await api.getTaskLog(taskId, after);
       if (requestGeneration !== logRequestGeneration.current || selectedTaskIdRef.current !== taskId) return;
-      setLogContent(log.content);
+      logOffset.current = log.next_offset;
+      setLogContent((current) => current + log.content);
     } catch (error) {
       if (requestGeneration !== logRequestGeneration.current || selectedTaskIdRef.current !== taskId) return;
       setLogContent('');
@@ -87,6 +92,7 @@ export function useBigEyeController(api: BigEyeApi, eventStream: ProjectEventStr
     setSelectedProjectId(projectId);
     ++taskRequestGeneration.current;
     ++logRequestGeneration.current;
+    logOffset.current = 0;
     setTasks([]);
     setTasksError(null);
     setTasksLoading(false);
@@ -118,6 +124,10 @@ export function useBigEyeController(api: BigEyeApi, eventStream: ProjectEventStr
       setProjectError('Worker count must be a positive whole number.');
       return;
     }
+    if (workerCountValue > MAX_WORKER_COUNT) {
+      setProjectError(`Worker count must not exceed ${MAX_WORKER_COUNT}.`);
+      return;
+    }
     setCreatingProject(true);
     setProjectError(null);
     try {
@@ -128,6 +138,7 @@ export function useBigEyeController(api: BigEyeApi, eventStream: ProjectEventStr
       setSelectedProjectId(project.id);
       ++taskRequestGeneration.current;
       ++logRequestGeneration.current;
+      logOffset.current = 0;
       setTasks([]);
       setTasksError(null);
       selectedTaskIdRef.current = null;
@@ -149,6 +160,7 @@ export function useBigEyeController(api: BigEyeApi, eventStream: ProjectEventStr
     selectedTaskIdRef.current = taskId;
     setSelectedTaskId(taskId);
     ++logRequestGeneration.current;
+    logOffset.current = 0;
     setLogContent('');
     setLogError(null);
     setLogLoading(false);
@@ -176,15 +188,29 @@ export function useBigEyeController(api: BigEyeApi, eventStream: ProjectEventStr
     return () => { active = false; };
   }, [api]);
 
+  const refreshProject = useCallback(async (projectId: string) => {
+    const requestGeneration = ++projectRequestGeneration.current;
+    try {
+      const refreshed = await api.getProject(projectId);
+      if (requestGeneration !== projectRequestGeneration.current || selectedProjectIdRef.current !== projectId) return;
+      setProjects((current) => current.map((item) => item.id === projectId ? refreshed : item));
+    } catch (error) {
+      if (requestGeneration === projectRequestGeneration.current && selectedProjectIdRef.current === projectId) {
+        setProjectError(message(error, 'Could not refresh the project.'));
+      }
+    }
+  }, [api]);
+
   useEffect(() => {
     if (!selectedProjectId) return;
     return eventStream.subscribe(selectedProjectId, () => {
       void loadTasks(selectedProjectId);
-      if (selectedTaskId) void loadLog(selectedTaskId);
+      void refreshProject(selectedProjectId);
+      if (selectedTaskIdRef.current) void loadLog(selectedTaskIdRef.current);
     }, (eventError) => {
       if (selectedProjectIdRef.current === selectedProjectId) setTasksError(eventError);
     });
-  }, [eventStream, loadLog, loadTasks, selectedProjectId, selectedTaskId]);
+  }, [eventStream, loadLog, loadTasks, refreshProject, selectedProjectId]);
 
   useEffect(() => {
     if (page === 'logs' && selectedTaskId) void loadLog(selectedTaskId);
@@ -204,7 +230,8 @@ export function useBigEyeController(api: BigEyeApi, eventStream: ProjectEventStr
       error: projectError,
       onRepositoryUrlChange: setRepositoryUrl,
       onWorkerCountChange: setWorkerCount,
-      onSubmit: submitProject
+      onSubmit: submitProject,
+      selectedProject
     },
     tasksView: { hasProject: Boolean(selectedProject), loading: tasksLoading, error: tasksError, tasks },
     logsView: {
