@@ -2,6 +2,8 @@
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+project_dir=$(CDPATH= cd -- "$script_dir/../.." && pwd)
+compose_file="$project_dir/compose.yaml"
 database_url=${DATABASE_URL:-postgresql://bigeye:bigeye@127.0.0.1:5433/bigeye}
 url_authority=${database_url#postgresql://}
 url_authority=${url_authority%%/*}
@@ -15,11 +17,11 @@ case "$database_host" in
         ;;
 esac
 
-database_name=$(docker compose exec -T postgres psql -U "${POSTGRES_USER:-bigeye}" -d "${POSTGRES_DB:-bigeye}" --tuples-only --no-align --command 'SELECT current_database()')
+database_name=$(docker compose -f "$compose_file" exec -T postgres psql -U "${POSTGRES_USER:-bigeye}" -d "${POSTGRES_DB:-bigeye}" --tuples-only --no-align --command 'SELECT current_database()')
 if [ "$database_name" != "bigeye" ]; then
     echo "Refusing to reset database '$database_name'; only the BigEye development database is allowed." >&2
     exit 1
 fi
 
-docker compose exec -T postgres psql -U "${POSTGRES_USER:-bigeye}" -d "${POSTGRES_DB:-bigeye}" --set ON_ERROR_STOP=1 --command 'DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;'
-docker compose exec -T postgres psql -U "${POSTGRES_USER:-bigeye}" -d "${POSTGRES_DB:-bigeye}" --set ON_ERROR_STOP=1 --file /docker-entrypoint-initdb.d/schema.sql
+docker compose -f "$compose_file" exec -T postgres psql -U "${POSTGRES_USER:-bigeye}" -d "${POSTGRES_DB:-bigeye}" --set ON_ERROR_STOP=1 --command 'DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;'
+docker compose -f "$compose_file" exec -T postgres psql -U "${POSTGRES_USER:-bigeye}" -d "${POSTGRES_DB:-bigeye}" --set ON_ERROR_STOP=1 --file /docker-entrypoint-initdb.d/schema.sql

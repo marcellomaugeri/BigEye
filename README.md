@@ -14,6 +14,7 @@ docker compose ps
 backend/database/reset.sh
 python3.14 -m venv backend/.venv
 backend/.venv/bin/python -m pip install -r backend/requirements.txt
+set -a; . ./.env; set +a
 backend/.venv/bin/uvicorn backend.api.app:app --reload
 cd frontend && npm install && npm run dev
 ```
@@ -27,9 +28,10 @@ postgres`, run Uvicorn from the repository root, then run `npm run dev` in
 
 Docker Desktop must be running for toolchain preparation. Docker uses
 `linux/amd64`, which may use emulation on non-amd64 hosts. The first toolchain
-preparation builds the image; later projects reuse its maintained tag. Set a
-real `OPENAI_API_KEY` in `.env` before repository analysis can call the Agents
-service. No key is stored or displayed by BigEye.
+preparation builds the image; later projects reuse its maintained tag. The
+shown `set -a; . ./.env; set +a` command deliberately exports a real
+`OPENAI_API_KEY` from `.env` to the Uvicorn process before repository analysis
+can call the Agents service. No key is stored or displayed by BigEye.
 
 Project files are under `workspace/projects/<id>/`: the clone is in
 `repository/`, the analysis is `analysis/repository.md`, and task logs are in

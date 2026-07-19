@@ -374,7 +374,7 @@ class TestToolchainService:
 
         task = SimpleNamespace(id=11, project_id=7)
         tasks = SimpleNamespace(finish=_async_spy())
-        logs = SimpleNamespace(path_for=lambda task: tmp_path / f"{task.id}.log")
+        logs = SimpleNamespace(append_sync=lambda task, text: (tmp_path / f"{task.id}.log").open("a", encoding="utf-8").write(text))
         builder = SimpleNamespace(ensure=lambda sink: SimpleNamespace(image_id="sha256:built"))
         async def fail(image, sink): raise RuntimeError("clang probe failed")
         verifier = SimpleNamespace(verify=fail)

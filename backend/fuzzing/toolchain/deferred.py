@@ -26,7 +26,20 @@ class DeferredToolchain:
         self._docker_client = docker_client or DockerClient()
 
     async def prepare(self, task) -> None:
-        client = await asyncio.to_thread(self._docker_client.connect)
+        connection = asyncio.create_task(asyncio.to_thread(self._docker_client.connect))
+        try:
+            client = await asyncio.shield(connection)
+        except asyncio.CancelledError:
+            def close_when_connected(operation):
+                if operation.cancelled():
+                    return
+                try:
+                    connected = operation.result()
+                except Exception:
+                    return
+                asyncio.create_task(asyncio.to_thread(connected.close))
+            connection.add_done_callback(close_when_connected)
+            raise
         try:
             inspector = ImageInspector(client)
             service = ToolchainService(

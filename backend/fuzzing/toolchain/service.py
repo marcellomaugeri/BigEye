@@ -1,7 +1,6 @@
 """Persist a truthful LLVM toolchain task result for one project."""
 
 import asyncio
-from pathlib import Path
 
 
 class ToolchainService:
@@ -14,15 +13,16 @@ class ToolchainService:
         self._verifier = verifier
 
     async def prepare(self, task) -> None:
-        path = Path(self._logs.path_for(task))
-        path.parent.mkdir(parents=True, exist_ok=True)
-
         def sink(text) -> None:
-            with path.open("a", encoding="utf-8") as log:
-                log.write(text)
+            self._logs.append_sync(task, str(text))
 
         try:
-            image = await asyncio.to_thread(self._builder.ensure, sink)
+            build = asyncio.create_task(asyncio.to_thread(self._builder.ensure, sink))
+            try:
+                image = await asyncio.shield(build)
+            except asyncio.CancelledError:
+                await asyncio.shield(build)
+                raise
             await self._verifier.verify(image.image_id, sink)
         except BaseException as error:
             if not isinstance(error, asyncio.CancelledError):

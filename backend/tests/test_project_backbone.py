@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import threading
 import warnings
 from datetime import UTC, datetime
 from pathlib import Path
@@ -264,6 +265,23 @@ class TestLogAndSse:
         with pytest.raises(UnsafeWorkspacePath):
             run(TaskLogReader(tmp_path).read(task(), 0))
 
+    def test_log_writer_rejects_ancestor_and_leaf_symlink_redirection(self, tmp_path: Path) -> None:
+        from backend.services.stream_task_output import TaskLogWriter
+        from backend.services.clone_repository import UnsafeWorkspacePath
+
+        outside = tmp_path.parent / "outside.log"
+        (tmp_path / "projects").symlink_to(tmp_path.parent)
+        with pytest.raises(UnsafeWorkspacePath):
+            run(TaskLogWriter(tmp_path).append(task(), "blocked\n"))
+        assert not outside.exists()
+        (tmp_path / "projects").unlink()
+        logs = tmp_path / "projects/7/logs"
+        logs.mkdir(parents=True)
+        (logs / "11.log").symlink_to(outside)
+        with pytest.raises(UnsafeWorkspacePath):
+            run(TaskLogWriter(tmp_path).append(task(), "blocked\n"))
+        assert not outside.exists()
+
     def test_sse_streams_do_not_consume_each_others_changes(self, tmp_path: Path) -> None:
         from backend.services.run_project_backbone import ProjectEventWatcher
         from backend.services.stream_task_output import TaskLogReader
@@ -380,6 +398,59 @@ class TestRecovery:
         pool.close.assert_awaited_once_with()
 
 
+class TestRuntimeContracts:
+    def test_production_graph_uses_real_executor_workflow_and_deferred_docker(self, tmp_path: Path) -> None:
+        from backend.api.dependencies import build_services
+        from backend.agents.workflow import RepositoryAnalysisWorkflow
+        from backend.fuzzing.toolchain.deferred import DeferredToolchain
+        from backend.services.execute_project_backbone import ExecuteProjectBackbone
+
+        services = build_services(AsyncMock(), tmp_path)
+        executor = services.recovery._scheduler
+        assert isinstance(executor, ExecuteProjectBackbone)
+        assert isinstance(executor._analysis, RepositoryAnalysisWorkflow)
+        assert isinstance(executor._toolchain, DeferredToolchain)
+
+    def test_deferred_docker_checks_close_the_connected_sdk_client(self, tmp_path: Path) -> None:
+        from backend.fuzzing.toolchain.deferred import DeferredToolchain
+
+        class Client:
+            def __init__(self):
+                self.closed = 0
+                self.api = SimpleNamespace(inspect_image=lambda tag: {"Id": "sha256:ready", "Os": "linux", "Architecture": "amd64"})
+            def close(self): self.closed += 1
+        client = Client()
+        docker = SimpleNamespace(connect=lambda: client)
+        toolchain = DeferredToolchain(tmp_path / "Dockerfile", SimpleNamespace(), docker)
+        (tmp_path / "Dockerfile").write_text("FROM ubuntu:24.04\n")
+
+        async def scenario():
+            assert await toolchain.docker_available() is True
+            assert await toolchain.toolchain_available() is True
+        run(scenario())
+        assert client.closed == 2
+
+    def test_cancelled_connect_closes_client_only_after_connecting_thread_stops(self, tmp_path: Path) -> None:
+        from backend.fuzzing.toolchain.deferred import DeferredToolchain
+
+        entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+        client = SimpleNamespace(close=closed.set)
+        class Docker:
+            def connect(self):
+                entered.set(); release.wait(1); return client
+        toolchain = DeferredToolchain(tmp_path / "Dockerfile", SimpleNamespace(), Docker())
+
+        async def scenario():
+            running = asyncio.create_task(toolchain.prepare(task()))
+            assert await asyncio.to_thread(entered.wait, 1)
+            running.cancel()
+            with pytest.raises(asyncio.CancelledError): await running
+            assert not closed.is_set()
+            release.set()
+            assert await asyncio.to_thread(closed.wait, 1)
+        run(scenario())
+
+
 class TestProjectExecution:
     def test_clone_and_toolchain_overlap_and_analysis_waits_only_for_clone(self, tmp_path: Path) -> None:
         from backend.services.execute_project_backbone import ExecuteProjectBackbone
@@ -478,6 +549,37 @@ class TestProjectExecution:
         clone.verify_committed.assert_awaited_once_with(recovered)
         clone.clone.assert_not_called()
         assert records[0].finished_at is not None and records[0].error is None
+
+    def test_projects_execute_independently_when_one_clone_fails(self, tmp_path: Path) -> None:
+        from backend.services.execute_project_backbone import ExecuteProjectBackbone
+
+        first = type(project())(1, "https://github.com/acme/one.git", 1, None, NOW, None, None)
+        second = type(project())(2, "https://github.com/acme/two.git", 1, None, NOW, None, None)
+        first_records = [_record(11, 1, "repository clone"), _record(12, 1, "LLVM toolchain preparation"), _record(13, 1, "repository analysis")]
+        second_records = [_record(21, 2, "repository clone"), _record(22, 2, "LLVM toolchain preparation"), _record(23, 2, "repository analysis")]
+        first_projects, first_tasks, first_logs = _execution_repositories(first, first_records)
+        second_projects, second_tasks, second_logs = _execution_repositories(second, second_records)
+        second_started, release_second = asyncio.Event(), asyncio.Event()
+        class FailingClone:
+            async def clone(self, value, clone_task): raise RuntimeError("first clone failed")
+        class WaitingClone:
+            async def clone(self, value, clone_task): second_started.set(); await release_second.wait()
+        class Toolchain:
+            async def prepare(self, value): return None
+        class Analysis:
+            async def analyse(self, project_id, root): return None
+
+        async def scenario():
+            failed = asyncio.create_task(ExecuteProjectBackbone(first_projects, first_tasks, FailingClone(), Toolchain(), Analysis(), first_logs, tmp_path).schedule(1))
+            healthy = asyncio.create_task(ExecuteProjectBackbone(second_projects, second_tasks, WaitingClone(), Toolchain(), Analysis(), second_logs, tmp_path).schedule(2))
+            await second_started.wait()
+            await failed
+            assert not healthy.done()
+            release_second.set()
+            await healthy
+        run(scenario())
+        assert first_projects.finished[1] is not None
+        assert second_projects.finished[2] is None
 
 
 async def _empty_command(*args, **kwargs):

@@ -39,6 +39,7 @@ class DevelopmentDatabaseTests(unittest.TestCase):
         self.assertIn("127.0.0.1:${BIGEYE_POSTGRES_PORT:-5433}:5432", compose)
         self.assertIn("PGDATA: /var/lib/postgresql/18/docker", compose)
         self.assertIn("./workspace/postgres:/var/lib/postgresql", compose)
+        self.assertIn("./backend/database/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro", compose)
         self.assertIn("healthcheck:", compose)
         self.assertNotIn("0.0.0.0", compose)
 
@@ -85,6 +86,23 @@ class DevelopmentDatabaseTests(unittest.TestCase):
         self.assertIn("DROP SCHEMA IF EXISTS public CASCADE", reset_script)
         self.assertNotIn("DROP DATABASE", reset_script)
         self.assertNotIn("dropdb", reset_script)
+        self.assertIn('docker compose -f "$compose_file" exec -T postgres psql', reset_script)
+        self.assertNotIn('psql "$database_url"', reset_script)
+        self.assertIn('project_dir=', reset_script)
+
+    def test_documented_key_export_and_vite_proxy_are_explicit(self) -> None:
+        readme = (ROOT / "README.md").read_text()
+        vite = (ROOT / "frontend/vite.config.ts").read_text()
+        self.assertIn("set -a; . ./.env; set +a", readme)
+        self.assertIn("'/api': 'http://127.0.0.1:8000'", vite)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            environment_file = Path(temporary_directory) / ".env"
+            environment_file.write_text("OPENAI_API_KEY=contract-test-key\n")
+            result = subprocess.run(
+                ["sh", "-c", 'set -a; . "$1"; set +a; test "$OPENAI_API_KEY" = contract-test-key', "sh", str(environment_file)],
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0)
 
     def test_reset_rejects_remote_databases_before_invoking_psql(self) -> None:
         reset_script = ROOT / "backend/database/reset.sh"
