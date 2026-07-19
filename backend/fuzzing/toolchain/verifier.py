@@ -49,6 +49,26 @@ BIGEYE_AFL_SOURCE
 AFL_CC=clang-18 afl-clang-fast -O1 /tmp/bigeye-afl.c -o /tmp/bigeye-afl
 printf A | afl-showmap -q -o /tmp/bigeye-afl.map -- /tmp/bigeye-afl
 test -s /tmp/bigeye-afl.map
+grammar_generator-json 1 64 /tmp/bigeye-grammar-seeds /tmp/bigeye-grammar-trees 1
+test -s /tmp/bigeye-grammar-seeds/0
+test -s /tmp/bigeye-grammar-trees/0
+python3 -c 'import json; json.load(open("/tmp/bigeye-grammar-seeds/0", encoding="utf-8"))'
+if ! AFL_CUSTOM_MUTATOR_LIBRARY=/usr/local/lib/afl/libgrammarmutator-json.so \
+    AFL_CUSTOM_MUTATOR_ONLY=1 \
+    AFL_NO_AFFINITY=1 \
+    AFL_NO_UI=1 \
+    AFL_SKIP_CPUFREQ=1 \
+    afl-fuzz -V 1 -m none -i /tmp/bigeye-grammar-seeds \
+      -o /tmp/bigeye-mutator-out -- /tmp/bigeye-afl \
+      > /tmp/bigeye-mutator.log 2>&1; then
+  cat /tmp/bigeye-mutator.log
+  exit 1
+fi
+cat /tmp/bigeye-mutator.log
+grep -F "Custom mutator '/usr/local/lib/afl/libgrammarmutator-json.so' installed successfully." /tmp/bigeye-mutator.log
+test -s /tmp/bigeye-mutator-out/default/fuzzer_stats
+awk '$1 == "execs_done" && $3 + 0 > 1 {{ print "JSON grammar mutator executed " $3 " target runs"; found=1 }} END {{ exit found ? 0 : 1 }}' \
+  /tmp/bigeye-mutator-out/default/fuzzer_stats
 """
 
 

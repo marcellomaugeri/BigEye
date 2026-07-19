@@ -75,3 +75,5 @@ RUN run_with_heartbeat() { \
     && test -x /usr/local/bin/afl-showmap \
     && test -s /usr/local/lib/afl/libgrammarmutator-json.so \
     && rm -rf /tmp/AFLplusplus /tmp/antlr-4.8-complete.jar /root/.cache
+
+ENV LD_LIBRARY_PATH=/usr/local/lib/afl

@@ -37,6 +37,31 @@ def test_toolchain_builds_and_installs_the_pinned_upstream_grammar_mutator() -> 
     assert "grammar_generator-json" in dockerfile
 
 
+def test_image_exposes_the_installed_grammar_mutator_to_the_runtime_loader() -> None:
+    dockerfile = (ROOT / "backend/fuzzing/images/Dockerfile").read_text()
+
+    assert "LD_LIBRARY_PATH=/usr/local/lib/afl" in dockerfile
+
+
+def test_verifier_generates_valid_json_and_runs_the_custom_mutator() -> None:
+    from backend.fuzzing.toolchain.verifier import ToolchainVerifier
+
+    command = ToolchainVerifier.command()
+    assert (
+        "grammar_generator-json 1 64 /tmp/bigeye-grammar-seeds "
+        "/tmp/bigeye-grammar-trees 1"
+    ) in command
+    assert 'json.load(open("/tmp/bigeye-grammar-seeds/0", encoding="utf-8"))' in command
+    assert "AFL_CUSTOM_MUTATOR_LIBRARY=/usr/local/lib/afl/libgrammarmutator-json.so" in command
+    assert "AFL_CUSTOM_MUTATOR_ONLY=1" in command
+    assert "afl-fuzz -V 1" in command
+    assert "Custom mutator '/usr/local/lib/afl/libgrammarmutator-json.so' installed successfully." in command
+    assert "/tmp/bigeye-mutator-out/default/fuzzer_stats" in command
+    assert "execs_done" in command
+    assert "> 1" in command
+    assert "JSON grammar mutator executed" in command
+
+
 def test_verifier_checks_both_engines_clean_coverage_and_mutator_tools() -> None:
     from backend.fuzzing.toolchain.verifier import ToolchainVerifier
 
