@@ -3,6 +3,7 @@
 import asyncio
 import os
 import re
+import signal
 import shutil
 import tempfile
 from contextlib import contextmanager
@@ -46,16 +47,31 @@ def clone_argv(repository_url: str, revision: str, destination: str) -> list[str
 
 
 async def _stop_process(process, drains=()) -> None:
-    process.terminate()
-    try:
-        await asyncio.wait_for(process.wait(), timeout=5)
-    except TimeoutError:
-        process.kill()
+    killed_group = False
+    if process.returncode is None:
+        _signal_process_group(process.pid, signal.SIGTERM)
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5)
+        except TimeoutError:
+            _signal_process_group(process.pid, signal.SIGKILL)
+            killed_group = True
+            await process.wait()
+    else:
         await process.wait()
+    if not killed_group and _signal_process_group(process.pid, 0):
+        _signal_process_group(process.pid, signal.SIGKILL)
     for drain_task in drains:
         drain_task.cancel()
     if drains:
         await asyncio.gather(*drains, return_exceptions=True)
+
+
+def _signal_process_group(process_group: int, signal_number: int) -> bool:
+    try:
+        os.killpg(process_group, signal_number)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 async def run_command(argv: list[str], cwd: Path | None = None, sink=None, env: dict[str, str] | None = None) -> str:
@@ -67,6 +83,7 @@ async def run_command(argv: list[str], cwd: Path | None = None, sink=None, env: 
         stderr=asyncio.subprocess.PIPE,
         stdin=asyncio.subprocess.DEVNULL,
         env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/false", **(env or {})},
+        start_new_session=True,
     )
     if not hasattr(process, "stdout"):
         try:

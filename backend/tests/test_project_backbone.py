@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import os
+import signal
 import threading
 from dataclasses import replace
 import warnings
@@ -271,37 +273,38 @@ class TestCloneRepository:
         with pytest.raises(GitCommandFailed):
             run(CloneRepositoryService(tmp_path, command, AsyncMock()).clone(project()))
 
-    def test_default_command_terminates_and_waits_when_cancelled(self, monkeypatch) -> None:
+    def test_default_command_starts_and_terminates_the_process_group_when_cancelled(self, monkeypatch) -> None:
         from backend.services.projects.clone_repository import run_command
 
         class Process:
             returncode = None
+            pid = 4312
 
             def __init__(self):
-                self.terminated = False
                 self.waited = False
 
             async def communicate(self):
                 await asyncio.Future()
 
-            def terminate(self):
-                self.terminated = True
-
             async def wait(self):
                 self.waited = True
                 self.returncode = -15
 
-            def kill(self):
-                raise AssertionError("kill is not needed after a successful terminate")
-
         process = Process()
+        signals = []
 
         async def create_subprocess_exec(*argv, **kwargs):
             assert argv == ("git", "rev-parse", "HEAD")
             assert "shell" not in kwargs
+            assert kwargs["start_new_session"] is True
             return process
 
         monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
+        def kill_group(process_group, signal_number):
+            if signal_number == 0:
+                raise ProcessLookupError
+            signals.append((process_group, signal_number))
+        monkeypatch.setattr(os, "killpg", kill_group)
 
         async def scenario():
             command = asyncio.create_task(run_command(["git", "rev-parse", "HEAD"]))
@@ -311,8 +314,48 @@ class TestCloneRepository:
                 await command
 
         run(scenario())
-        assert process.terminated is True
+        assert signals == [(4312, signal.SIGTERM)]
         assert process.waited is True
+
+    def test_process_group_shutdown_escalates_to_kill_after_term_timeout(self, monkeypatch) -> None:
+        from backend.services.projects.clone_repository import _stop_process
+
+        class Process:
+            returncode = None
+            pid = 9831
+
+            def __init__(self): self.waits = 0
+            async def wait(self):
+                self.waits += 1
+                if self.waits == 1:
+                    raise TimeoutError
+                self.returncode = -9
+                return -9
+
+        signals = []
+        monkeypatch.setattr(os, "killpg", lambda process_group, signal_number: signals.append((process_group, signal_number)))
+
+        run(_stop_process(Process()))
+
+        assert signals == [(9831, signal.SIGTERM), (9831, signal.SIGKILL)]
+
+    def test_process_group_shutdown_kills_surviving_descendants_after_parent_exits(self, monkeypatch) -> None:
+        from backend.services.projects.clone_repository import _stop_process
+
+        class Process:
+            returncode = None
+            pid = 6142
+
+            async def wait(self):
+                self.returncode = -15
+                return -15
+
+        calls = []
+        monkeypatch.setattr(os, "killpg", lambda process_group, signal_number: calls.append((process_group, signal_number)))
+
+        run(_stop_process(Process()))
+
+        assert calls == [(6142, signal.SIGTERM), (6142, 0), (6142, signal.SIGKILL)]
 
     def test_stream_sink_failure_terminates_git_and_awaits_readers(self, monkeypatch) -> None:
         from backend.services.projects.clone_repository import run_command
@@ -321,18 +364,22 @@ class TestCloneRepository:
             async def read(self, size): return self.chunks.pop(0) if self.chunks else b""
         class Process:
             returncode = 0
+            pid = 7361
             def __init__(self):
                 self.stdout, self.stderr = Reader([b"stdout\n"]), Reader([b"stderr\n"])
-                self.terminated = self.waited = False
-            def terminate(self): self.terminated = True
-            def kill(self): raise AssertionError("terminate should be enough")
+                self.waited = False
             async def wait(self): self.waited = True; return 0
         process = Process()
         async def create(*args, **kwargs): return process
         monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+        def missing_group(process_group, signal_number):
+            if signal_number == 0:
+                raise ProcessLookupError
+            raise AssertionError("finished group must not be signalled")
+        monkeypatch.setattr(os, "killpg", missing_group)
         with pytest.raises(RuntimeError, match="sink failed"):
             run(run_command(["git", "rev-parse", "HEAD"], sink=lambda text: (_ for _ in ()).throw(RuntimeError("sink failed"))))
-        assert process.terminated and process.waited
+        assert process.waited
 
 
 class TestLogAndSse:

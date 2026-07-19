@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import os
 from pathlib import Path
+import shutil
+import threading
+import time
 from types import SimpleNamespace
+
+import pytest
 
 
 def test_clone_argv_uses_no_checkout_for_requested_revision_resolution() -> None:
@@ -109,6 +116,140 @@ def test_image_reuse_requires_amd64_and_every_expected_label() -> None:
     assert builder.inspect_matching("bigeye-repository:test", labels) is None
 
 
+def test_repository_context_preserves_modes_empty_directories_and_safe_symlinks(tmp_path: Path) -> None:
+    from backend.fuzzing.layers.repository_layer import RepositoryLayerService
+
+    repository = tmp_path / "checkout"
+    scripts = repository / "scripts"
+    empty = repository / "empty"
+    links = repository / "links"
+    scripts.mkdir(parents=True)
+    empty.mkdir()
+    links.mkdir()
+    executable = scripts / "run.sh"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o751)
+    scripts.chmod(0o750)
+    empty.chmod(0o710)
+    (links / "relative-run").symlink_to("../scripts/run.sh")
+    (links / "absolute-run").symlink_to(executable.resolve())
+
+    manifest = RepositoryLayerService(tmp_path / "workspace", _Builder(), _Inspector()).prepare(
+        7, repository, "d" * 40, "bigeye-toolchain:test", lambda text: None
+    )
+    copied = manifest.context_dir / "repository"
+
+    assert (copied / "scripts").stat().st_mode & 0o777 == 0o750
+    assert (copied / "scripts/run.sh").stat().st_mode & 0o777 == 0o751
+    assert (copied / "empty").is_dir()
+    assert (copied / "empty").stat().st_mode & 0o777 == 0o710
+    assert os.readlink(copied / "links/relative-run") == "../scripts/run.sh"
+    assert os.readlink(copied / "links/absolute-run") == "../scripts/run.sh"
+    assert (copied / "links/absolute-run").resolve() == (copied / "scripts/run.sh").resolve()
+
+
+def test_repository_tag_hashes_file_directory_and_symlink_semantics(tmp_path: Path) -> None:
+    from backend.fuzzing.layers.repository_layer import RepositoryLayerService
+
+    repository = tmp_path / "checkout"
+    directory = repository / "bin"
+    directory.mkdir(parents=True)
+    executable = directory / "run"
+    executable.write_text("run\n")
+    executable.chmod(0o755)
+    link = repository / "run-link"
+    link.symlink_to("bin/run")
+    service = RepositoryLayerService(tmp_path / "workspace", _Builder(), _Inspector())
+
+    original = service.prepare(7, repository, "e" * 40, "bigeye-toolchain:test", lambda text: None)
+    executable.chmod(0o644)
+    file_mode_changed = service.prepare(7, repository, "e" * 40, "bigeye-toolchain:test", lambda text: None)
+    directory.chmod(0o700)
+    directory_mode_changed = service.prepare(7, repository, "e" * 40, "bigeye-toolchain:test", lambda text: None)
+    link.unlink()
+    link.symlink_to("bin")
+    link_changed = service.prepare(7, repository, "e" * 40, "bigeye-toolchain:test", lambda text: None)
+
+    assert len({original.tag, file_mode_changed.tag, directory_mode_changed.tag, link_changed.tag}) == 4
+
+
+def test_concurrent_identical_prepare_publishes_and_builds_once(tmp_path: Path) -> None:
+    from backend.fuzzing.layers.repository_layer import RepositoryLayerService
+
+    class CountingRepositoryLayerService(RepositoryLayerService):
+        publications = 0
+
+        @classmethod
+        def _publish_context(cls, *args):
+            cls.publications += 1
+            return super()._publish_context(*args)
+
+    repository = tmp_path / "checkout"
+    repository.mkdir()
+    (repository / "main.c").write_text("int main(void) { return 0; }\n")
+    builder = _ConcurrentBuilder()
+    service = CountingRepositoryLayerService(tmp_path / "workspace", builder, _Inspector())
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(service.prepare, 7, repository, "f" * 40, "bigeye-toolchain:test", lambda text: None)
+            for _ in range(2)
+        ]
+        manifests = [future.result() for future in futures]
+
+    assert manifests[0].tag == manifests[1].tag
+    assert manifests[0].context_dir == manifests[1].context_dir
+    assert service.publications == 1
+    assert builder.build_calls == 1
+    assert (manifests[0].context_dir / "repository/main.c").is_file()
+
+
+def test_interrupted_context_population_never_publishes_partial_context(tmp_path: Path, monkeypatch) -> None:
+    from backend.fuzzing.layers.repository_layer import RepositoryLayerService
+
+    repository = tmp_path / "checkout"
+    repository.mkdir()
+    (repository / "main.c").write_text("int main(void) { return 0; }\n")
+    copyfile = shutil.copyfile
+
+    def interrupted(source, destination):
+        copyfile(source, destination)
+        raise RuntimeError("interrupted copy")
+
+    monkeypatch.setattr("backend.fuzzing.layers.repository_layer.shutil.copyfile", interrupted)
+    workspace = tmp_path / "workspace"
+
+    with pytest.raises(RuntimeError, match="interrupted copy"):
+        RepositoryLayerService(workspace, _Builder(), _Inspector()).prepare(
+            7, repository, "1" * 40, "bigeye-toolchain:test", lambda text: None
+        )
+
+    layers = workspace / "projects/7/layers"
+    assert not layers.exists() or list(layers.iterdir()) == []
+
+
+def test_invalid_published_context_is_rebuilt_before_image_reuse(tmp_path: Path) -> None:
+    from backend.fuzzing.layers.repository_layer import RepositoryLayerService
+
+    repository = tmp_path / "checkout"
+    repository.mkdir()
+    (repository / "main.c").write_text("safe\n")
+    builder = _Builder()
+    service = RepositoryLayerService(tmp_path / "workspace", builder, _Inspector())
+    first = service.prepare(7, repository, "2" * 40, "bigeye-toolchain:test", lambda text: None)
+    (first.context_dir / ".env").write_text("TOKEN=partial\n")
+    builder.reuse = True
+
+    second = service.prepare(7, repository, "2" * 40, "bigeye-toolchain:test", lambda text: None)
+
+    assert not (second.context_dir / ".env").exists()
+    (second.context_dir / "repository/main.c").unlink()
+    third = service.prepare(7, repository, "2" * 40, "bigeye-toolchain:test", lambda text: None)
+
+    assert (third.context_dir / "repository/main.c").read_text() == "safe\n"
+    assert len(builder.calls) == 1
+
+
 class _Inspector:
     def __init__(self, image_id: str = "sha256:parent"):
         self.image_id = image_id
@@ -130,4 +271,23 @@ class _Builder:
 
     def build(self, dockerfile: Path, tag: str, sink):
         self.calls.append((dockerfile, tag))
+        return "sha256:built"
+
+
+class _ConcurrentBuilder:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._built = False
+        self.build_calls = 0
+
+    def inspect_matching(self, tag: str, labels: dict[str, str]):
+        with self._lock:
+            return "sha256:built" if self._built else None
+
+    def build(self, dockerfile: Path, tag: str, sink):
+        with self._lock:
+            self.build_calls += 1
+        time.sleep(0.05)
+        with self._lock:
+            self._built = True
         return "sha256:built"
