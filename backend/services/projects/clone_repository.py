@@ -129,18 +129,21 @@ class CloneRepositoryService:
                     return recovered
             raise UnsafeWorkspacePath("repository destination already exists")
         self._remove_staging(staging, project_root)
-        kwargs = {"sink": lambda text: self._logs.append_sync(task, text)} if self._logs is not None and task is not None else {}
+        kwargs = {}
+        token = None
         if project.token_present:
-            token = await self._projects.get_repository_token(project.id)
+            token = await self._projects.get_repository_token(project.id) or None
             if token:
                 kwargs["env"] = {
                     "GIT_CONFIG_COUNT": "1",
                     "GIT_CONFIG_KEY_0": "http.extraHeader",
                     "GIT_CONFIG_VALUE_0": f"Authorization: Bearer {token}",
                 }
+        if self._logs is not None and task is not None:
+            kwargs["sink"] = self._task_log_sink(task, token)
         try:
-            await self._command(["git", "clone", "--", repository_url, str(staging)], **kwargs)
-            await self._command(["git", "checkout", "--detach", project.requested_revision], cwd=staging, **kwargs)
+            await self._run_command(["git", "clone", "--", repository_url, str(staging)], kwargs)
+            await self._run_command(["git", "checkout", "--detach", project.requested_revision], kwargs, staging)
             commit_sha = await self._head(staging, kwargs)
             os.replace(staging, destination)
             await self._projects.set_commit_sha(project.id, commit_sha)
@@ -157,8 +160,33 @@ class CloneRepositoryService:
             raise UnsafeWorkspacePath("repository staging directory is unsafe")
         shutil.rmtree(staging)
 
+    def _task_log_sink(self, task, token: str | None):
+        if token is None:
+            return lambda text: self._logs.append_sync(task, text)
+        output = []
+
+        def sink(text: str) -> None:
+            output.append(text)
+
+        def flush() -> None:
+            if output:
+                self._logs.append_sync(task, "".join(output).replace(token, "[REDACTED]"))
+                output.clear()
+
+        sink.flush = flush
+        return sink
+
+    async def _run_command(self, argv: list[str], kwargs, cwd: Path | None = None) -> str:
+        try:
+            return await self._command(argv, cwd=cwd, **kwargs)
+        finally:
+            sink = kwargs.get("sink")
+            flush = getattr(sink, "flush", None)
+            if flush is not None:
+                flush()
+
     async def _head(self, destination: Path, kwargs) -> str:
-        commit_sha = await self._command(["git", "rev-parse", "HEAD"], cwd=destination, **kwargs)
+        commit_sha = await self._run_command(["git", "rev-parse", "HEAD"], kwargs, destination)
         if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", commit_sha) is None:
             raise GitCommandFailed("Git did not return a full object ID")
         return commit_sha

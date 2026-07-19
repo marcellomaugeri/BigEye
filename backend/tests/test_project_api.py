@@ -3,8 +3,12 @@
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+import warnings
 
 import pytest
+
+warnings.filterwarnings("ignore", message="Using `httpx` with `starlette.testclient` is deprecated")
+
 from starlette.testclient import TestClient
 
 

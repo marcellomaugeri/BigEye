@@ -209,6 +209,29 @@ class TestCloneRepository:
         assert all("secret-read-token" not in " ".join(argv) for argv, _ in calls)
         assert calls[0][1]["GIT_CONFIG_VALUE_0"] == "Authorization: Bearer secret-read-token"
 
+    def test_clone_redacts_repository_token_from_git_output_before_task_log(self, tmp_path: Path) -> None:
+        from backend.services.projects.clone_repository import CloneRepositoryService
+
+        token = "secret-read-token"
+        logged = []
+
+        async def command(argv, cwd=None, sink=None, env=None):
+            if argv[1] == "clone":
+                Path(argv[-1]).mkdir(parents=True)
+            sink("remote output includes secret-")
+            sink("read-token and continues\n")
+            return "a" * 40 if argv[1] == "rev-parse" else ""
+
+        project_repository = AsyncMock()
+        project_repository.get_repository_token.return_value = token
+        logs = SimpleNamespace(append_sync=lambda item, text: logged.append(text))
+        value = replace(project(), token_present=True)
+
+        run(CloneRepositoryService(tmp_path, command, project_repository, logs).clone(value, task()))
+
+        assert logged == ["remote output includes [REDACTED] and continues\n"] * 3
+        assert all(token not in text for text in logged)
+
     def test_clone_rejects_workspace_symlink_escape(self, tmp_path: Path) -> None:
         from backend.services.projects.clone_repository import CloneRepositoryService, UnsafeWorkspacePath
 
