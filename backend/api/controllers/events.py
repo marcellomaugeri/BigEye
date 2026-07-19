@@ -29,5 +29,5 @@ async def get_project_log(
         raise HTTPException(status_code=422, detail="invalid project event log") from error
     return EventLogResponse(
         events=[StoredEventResponse.from_model(event) for event in events],
-        next_offset=events[-1].id if events else after,
+        next_offset=events.next_offset,
     )

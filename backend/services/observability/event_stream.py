@@ -46,9 +46,14 @@ class ProjectEventStream:
                     events = await self._store.read(project_id, "events", cursor, 1000)
                 except (CorruptEventLog, InvalidEventCursor):
                     return
+                emitted = False
                 for event in events:
                     cursor = event.id
+                    emitted = True
                     yield self.frame(event)
+                if not emitted and events.next_offset != cursor:
+                    cursor = events.next_offset
+                    continue
                 await signal.wait()
                 signal.clear()
         finally:

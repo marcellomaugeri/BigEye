@@ -32,6 +32,14 @@ class CorruptEventLog(ValueError):
     """Raised when an event record cannot be read within the bounded format."""
 
 
+class EventPage(list[StoredEvent]):
+    """A list-compatible event page with the last safely examined cursor."""
+
+    def __init__(self, events=(), next_offset: int = -1):
+        super().__init__(events)
+        self.next_offset = next_offset
+
+
 class ProjectEventStore:
     """Append-only activity/debug records plus a compact SSE invalidation log."""
 
@@ -67,7 +75,7 @@ class ProjectEventStore:
             listener(project_id)
         return event
 
-    async def read(self, project_id: int, stream: str, after: int, limit: int) -> list[StoredEvent]:
+    async def read(self, project_id: int, stream: str, after: int, limit: int) -> EventPage:
         self._validate_project_id(project_id)
         self._validate_stream(stream)
         if not isinstance(after, int) or isinstance(after, bool) or after < -1:
@@ -78,7 +86,7 @@ class ProjectEventStore:
         if descriptor is None:
             if after not in (-1, 0):
                 raise InvalidEventCursor("event cursor is not a record boundary")
-            return []
+            return EventPage(next_offset=after)
         try:
             return self._read_records(descriptor, stream, after, limit)
         finally:
@@ -109,14 +117,15 @@ class ProjectEventStore:
         finally:
             os.close(descriptor)
 
-    def _read_records(self, descriptor: int, stream: str, after: int, limit: int) -> list[StoredEvent]:
+    def _read_records(self, descriptor: int, stream: str, after: int, limit: int) -> EventPage:
         size = os.fstat(descriptor).st_size
         if after > size:
             raise InvalidEventCursor("event cursor is not a record boundary")
         if after == size:
-            return []
+            return EventPage(next_offset=size)
         records: list[StoredEvent] = []
         consumed = 0
+        next_offset = after
         with os.fdopen(os.dup(descriptor), "rb", closefd=True) as file:
             if after >= 0:
                 if after > 0:
@@ -124,24 +133,32 @@ class ProjectEventStore:
                     if file.read(1) != b"\n":
                         raise InvalidEventCursor("event cursor is not a record boundary")
                 file.seek(after)
-                self._read_line(file)
+                consumed += len(self._read_line(file))
             while len(records) < limit:
                 offset = file.tell()
-                raw = self._read_line(file)
+                remaining = EVENT_RESPONSE_MAX_BYTES - consumed
+                if remaining <= 0:
+                    break
+                raw = file.readline(min(EVENT_RECORD_MAX_BYTES, remaining) + 1)
                 if not raw:
+                    next_offset = size
                     break
-                if consumed + len(raw) > EVENT_RESPONSE_MAX_BYTES:
+                if len(raw) > remaining:
+                    file.seek(offset)
                     break
+                if len(raw) > EVENT_RECORD_MAX_BYTES or not raw.endswith(b"\n"):
+                    raise CorruptEventLog("project event log is corrupt")
+                consumed += len(raw)
+                next_offset = offset
                 try:
                     value = json.loads(raw.decode("utf-8"))
                     created_at = datetime.fromisoformat(value["created_at"])
                     if value["stream"] != stream:
                         continue
                     records.append(StoredEvent(offset, created_at, value["stream"], value["payload"]))
-                    consumed += len(raw)
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                     continue
-        return records
+        return EventPage(records, next_offset)
 
     @staticmethod
     def _read_line(file) -> bytes:

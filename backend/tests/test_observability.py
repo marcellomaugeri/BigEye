@@ -141,6 +141,41 @@ def test_event_log_read_stays_bounded_and_at_record_boundaries(tmp_path: Path, m
     assert [event.id for event in run(store.read(7, "activity", page[-1].id, 20))] == [third.id]
 
 
+@pytest.mark.parametrize("raw", [
+    b"{not-json}\n",
+    b'{"id":0,"created_at":"not-a-time","stream":"activity","payload":{}}\n',
+    b'{"id":0}\n',
+    b'{"id":0,"created_at":"2026-07-19T00:00:00+00:00","stream":"debug","payload":{}}\n',
+])
+def test_every_examined_record_charges_the_bounded_scan_budget(tmp_path: Path, monkeypatch, raw: bytes) -> None:
+    from backend.services.observability import event_store
+    from backend.services.observability.event_store import ProjectEventStore
+
+    monkeypatch.setattr(event_store, "EVENT_RESPONSE_MAX_BYTES", len(raw) * 2)
+    path = tmp_path / "projects/7/logs"
+    path.mkdir(parents=True)
+    (path / "activity.jsonl").write_bytes(raw * 3)
+
+    page = run(ProjectEventStore(tmp_path).read(7, "activity", -1, 20))
+
+    assert page == []
+    assert page.next_offset == len(raw)
+
+
+def test_valid_record_after_a_wrong_stream_record_is_still_returned(tmp_path: Path) -> None:
+    from backend.services.observability.event_store import ProjectEventStore
+
+    wrong = b'{"id":0,"created_at":"2026-07-19T00:00:00+00:00","stream":"debug","payload":{}}\n'
+    valid = b'{"id":90,"created_at":"2026-07-19T00:00:00+00:00","stream":"activity","payload":{"message":"ok"}}\n'
+    path = tmp_path / "projects/7/logs"
+    path.mkdir(parents=True)
+    (path / "activity.jsonl").write_bytes(wrong + valid)
+
+    records = run(ProjectEventStore(tmp_path).read(7, "activity", -1, 20))
+
+    assert [event.payload for event in records] == [{"message": "ok"}]
+
+
 def test_oversized_newline_free_record_is_rejected_without_an_unbounded_read(tmp_path: Path, monkeypatch) -> None:
     from backend.services.observability import event_store
     from backend.services.observability.event_store import CorruptEventLog, ProjectEventStore
