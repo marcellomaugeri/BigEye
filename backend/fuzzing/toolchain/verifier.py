@@ -23,7 +23,7 @@ llvm-config-18 --version
 cat > /tmp/bigeye-fuzzer.cc <<'BIGEYE_FUZZER_SOURCE'
 {FUZZER_SOURCE}BIGEYE_FUZZER_SOURCE
 clang++-18 -std=c++17 -fsanitize=fuzzer,address,undefined -g -O1 /tmp/bigeye-fuzzer.cc -o /tmp/bigeye-fuzzer
-/tmp/bigeye-fuzzer -runs=1
+ASAN_OPTIONS=detect_leaks=0 /tmp/bigeye-fuzzer -runs=1
 """
 
 

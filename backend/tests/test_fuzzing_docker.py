@@ -364,6 +364,7 @@ def _result(command, sink):
     assert command[0:2] == ["bash", "-lc"]
     assert "clang-18 --version" in command[2]
     assert "-fsanitize=fuzzer,address,undefined" in command[2]
+    assert "ASAN_OPTIONS=detect_leaks=0" in command[2]
     assert "-runs=1" in command[2]
     from backend.fuzzing.docker.container_runner import ContainerResult
     return ContainerResult(0, "verified\n")
