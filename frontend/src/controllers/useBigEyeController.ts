@@ -134,6 +134,7 @@ export function useBigEyeController(api: BigEyeApi, eventStream: ProjectEventStr
       setSelectedTaskId(null);
       setLogContent('');
       setLogError(null);
+      setLogLoading(false);
       setRepositoryUrl('');
       setPage('tasks');
       await loadTasks(project.id);

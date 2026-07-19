@@ -203,6 +203,30 @@ describe('App journey', () => {
     expect(screen.getByLabelText('Current project')).toHaveValue(createdProject.id);
   });
 
+  it('clears a stale log loading state after creating a taskless project', async () => {
+    const firstLog = deferred<{ content: string; next_offset: number }>();
+    const createdProject: Project = { ...secondProject, id: 'project-created', repository_url: 'https://github.com/example/created.git' };
+    const api = apiDouble({
+      createProject: vi.fn().mockResolvedValue(createdProject),
+      listTasks: vi.fn((projectId: string) => Promise.resolve(projectId === firstProject.id ? [firstTask] : [])),
+      getTaskLog: vi.fn().mockReturnValue(firstLog.promise)
+    });
+    const user = userEvent.setup();
+
+    render(<App api={api} />);
+
+    await screen.findByRole('option', { name: secondProject.repository_url });
+    await user.click(screen.getByRole('link', { name: 'Logs' }));
+    await waitFor(() => expect(api.getTaskLog).toHaveBeenCalledWith(firstTask.id, 0));
+    await user.click(screen.getByRole('link', { name: 'Projects' }));
+    await user.type(screen.getByLabelText('Repository URL'), createdProject.repository_url);
+    await user.click(screen.getByRole('button', { name: 'Create project' }));
+    expect(await screen.findByRole('heading', { name: 'Tasks' })).toBeInTheDocument();
+    await user.click(screen.getByRole('link', { name: 'Logs' }));
+
+    expect(await screen.findByText('This project has no task logs yet.')).toBeInTheDocument();
+  });
+
   it('shows an operational error when the project event stream fails', async () => {
     let reportError: ((message: string) => void) | undefined;
     const eventStream: ProjectEventStream = {
