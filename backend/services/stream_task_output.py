@@ -26,8 +26,9 @@ class TaskLogLimitExceeded(RuntimeError):
 
 
 class TaskLogReader:
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, events=None):
         self._workspace = Path(workspace)
+        self._events = events
 
     def path_for(self, task) -> Path:
         return contained_path(self._workspace, "projects", str(task.project_id), "logs", f"{task.id}.log")
@@ -154,6 +155,7 @@ class TaskLogWriter(TaskLogReader):
         if not isinstance(content, str):
             raise TypeError("task log content must be text")
         encoded = content.encode("utf-8")
+        persisted = False
         directory = self._log_directory(task, create=True)
         try:
             try:
@@ -174,10 +176,13 @@ class TaskLogWriter(TaskLogReader):
                     if count <= 0:
                         raise OSError("task log could not be written")
                     written += count
+                persisted = True
             finally:
                 os.close(descriptor)
         finally:
             os.close(directory)
+        if persisted and self._events is not None:
+            self._events.append_sync(task.project_id, "debug", {"task_id": task.id, "bytes": len(encoded)})
 
     async def append(self, task, content: str) -> None:
         self.append_sync(task, content)

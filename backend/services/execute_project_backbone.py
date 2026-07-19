@@ -13,7 +13,7 @@ TASK_NAMES = ("repository clone", "LLVM toolchain preparation", "repository anal
 class ExecuteProjectBackbone:
     """Keep task truth in one place while capabilities stay focused."""
 
-    def __init__(self, projects, tasks, clone, toolchain, analysis, logs, workspace: Path):
+    def __init__(self, projects, tasks, clone, toolchain, analysis, logs, workspace: Path, events=None):
         self._projects = projects
         self._tasks = tasks
         self._clone = clone
@@ -21,6 +21,7 @@ class ExecuteProjectBackbone:
         self._analysis = analysis
         self._logs = logs
         self._workspace = Path(workspace)
+        self._events = events
 
     async def schedule(self, project_id: int) -> None:
         project = await self._projects.get(project_id)
@@ -61,6 +62,8 @@ class ExecuteProjectBackbone:
             verify = getattr(self._clone, "verify_committed", None)
             if project.commit_sha and verify is not None and await verify(project):
                 await self._tasks.finish(task.id)
+                await self._task_completed(task)
+                await self._project_invalidated(task.project_id)
                 return True
             if project.commit_sha is None:
                 recover = getattr(self._clone, "recover_published", None)
@@ -68,9 +71,13 @@ class ExecuteProjectBackbone:
                     recovered = await recover(project, task)
                     if recovered is not None:
                         await self._tasks.finish(task.id)
+                        await self._task_completed(task)
+                        await self._project_invalidated(task.project_id)
                         return True
             await self._clone.clone(project, task)
             await self._tasks.finish(task.id)
+            await self._task_completed(task)
+            await self._project_invalidated(task.project_id)
             return True
         except asyncio.CancelledError:
             raise
@@ -84,6 +91,7 @@ class ExecuteProjectBackbone:
         try:
             await capability(task)
             await self._tasks.finish(task.id)
+            await self._task_completed(task)
             return True
         except asyncio.CancelledError:
             raise
@@ -104,6 +112,8 @@ class ExecuteProjectBackbone:
         except TaskLogLimitExceeded:
             pass
         await self._tasks.finish(task.id, message)
+        if self._events is not None:
+            await self._events.append(task.project_id, "activity", {"task_id": task.id, "state": "failed"})
 
     async def _persist_project_error(self, project_id: int) -> None:
         tasks = await self._tasks.list_for_project(project_id)
@@ -111,3 +121,12 @@ class ExecuteProjectBackbone:
             return
         errors = [f"{task.name}: {task.error}" for task in tasks if task.error]
         await self._projects.finish(project_id, "; ".join(errors) if errors else None)
+        await self._project_invalidated(project_id)
+
+    async def _task_completed(self, task) -> None:
+        if self._events is not None:
+            await self._events.append(task.project_id, "activity", {"task_id": task.id, "state": "completed"})
+
+    async def _project_invalidated(self, project_id: int) -> None:
+        if self._events is not None:
+            await self._events.append(project_id, "events", {"name": "project"})

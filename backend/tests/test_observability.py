@@ -47,6 +47,23 @@ def test_redaction_recurses_before_durable_serialization(tmp_path: Path) -> None
     }
 
 
+def test_redaction_normalizes_nested_key_separators_and_case() -> None:
+    from backend.services.observability.redaction import redact
+
+    value = redact({
+        "OPENAI_API_KEY": "openai", "X-Api-Key": "header", "AWS_SECRET_ACCESS_KEY": "aws",
+        "nested": [{"Authorization": "Bearer secret", "repository_token": "token"}],
+        "credentials": {"password": "password", "credential": "credential"},
+        "safe_key": "visible", "monkey": "visible", "secretary": "visible",
+    })
+
+    assert value == {
+        "OPENAI_API_KEY": "[REDACTED]", "X-Api-Key": "[REDACTED]", "AWS_SECRET_ACCESS_KEY": "[REDACTED]",
+        "nested": [{"Authorization": "[REDACTED]", "repository_token": "[REDACTED]"}],
+        "credentials": "[REDACTED]", "safe_key": "visible", "monkey": "visible", "secretary": "visible",
+    }
+
+
 def test_activity_and_debug_are_separate_from_internal_events_stream(tmp_path: Path) -> None:
     from backend.services.observability.event_store import ProjectEventStore
 
@@ -124,6 +141,54 @@ def test_event_log_read_stays_bounded_and_at_record_boundaries(tmp_path: Path, m
     assert [event.id for event in run(store.read(7, "activity", page[-1].id, 20))] == [third.id]
 
 
+def test_oversized_newline_free_record_is_rejected_without_an_unbounded_read(tmp_path: Path, monkeypatch) -> None:
+    from backend.services.observability import event_store
+    from backend.services.observability.event_store import CorruptEventLog, ProjectEventStore
+
+    monkeypatch.setattr(event_store, "EVENT_RECORD_MAX_BYTES", 32)
+    path = tmp_path / "projects/7/logs"
+    path.mkdir(parents=True)
+    (path / "activity.jsonl").write_bytes(b"x" * 33)
+    original = event_store.os.fdopen
+
+    class BoundedFile:
+        def __init__(self, file): self._file = file
+        def __enter__(self): return self
+        def __exit__(self, *args): return self._file.close()
+        def readline(self, size=-1):
+            assert size != -1
+            return self._file.readline(size)
+        def __getattr__(self, name): return getattr(self._file, name)
+
+    monkeypatch.setattr(event_store.os, "fdopen", lambda *args, **kwargs: BoundedFile(original(*args, **kwargs)))
+    with pytest.raises(CorruptEventLog, match="corrupt"):
+        run(ProjectEventStore(tmp_path).read(7, "activity", -1, 20))
+
+
+def test_mid_record_cursor_is_rejected_instead_of_discarding_data(tmp_path: Path) -> None:
+    from backend.services.observability.event_store import InvalidEventCursor, ProjectEventStore
+
+    store = ProjectEventStore(tmp_path)
+    first = run(store.append(7, "activity", {"message": "one"}))
+    run(store.append(7, "activity", {"message": "two"}))
+
+    with pytest.raises(InvalidEventCursor, match="cursor"):
+        run(store.read(7, "activity", first.id + 1, 20))
+    assert run(store.read(7, "activity", -1, 20))[0].id == first.id
+    assert run(store.read(7, "activity", first.id, 20))[0].payload["message"] == "two"
+
+
+def test_empty_event_log_accepts_only_initial_or_exact_eof_cursor(tmp_path: Path) -> None:
+    from backend.services.observability.event_store import InvalidEventCursor, ProjectEventStore
+
+    store = ProjectEventStore(tmp_path)
+
+    assert run(store.read(7, "events", -1, 20)) == []
+    assert run(store.read(7, "events", 0, 20)) == []
+    with pytest.raises(InvalidEventCursor, match="cursor"):
+        run(store.read(7, "events", 1, 20))
+
+
 def test_activity_and_debug_query_routes_exclude_internal_events(tmp_path: Path) -> None:
     from backend.api.controllers.events import get_project_log
     from backend.services.observability.event_store import ProjectEventStore
@@ -154,4 +219,25 @@ def test_sse_rejects_an_invalid_last_event_id() -> None:
 
     with pytest.raises(HTTPException) as error:
         run(project_events(7, request))
+    assert error.value.status_code == 422
+
+
+def test_sse_rejects_a_mid_record_last_event_id(tmp_path: Path) -> None:
+    from backend.api.controllers.projects import project_events
+    from backend.services.observability.event_store import ProjectEventStore
+    from backend.services.observability.event_stream import ProjectEventStream
+
+    store = ProjectEventStore(tmp_path)
+    first = run(store.append(7, "activity", {"message": "one"}))
+    event_id = run(store.read(7, "events", -1, 1))[0].id
+    request = SimpleNamespace(
+        headers={"last-event-id": str(event_id + 1)},
+        app=SimpleNamespace(state=SimpleNamespace(services=SimpleNamespace(
+            projects=SimpleNamespace(get=AsyncMock(return_value=object())), events=ProjectEventStream(store), observability=store,
+        ))),
+    )
+
+    with pytest.raises(HTTPException) as error:
+        run(project_events(7, request))
+    assert first.id == 0
     assert error.value.status_code == 422

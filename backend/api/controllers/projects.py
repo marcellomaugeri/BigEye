@@ -6,6 +6,7 @@ from starlette.responses import StreamingResponse
 from backend.api.views.project import CreateProjectRequest, ProjectResponse
 from backend.api.views.task import TaskResponse
 from backend.services.projects.create_project import InvalidRepositoryUrl
+from backend.services.projects.clone_repository import UnsafeWorkspacePath
 from backend.services.run_project_backbone import AnalysisNotReady
 
 
@@ -74,6 +75,10 @@ async def project_events(project_id: int, request: Request):
             cursor = int(after)
         except ValueError as error:
             raise HTTPException(status_code=422, detail="Last-Event-ID must be a non-negative byte offset") from error
+    try:
+        await services(request).observability.read(project_id, "events", cursor, 1)
+    except (ValueError, UnsafeWorkspacePath) as error:
+        raise HTTPException(status_code=422, detail="Last-Event-ID must be an event record boundary") from error
     return StreamingResponse(
         services(request).events.stream(project_id, cursor),
         media_type="text/event-stream",

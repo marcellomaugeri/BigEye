@@ -42,13 +42,13 @@ class Services:
 def build_services(pool, workspace: Path) -> Services:
     projects = ProjectRepository(pool)
     tasks = TaskRepository(pool)
-    logs = TaskLogWriter(workspace)
+    observability = ProjectEventStore(workspace)
+    logs = TaskLogWriter(workspace, observability)
     clone = CloneRepositoryService(workspace, projects=projects, logs=logs)
     toolchain = DeferredToolchain(Path(__file__).parents[1] / "fuzzing/images/Dockerfile", logs)
     analysis = RepositoryAnalysisWorkflow(workspace)
-    executor = ExecuteProjectBackbone(projects, tasks, clone, toolchain, analysis, logs, workspace)
+    executor = ExecuteProjectBackbone(projects, tasks, clone, toolchain, analysis, logs, workspace, observability)
     backbone = ProjectBackboneService(projects, executor)
-    observability = ProjectEventStore(workspace)
     return Services(
         project_creator=CreateProjectService(projects, backbone), projects=projects, tasks=tasks,
         logs=logs, events=ProjectEventStream(observability),

@@ -643,6 +643,46 @@ class TestRuntimeContracts:
 
 
 class TestProjectExecution:
+    def test_lifecycle_emits_durable_project_activity_and_debug_without_manual_events(self, tmp_path: Path) -> None:
+        from backend.services.execute_project_backbone import ExecuteProjectBackbone
+        from backend.services.observability.event_store import ProjectEventStore
+        from backend.services.observability.event_stream import ProjectEventStream
+        from backend.services.stream_task_output import TaskLogWriter
+
+        records = [_record(11, 7, "repository clone"), _record(12, 7, "LLVM toolchain preparation"), _record(13, 7, "repository analysis")]
+        projects, tasks, _ = _execution_repositories(project(), records)
+        store = ProjectEventStore(tmp_path)
+        logs = TaskLogWriter(tmp_path, store)
+        clone_logged, release_clone = asyncio.Event(), asyncio.Event()
+
+        class Clone:
+            async def clone(self, value, clone_task):
+                await asyncio.to_thread(logs.append_sync, clone_task, "clone is running\n")
+                clone_logged.set()
+                await release_clone.wait()
+        class Toolchain:
+            async def prepare(self, toolchain_task):
+                await logs.append(toolchain_task, "toolchain is running\n")
+        class Analysis:
+            async def analyse(self, project_id, root): return None
+
+        executor = ExecuteProjectBackbone(projects, tasks, Clone(), Toolchain(), Analysis(), logs, tmp_path, store)
+        stream = ProjectEventStream(store).stream(7, -1)
+
+        async def scenario():
+            running = asyncio.create_task(executor.schedule(7))
+            await asyncio.wait_for(clone_logged.wait(), 1)
+            first = await asyncio.wait_for(anext(stream), 1)
+            assert "event: debug" in first
+            assert records[0].finished_at is None
+            release_clone.set()
+            await running
+            return [event.payload["name"] for event in await store.read(7, "events", -1, 100)]
+
+        names = run(scenario())
+        run(stream.aclose())
+        assert {"project", "activity", "debug"}.issubset(names)
+
     def test_clone_and_toolchain_overlap_and_analysis_waits_only_for_clone(self, tmp_path: Path) -> None:
         from backend.services.execute_project_backbone import ExecuteProjectBackbone
 

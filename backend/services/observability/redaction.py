@@ -15,7 +15,10 @@ def _is_secret_key(key: object) -> bool:
     if not isinstance(key, str):
         return False
     normalized = key.lower().replace("-", "_")
-    return normalized in _SECRET_KEYS or normalized.endswith("_token") or normalized.endswith("_secret")
+    return (
+        normalized in _SECRET_KEYS
+        or normalized.endswith(("_token", "_secret", "_password", "_credential", "_credentials", "_api_key", "_access_key"))
+    )
 
 
 def redact(value):

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import threading
 
 from backend.models.event import StoredEvent
 from backend.services.observability.redaction import redact
@@ -23,12 +24,21 @@ _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | 
 _FILE_FLAGS = getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 
 
+class InvalidEventCursor(ValueError):
+    """Raised when an event cursor is not the start of a stored record."""
+
+
+class CorruptEventLog(ValueError):
+    """Raised when an event record cannot be read within the bounded format."""
+
+
 class ProjectEventStore:
     """Append-only activity/debug records plus a compact SSE invalidation log."""
 
     def __init__(self, workspace: Path):
         self._workspace = Path(workspace)
-        self._locks: dict[int, asyncio.Lock] = {}
+        self._locks: dict[int, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
         self._listeners: set[Callable[[int], None]] = set()
 
     def subscribe(self, listener: Callable[[int], None]) -> None:
@@ -40,10 +50,14 @@ class ProjectEventStore:
         return contained_path(self._workspace, "projects", str(project_id), "logs", f"{stream}.jsonl")
 
     async def append(self, project_id: int, stream: str, payload) -> StoredEvent:
+        return await asyncio.to_thread(self.append_sync, project_id, stream, payload)
+
+    def append_sync(self, project_id: int, stream: str, payload) -> StoredEvent:
         self._validate_project_id(project_id)
         self._validate_stream(stream)
-        lock = self._locks.setdefault(project_id, asyncio.Lock())
-        async with lock:
+        with self._locks_guard:
+            lock = self._locks.setdefault(project_id, threading.Lock())
+        with lock:
             if stream == "events":
                 event = self._append(project_id, stream, self._invalidation_payload(payload))
             else:
@@ -62,6 +76,8 @@ class ProjectEventStore:
             raise ValueError("event limit is invalid")
         descriptor = self._open_file(project_id, stream, create=False, write=False)
         if descriptor is None:
+            if after not in (-1, 0):
+                raise InvalidEventCursor("event cursor is not a record boundary")
             return []
         try:
             return self._read_records(descriptor, stream, after, limit)
@@ -101,17 +117,20 @@ class ProjectEventStore:
         consumed = 0
         with os.fdopen(os.dup(descriptor), "rb", closefd=True) as file:
             if after >= 0:
-                file.seek(after)
-                file.readline(EVENT_RECORD_MAX_BYTES + 1)
+                if after == size:
+                    return []
+                file.seek(0)
+                while file.tell() != after:
+                    if file.tell() > after or file.tell() >= size:
+                        raise InvalidEventCursor("event cursor is not a record boundary")
+                    self._read_line(file)
+                self._read_line(file)
             while len(records) < limit:
                 offset = file.tell()
-                raw = file.readline(EVENT_RECORD_MAX_BYTES + 1)
+                raw = self._read_line(file)
                 if not raw:
                     break
-                if not raw.endswith(b"\n"):
-                    file.readline()
-                    continue
-                if len(raw) > EVENT_RECORD_MAX_BYTES or consumed + len(raw) > EVENT_RESPONSE_MAX_BYTES:
+                if consumed + len(raw) > EVENT_RESPONSE_MAX_BYTES:
                     break
                 try:
                     value = json.loads(raw.decode("utf-8"))
@@ -123,6 +142,15 @@ class ProjectEventStore:
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                     continue
         return records
+
+    @staticmethod
+    def _read_line(file) -> bytes:
+        raw = file.readline(EVENT_RECORD_MAX_BYTES + 1)
+        if not raw:
+            return raw
+        if len(raw) > EVENT_RECORD_MAX_BYTES or not raw.endswith(b"\n"):
+            raise CorruptEventLog("project event log is corrupt")
+        return raw
 
     def _open_file(self, project_id: int, stream: str, create: bool, write: bool) -> int | None:
         try:

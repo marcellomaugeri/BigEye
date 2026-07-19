@@ -1,37 +1,51 @@
 """Resumable SSE rendering of durable project invalidations."""
 
 import asyncio
+import threading
+
+from backend.services.observability.event_store import CorruptEventLog, InvalidEventCursor
 
 
 class ProjectEventStream:
     def __init__(self, store):
         self._store = store
-        self._signals: dict[int, set[asyncio.Event]] = {}
+        self._signals: dict[int, set[tuple[asyncio.AbstractEventLoop, asyncio.Event]]] = {}
+        self._signals_lock = threading.Lock()
         store.subscribe(self._notify)
 
     def _subscribe(self, project_id: int) -> asyncio.Event:
         signal = asyncio.Event()
-        self._signals.setdefault(project_id, set()).add(signal)
+        with self._signals_lock:
+            self._signals.setdefault(project_id, set()).add((asyncio.get_running_loop(), signal))
         return signal
 
     def _unsubscribe(self, project_id: int, signal: asyncio.Event) -> None:
-        signals = self._signals.get(project_id)
-        if signals is None:
-            return
-        signals.discard(signal)
-        if not signals:
-            self._signals.pop(project_id, None)
+        with self._signals_lock:
+            signals = self._signals.get(project_id)
+            if signals is None:
+                return
+            signals = {(loop, item) for loop, item in signals if item is not signal}
+            if signals:
+                self._signals[project_id] = signals
+            else:
+                self._signals.pop(project_id, None)
 
     def _notify(self, project_id: int) -> None:
-        for signal in tuple(self._signals.get(project_id, ())):
-            signal.set()
+        with self._signals_lock:
+            signals = tuple(self._signals.get(project_id, ()))
+        for loop, signal in signals:
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(signal.set)
 
     async def stream(self, project_id: int, after: int = -1):
         signal = self._subscribe(project_id)
         cursor = after
         try:
             while True:
-                events = await self._store.read(project_id, "events", cursor, 1000)
+                try:
+                    events = await self._store.read(project_id, "events", cursor, 1000)
+                except (CorruptEventLog, InvalidEventCursor):
+                    return
                 for event in events:
                     cursor = event.id
                     yield self.frame(event)
