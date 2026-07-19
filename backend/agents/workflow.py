@@ -50,19 +50,22 @@ def _directory_flags() -> int:
 
 
 def _open_workspace(workspace: Path) -> tuple[Path, int]:
+    absolute_workspace = Path(os.path.abspath(os.fspath(workspace)))
     try:
-        workspace.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(workspace, _directory_flags())
-        root = workspace.resolve(strict=True)
+        descriptor = os.open("/", _directory_flags())
     except OSError as error:
         raise CitationValidationError("workspace directory is unsafe") from error
     try:
+        for part in absolute_workspace.parts[1:]:
+            child_descriptor = _open_or_create_directory(descriptor, part)
+            os.close(descriptor)
+            descriptor = child_descriptor
         if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
             raise CitationValidationError("workspace directory is unsafe")
     except BaseException:
         os.close(descriptor)
         raise
-    return root, descriptor
+    return absolute_workspace, descriptor
 
 
 def _open_or_create_directory(parent_descriptor: int, name: str) -> int:

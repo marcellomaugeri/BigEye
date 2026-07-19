@@ -12,6 +12,9 @@ from backend.agents.repository_analysis import build_repository_analysis_agent
 from backend.agents.tools.agent_dispatch import repository_analysis_tool
 from backend.agents.tools.code_navigation import (
     CodeNavigationError,
+    MAX_DIRECTORY_DEPTH,
+    MAX_DIRECTORY_ENTRIES,
+    MAX_DIRECTORIES,
     inspect_git_metadata,
     list_project_files,
     read_source_lines,
@@ -90,6 +93,35 @@ def test_navigation_listing_skips_case_insensitive_git_and_symlinks(tmp_path: Pa
     (root / "linked.rs").symlink_to(root / "src" / "main.rs")
 
     assert list_project_files(root) == ["README.md", "src/main.rs"]
+
+
+def test_navigation_rejects_too_many_directories(tmp_path: Path) -> None:
+    root = write_repository(tmp_path)
+    for index in range(MAX_DIRECTORIES + 1):
+        (root / f"empty-{index}").mkdir()
+
+    with pytest.raises(CodeNavigationError):
+        list_project_files(root)
+
+
+def test_navigation_rejects_excessive_directory_depth(tmp_path: Path) -> None:
+    root = write_repository(tmp_path)
+    directory = root
+    for index in range(MAX_DIRECTORY_DEPTH + 1):
+        directory = directory / f"level-{index}"
+        directory.mkdir()
+
+    with pytest.raises(CodeNavigationError):
+        list_project_files(root)
+
+
+def test_navigation_rejects_directory_entry_budget(tmp_path: Path) -> None:
+    root = write_repository(tmp_path)
+    for index in range(MAX_DIRECTORY_ENTRIES + 1):
+        (root / f"entry-{index}").write_text("x\n", encoding="utf-8")
+
+    with pytest.raises(CodeNavigationError):
+        list_project_files(root)
 
 
 def test_git_metadata_uses_bounded_argv_and_repository_root(tmp_path: Path) -> None:
@@ -247,6 +279,23 @@ def test_workflow_rejects_symlinked_workspace_root(tmp_path: Path) -> None:
 
     with pytest.raises(CitationValidationError):
         asyncio.run(RepositoryAnalysisWorkflow(workspace, runner=runner).analyse(13, root))
+
+
+def test_workflow_rejects_ancestor_symlinked_workspace_without_external_publish(tmp_path: Path) -> None:
+    root = write_repository(tmp_path)
+    trusted = tmp_path / "trusted"
+    trusted.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (trusted / "parent-link").symlink_to(outside, target_is_directory=True)
+    workspace = trusted / "parent-link" / "workspace"
+
+    async def runner(agent, prompt, *, context):
+        return dispatched_result(agent, "Entry point [src/main.rs:1-1].")
+
+    with pytest.raises(CitationValidationError):
+        asyncio.run(RepositoryAnalysisWorkflow(workspace, runner=runner).analyse(14, root))
+    assert not (outside / "workspace").exists()
 
 
 def test_workflow_does_not_retry_runner_errors_or_publish_two_invalid_outputs(tmp_path: Path) -> None:

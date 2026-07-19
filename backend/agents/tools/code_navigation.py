@@ -5,6 +5,7 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 import subprocess
+from collections import deque
 from contextlib import contextmanager
 
 from agents import RunContextWrapper, function_tool
@@ -13,6 +14,9 @@ from backend.agents.context import AgentContext
 
 
 MAX_FILES = 500
+MAX_DIRECTORIES = 64
+MAX_DIRECTORY_ENTRIES = 256
+MAX_DIRECTORY_DEPTH = 12
 MAX_FILE_BYTES = 1_000_000
 MAX_LINE_RANGE = 200
 MAX_QUERY_LENGTH = 200
@@ -123,46 +127,85 @@ def _read_relative_text(root_descriptor: int, parts: tuple[str, ...]) -> str:
         os.close(descriptor)
 
 
-def _list_directory(directory_descriptor: int, prefix: tuple[str, ...], files: list[str], limit: int) -> None:
+def _open_contained_directory(root_descriptor: int, parts: tuple[str, ...]) -> int:
+    descriptor = os.dup(root_descriptor)
     try:
-        names = sorted(os.listdir(directory_descriptor))
+        for part in parts:
+            child_descriptor = os.open(part, _open_flags(directory=True), dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child_descriptor
+            if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise CodeNavigationError("repository directory cannot be listed")
     except OSError as error:
         raise CodeNavigationError("repository directory cannot be listed") from error
-    for name in names:
-        if name.casefold() == ".git":
-            continue
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _enumerate_project_files(root_descriptor: int, limit: int) -> list[str]:
+    files: list[str] = []
+    pending = deque([((), 0)])
+    directories = 0
+    entries = 0
+    while pending:
+        parts, depth = pending.popleft()
+        directories += 1
+        if directories > MAX_DIRECTORIES:
+            raise CodeNavigationError("repository contains too many directories")
+        directory_descriptor = _open_contained_directory(root_descriptor, parts)
         try:
-            child_directory = os.open(name, _open_flags(directory=True), dir_fd=directory_descriptor)
-        except OSError:
             try:
-                descriptor = os.open(name, _open_flags(), dir_fd=directory_descriptor)
+                scan_descriptor = os.dup(directory_descriptor)
+                scanner = os.scandir(scan_descriptor)
             except OSError:
-                continue
+                raise CodeNavigationError("repository directory cannot be listed") from None
             try:
-                if stat.S_ISREG(os.fstat(descriptor).st_mode):
-                    files.append("/".join((*prefix, name)))
-                    if len(files) >= limit:
-                        return
+                for entry in scanner:
+                    entries += 1
+                    if entries > MAX_DIRECTORY_ENTRIES:
+                        raise CodeNavigationError("repository contains too many directory entries")
+                    name = entry.name
+                    if name.casefold() == ".git":
+                        continue
+                    try:
+                        child_directory = os.open(name, _open_flags(directory=True), dir_fd=directory_descriptor)
+                    except OSError:
+                        try:
+                            descriptor = os.open(name, _open_flags(), dir_fd=directory_descriptor)
+                        except OSError:
+                            continue
+                        try:
+                            if stat.S_ISREG(os.fstat(descriptor).st_mode):
+                                files.append("/".join((*parts, name)))
+                                if len(files) >= limit:
+                                    return sorted(files)
+                        finally:
+                            os.close(descriptor)
+                        continue
+                    try:
+                        if not stat.S_ISDIR(os.fstat(child_directory).st_mode):
+                            continue
+                    finally:
+                        os.close(child_directory)
+                    child_depth = depth + 1
+                    if child_depth > MAX_DIRECTORY_DEPTH:
+                        raise CodeNavigationError("repository directory nesting is too deep")
+                    pending.append(((*parts, name), child_depth))
             finally:
-                os.close(descriptor)
-            continue
-        try:
-            if stat.S_ISDIR(os.fstat(child_directory).st_mode):
-                _list_directory(child_directory, (*prefix, name), files, limit)
-                if len(files) >= limit:
-                    return
+                scanner.close()
         finally:
-            os.close(child_directory)
+            os.close(directory_descriptor)
+    return sorted(files)
 
 
 def list_project_files(repository_root: Path, limit: int = MAX_FILES) -> list[str]:
     """List at most ``limit`` contained, non-Git, text-like repository files."""
     if not isinstance(limit, int) or limit < 1 or limit > MAX_FILES:
         raise CodeNavigationError("file listing limit is outside the allowed range")
-    files: list[str] = []
     with _opened_repository_root(repository_root) as (_, descriptor):
-        _list_directory(descriptor, (), files, limit)
-    return sorted(files)
+        return _enumerate_project_files(descriptor, limit)
 
 
 def read_source_lines(repository_root: Path, relative_path: str, start_line: int, end_line: int) -> str:
@@ -191,9 +234,7 @@ def search_source_text(repository_root: Path, query: str, limit: int = MAX_SEARC
         raise CodeNavigationError("search result limit is outside the allowed bounds")
     matches: list[dict[str, int | str]] = []
     with _opened_repository_root(repository_root) as (_, descriptor):
-        files: list[str] = []
-        _list_directory(descriptor, (), files, MAX_FILES)
-        for relative_path in sorted(files):
+        for relative_path in _enumerate_project_files(descriptor, MAX_FILES):
             try:
                 content = _read_relative_text(descriptor, tuple(relative_path.split("/")))
             except CodeNavigationError:
