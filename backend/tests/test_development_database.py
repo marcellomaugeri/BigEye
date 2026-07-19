@@ -1,7 +1,10 @@
 """Focused checks for the local PostgreSQL development foundation."""
 
 from pathlib import Path
+import os
 import re
+import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -82,6 +85,39 @@ class DevelopmentDatabaseTests(unittest.TestCase):
         self.assertIn("DROP SCHEMA IF EXISTS public CASCADE", reset_script)
         self.assertNotIn("DROP DATABASE", reset_script)
         self.assertNotIn("dropdb", reset_script)
+
+    def test_reset_rejects_remote_databases_before_invoking_psql(self) -> None:
+        reset_script = ROOT / "backend/database/reset.sh"
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            psql = temporary_path / "psql"
+            psql.write_text(
+                "#!/usr/bin/env sh\n"
+                "touch \"$BIGEYE_PSQL_CALLED\"\n"
+                "printf 'bigeye\\n'\n"
+            )
+            psql.chmod(0o755)
+            psql_called = temporary_path / "psql-called"
+            environment = {
+                **os.environ,
+                "DATABASE_URL": "postgresql://bigeye:bigeye@db.example.test:5433/bigeye",
+                "BIGEYE_PSQL_CALLED": str(psql_called),
+                "PATH": f"{temporary_path}{os.pathsep}{os.environ['PATH']}",
+            }
+
+            result = subprocess.run(
+                ["sh", str(reset_script)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            psql_was_called = psql_called.exists()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("loopback", result.stderr)
+        self.assertFalse(psql_was_called)
 
     @staticmethod
     def _columns_for(table: str, schema: str) -> set[str]:

@@ -3,6 +3,17 @@ set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 database_url=${DATABASE_URL:-postgresql://bigeye:bigeye@127.0.0.1:5433/bigeye}
+url_authority=${database_url#postgresql://}
+url_authority=${url_authority%%/*}
+database_host=${url_authority##*@}
+
+case "$database_host" in
+    127.0.0.1|127.0.0.1:*|localhost|localhost:*|"[::1]"|"[::1]":*) ;;
+    *)
+        echo "Refusing to reset a non-loopback database host." >&2
+        exit 1
+        ;;
+esac
 
 database_name=$(psql "$database_url" --tuples-only --no-align --command 'SELECT current_database()')
 if [ "$database_name" != "bigeye" ]; then
