@@ -12,6 +12,10 @@ from backend.fuzzing.crashes.replay import ReplayResult
 _ADDRESS = re.compile(r"\b0x[0-9a-fA-F]+\b")
 _FRAME_PREFIX = re.compile(r"^\s*#\d+\s+")
 _WHITESPACE = re.compile(r"\s+")
+_PROJECT_SOURCE = re.compile(
+    r"(?<![/A-Za-z0-9_.-])(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+"
+    r"\.(?:c|cc|cpp|cxx|h|hh|hpp|hxx|rs|swift|m|mm):\d+(?::\d+)?"
+)
 
 
 def _text(value: str | None) -> str:
@@ -21,6 +25,9 @@ def _text(value: str | None) -> str:
 def normalise_stack(stack: str) -> tuple[str, ...]:
     frames = []
     for raw in stack.splitlines()[:64]:
+        source = _PROJECT_SOURCE.search(raw)
+        if source is None:
+            continue
         value = _FRAME_PREFIX.sub("", raw)
         value = _ADDRESS.sub("<address>", value)
         value = _text(value)
@@ -45,8 +52,5 @@ def failure_signature(result: ReplayResult) -> str:
 
 
 def crash_fingerprint(result: ReplayResult) -> str:
-    """Group equivalent failures while retaining behaviourally relevant coverage."""
-    return _hash({
-        "failure": failure_signature(result),
-        "coverage": sorted({_text(value) for value in result.coverage if value}),
-    })
+    """Group by stable failure identity; full coverage remains evidence, not identity."""
+    return failure_signature(result)

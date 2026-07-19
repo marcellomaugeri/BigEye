@@ -6,7 +6,11 @@ from dataclasses import dataclass
 import re
 from typing import Protocol
 
-from backend.fuzzing.crashes.quarantine import CrashObservation
+from backend.fuzzing.crashes.quarantine import CrashObservation, _source_reference
+
+
+_SIGNAL_PATTERN = re.compile(r"SIG[A-Z0-9]+\Z")
+_SANITIZERS = frozenset({"address", "undefined", "memory", "thread", "cfi", "leak", "none"})
 
 
 @dataclass(frozen=True)
@@ -46,6 +50,15 @@ class ReplayResult:
             raise ValueError("replay exit code is invalid")
         if not isinstance(self.image_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", self.image_id):
             raise ValueError("replay image ID must be exact")
+        if self.signal is not None and not _SIGNAL_PATTERN.fullmatch(self.signal):
+            raise ValueError("replay signal is not a validated signal name")
+        if self.sanitizer is not None and (
+            not self.sanitizer or any(part not in _SANITIZERS for part in self.sanitizer.split("+"))
+        ):
+            raise ValueError("replay sanitizer is not a validated sanitizer name")
+        _source_reference(self.source_location, "replay source location")
+        for value in self.coverage:
+            _source_reference(value, "replay coverage location")
 
 
 @dataclass(frozen=True)

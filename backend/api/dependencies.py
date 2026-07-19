@@ -5,6 +5,7 @@ from pathlib import Path
 
 from backend.repositories.project_repository import ProjectRepository
 from backend.repositories.coverage_repository import CoverageRepository
+from backend.repositories.finding_repository import FindingRepository
 from backend.repositories.task_repository import TaskRepository
 from backend.services.check_settings import SettingsService
 from backend.services.projects.create_project import CreateProjectService
@@ -20,6 +21,8 @@ from backend.services.execute_project_backbone import ExecuteProjectBackbone
 from backend.agents.workflow import RepositoryAnalysisWorkflow
 from backend.fuzzing.toolchain.deferred import DeferredToolchain
 from backend.fuzzing.coverage.traceability import ProjectCheckoutRegistry, TraceabilityService
+from backend.fuzzing.crashes.artifacts import FindingArtifactStore
+from backend.fuzzing.crashes.quarantine import CrashQuarantine
 
 
 @dataclass
@@ -35,6 +38,8 @@ class Services:
     project_settings: object | None = None
     observability: object | None = None
     coverage: object | None = None
+    findings: object | None = None
+    finding_artifacts: object | None = None
 
     async def close(self) -> None:
         close = getattr(self.recovery, "close", None)
@@ -45,6 +50,7 @@ class Services:
 def build_services(pool, workspace: Path) -> Services:
     projects = ProjectRepository(pool)
     coverage_repository = CoverageRepository(pool)
+    findings = FindingRepository(pool)
     tasks = TaskRepository(pool)
     observability = ProjectEventStore(workspace)
     logs = TaskLogWriter(workspace, observability)
@@ -59,11 +65,12 @@ def build_services(pool, workspace: Path) -> Services:
         replay_verifier=None,
         checkout_registry=ProjectCheckoutRegistry(workspace, projects),
     )
+    finding_artifacts = FindingArtifactStore(CrashQuarantine(workspace))
     return Services(
         project_creator=CreateProjectService(projects, backbone), projects=projects, tasks=tasks,
         logs=logs, events=ProjectEventStream(observability),
         settings=SettingsService(pool, toolchain.docker_available, toolchain.toolchain_available),
         recovery=backbone, analysis=AnalysisReader(workspace),
         project_settings=ProjectSettingsService(projects), observability=observability,
-        coverage=coverage,
+        coverage=coverage, findings=findings, finding_artifacts=finding_artifacts,
     )

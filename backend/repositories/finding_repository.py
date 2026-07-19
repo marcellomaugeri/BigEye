@@ -1,6 +1,7 @@
 """SQL access for findings only."""
 
 import re
+from datetime import datetime
 
 from backend.models.finding import Finding
 
@@ -19,20 +20,41 @@ class FindingRepository:
         return self._finding(row) if row else None
 
     async def list_for_project(self, project_id: int) -> list[Finding]:
+        rows, _has_more = await self.list_page(project_id, 100, None)
+        return rows
+
+    async def list_page(
+        self, project_id: int, limit: int, before: tuple[datetime, int] | None,
+    ) -> tuple[list[Finding], bool]:
+        if isinstance(project_id, bool) or not isinstance(project_id, int) or project_id <= 0:
+            raise ValueError("project ID must be positive")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("finding page limit must be between one and one hundred")
+        before_created_at, before_id = before if before is not None else (None, None)
+        if before is not None and (
+            not isinstance(before, tuple) or len(before) != 2
+            or not isinstance(before_created_at, datetime) or before_created_at.tzinfo is None
+            or isinstance(before_id, bool) or not isinstance(before_id, int) or before_id <= 0
+        ):
+            raise ValueError("finding cursor boundary is invalid")
         rows = await self._pool.fetch(
             """SELECT id, project_id, fingerprint, classification, priority_rank, priority_reason, description,
                       reproducible, occurrence_count, created_at, triaged_at, error
-               FROM findings WHERE project_id = $1 ORDER BY created_at DESC, id DESC""",
-            project_id,
+               FROM findings
+              WHERE project_id = $1
+                AND ($3::timestamptz IS NULL OR (created_at, id) < ($3::timestamptz, $4::bigint))
+              ORDER BY created_at DESC, id DESC
+              LIMIT $2""",
+            project_id, limit + 1, before_created_at, before_id,
         )
-        return [self._finding(row) for row in rows]
+        has_more = len(rows) > limit
+        return [self._finding(row) for row in rows[:limit]], has_more
 
     async def create_or_increment(
         self, *, project_id: int, fingerprint: str, classification: str,
-        priority_rank: int | None, priority_reason: str | None,
         description: str, reproducible: bool,
     ) -> Finding:
-        """Serialize one project/fingerprint group without requiring a schema constraint."""
+        """Atomically publish one database-unique project/fingerprint crash group."""
         if isinstance(project_id, bool) or not isinstance(project_id, int) or project_id <= 0:
             raise ValueError("project ID must be positive")
         if not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
@@ -42,55 +64,68 @@ class FindingRepository:
             "flaky or environmental", "unresolved",
         }:
             raise ValueError("finding classification is unsupported")
-        if priority_rank is not None and (
-            isinstance(priority_rank, bool) or not isinstance(priority_rank, int) or not 1 <= priority_rank <= 2_147_483_647
-        ):
-            raise ValueError("finding priority rank must be a positive integer")
-        for value, label, maximum in (
-            (priority_reason, "priority reason", 2_000),
-            (description, "description", 1_000),
-        ):
-            if value is not None and (not isinstance(value, str) or not value or len(value) > maximum or "\x00" in value):
-                raise ValueError(f"finding {label} is invalid")
+        if not isinstance(description, str) or not description or len(description) > 1_000 or "\x00" in description:
+            raise ValueError("finding description is invalid")
         if not isinstance(reproducible, bool):
             raise ValueError("finding reproducibility must be boolean")
-        row = await self._pool.fetchrow(
-            """WITH locked AS MATERIALIZED (
-                       SELECT pg_advisory_xact_lock(hashtextextended($1::bigint::text || ':' || $2, 0))
-                   ), updated AS (
-                       UPDATE findings
-                          SET classification = $3,
-                              priority_rank = $4,
-                              priority_reason = $5,
-                              description = $6,
-                              reproducible = $7,
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock($1::bigint)", project_id,
+                )
+                candidate = await connection.fetchrow(
+                    """INSERT INTO findings
+                              (project_id, fingerprint, classification, priority_rank, priority_reason,
+                               description, reproducible, occurrence_count, triaged_at)
+                       VALUES ($1, $2, $3, NULL, NULL, $4, $5, 1, CURRENT_TIMESTAMP)
+                       ON CONFLICT (project_id, fingerprint) DO UPDATE
+                          SET classification = EXCLUDED.classification,
+                              description = EXCLUDED.description,
+                              reproducible = EXCLUDED.reproducible,
                               occurrence_count = findings.occurrence_count + 1,
                               triaged_at = CURRENT_TIMESTAMP,
                               error = NULL
-                         FROM locked
-                        WHERE findings.project_id = $1 AND findings.fingerprint = $2
-                    RETURNING findings.id, findings.project_id, findings.fingerprint,
-                              findings.classification, findings.priority_rank, findings.priority_reason,
-                              findings.description, findings.reproducible, findings.occurrence_count,
-                              findings.created_at, findings.triaged_at, findings.error
-                   ), inserted AS (
-                       INSERT INTO findings
-                              (project_id, fingerprint, classification, priority_rank, priority_reason,
-                               description, reproducible, occurrence_count, triaged_at)
-                       SELECT $1, $2, $3, $4, $5, $6, $7, 1, CURRENT_TIMESTAMP
-                         FROM locked
-                        WHERE NOT EXISTS (SELECT 1 FROM updated)
-                    RETURNING id, project_id, fingerprint, classification, priority_rank, priority_reason,
+                    RETURNING id""",
+                    project_id, fingerprint, classification, description, reproducible,
+                )
+                if candidate is None:
+                    raise RuntimeError("finding publication did not return a crash group")
+                await connection.execute(
+                    """WITH ranked AS (
+                           SELECT id,
+                                  ROW_NUMBER() OVER (
+                                      ORDER BY CASE classification
+                                          WHEN 'true vulnerability' THEN 1
+                                          WHEN 'improper contract usage' THEN 2
+                                          WHEN 'unresolved' THEN 3
+                                          WHEN 'flaky or environmental' THEN 4
+                                          WHEN 'harness-induced false positive' THEN 5
+                                          ELSE 6 END,
+                                      reproducible DESC, occurrence_count DESC,
+                                      created_at, fingerprint, id
+                                  ) AS project_rank
+                             FROM findings
+                            WHERE project_id = $1
+                       )
+                       UPDATE findings
+                          SET priority_rank = ranked.project_rank,
+                              priority_reason = findings.classification || '; '
+                                  || CASE WHEN findings.reproducible THEN 'reproducible' ELSE 'not reproducible' END
+                                  || '; observed ' || findings.occurrence_count::text
+                                  || CASE WHEN findings.occurrence_count = 1 THEN ' time' ELSE ' times' END
+                         FROM ranked
+                        WHERE findings.id = ranked.id""",
+                    project_id,
+                )
+                row = await connection.fetchrow(
+                    """SELECT id, project_id, fingerprint, classification, priority_rank, priority_reason,
                               description, reproducible, occurrence_count, created_at, triaged_at, error
-                   )
-                   SELECT * FROM updated
-                   UNION ALL
-                   SELECT * FROM inserted""",
-            project_id, fingerprint, classification, priority_rank, priority_reason, description, reproducible,
-        )
-        if row is None:
-            raise RuntimeError("finding publication did not return a crash group")
-        return self._finding(row)
+                         FROM findings WHERE id = $1 AND project_id = $2""",
+                    candidate["id"], project_id,
+                )
+                if row is None:
+                    raise RuntimeError("ranked finding publication did not return its crash group")
+                return self._finding(row)
 
     @staticmethod
     def _finding(row) -> Finding:

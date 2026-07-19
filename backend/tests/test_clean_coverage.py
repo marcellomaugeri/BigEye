@@ -507,6 +507,14 @@ def test_coverage_repository_inserts_existing_minimal_row_contract():
     assert "INSERT INTO coverage_evidence" in pool.fetchrow.await_args.args[0]
 
 
+def test_release_schema_guarantees_one_coverage_hit_per_project_source_line_and_asset():
+    from pathlib import Path
+
+    schema = (Path(__file__).parents[1] / "database" / "schema.sql").read_text()
+
+    assert "UNIQUE (project_id, commit_sha, source_path, line_number, asset_id)" in schema
+
+
 def test_llvm_cov_regions_span_lines_skip_gaps_and_use_region_file_ids(tmp_path: Path):
     from backend.fuzzing.coverage.llvm_coverage import LlvmCoverage
 

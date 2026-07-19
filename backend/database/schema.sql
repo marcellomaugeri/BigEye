@@ -63,6 +63,7 @@ CREATE TABLE coverage_evidence (
     asset_id BIGINT NOT NULL,
     first_testcase_sha256 TEXT NOT NULL,
     cpu_exposure_seconds DOUBLE PRECISION NOT NULL,
+    UNIQUE (project_id, commit_sha, source_path, line_number, asset_id),
     FOREIGN KEY (project_id) REFERENCES projects (id),
     FOREIGN KEY (campaign_id) REFERENCES campaigns (id),
     FOREIGN KEY (asset_id) REFERENCES assets (id)
@@ -81,6 +82,7 @@ CREATE TABLE findings (
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     triaged_at TIMESTAMPTZ,
     error TEXT,
+    UNIQUE (project_id, fingerprint),
     FOREIGN KEY (project_id) REFERENCES projects (id)
 );
 
@@ -88,5 +90,4 @@ CREATE INDEX tasks_project_created_at_idx ON tasks (project_id, created_at, id);
 CREATE INDEX assets_project_created_at_idx ON assets (project_id, created_at, id);
 CREATE INDEX campaigns_project_started_at_idx ON campaigns (project_id, started_at, id);
 CREATE INDEX coverage_evidence_project_source_line_idx ON coverage_evidence (project_id, source_path, line_number);
-CREATE INDEX findings_project_fingerprint_idx ON findings (project_id, fingerprint);
 CREATE INDEX findings_project_created_at_idx ON findings (project_id, created_at, id);

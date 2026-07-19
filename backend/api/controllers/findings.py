@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import base64
+import json
+from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Path, Request, Response
+from fastapi import APIRouter, HTTPException, Path, Query, Request, Response
 
-from backend.api.views.finding import FindingDetailResponse, FindingResponse
+from backend.api.views.finding import FindingDetailResponse, FindingPageResponse, FindingResponse
 
 
 router = APIRouter()
 _MAX_REPRODUCER_BYTES = 16 * 1024 * 1024
 PositiveId = Annotated[int, Path(ge=1)]
+PageLimit = Annotated[int, Query(ge=1, le=100)]
+Cursor = Annotated[str | None, Query(max_length=512)]
 
 
 async def _finding(project_id: PositiveId, finding_id: PositiveId, request: Request):
@@ -21,10 +26,44 @@ async def _finding(project_id: PositiveId, finding_id: PositiveId, request: Requ
     return finding
 
 
-@router.get("/projects/{project_id}/findings", response_model=list[FindingResponse])
-async def list_findings(project_id: PositiveId, request: Request):
-    findings = await request.app.state.services.findings.list_for_project(project_id)
-    return [FindingResponse.from_model(finding) for finding in findings]
+def _encode_cursor(project_id: int, finding) -> str:
+    payload = json.dumps(
+        {"project_id": project_id, "created_at": finding.created_at.isoformat(), "id": finding.id},
+        ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    ).encode("ascii")
+    return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+
+
+def _decode_cursor(value: str | None, project_id: int) -> tuple[datetime, int] | None:
+    if value is None:
+        return None
+    try:
+        padding = "=" * (-len(value) % 4)
+        payload = base64.b64decode(value + padding, altchars=b"-_", validate=True)
+        decoded = json.loads(payload)
+        if not isinstance(decoded, dict) or set(decoded) != {"project_id", "created_at", "id"}:
+            raise ValueError
+        if decoded["project_id"] != project_id:
+            raise ValueError
+        created_at = datetime.fromisoformat(decoded["created_at"])
+        finding_id = decoded["id"]
+        if created_at.tzinfo is None or isinstance(finding_id, bool) or not isinstance(finding_id, int) or finding_id <= 0:
+            raise ValueError
+        return created_at, finding_id
+    except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=422, detail="invalid findings cursor") from error
+
+
+@router.get("/projects/{project_id}/findings", response_model=FindingPageResponse)
+async def list_findings(
+    project_id: PositiveId, request: Request, limit: PageLimit = 50, cursor: Cursor = None,
+):
+    before = _decode_cursor(cursor, project_id)
+    findings, has_more = await request.app.state.services.findings.list_page(project_id, limit, before)
+    return FindingPageResponse(
+        items=[FindingResponse.from_model(finding) for finding in findings],
+        next_cursor=_encode_cursor(project_id, findings[-1]) if has_more and findings else None,
+    )
 
 
 @router.get("/projects/{project_id}/findings/{finding_id}", response_model=FindingDetailResponse)

@@ -16,8 +16,16 @@ from backend.fuzzing.crashes.minimisation import CrashMinimiser
 from backend.fuzzing.crashes.quarantine import CrashObservation, CrashQuarantine
 from backend.fuzzing.crashes.replay import ReplayResult
 from backend.fuzzing.crashes.artifacts import FindingArtifactStore
+from backend.fuzzing.crashes.correction import (
+    CorrectionCandidate,
+    CorrectionImage,
+    HarnessCorrectionExperiment,
+)
 from backend.fuzzing.crashes.triage import CrashPipeline, CrashTriageEvidence
 from backend.models.finding import Finding
+
+
+NOW = datetime(2026, 7, 20, tzinfo=UTC)
 
 
 def run(coroutine):
@@ -94,13 +102,18 @@ class Findings:
         key = (values["project_id"], values["fingerprint"])
         existing = self.rows.get(key)
         count = 1 if existing is None else existing.occurrence_count + 1
+        priority_reason = (
+            f"{values['classification']}; "
+            f"{'reproducible' if values['reproducible'] else 'not reproducible'}; "
+            f"observed {count} {'time' if count == 1 else 'times'}"
+        )
         finding = Finding(
             id=len(self.rows) + 1 if existing is None else existing.id,
             project_id=values["project_id"],
             fingerprint=values["fingerprint"],
             classification=values["classification"],
-            priority_rank=values["priority_rank"],
-            priority_reason=values["priority_reason"],
+            priority_rank=1,
+            priority_reason=priority_reason,
             description=values["description"],
             reproducible=values["reproducible"],
             occurrence_count=count,
@@ -221,7 +234,7 @@ def test_flaky_crash_is_retained_and_cannot_be_promoted_to_vulnerability(tmp_pat
     assert service.artifacts.read_reproducer(finding)
 
 
-def test_harness_failure_is_not_promoted_as_target_vulnerability(tmp_path: Path):
+def test_fabricated_correction_dictionary_cannot_classify_a_false_positive(tmp_path: Path):
     class Correction:
         def __init__(self):
             self.calls = []
@@ -242,10 +255,76 @@ def test_harness_failure_is_not_promoted_as_target_vulnerability(tmp_path: Path)
 
     finding = run(service.process(observation(harness_misuse_evidence=("probe:invalid-call-order",))))
 
-    assert finding.classification == "harness-induced false positive"
-    assert finding.classification != "true vulnerability"
-    assert correction.calls == [(31, b"crash")]
-    assert service.artifacts.detail(finding)["correction"]["asset_id"] == 99
+    assert finding.classification == "unresolved"
+    assert correction.calls == []
+
+
+def test_validated_correction_uses_persisted_lineage_exact_images_and_runs_once_per_group(tmp_path: Path):
+    from backend.models.asset import CampaignAsset
+
+    original_asset = CampaignAsset(
+        31, 7, "target", "parser", "1" * 64, None, NOW, NOW, None,
+    )
+    corrected_asset = CampaignAsset(
+        99, 7, "target", "parser correction", "2" * 64, 31, NOW, NOW, None,
+    )
+
+    class Assets:
+        async def get(self, asset_id):
+            return {31: original_asset, 99: corrected_asset}.get(asset_id)
+
+    class Images:
+        def inspect_exact(self, image_id):
+            labels = {"bigeye.project": "7", "bigeye.commit": "a" * 40, "bigeye.layer": "target"}
+            return CorrectionImage(image_id, "linux", "amd64", labels)
+
+    class Builder:
+        def __init__(self):
+            self.calls = 0
+
+        async def create_child(self, crash, input_bytes, original):
+            self.calls += 1
+            return CorrectionCandidate(99, "sha256:" + "e" * 64)
+
+    class CorrectionReplay(Replay):
+        async def replay(self, crash, input_bytes, variant):
+            if crash.target_asset_id == 99:
+                self.calls.append((variant, input_bytes))
+                return ReplayResult(
+                    variant="original", crashed=False, signal=None, stack="", sanitizer="address",
+                    source_location=None, coverage=(), exit_code=0, image_id=crash.image_id,
+                )
+            return await super().replay(crash, input_bytes, variant)
+
+    replayer = CorrectionReplay()
+    builder = Builder()
+    correction = HarnessCorrectionExperiment(Assets(), Images(), builder, replayer)
+    service, _, _ = pipeline(tmp_path, replay=replayer, specialist=Specialist("true vulnerability"), corrector=correction)
+    crash = observation(harness_misuse_evidence=("probe:invalid-call-order",))
+
+    first = run(service.process(crash))
+    second = run(service.process(replace(crash, input_bytes=b"other")))
+
+    assert first.classification == "harness-induced false positive"
+    assert second.classification == "harness-induced false positive"
+    assert builder.calls == 1
+    correction_detail = service.artifacts.detail(second)["correction"]
+    assert correction_detail["corrected_asset_id"] == 99
+    assert correction_detail["signature_disappeared"] is True
+
+
+def test_correction_evidence_rejects_a_contradictory_disappearance_claim():
+    from backend.fuzzing.crashes.correction import CorrectionEvidence
+
+    with pytest.raises(ValueError, match="disappearance"):
+        CorrectionEvidence(
+            project_id=7, target_asset_id=31, corrected_asset_id=99,
+            base_image_id="sha256:" + "b" * 64,
+            corrected_image_id="sha256:" + "e" * 64,
+            commit_sha="a" * 40, base_signature="1" * 64,
+            corrected_signature="2" * 64, signature_disappeared=True,
+            evidence_id="correction:" + "3" * 64,
+        )
 
 
 def test_replay_rejects_a_result_from_a_different_image(tmp_path: Path):
@@ -280,10 +359,14 @@ def test_unproven_exploitability_claim_is_not_published(tmp_path: Path):
         specialist=Specialist("true vulnerability", "Exploitable remote code execution in parser."),
     )
 
-    finding = run(service.process(observation(exploitability_proven=False)))
+    finding = run(service.process(observation()))
 
     assert "exploit" not in finding.description.casefold()
     assert "code execution" not in finding.description.casefold()
+    assert finding.description == (
+        "Reproduced address sanitizer failure near src/parser.c:42; "
+        "investigate the affected operation."
+    )
 
 
 def test_unproven_exploitability_claim_is_removed_from_priority_rationale(tmp_path: Path):
@@ -292,10 +375,34 @@ def test_unproven_exploitability_claim_is_removed_from_priority_rationale(tmp_pa
         specialist=Specialist(priority="Priority one because remote code execution is exploitable."),
     )
 
-    finding = run(service.process(observation(exploitability_proven=False)))
+    finding = run(service.process(observation()))
 
     assert "exploit" not in finding.priority_reason.casefold()
     assert "code execution" not in finding.priority_reason.casefold()
+
+
+def test_model_authored_claims_never_reach_finding_detail_fields(tmp_path: Path):
+    class HostileSpecialist:
+        async def triage(self, evidence):
+            claim = "Proven exploitable RCE with attacker-controlled code execution."
+            return TriageResult(
+                classification="true vulnerability",
+                description=claim,
+                evidence_ids=list(evidence.evidence_ids),
+                uncertainty=claim,
+                priority_rationale=claim,
+                repair_intent=claim,
+            )
+
+    service, _, _ = pipeline(tmp_path, specialist=HostileSpecialist())
+
+    finding = run(service.process(observation()))
+    published = service.artifacts.detail(finding)
+    text = json.dumps({"description": finding.description, **published}).casefold()
+
+    assert "exploit" not in text
+    assert "code execution" not in text
+    assert "attacker-controlled" not in text
 
 
 def test_empty_crashing_input_is_retained_as_a_valid_reproducer(tmp_path: Path):
@@ -307,7 +414,7 @@ def test_empty_crashing_input_is_retained_as_a_valid_reproducer(tmp_path: Path):
     assert service.artifacts.detail(finding)["reproducer"]["size"] == 0
 
 
-def test_fingerprint_normalises_addresses_but_keeps_source_signal_and_coverage():
+def test_fingerprint_normalises_addresses_and_ignores_incidental_coverage():
     left = ReplayResult(
         variant="original", crashed=True, signal="SIGSEGV",
         stack="#0 0x1234 in parse src/a.c:42", sanitizer="address",
@@ -318,7 +425,36 @@ def test_fingerprint_normalises_addresses_but_keeps_source_signal_and_coverage()
     changed = replace(left, coverage=("src/a.c:41", "src/a.c:99"))
 
     assert crash_fingerprint(left) == crash_fingerprint(right)
-    assert crash_fingerprint(left) != crash_fingerprint(changed)
+    assert crash_fingerprint(left) == crash_fingerprint(changed)
+
+
+def test_fingerprint_keeps_distinct_project_crash_sites_separate():
+    first = ReplayResult(
+        variant="original", crashed=True, signal="SIGSEGV",
+        stack="#0 0x1234 in parse src/a.c:42\n#1 libc.so", sanitizer="address",
+        source_location="src/a.c:42", coverage=("src/a.c:42",), exit_code=-11,
+        image_id="sha256:" + "b" * 64,
+    )
+    second = replace(first, stack="#0 0x999 in parse src/b.c:9\n#1 libc.so", source_location="src/b.c:9")
+    incidental = replace(first, stack="#0 0x9999 in parse src/a.c:42\n#1 changed-libc.so")
+
+    assert crash_fingerprint(first) != crash_fingerprint(second)
+    assert crash_fingerprint(first) == crash_fingerprint(incidental)
+
+
+def test_replay_result_rejects_unvalidated_signal_and_sanitizer_names():
+    with pytest.raises(ValueError, match="signal"):
+        ReplayResult(
+            variant="original", crashed=True, signal="not-a-signal", stack="#0 parse src/a.c:42",
+            sanitizer="address", source_location="src/a.c:42", coverage=(), exit_code=-1,
+            image_id="sha256:" + "b" * 64,
+        )
+    with pytest.raises(ValueError, match="sanitizer"):
+        ReplayResult(
+            variant="original", crashed=True, signal="SIGSEGV", stack="#0 parse src/a.c:42",
+            sanitizer="<script>", source_location="src/a.c:42", coverage=(), exit_code=-1,
+            image_id="sha256:" + "b" * 64,
+        )
 
 
 def test_quarantine_rejects_oversized_inputs_and_symlinked_project_paths(tmp_path: Path):
@@ -332,6 +468,24 @@ def test_quarantine_rejects_oversized_inputs_and_symlinked_project_paths(tmp_pat
     (tmp_path / "projects" / "7").symlink_to(outside, target_is_directory=True)
     with pytest.raises(ValueError, match="symlink|non-directory"):
         CrashQuarantine(tmp_path).persist(observation())
+
+
+def test_quarantine_rejects_metadata_larger_than_its_reader_bound_before_publication(tmp_path: Path):
+    large_coverage = tuple(f"src/{'a' * 1000}{index}.c:1" for index in range(3_000))
+    crash = observation(coverage=large_coverage)
+
+    with pytest.raises(ValueError, match="metadata exceeds"):
+        CrashQuarantine(tmp_path).persist(crash)
+
+    assert not (tmp_path / "projects").exists()
+
+
+def test_observation_caps_evidence_sources_to_the_specialist_output_bound():
+    images = tuple((f"sanitizer-{index}", "sha256:" + f"{index:064x}") for index in range(17))
+    with pytest.raises(ValueError, match="sanitizer variants"):
+        observation(compatible_sanitizer_variants=images)
+    with pytest.raises(ValueError, match="harness evidence"):
+        observation(harness_misuse_evidence=tuple(f"probe:{index}" for index in range(17)))
 
 
 def test_quarantine_rejects_a_project_path_swap_before_publication(tmp_path: Path):
@@ -376,3 +530,54 @@ def test_finding_publication_rejects_a_tampered_occurrence_record(tmp_path: Path
         FindingArtifactStore(quarantine).publish(
             fingerprint, crash, b"crash", artifact_evidence(fingerprint), artifact_triage(),
         )
+
+
+def test_finding_artefacts_publish_one_immutable_generation_and_pointer(tmp_path: Path):
+    quarantine = CrashQuarantine(tmp_path)
+    crash = quarantine.persist(observation())
+    fingerprint = "d" * 64
+    store = FindingArtifactStore(quarantine)
+
+    store.publish(fingerprint, crash, b"crash", artifact_evidence(fingerprint), artifact_triage())
+
+    root = tmp_path / "projects" / "7" / "findings" / fingerprint
+    pointer = json.loads((root / "current.json").read_text())
+    generation = root / "generations" / pointer["generation"]
+    assert set(path.name for path in generation.iterdir()) == {"minimal.bin", "evidence.json"}
+    assert (generation / "minimal.bin").read_bytes() == b"crash"
+    assert not (root / "minimal.bin").exists()
+    assert not (root / "evidence.json").exists()
+    assert generation.stat().st_mode & 0o222 == 0
+    assert all(path.stat().st_mode & 0o222 == 0 for path in generation.iterdir())
+
+
+def test_failed_generation_update_keeps_the_previous_complete_generation(tmp_path: Path):
+    quarantine = CrashQuarantine(tmp_path)
+    first = quarantine.persist(observation(input_bytes=b"first"))
+    second = quarantine.persist(observation(input_bytes=b"second"))
+    fingerprint = "c" * 64
+    store = FindingArtifactStore(quarantine)
+    store.publish(fingerprint, first, b"larger", artifact_evidence(fingerprint), artifact_triage())
+    root = tmp_path / "projects" / "7" / "findings" / fingerprint
+    previous_pointer = (root / "current.json").read_bytes()
+
+    class FailingPointerStore(FindingArtifactStore):
+        def _before_pointer_switch(self, _directory, _generation):
+            raise RuntimeError("forced pointer failure")
+
+    with pytest.raises(RuntimeError, match="forced pointer failure"):
+        FailingPointerStore(quarantine).publish(
+            fingerprint, second, b"x", artifact_evidence(fingerprint), artifact_triage(),
+        )
+
+    assert (root / "current.json").read_bytes() == previous_pointer
+    assert [path.name for path in (root / "generations").iterdir()] == [
+        json.loads(previous_pointer)["generation"]
+    ]
+    finding = replace(
+        Findings().rows.get((7, fingerprint), None) or Finding(
+            5, 7, fingerprint, "unresolved", 1, "reason", "description", True, 1,
+            datetime(2026, 7, 20, tzinfo=UTC), datetime(2026, 7, 20, tzinfo=UTC), None,
+        )
+    )
+    assert store.read_reproducer(finding) == b"larger"

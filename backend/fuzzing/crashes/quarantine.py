@@ -18,6 +18,9 @@ MAX_STACK_CHARS = 128 * 1024
 MAX_COMMAND_ITEMS = 256
 MAX_COMMAND_ITEM_CHARS = 4_096
 MAX_COVERAGE_ITEMS = 65_536
+MAX_METADATA_BYTES = 2 * 1024 * 1024
+MAX_COMPATIBLE_VARIANTS = 16
+MAX_HARNESS_EVIDENCE_IDS = 16
 _IMAGE_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _COMMIT_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -68,7 +71,6 @@ class CrashObservation:
     compatible_sanitizer_variants: tuple[tuple[str, str], ...] = ()
     clean_image_id: str | None = None
     harness_misuse_evidence: tuple[str, ...] = ()
-    exploitability_proven: bool = False
 
     def __post_init__(self) -> None:
         _positive_id(self.project_id, "project ID")
@@ -101,7 +103,10 @@ class CrashObservation:
             raise ValueError("coverage evidence exceeds its bound")
         for value in self.coverage:
             _source_reference(value, "coverage location")
-        if not isinstance(self.compatible_sanitizer_variants, tuple) or len(self.compatible_sanitizer_variants) > 64:
+        if (
+            not isinstance(self.compatible_sanitizer_variants, tuple)
+            or len(self.compatible_sanitizer_variants) > MAX_COMPATIBLE_VARIANTS
+        ):
             raise ValueError("sanitizer variants exceed their bound")
         variant_names = set()
         for value in self.compatible_sanitizer_variants:
@@ -112,14 +117,15 @@ class CrashObservation:
             if name in variant_names or not _IMAGE_PATTERN.fullmatch(image_id):
                 raise ValueError("sanitizer variant names and image IDs must be unique and exact")
             variant_names.add(name)
-        if not isinstance(self.harness_misuse_evidence, tuple) or len(self.harness_misuse_evidence) > 64:
+        if (
+            not isinstance(self.harness_misuse_evidence, tuple)
+            or len(self.harness_misuse_evidence) > MAX_HARNESS_EVIDENCE_IDS
+        ):
             raise ValueError("harness evidence exceeds its bound")
         for value in self.harness_misuse_evidence:
             _bounded_text(value, "harness evidence", 2_000, empty=False)
             if value.startswith("/") or ".." in value or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]*", value):
                 raise ValueError("harness evidence must be a bounded identifier, not a path or text payload")
-        if not isinstance(self.exploitability_proven, bool):
-            raise ValueError("exploitability proof flag must be boolean")
 
     def provenance(self) -> dict[str, object]:
         """Return bounded JSON data; the input remains a separate binary artefact."""
@@ -144,7 +150,6 @@ class CrashObservation:
                 for sanitizer, image_id in self.compatible_sanitizer_variants
             ],
             "harness_misuse_evidence": list(self.harness_misuse_evidence),
-            "exploitability_proven": self.exploitability_proven,
             "input_sha256": sha256(self.input_bytes).hexdigest(),
             "input_size": len(self.input_bytes),
         }
@@ -183,6 +188,8 @@ class CrashQuarantine:
             raise ValueError("crash input exceeds the quarantine bound")
         metadata = observation.provenance()
         encoded = json.dumps(metadata, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > MAX_METADATA_BYTES:
+            raise ValueError("crash metadata exceeds the quarantine reader bound")
         digest = sha256()
         digest.update(len(encoded).to_bytes(8, "big")); digest.update(encoded)
         digest.update(len(observation.input_bytes).to_bytes(8, "big")); digest.update(observation.input_bytes)
@@ -248,7 +255,7 @@ class CrashQuarantine:
         return self._read_file(crash, "original.bin", max_bytes or self.max_input_bytes)
 
     def read_metadata(self, crash: QuarantinedCrash) -> bytes:
-        return self._read_file(crash, "metadata.json", 2 * 1024 * 1024)
+        return self._read_file(crash, "metadata.json", MAX_METADATA_BYTES)
 
     def _read_file(self, crash: QuarantinedCrash, name: str, maximum: int) -> bytes:
         _positive_id(crash.project_id, "project ID")

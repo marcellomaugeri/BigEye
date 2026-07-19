@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class FindingResponse(BaseModel):
@@ -71,18 +71,36 @@ class MinimisationResponse(BaseModel):
 class CorrectionResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    asset_id: int | None = Field(default=None, gt=0)
-    parent_asset_id: int | None = Field(default=None, gt=0)
-    image_id: str | None = Field(default=None, pattern=r"^sha256:[0-9a-f]{64}$")
+    project_id: int | None = Field(default=None, gt=0)
+    target_asset_id: int | None = Field(default=None, gt=0)
+    corrected_asset_id: int | None = Field(default=None, gt=0)
+    base_image_id: str | None = Field(default=None, pattern=r"^sha256:[0-9a-f]{64}$")
+    corrected_image_id: str | None = Field(default=None, pattern=r"^sha256:[0-9a-f]{64}$")
     commit_sha: str | None = Field(default=None, pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
-    crashed: bool | None = None
-    evidence_id: str | None = Field(default=None, max_length=2_000)
+    base_signature: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    corrected_signature: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    signature_disappeared: bool | None = None
+    evidence_id: str | None = Field(default=None, pattern=r"^correction:[0-9a-f]{64}$")
     error: str | None = Field(default=None, max_length=2_000)
+
+    @model_validator(mode="after")
+    def complete_evidence_or_error(self):
+        evidence_fields = (
+            self.project_id, self.target_asset_id, self.corrected_asset_id,
+            self.base_image_id, self.corrected_image_id, self.commit_sha,
+            self.base_signature, self.signature_disappeared, self.evidence_id,
+        )
+        if self.error is not None:
+            if any(value is not None for value in evidence_fields) or self.corrected_signature is not None:
+                raise ValueError("correction error cannot include unvalidated evidence")
+        elif any(value is None for value in evidence_fields):
+            raise ValueError("correction evidence is incomplete")
+        return self
 
 
 class FindingDetailResponse(FindingResponse):
     uncertainty: str = Field(min_length=1, max_length=2_000)
-    evidence_ids: list[str] = Field(min_length=1, max_length=128)
+    evidence_ids: list[str] = Field(min_length=1, max_length=64)
     reproducer: ReproducerMetadata
     replay: ReplaySummaryResponse
     minimisation: MinimisationResponse | None = None
@@ -93,3 +111,10 @@ class FindingDetailResponse(FindingResponse):
     def from_model_and_evidence(cls, finding, evidence: dict[str, object]):
         base = FindingResponse.from_model(finding).model_dump()
         return cls(**base, **evidence)
+
+
+class FindingPageResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[FindingResponse] = Field(max_length=100)
+    next_cursor: str | None = Field(default=None, max_length=512)

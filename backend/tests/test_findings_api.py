@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 from backend.models.finding import Finding
@@ -22,8 +23,13 @@ ROW = Finding(
 
 
 class FindingRows:
-    async def list_for_project(self, project_id):
-        return [ROW] if project_id == 7 else []
+    def __init__(self, has_more=False):
+        self.has_more = has_more
+        self.page_calls = []
+
+    async def list_page(self, project_id, limit, before):
+        self.page_calls.append((project_id, limit, before))
+        return ([ROW] if project_id == 7 else []), self.has_more
 
     async def get(self, finding_id):
         return ROW if finding_id == 5 else None
@@ -70,14 +76,14 @@ def test_list_contains_only_persisted_replayed_groups():
         response = api.get("/api/projects/7/findings")
 
     assert response.status_code == 200
-    assert response.json() == [{
+    assert response.json() == {"items": [{
         "id": "5", "project_id": "7", "classification": "true vulnerability",
         "priority_rank": 1,
         "priority_reason": "Reproducible sanitizer failure in a reachable parser.",
         "description": "Reproduced parser memory failure.", "reproducible": True,
         "occurrence_count": 2, "created_at": "2026-07-20T00:00:00Z",
         "triaged_at": "2026-07-20T00:00:00Z",
-    }]
+    }], "next_cursor": None}
 
 
 def test_detail_is_project_scoped_and_exposes_bounded_evidence_not_logs_or_paths():
@@ -121,35 +127,87 @@ def test_finding_route_identifiers_must_be_positive():
     assert finding.status_code == 422
 
 
+def test_findings_list_enforces_limit_and_project_scoped_cursor():
+    rows = FindingRows(has_more=True)
+    with client(rows=rows) as api:
+        first = api.get("/api/projects/7/findings", params={"limit": 1})
+        cursor = first.json()["next_cursor"]
+        continued = api.get("/api/projects/7/findings", params={"limit": 1, "cursor": cursor})
+        wrong_project = api.get("/api/projects/8/findings", params={"cursor": cursor})
+        too_small = api.get("/api/projects/7/findings", params={"limit": 0})
+        too_large = api.get("/api/projects/7/findings", params={"limit": 101})
+
+    assert first.status_code == 200
+    assert continued.status_code == 200
+    assert rows.page_calls[1][2] == (NOW, 5)
+    assert wrong_project.status_code == 422
+    assert too_small.status_code == 422
+    assert too_large.status_code == 422
+
+
 def test_repository_creates_or_atomically_increments_one_project_fingerprint_group():
-    class Pool:
+    class Transaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class Connection:
         def __init__(self):
-            self.call = None
+            self.calls = []
+
+        def transaction(self):
+            return Transaction()
+
+        async def execute(self, query, *arguments):
+            self.calls.append((query, arguments))
 
         async def fetchrow(self, query, *arguments):
-            self.call = (query, arguments)
+            self.calls.append((query, arguments))
+            if "INSERT INTO findings" in query:
+                return {"id": 5}
             return {
                 "id": 5, "project_id": 7, "fingerprint": "a" * 64,
                 "classification": "true vulnerability", "priority_rank": 1,
-                "priority_reason": "reason", "description": "description",
-                "reproducible": True, "occurrence_count": 2,
-                "created_at": NOW, "triaged_at": NOW, "error": None,
+                "priority_reason": "true vulnerability; reproducible; observed 2 times",
+                "description": "description", "reproducible": True,
+                "occurrence_count": 2, "created_at": NOW, "triaged_at": NOW, "error": None,
             }
+
+    class Acquire:
+        def __init__(self, connection):
+            self.connection = connection
+
+        async def __aenter__(self):
+            return self.connection
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class Pool:
+        def __init__(self):
+            self.connection = Connection()
+
+        def acquire(self):
+            return Acquire(self.connection)
 
     from backend.repositories.finding_repository import FindingRepository
 
     pool = Pool()
     row = __import__("asyncio").run(FindingRepository(pool).create_or_increment(
         project_id=7, fingerprint="a" * 64, classification="true vulnerability",
-        priority_rank=1, priority_reason="reason", description="description", reproducible=True,
+        description="description", reproducible=True,
     ))
 
     assert row.occurrence_count == 2
-    query, arguments = pool.call
-    assert "pg_advisory_xact_lock" in query
-    assert "$1::bigint" in query
-    assert "occurrence_count = findings.occurrence_count + 1" in query
-    assert arguments == (7, "a" * 64, "true vulnerability", 1, "reason", "description", True)
+    queries = [query for query, _arguments in pool.connection.calls]
+    assert "pg_advisory_xact_lock" in queries[0]
+    assert "INSERT INTO findings" in queries[1]
+    assert "ON CONFLICT (project_id, fingerprint)" in queries[1]
+    assert "occurrence_count = findings.occurrence_count + 1" in queries[1]
+    assert "ROW_NUMBER() OVER" in queries[2]
+    assert "priority_reason" in queries[2]
 
 
 def test_reproducer_metadata_accepts_an_empty_crash_input():
@@ -160,9 +218,58 @@ def test_reproducer_metadata_accepts_an_empty_crash_input():
     assert value.size == 0
 
 
+def test_production_services_wire_committed_finding_routes(tmp_path):
+    from backend.api.app import create_app
+    from backend.api.dependencies import build_services
+    from backend.fuzzing.crashes.artifacts import FindingArtifactStore
+    from backend.repositories.finding_repository import FindingRepository
+
+    class Pool:
+        def __init__(self):
+            self.fetch_calls = []
+
+        async def fetch(self, query, *arguments):
+            self.fetch_calls.append((query, arguments))
+            return []
+
+    class Recovery:
+        async def recover(self):
+            return None
+
+    pool = Pool()
+    services = build_services(pool, tmp_path)
+    services.recovery = Recovery()
+
+    with TestClient(create_app(services=services)) as api:
+        response = api.get("/api/projects/7/findings")
+
+    assert response.status_code == 200
+    assert response.json() == {"items": [], "next_cursor": None}
+    assert isinstance(services.findings, FindingRepository)
+    assert isinstance(services.finding_artifacts, FindingArtifactStore)
+    assert pool.fetch_calls[0][1] == (7, 51, None, None)
+
+
+def test_finding_detail_caps_evidence_identifiers_at_specialist_bound():
+    from pydantic import ValidationError
+    from backend.api.views.finding import FindingDetailResponse
+
+    values = {
+        **ROW.__dict__, "id": "5", "project_id": "7", "error": None,
+        "uncertainty": "uncertain", "evidence_ids": [f"evidence:{index}" for index in range(65)],
+        "reproducer": {"sha256": "b" * 64, "size": 0},
+        "replay": {"attempts": 3, "matching": 3},
+    }
+    values.pop("fingerprint")
+    values.pop("error")
+
+    with pytest.raises(ValidationError):
+        FindingDetailResponse(**values)
+
+
 def test_repository_rejects_non_text_classification_without_querying():
     class Pool:
-        async def fetchrow(self, *_args):
+        def acquire(self):
             raise AssertionError("invalid finding must not reach PostgreSQL")
 
     from backend.repositories.finding_repository import FindingRepository
@@ -172,5 +279,13 @@ def test_repository_rejects_non_text_classification_without_querying():
     with pytest.raises(ValueError, match="classification"):
         asyncio.run(FindingRepository(Pool()).create_or_increment(
             project_id=7, fingerprint="a" * 64, classification=["unresolved"],
-            priority_rank=None, priority_reason=None, description="description", reproducible=False,
+            description="description", reproducible=False,
         ))
+
+
+def test_release_schema_guarantees_one_finding_group_per_project_fingerprint():
+    from pathlib import Path
+
+    schema = (Path(__file__).parents[1] / "database" / "schema.sql").read_text()
+
+    assert "UNIQUE (project_id, fingerprint)" in schema
