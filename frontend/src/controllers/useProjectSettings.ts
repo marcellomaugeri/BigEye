@@ -15,6 +15,8 @@ export function useProjectSettings(api: BigEyeApi, project: Project | null, enab
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const requestGeneration = useRef(0);
+  const selectedProjectIdRef = useRef<string | null>(project?.id ?? null);
+  selectedProjectIdRef.current = project?.id ?? null;
 
   const load = useCallback(async (projectId: string) => {
     const generation = ++requestGeneration.current;
@@ -35,6 +37,7 @@ export function useProjectSettings(api: BigEyeApi, project: Project | null, enab
 
   useEffect(() => {
     if (!enabled || !project) return;
+    setSaving(false);
     void load(project.id);
   }, [enabled, load, project]);
 
@@ -45,6 +48,8 @@ export function useProjectSettings(api: BigEyeApi, project: Project | null, enab
       setError('Worker count must be a positive whole number.');
       return;
     }
+    const projectId = project.id;
+    const generation = ++requestGeneration.current;
     setSaving(true);
     setError(null);
     try {
@@ -52,14 +57,17 @@ export function useProjectSettings(api: BigEyeApi, project: Project | null, enab
         worker_count: workerCountValue,
         ...(repositoryToken ? { repository_token: repositoryToken } : {})
       };
-      const nextSettings = await api.updateProjectSettings(project.id, request);
+      const nextSettings = await api.updateProjectSettings(projectId, request);
+      if (generation !== requestGeneration.current || selectedProjectIdRef.current !== projectId) return;
       setSettings(nextSettings);
       setWorkerCount(String(nextSettings.worker_count));
       setRepositoryToken('');
     } catch (requestError) {
-      setError(message(requestError, 'Could not save project settings.'));
+      if (generation === requestGeneration.current && selectedProjectIdRef.current === projectId) {
+        setError(message(requestError, 'Could not save project settings.'));
+      }
     } finally {
-      setSaving(false);
+      if (generation === requestGeneration.current && selectedProjectIdRef.current === projectId) setSaving(false);
     }
   }, [api, project, repositoryToken, settings, workerCount]);
 

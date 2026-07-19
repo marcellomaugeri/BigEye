@@ -4,7 +4,7 @@
   --color-red: #c81e2a;
   --color-warm: #f5f2ed;
   --color-grey: #737373;
-  --focus-ring: 0 0 0 3px rgba(200, 30, 42, 0.28);
+  --focus-outline: 3px solid var(--color-red);
   color: var(--color-black);
   background: var(--color-warm);
   font-family: Inter, ui-sans-serif, system-ui, sans-serif;
@@ -15,7 +15,7 @@ body { margin: 0; min-width: 20rem; }
 button, input, select { font: inherit; }
 button { cursor: pointer; }
 button:disabled, select:disabled { cursor: not-allowed; opacity: .55; }
-button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible { box-shadow: var(--focus-ring); outline: 0; }
+button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible { outline: var(--focus-outline); outline-offset: 3px; }
 
 .app-shell { display: grid; grid-template-columns: 15rem minmax(0, 1fr); min-height: 100vh; }
 .sidebar { background: var(--color-black); color: var(--color-white); display: flex; flex-direction: column; padding: 1.5rem 1rem; }

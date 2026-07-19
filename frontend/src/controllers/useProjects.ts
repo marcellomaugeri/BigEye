@@ -55,12 +55,13 @@ export function useProjects(api: BigEyeApi, onProjectCreated: () => void) {
         ...current.filter((project) => createdProjectIds.current.has(project.id) && !nextProjects.some((item) => item.id === project.id))
       ]);
       const currentId = selectedProjectIdRef.current;
-      const nextId = nextProjects.some((project) => project.id === currentId)
+      const selectedCreatedProject = currentId !== null && createdProjectIds.current.has(currentId);
+      const nextId = nextProjects.some((project) => project.id === currentId) || selectedCreatedProject
         ? currentId
         : (nextProjects[0]?.id ?? null);
       selectedProjectIdRef.current = nextId;
       setSelectedProjectId(nextId);
-      if (nextId) void refreshProject(nextId);
+      if (nextId && nextProjects.some((project) => project.id === nextId)) void refreshProject(nextId);
     }).catch((requestError: unknown) => {
       if (active) setError(message(requestError, 'Could not load projects.'));
     }).finally(() => { if (active) setLoading(false); });

@@ -42,6 +42,16 @@ function apiDouble(overrides: Record<string, unknown> = {}) {
   } as BigEyeApi & Record<string, ReturnType<typeof vi.fn>>;
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 describe('App journey', () => {
   it('keeps implementation names out of primary navigation', async () => {
     render(<App api={apiDouble()} />);
@@ -128,5 +138,55 @@ describe('App journey', () => {
     resolveFirst(activeProject);
 
     await waitFor(() => expect(screen.getByLabelText('Current project')).toHaveValue(secondProject.id));
+  });
+
+  it('keeps a newly created project selected when the initial list resolves without it', async () => {
+    const initialProjects = deferred<typeof activeProject[]>();
+    const createdProject = { ...activeProject, id: '9', repository_url: 'https://github.com/acme/created.git' };
+    const api = apiDouble({
+      listProjects: vi.fn().mockReturnValue(initialProjects.promise),
+      createProject: vi.fn().mockResolvedValue(createdProject),
+      getProject: vi.fn().mockResolvedValue(activeProject)
+    });
+    const user = userEvent.setup();
+    render(<App api={api} />);
+
+    await user.type(screen.getByLabelText('Repository URL'), createdProject.repository_url);
+    await user.type(screen.getByLabelText('Revision'), createdProject.requested_revision);
+    await user.click(screen.getByRole('button', { name: 'Start project' }));
+    initialProjects.resolve([activeProject]);
+
+    expect(await screen.findByRole('option', { name: createdProject.repository_url })).toBeInTheDocument();
+    expect(screen.getByLabelText('Current project')).toHaveValue(createdProject.id);
+  });
+
+  it('keeps project B settings when a delayed save for project A completes', async () => {
+    const secondProject = { ...activeProject, id: '8', repository_url: 'https://github.com/acme/second.git', worker_count: 3 };
+    const secondSettings = deferred<{ requested_revision: string; commit_sha: string | null; worker_count: number; token_present: boolean }>();
+    const saveA = deferred<{ requested_revision: string; commit_sha: string | null; worker_count: number; token_present: boolean }>();
+    const api = apiDouble({
+      listProjects: vi.fn().mockResolvedValue([activeProject, secondProject]),
+      getProject: vi.fn((projectId: string) => Promise.resolve(projectId === secondProject.id ? secondProject : activeProject)),
+      getProjectSettings: vi.fn()
+        .mockResolvedValueOnce({ requested_revision: activeProject.requested_revision, commit_sha: activeProject.commit_sha, worker_count: activeProject.worker_count, token_present: activeProject.token_present })
+        .mockReturnValueOnce(secondSettings.promise),
+      updateProjectSettings: vi.fn().mockReturnValue(saveA.promise)
+    });
+    const user = userEvent.setup();
+    render(<App api={api} />);
+
+    await user.click(screen.getByRole('link', { name: 'Settings' }));
+    await screen.findByDisplayValue(String(activeProject.worker_count));
+    await user.clear(screen.getByLabelText('Worker count'));
+    await user.type(screen.getByLabelText('Worker count'), '4');
+    await user.click(screen.getByRole('button', { name: 'Save settings' }));
+    await user.selectOptions(screen.getByLabelText('Current project'), secondProject.id);
+    await waitFor(() => expect(api.getProjectSettings).toHaveBeenCalledWith(secondProject.id));
+    secondSettings.resolve({ requested_revision: secondProject.requested_revision, commit_sha: secondProject.commit_sha, worker_count: secondProject.worker_count, token_present: false });
+
+    expect(await screen.findByDisplayValue('3')).toBeInTheDocument();
+    saveA.resolve({ requested_revision: activeProject.requested_revision, commit_sha: activeProject.commit_sha, worker_count: 4, token_present: activeProject.token_present });
+
+    await waitFor(() => expect(screen.getByLabelText('Worker count')).toHaveValue(3));
   });
 });
