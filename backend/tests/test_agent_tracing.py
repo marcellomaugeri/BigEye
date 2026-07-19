@@ -218,7 +218,7 @@ def test_campaign_manager_returns_structured_decision_and_writes_plain_activity(
     context = context_for(tmp_path)
     decision = CampaignDecision(
         decision="prepare target", motivation="The parser accepts untrusted bytes.", evidence_ids=["known"],
-        bounded_actions=["prepare_system_target"], next_review_condition="after target probe",
+        bounded_actions=[], next_review_condition="after target probe",
         uncertainty="runtime behaviour is not measured yet",
     )
     calls = []
@@ -265,7 +265,7 @@ def test_campaign_manager_accepts_source_evidence_registered_inside_a_specialist
         return SimpleNamespace(
             final_output=CampaignDecision(
                 decision="prepare target", motivation="The executable has a source entry point.",
-                evidence_ids=[evidence_id], bounded_actions=["prepare_system_target"],
+                evidence_ids=[evidence_id], bounded_actions=[],
                 next_review_condition="after probe", uncertainty="input path not measured",
             ),
             raw_responses=[], new_items=[],
@@ -310,23 +310,29 @@ def test_campaign_manager_returns_specialist_and_operation_records_for_determini
         def to_input_list(self):
             return []
 
-    async def nested_runner(*args, **kwargs):
+    operation_outputs = {}
+
+    async def nested_runner(starting_agent=None, context=None, hooks=None, **kwargs):
+        await hooks.on_agent_start(context, starting_agent)
+        operation_tool = next(
+            tool for tool in starting_agent.tools if tool.name == "request_contained_operation"
+        )
+        operation_context = ToolContext(
+            context.context, tool_name=operation_tool.name, tool_call_id="call-operation",
+            tool_arguments=(
+                '{"operation":"probe","asset_paths":["system/parser/config.sh"],'
+                '"assertions":["reaches parser"]}'
+            ), run_config=RunConfig(), agent=starting_agent,
+        )
+        operation_outputs[context.tool_call_id] = await operation_tool.on_invoke_tool(
+            operation_context, operation_context.tool_arguments,
+        )
         return NestedResult()
 
     monkeypatch.setattr(Runner, "run", nested_runner)
 
     async def manager_runner(agent, prompt, **kwargs):
         target_tool = next(tool for tool in agent.tools if tool.name == "prepare_system_target")
-        worker = target_tool._agent_instance
-        operation_tool = next(tool for tool in worker.tools if tool.name == "request_contained_operation")
-        operation_context = ToolContext(
-            context, tool_name=operation_tool.name, tool_call_id="call-operation",
-            tool_arguments=(
-                '{"operation":"probe","asset_paths":["system/parser/config.sh"],'
-                '"assertions":["reaches parser"]}'
-            ), run_config=RunConfig(),
-        )
-        operation = await operation_tool.on_invoke_tool(operation_context, operation_context.tool_arguments)
         target_context = ToolContext(
             context, tool_name=target_tool.name, tool_call_id="call-specialist",
             tool_arguments='{"assignment":"parser","evidence_ids":["known"]}',
@@ -336,7 +342,7 @@ def test_campaign_manager_returns_specialist_and_operation_records_for_determini
         return SimpleNamespace(
             final_output=CampaignDecision(
                 decision="probe", motivation="proposal ready", evidence_ids=["known"],
-                bounded_actions=[operation["request_id"], specialist["result_id"]],
+                bounded_actions=[*specialist["operation_request_ids"], specialist["result_id"]],
                 next_review_condition="after probe", uncertainty="not probed",
             ), raw_responses=[], new_items=[],
         )
@@ -345,9 +351,30 @@ def test_campaign_manager_returns_specialist_and_operation_records_for_determini
         context, [{"evidence_id": "known", "summary": "parser"}], "prepare parser",
     ))
 
-    assert review.target_proposals[0].proposal.target_name == "parser"
-    assert review.operation_requests[0].operation == "probe"
+    assert review.known_target_proposals[0].proposal.target_name == "parser"
+    assert review.known_operation_requests[0].operation == "probe"
+    assert review.known_operation_requests[0].tool_call_id == "call-specialist"
     assert review.decision.bounded_actions == [
-        review.operation_requests[0].request_id,
-        review.target_proposals[0].result_id,
+        review.known_operation_requests[0].request_id,
+        review.known_target_proposals[0].result_id,
     ]
+    assert review.selected_action_ids == tuple(review.decision.bounded_actions)
+
+
+def test_campaign_manager_rejects_nonexistent_or_stale_action_ids(tmp_path: Path) -> None:
+    store = ProjectEventStore(tmp_path)
+    context = context_for(tmp_path)
+
+    async def runner(agent, prompt, **kwargs):
+        return SimpleNamespace(
+            final_output=CampaignDecision(
+                decision="probe", motivation="unsupported action", evidence_ids=["known"],
+                bounded_actions=["operation_from_another_review"],
+                next_review_condition="after probe", uncertainty="not probed",
+            ), raw_responses=[], new_items=[],
+        )
+
+    with pytest.raises(ValueError, match="action outside this review"):
+        run(CampaignManager(store, runner=runner).review(
+            context, [{"evidence_id": "known", "summary": "parser"}], "prepare parser",
+        ))

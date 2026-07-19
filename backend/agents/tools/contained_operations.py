@@ -13,6 +13,8 @@ _OPERATIONS = frozenset({"build", "probe", "replay", "coverage"})
 
 def contained_operation_error(_context, _error: Exception) -> str:
     """Return a bounded correction contract for model-authored operation requests."""
+    if not isinstance(_error, ValueError):
+        raise _error
     return (
         "Contained operation request rejected. Use build, probe, replay, or coverage; reference 0 to 16 "
         "existing generated draft paths and provide 1 to 16 concrete assertions."

@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from contextvars import ContextVar
 from pathlib import PurePosixPath
 
-from agents import RunConfig, RunContextWrapper, Runner, function_tool
+from agents import RunConfig, RunContextWrapper, RunHooks, Runner, function_tool
 from agents.agent_tool_input import default_tool_input_builder
+from agents.tool_context import ToolContext
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from backend.agents.context import AgentContext
-from backend.agents.outputs.campaign_review import CampaignReviewCollection
+from backend.agents.outputs.campaign_review import CampaignReviewCollection, SpecialistInvocation
 from backend.agents.outputs.target_proposal import TargetProposal
 from backend.agents.outputs.triage_result import TriageResult
 from backend.agents.specialists.component_target import build_component_target_agent
@@ -34,6 +36,19 @@ from backend.agents.tools.web_research import (
 
 class SpecialistValidationError(ValueError):
     """Raised when structured specialist evidence cannot be verified."""
+
+
+class ManagerEnvelopeValidationError(SpecialistValidationError):
+    """Raised when the manager's bounded specialist assignment is invalid."""
+
+
+_CURRENT_SPECIALIST_INVOCATION: ContextVar[SpecialistInvocation | None] = ContextVar(
+    "current_specialist_invocation", default=None,
+)
+_SPECIALIST_CORRECTION = (
+    "Specialist request rejected. Provide one bounded assignment and only evidence IDs supplied "
+    "by this review, then call the specialist again."
+)
 
 
 class SpecialistRequest(BaseModel):
@@ -109,6 +124,7 @@ def _tool(
     collection: CampaignReviewCollection, web_domains: frozenset[str], hooks=None, trace=None,
 ):
     validated_ids = evidence_ids
+    specialist_hooks = hooks or RunHooks()
 
     @function_tool(name_override="retrieve_repository_evidence", failure_error_function=evidence_request_error)
     async def registered_retrieval(
@@ -132,7 +148,10 @@ def _tool(
         request = contained_operation_request(
             tool_context.context, operation, asset_paths, assertions,
         )
-        return collection.record_operation(tool_name, request).model_dump(mode="json")
+        invocation = _CURRENT_SPECIALIST_INVOCATION.get()
+        if invocation is None or invocation.specialist != tool_name:
+            raise RuntimeError("contained operation is missing its specialist invocation")
+        return collection.record_operation(invocation, request).model_dump(mode="json")
 
     def build(model: str):
         worker = builder(model, web_domains)
@@ -148,10 +167,18 @@ def _tool(
     def input_builder(options):
         params = options.get("params") or {}
         requested = params.get("evidence_ids", []) if isinstance(params, dict) else []
-        _validate_evidence_ids(requested, frozenset(validated_ids))
+        try:
+            _validate_evidence_ids(requested, frozenset(validated_ids))
+        except SpecialistValidationError as error:
+            raise ManagerEnvelopeValidationError("manager specialist envelope is invalid") from error
         records = []
         for evidence_id in requested:
-            value = dict(evidence_records[evidence_id])
+            try:
+                value = dict(evidence_records[evidence_id])
+            except KeyError as error:
+                raise ManagerEnvelopeValidationError(
+                    "manager specialist envelope is invalid"
+                ) from error
             value["trusted_instructions"] = False
             records.append(value)
         nested = {
@@ -165,8 +192,26 @@ def _tool(
         }
         return default_tool_input_builder({"params": nested, "summary": None, "json_schema": None})
 
-    async def output_extractor(result):
+    def current_invocation() -> SpecialistInvocation:
+        invocation = _CURRENT_SPECIALIST_INVOCATION.get()
+        if invocation is None or invocation.specialist != tool_name:
+            raise RuntimeError("specialist result is missing its agent-tool invocation")
+        return invocation
+
+    def validate_result_invocation(result, expected: SpecialistInvocation) -> object:
         parent_invocation = getattr(result, "agent_tool_invocation", None)
+        if parent_invocation is None:
+            raise RuntimeError("specialist result is missing agent-tool invocation metadata")
+        if (
+            getattr(parent_invocation, "tool_name", None) != expected.specialist
+            or getattr(parent_invocation, "tool_call_id", None) != expected.tool_call_id
+        ):
+            raise RuntimeError("specialist result invocation does not match its agent-tool call")
+        return parent_invocation
+
+    async def output_extractor(result):
+        luna_invocation = current_invocation()
+        parent_invocation = validate_result_invocation(result, luna_invocation)
         if trace is not None:
             trace.record_result(luna, getattr(result, "input", None), result)
         try:
@@ -182,9 +227,14 @@ def _tool(
             output = validator(getattr(result, "final_output", None), frozenset(validated_ids))
         except (SpecialistValidationError, UnofficialWebCitation) as error:
             validation_error = SpecialistValidationError(str(error))
+            collection.complete_attempt(luna_invocation, actionable=False)
             if trace is not None:
                 trace.retry(luna, validation_error, invocation=parent_invocation)
             terra = build("gpt-5.6-terra")
+            terra_invocation = SpecialistInvocation(
+                specialist=tool_name, tool_call_id=luna_invocation.tool_call_id,
+                attempt=2, model="gpt-5.6-terra",
+            )
             retry_input = list(result.to_input_list())
             retry_input.append({
                 "role": "user",
@@ -196,9 +246,11 @@ def _tool(
             run_config = trace.run_config(f"{tool_name} validation retry") if trace is not None else RunConfig(
                 workflow_name=f"{tool_name} validation retry", trace_include_sensitive_data=False,
             )
+            retry_token = _CURRENT_SPECIALIST_INVOCATION.set(terra_invocation)
             try:
                 retry_result = await Runner.run(
-                    terra, retry_input, context=context, hooks=hooks, run_config=run_config,
+                    starting_agent=terra, input=retry_input, context=context,
+                    hooks=specialist_hooks, run_config=run_config,
                 )
                 if trace is not None:
                     trace.record_result(
@@ -215,23 +267,68 @@ def _tool(
                         "trusted_instructions": False,
                     }
                 output = validator(getattr(retry_result, "final_output", None), frozenset(validated_ids))
+            except (SpecialistValidationError, UnofficialWebCitation) as retry_error:
+                collection.complete_attempt(terra_invocation, actionable=False)
+                validation_error = SpecialistValidationError(str(retry_error))
+                if trace is not None:
+                    trace.error(terra, validation_error, invocation=parent_invocation)
+                raise validation_error from retry_error
             except Exception as retry_error:
+                collection.complete_attempt(terra_invocation, actionable=False)
                 if trace is not None:
                     trace.error(terra, retry_error, invocation=parent_invocation)
                 raise
-        record = collection.record_specialist(tool_name, output)
-        return {"result_id": record.result_id, "result": output.model_dump(mode="json")}
+            finally:
+                _CURRENT_SPECIALIST_INVOCATION.reset(retry_token)
+            successful_invocation = terra_invocation
+        else:
+            successful_invocation = luna_invocation
+        record = collection.record_specialist(successful_invocation, output)
+        collection.complete_attempt(successful_invocation, actionable=True)
+        return {
+            "result_id": record.result_id,
+            "operation_request_ids": list(collection.operation_ids(successful_invocation)),
+        }
 
     def specialist_failure(tool_context, error: Exception):
+        active_invocation = _CURRENT_SPECIALIST_INVOCATION.get()
+        invocation = SpecialistInvocation(
+            specialist=tool_name, tool_call_id=tool_context.tool_call_id,
+            attempt=active_invocation.attempt if active_invocation is not None else 1,
+            model=active_invocation.model if active_invocation is not None else "gpt-5.6-luna",
+        )
+        collection.complete_attempt(invocation, actionable=False)
         if trace is not None:
             trace.error(luna, error, invocation=tool_context)
+        try:
+            SpecialistRequest.model_validate_json(tool_context.tool_arguments)
+            invalid_envelope = False
+        except (ValidationError, ValueError, TypeError):
+            invalid_envelope = True
+        if isinstance(error, SpecialistValidationError) or invalid_envelope:
+            return _SPECIALIST_CORRECTION
         raise error
 
-    return luna.as_tool(
+    tool = luna.as_tool(
         tool_name=tool_name, tool_description=description, parameters=SpecialistRequest,
         input_builder=input_builder, include_input_schema=True, custom_output_extractor=output_extractor,
-        hooks=hooks, failure_error_function=specialist_failure,
+        hooks=specialist_hooks, failure_error_function=specialist_failure,
     )
+    invoke_agent_tool = tool.on_invoke_tool
+
+    async def invoke_with_identity(tool_context: ToolContext, input_json: str):
+        invocation = SpecialistInvocation(
+            specialist=tool_name, tool_call_id=tool_context.tool_call_id,
+            attempt=1, model="gpt-5.6-luna",
+        )
+        token = _CURRENT_SPECIALIST_INVOCATION.set(invocation)
+        try:
+            return await invoke_agent_tool(tool_context, input_json)
+        finally:
+            _CURRENT_SPECIALIST_INVOCATION.reset(token)
+
+    tool.on_invoke_tool = invoke_with_identity
+    return tool
 
 
 def dispatch_tools(

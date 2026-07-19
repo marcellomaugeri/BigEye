@@ -56,14 +56,20 @@ def _bounded_evidence(evidence) -> tuple[list[dict], frozenset[str]]:
     return items, frozenset(identifiers)
 
 
-def _decision(value, evidence_ids: frozenset[str]) -> CampaignDecision:
+def _decision(
+    value, evidence_ids: frozenset[str], actionable_ids: frozenset[str],
+) -> CampaignDecision:
     try:
         decision = value if isinstance(value, CampaignDecision) else CampaignDecision.model_validate(value)
     except (ValidationError, TypeError) as error:
         raise SpecialistValidationError("manager returned an invalid campaign decision") from error
     _validate_evidence_ids(decision.evidence_ids, evidence_ids)
+    if len(decision.bounded_actions) != len(set(decision.bounded_actions)):
+        raise SpecialistValidationError("manager returned duplicate bounded actions")
     if any(not action.strip() or len(action) > 500 for action in decision.bounded_actions):
         raise SpecialistValidationError("manager returned an invalid bounded action")
+    if set(decision.bounded_actions) - actionable_ids:
+        raise SpecialistValidationError("manager selected an action outside this review")
     return decision
 
 
@@ -102,7 +108,10 @@ class CampaignManager:
                 run_config=trace.run_config("BigEye campaign review"),
             )
             trace.record_result(agent, prompt, result)
-            decision = _decision(getattr(result, "final_output", None), frozenset(evidence_registry))
+            decision = _decision(
+                getattr(result, "final_output", None), frozenset(evidence_registry),
+                collection.actionable_ids(),
+            )
             trace.activity(
                 decision.decision, decision.motivation, decision.evidence_ids,
                 decision.next_review_condition,

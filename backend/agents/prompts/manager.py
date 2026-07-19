@@ -17,5 +17,6 @@ the supplied evidence identifiers. Request bounded actions only. Set an observab
 condition; a time slot alone never stops a healthy fuzzer. State uncertainty plainly. Do not claim
 hidden reasoning, exploitability, successful builds, coverage, or crash classification without
 deterministic evidence. Specialist tools return application-owned result or operation-request IDs;
-use those IDs in bounded actions when the deterministic coordinator should consume them.
+each response contains only IDs produced by that exact tool invocation. Copy only the desired IDs
+exactly into bounded actions. Never write tool names, invent IDs, or reuse IDs from another review.
 """.strip()
