@@ -34,11 +34,12 @@ class _GeneratedLayerService:
     def _prepare(self, project, parent_manifest: LayerManifest, assets, dockerfile_template: str, sink, network_mode: str | None):
         if parent_manifest.kind != self._parent_kind:
             raise ValueError(f"{self._kind} layers require a {self._parent_kind} parent")
-        parent = self._inspector.inspect(parent_manifest.tag)
         project_id = self._project_id(project)
         commit_sha = self._commit(project)
+        parent = self._verify_parent(parent_manifest, project_id, commit_sha)
         assets = tuple(assets)
         asset_digest = self._assets_digest(project_id, assets)
+        dockerfile_template = self._asset_dockerfile(project_id, assets, dockerfile_template, parent.image_id, project_id, commit_sha)
         template = dockerfile_template.format(parent=parent_manifest.tag, content_hash="{content_hash}")
         content_hash = self._digest(parent.image_id, commit_sha, template, asset_digest)
         kind = self._kind
@@ -94,6 +95,39 @@ class _GeneratedLayerService:
                 for value in (relative, data):
                     digest.update(len(value).to_bytes(8, "big")); digest.update(value)
         return digest.hexdigest()
+
+    def _verify_parent(self, parent_manifest: LayerManifest, project_id: int, commit_sha: str):
+        labels = parent_manifest.labels
+        expected = {
+            "bigeye.project": str(project_id),
+            "bigeye.commit": commit_sha,
+            "bigeye.layer": parent_manifest.kind,
+            "bigeye.content-hash": parent_manifest.content_hash,
+        }
+        if any(labels.get(key) != value for key, value in expected.items()):
+            raise ValueError("parent manifest does not belong to this project and commit")
+        if not isinstance(labels.get("bigeye.parent-image"), str) or not labels["bigeye.parent-image"]:
+            raise ValueError("parent manifest is missing its parent image label")
+        parent = self._inspector.inspect(parent_manifest.tag)
+        verifier = getattr(self._image_builder, "verify_parent", None)
+        if verifier is None or not verifier(parent_manifest.tag, labels, parent.image_id):
+            raise ValueError("parent tag no longer matches its inspected manifest labels")
+        return parent
+
+    def _asset_dockerfile(self, project_id: int, assets, starter: str, parent_image: str, project: int, commit: str) -> str:
+        _, asset = assets[self._dockerfile_asset_index]
+        candidate = self._asset_path(project_id, asset) / "Dockerfile"
+        if not candidate.exists():
+            return starter
+        if candidate.is_symlink() or not candidate.is_file():
+            raise ValueError("asset Dockerfile must be a regular file")
+        text = candidate.read_text(encoding="utf-8")
+        return (
+            text.rstrip() + "\n"
+            f"LABEL bigeye.project=\"{project}\" bigeye.commit=\"{commit}\" "
+            f"bigeye.layer=\"{self._kind}\" bigeye.content-hash=\"{{content_hash}}\" "
+            f"bigeye.parent-image=\"{parent_image}\"\n"
+        )
 
     def _asset_path(self, project_id: int, asset) -> Path:
         if not isinstance(asset.id, int) or asset.id <= 0:
@@ -173,7 +207,16 @@ class _GeneratedLayerService:
                 source = self._asset_path(project_id, asset)
                 if source.is_symlink() or not source.is_dir():
                     raise ValueError("validated asset directory is missing")
-                shutil.copytree(source, context / name, symlinks=False)
+                shutil.copytree(source, context / name, symlinks=True)
+                staged_files = {
+                    entry.relative_to(context / name).as_posix(): (entry, None)
+                    for entry in (context / name).rglob("*") if entry.is_file() and not entry.is_symlink()
+                }
+                for entry in (context / name).rglob("*"):
+                    if entry.is_symlink() or not (entry.is_file() or entry.is_dir()):
+                        raise ValueError("generated context contains an unsafe asset entry")
+                if collection_hash(staged_files, asset.kind) != asset.content_hash:
+                    raise ValueError("generated context asset content hash does not match persisted asset")
             self._fsync_tree(context)
             os.replace(staging, destination)
             self._fsync_directory(parent)
@@ -214,6 +257,7 @@ class ProjectLayerService(_GeneratedLayerService):
     _kind = "project"
     _parent_kind = "repository"
     _network_allowed = True
+    _dockerfile_asset_index = 0
 
     def prepare(self, project, repository_manifest: LayerManifest, build_asset, sink) -> LayerManifest:
         parent_image = self._inspector.inspect(repository_manifest.tag).image_id

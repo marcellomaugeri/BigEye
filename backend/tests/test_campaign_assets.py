@@ -101,7 +101,7 @@ def test_asset_rejects_unsafe_names_and_host_executables_except_generated_shell_
     shell.write_text("#!/bin/sh\nexit 0\n")
     shell.chmod(0o755)
     asset = run(store.create(7, "script", "run.sh", {"run.sh": shell}, None))
-    assert (tmp_path / "workspace/projects/7/assets" / str(asset.id) / "run.sh").stat().st_mode & 0o777 == 0o700
+    assert (tmp_path / "workspace/projects/7/assets" / str(asset.id) / "run.sh").stat().st_mode & 0o777 == 0o500
 
 
 def test_asset_rejects_source_outside_its_project_before_persisting(tmp_path: Path) -> None:
@@ -114,3 +114,50 @@ def test_asset_rejects_source_outside_its_project_before_persisting(tmp_path: Pa
     with pytest.raises(ValueError, match="contained project workspace"):
         run(AssetStore(tmp_path / "workspace", repository).create(7, "adapter", "adapter.py", {"adapter.py": source}, None))
     assert repository.created == []
+
+
+def test_source_swapped_to_symlink_after_validation_never_publishes_host_bytes(tmp_path: Path) -> None:
+    from backend.fuzzing.assets.store import AssetStore
+
+    workspace = tmp_path / "workspace"
+    source = workspace / "projects/7/drafts/adapter.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("safe\n")
+    host = tmp_path / "host-secret.py"
+    host.write_text("host-only\n")
+
+    class SwappingAssets(_Assets):
+        async def create(self, *args):
+            asset = await super().create(*args)
+            source.unlink()
+            source.symlink_to(host)
+            return asset
+
+    repository = SwappingAssets()
+    with pytest.raises(OSError):
+        run(AssetStore(workspace, repository).create(7, "adapter", "adapter.py", {"adapter.py": source}, None))
+
+    assert not (workspace / "projects/7/assets/1").exists()
+    assert repository.errors and "host-only" not in repository.errors[0][1]
+
+
+def test_source_content_changed_after_validation_does_not_publish_new_bytes_under_old_hash(tmp_path: Path) -> None:
+    from backend.fuzzing.assets.store import AssetStore
+
+    workspace = tmp_path / "workspace"
+    source = workspace / "projects/7/drafts/adapter.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("first\n")
+
+    class RewritingAssets(_Assets):
+        async def create(self, *args):
+            asset = await super().create(*args)
+            source.write_text("second\n")
+            return asset
+
+    repository = RewritingAssets()
+    with pytest.raises(ValueError, match="changed after content validation"):
+        run(AssetStore(workspace, repository).create(7, "adapter", "adapter.py", {"adapter.py": source}, None))
+
+    assert not (workspace / "projects/7/assets/1").exists()
+    assert repository.errors

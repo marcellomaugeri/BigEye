@@ -10,6 +10,7 @@ class CoverageLayerService(_GeneratedLayerService):
     _kind = "coverage"
     _parent_kind = "project"
     _network_allowed = False
+    _dockerfile_asset_index = 0
 
     def prepare(self, project, project_manifest, adapter_asset, coverage_configuration, sink):
         LayerPolicy().validate_coverage_inputs((

@@ -92,3 +92,7 @@ class ImageBuilder:
             return None
         image_id = image.get("Id")
         return str(image_id) if image_id else None
+
+    def verify_parent(self, tag: str, labels: dict[str, str], expected_image_id: str) -> bool:
+        """Verify the manifest labels still name the inspected linux/amd64 parent image."""
+        return self.inspect_matching(tag, labels) == expected_image_id

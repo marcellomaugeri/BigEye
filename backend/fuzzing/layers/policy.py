@@ -10,7 +10,7 @@ class LayerPolicyError(ValueError):
 
 
 _ALLOWED = frozenset({"ARG", "FROM", "WORKDIR", "COPY", "ENV", "RUN", "LABEL"})
-_FORBIDDEN = re.compile(r"oss[-_ ]?fuzz|--mount(?:=|\s).*?(?:secret|cache|ssh)|--(?:privileged|device)|/var/run/docker\.sock|docker\.sock", re.I)
+_FORBIDDEN = re.compile(r"oss[-_ ]?fuzz|--mount(?:=|\s).*?(?:secret|cache|ssh)|--(?:privileged|device)|--(?:network|security)(?:=|\s)|/var/run/docker\.sock|docker\.sock", re.I)
 _MAX_RUN_STEPS = 8
 _MAX_INSTRUCTION_BYTES = 4096
 _MAX_DOCKERFILE_BYTES = 64 * 1024

@@ -11,6 +11,7 @@ class TargetLayerService(_GeneratedLayerService):
     _kind = "target"
     _parent_kind = "project"
     _network_allowed = False
+    _dockerfile_asset_index = 0
 
     @staticmethod
     def tag(
