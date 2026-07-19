@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 
 from backend.services.clone_repository import GitCommandFailed, contained_path
+from backend.services.stream_task_output import TaskLogLimitExceeded
 
 
 TASK_NAMES = ("repository clone", "LLVM toolchain preparation", "repository analysis")
@@ -98,7 +99,10 @@ class ExecuteProjectBackbone:
 
     async def _fail(self, task, error: Exception | str) -> None:
         message = str(error) or type(error).__name__
-        await self._logs.append(task, f"{message}\n")
+        try:
+            await self._logs.append(task, f"{message}\n")
+        except TaskLogLimitExceeded:
+            pass
         await self._tasks.finish(task.id, message)
 
     async def _finish_project(self, project_id: int) -> None:

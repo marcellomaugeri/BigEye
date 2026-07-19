@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+from backend.fuzzing.docker.client import DOCKER_REQUEST_TIMEOUT_SECONDS
+
 
 PLATFORM = "linux/amd64"
 IMAGE_BUILD_LOG_MAX_BYTES = 5 * 1024 * 1024
@@ -29,7 +31,7 @@ class ImageBuilder:
             raise ValueError("dockerfile must be an existing Dockerfile")
         stream = self._client.api.build(
             path=str(dockerfile.parent), dockerfile=dockerfile.name, tag=tag,
-            platform=PLATFORM, decode=True, rm=True,
+            platform=PLATFORM, decode=True, rm=True, timeout=DOCKER_REQUEST_TIMEOUT_SECONDS,
         )
         emitted = 0
         def emit(text: str) -> None:

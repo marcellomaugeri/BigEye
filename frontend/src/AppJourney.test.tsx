@@ -275,4 +275,43 @@ describe('App journey', () => {
     expect(api.getTaskLog).toHaveBeenLastCalledWith(task.id, 4);
     expect(screen.getByLabelText('Task log output').textContent).toBe('one\ntwo\n');
   });
+
+  it('drains all available bounded log chunks without waiting for another event', async () => {
+    const firstChunk = 'a'.repeat(64 * 1024);
+    const api = apiDouble({
+      getTaskLog: vi.fn()
+        .mockResolvedValueOnce({ content: firstChunk, next_offset: firstChunk.length })
+        .mockResolvedValueOnce({ content: 'tail', next_offset: firstChunk.length + 4 })
+    });
+    const user = userEvent.setup();
+    render(<App api={api} />);
+    await screen.findByRole('option', { name: secondProject.repository_url });
+    await user.click(screen.getByRole('link', { name: 'Logs' }));
+    await waitFor(() => expect(api.getTaskLog).toHaveBeenLastCalledWith(task.id, firstChunk.length));
+    expect(screen.getByLabelText('Task log output').textContent).toBe(`${firstChunk}tail`);
+  });
+
+  it('preserves the existing log and cursor when an incremental request fails', async () => {
+    let notify: (() => void) | undefined;
+    const api = apiDouble({
+      getTaskLog: vi.fn()
+        .mockResolvedValueOnce({ content: 'one\n', next_offset: 4 })
+        .mockRejectedValueOnce(new Error('temporary failure'))
+        .mockResolvedValueOnce({ content: 'two\n', next_offset: 8 })
+        .mockResolvedValueOnce({ content: '', next_offset: 8 })
+    });
+    const eventStream: ProjectEventStream = { subscribe: vi.fn((_id, onEvent) => { notify = onEvent; return () => undefined; }) };
+    const user = userEvent.setup();
+    render(<App api={api} eventStream={eventStream} />);
+    await screen.findByRole('option', { name: secondProject.repository_url });
+    await waitFor(() => expect(eventStream.subscribe).toHaveBeenCalled());
+    await user.click(screen.getByRole('link', { name: 'Logs' }));
+    expect(await screen.findByText('one')).toBeInTheDocument();
+    notify?.();
+    expect(await screen.findByRole('alert')).toHaveTextContent('temporary failure');
+    expect(screen.getByLabelText('Task log output').textContent).toBe('one\n');
+    notify?.();
+    await waitFor(() => expect(api.getTaskLog).toHaveBeenLastCalledWith(task.id, 4));
+    expect(screen.getByLabelText('Task log output').textContent).toBe('one\ntwo\n');
+  });
 });

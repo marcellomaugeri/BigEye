@@ -96,6 +96,29 @@ class TestBoundedGitAndLogs:
 
 
 class TestDockerBounds:
+    def test_deferred_cancellation_cancels_owned_operation_before_closing_client(self, tmp_path: Path) -> None:
+        from backend.fuzzing.toolchain.deferred import DeferredToolchain
+
+        entered, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        client = SimpleNamespace(close=lambda: None)
+        toolchain = DeferredToolchain(tmp_path / "Dockerfile", SimpleNamespace(), SimpleNamespace(connect=lambda: client))
+        async def operation(_client):
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+        async def scenario():
+            running = asyncio.create_task(toolchain._with_client(operation))
+            await entered.wait()
+            running.cancel()
+            await asyncio.sleep(0)
+            release.set()
+            with pytest.raises(asyncio.CancelledError): await running
+        run(scenario())
+        assert cancelled.is_set()
+
     def test_connect_closes_created_client_when_ping_fails_and_uses_timeout(self) -> None:
         from backend.fuzzing.docker.client import DOCKER_REQUEST_TIMEOUT_SECONDS, DockerClient, DockerUnavailable
         class DockerException(Exception): pass
@@ -104,6 +127,34 @@ class TestDockerBounds:
         with pytest.raises(DockerUnavailable): DockerClient(module).connect()
         client.close.assert_called_once_with()
         assert module.kwargs["timeout"] == DOCKER_REQUEST_TIMEOUT_SECONDS
+
+    def test_connect_closes_client_for_unexpected_post_creation_error(self) -> None:
+        from backend.fuzzing.docker.client import DockerClient
+        class DockerException(Exception): pass
+        closed = []
+        client = SimpleNamespace(close=lambda: closed.append(True), ping=lambda: (_ for _ in ()).throw(ValueError("bug")))
+        module = SimpleNamespace(from_env=lambda **kwargs: client, errors=SimpleNamespace(DockerException=DockerException))
+        with pytest.raises(ValueError, match="bug"):
+            DockerClient(module).connect()
+        assert closed == [True]
+
+    def test_settings_classifies_bounded_verifier_timeout_as_unavailable(self, tmp_path: Path) -> None:
+        from backend.fuzzing.toolchain.deferred import DeferredToolchain
+        class Container:
+            id = "probe"
+            def start(self): pass
+            def wait(self, timeout): raise TimeoutError()
+            def stop(self, timeout=0): pass
+            def kill(self): pass
+            def remove(self, force=True): pass
+        client = SimpleNamespace(
+            close=lambda: None,
+            api=SimpleNamespace(inspect_image=lambda tag: {"Id": "sha256:ready", "Os": "linux", "Architecture": "amd64"}),
+            containers=SimpleNamespace(create=lambda *args, **kwargs: Container()),
+        )
+        dockerfile = tmp_path / "Dockerfile"; dockerfile.write_text("FROM scratch")
+        toolchain = DeferredToolchain(dockerfile, SimpleNamespace(), SimpleNamespace(connect=lambda: client))
+        assert run(toolchain.toolchain_available()) is False
 
     def test_image_builder_stops_and_closes_stream_at_log_budget(self, tmp_path: Path, monkeypatch) -> None:
         from backend.fuzzing.docker.image_builder import ImageBuildLogLimitExceeded, ImageBuilder
@@ -126,3 +177,14 @@ class TestProjectEventState:
         tasks = AsyncMock(); tasks.list_for_project.return_value = []
         snapshot = run(ProjectEventWatcher(tasks, SimpleNamespace(), projects).snapshot(7))
         assert snapshot[0] == (None, None, None)
+
+
+class TestTerminalPersistence:
+    def test_task_log_limit_does_not_block_task_terminal_error_persistence(self, tmp_path: Path) -> None:
+        from backend.services.execute_project_backbone import ExecuteProjectBackbone
+        from backend.services.stream_task_output import TaskLogLimitExceeded
+        tasks = SimpleNamespace(finish=AsyncMock())
+        executor = ExecuteProjectBackbone(SimpleNamespace(), tasks, SimpleNamespace(), SimpleNamespace(), SimpleNamespace(),
+                                          SimpleNamespace(append=AsyncMock(side_effect=TaskLogLimitExceeded("full"))), tmp_path)
+        run(executor._fail(task(), RuntimeError("capability failed")))
+        tasks.finish.assert_awaited_once_with(11, "capability failed")

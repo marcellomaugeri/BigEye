@@ -20,8 +20,18 @@ class DockerClient:
             client = self._docker.from_env(timeout=DOCKER_REQUEST_TIMEOUT_SECONDS)
             client.ping()
         except self._docker.errors.DockerException as error:
-            close = getattr(client, "close", None)
-            if close is not None:
-                close()
+            self._close(client)
             raise DockerUnavailable("Docker is unavailable") from error
+        except BaseException:
+            self._close(client)
+            raise
         return client
+
+    @staticmethod
+    def _close(client) -> None:
+        close = getattr(client, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception:
+                pass

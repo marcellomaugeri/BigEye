@@ -20,6 +20,7 @@ def run(awaitable):
 
 class TestImageBuilder:
     def test_build_uses_engine_api_with_exact_context_platform_tag_and_forwards_logs(self, tmp_path: Path) -> None:
+        from backend.fuzzing.docker.client import DOCKER_REQUEST_TIMEOUT_SECONDS
         from backend.fuzzing.docker.image_builder import ImageBuilder
 
         dockerfile = tmp_path / "Dockerfile"
@@ -38,7 +39,7 @@ class TestImageBuilder:
         image_id = ImageBuilder(SimpleNamespace(api=api)).build(dockerfile, "bigeye-llvm:test", logs.append)
 
         assert image_id == "sha256:canonical"
-        assert calls == [{"path": str(tmp_path), "dockerfile": "Dockerfile", "tag": "bigeye-llvm:test", "platform": "linux/amd64", "decode": True, "rm": True}]
+        assert calls == [{"path": str(tmp_path), "dockerfile": "Dockerfile", "tag": "bigeye-llvm:test", "platform": "linux/amd64", "decode": True, "rm": True, "timeout": DOCKER_REQUEST_TIMEOUT_SECONDS}]
         assert logs == ["Step 1/1 : FROM ubuntu:24.04\n"]
 
     def test_build_forwards_daemon_error_text_and_does_not_report_success(self, tmp_path: Path) -> None:

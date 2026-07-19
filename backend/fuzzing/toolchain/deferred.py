@@ -5,8 +5,8 @@ from pathlib import Path
 
 from docker.errors import DockerException
 
-from backend.fuzzing.docker.client import DockerClient, DockerUnavailable
-from backend.fuzzing.docker.container_runner import ContainerRunner
+from backend.fuzzing.docker.client import DOCKER_REQUEST_TIMEOUT_SECONDS, DockerClient, DockerUnavailable
+from backend.fuzzing.docker.container_runner import ContainerOutputExceeded, ContainerRunner, ContainerTimedOut
 from backend.fuzzing.docker.image_builder import ImageBuilder
 from backend.fuzzing.docker.image_inspector import ImageInspector, MissingImage
 from backend.fuzzing.toolchain.builder import ToolchainBuilder
@@ -44,8 +44,9 @@ class DeferredToolchain:
         try:
             return await asyncio.shield(work)
         except asyncio.CancelledError as cancellation:
+            work.cancel()
             try:
-                await asyncio.shield(work)
+                await asyncio.wait_for(asyncio.shield(work), timeout=DOCKER_REQUEST_TIMEOUT_SECONDS)
             except BaseException:
                 pass
             raise cancellation
@@ -67,7 +68,7 @@ class DeferredToolchain:
     async def docker_available(self) -> bool:
         try:
             return await self._with_client(lambda client: _true())
-        except (DockerUnavailable, DockerException, MissingImage, UnsupportedImagePlatform, ToolchainVerificationFailed):
+        except (DockerUnavailable, DockerException):
             return False
 
     async def toolchain_available(self) -> bool:
@@ -82,7 +83,8 @@ class DeferredToolchain:
         try:
             image = await asyncio.to_thread(inspector.inspect, builder.tag())
             await ToolchainVerifier(inspector, ContainerRunner(client)).verify(image.image_id, lambda text: None)
-        except (MissingImage, UnsupportedImagePlatform, ToolchainVerificationFailed):
+        except (DockerException, MissingImage, UnsupportedImagePlatform, ToolchainVerificationFailed,
+                ContainerTimedOut, ContainerOutputExceeded):
             return False
         return True
 

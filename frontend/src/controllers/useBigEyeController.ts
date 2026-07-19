@@ -6,6 +6,7 @@ import type { BigEyeApi } from '../services/apiClient';
 import type { ProjectEventStream } from '../services/eventStream';
 
 export type Page = 'projects' | 'tasks' | 'findings' | 'logs' | 'settings';
+const TASK_LOG_CHUNK_BYTES = 64 * 1024;
 
 function message(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
@@ -73,14 +74,18 @@ export function useBigEyeController(api: BigEyeApi, eventStream: ProjectEventStr
     setLogLoading(true);
     setLogError(null);
     try {
-      const after = logOffset.current;
-      const log = await api.getTaskLog(taskId, after);
-      if (requestGeneration !== logRequestGeneration.current || selectedTaskIdRef.current !== taskId) return;
-      logOffset.current = log.next_offset;
-      setLogContent((current) => current + log.content);
+      let after = logOffset.current;
+      while (true) {
+        const log = await api.getTaskLog(taskId, after);
+        if (requestGeneration !== logRequestGeneration.current || selectedTaskIdRef.current !== taskId) return;
+        logOffset.current = log.next_offset;
+        if (!log.content) return;
+        setLogContent((current) => current + log.content);
+        if (log.content.length < TASK_LOG_CHUNK_BYTES || log.next_offset <= after) return;
+        after = log.next_offset;
+      }
     } catch (error) {
       if (requestGeneration !== logRequestGeneration.current || selectedTaskIdRef.current !== taskId) return;
-      setLogContent('');
       setLogError(message(error, 'Could not load the task log.'));
     } finally {
       if (requestGeneration === logRequestGeneration.current && selectedTaskIdRef.current === taskId) setLogLoading(false);
