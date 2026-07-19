@@ -1,1 +1,1 @@
-"""Bounded agent capabilities for repository analysis."""
+"""Bounded agent capabilities for autonomous fuzzing campaigns."""

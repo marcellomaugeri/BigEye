@@ -1,1 +1,1 @@
-"""Instructions for the temporary repository-analysis agents."""
+"""Instructions for the campaign manager and temporary specialists."""

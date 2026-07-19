@@ -4,15 +4,21 @@ from types import SimpleNamespace
 
 import pytest
 from agents import Agent
-from agents.items import ToolCallItem
+from pydantic import ValidationError
 from agents.run import RunConfig
 from agents.tool_context import ToolContext
 
 from backend.agents.context import AgentContext
 from backend.agents.manager import build_manager_agent
-from backend.agents.prompts.repository_analysis import REPOSITORY_ANALYSIS_PROMPT
-from backend.agents.repository_analysis import build_repository_analysis_agent
-from backend.agents.tools.agent_dispatch import repository_analysis_tool
+from backend.agents.outputs.campaign_decision import CampaignDecision
+from backend.agents.outputs.target_proposal import TargetProposal
+from backend.agents.outputs.triage_result import TriageResult
+from backend.agents.prompts.component_target import COMPONENT_TARGET_PROMPT
+from backend.agents.prompts.crash_triage import CRASH_TRIAGE_PROMPT
+from backend.agents.prompts.system_target import SYSTEM_TARGET_PROMPT
+from backend.agents.tools.agent_dispatch import dispatch_tools
+from backend.agents.tools.contained_operations import contained_operation_request
+from backend.agents.tools.generated_assets import GeneratedAssetError, write_asset_file
 from backend.agents.tools.code_navigation import (
     CodeNavigationError,
     MAX_DIRECTORY_DEPTH,
@@ -31,7 +37,6 @@ from backend.agents.tools.code_navigation import (
 )
 from backend.agents.tools.evidence_retrieval import evidence_retrieval_tools
 from backend.fuzzing.discovery.retrieval import EvidenceRetriever
-from backend.agents.workflow import CitationValidationError, RepositoryAnalysisWorkflow, validate_citations
 
 
 def write_repository(tmp_path: Path) -> Path:
@@ -43,20 +48,9 @@ def write_repository(tmp_path: Path) -> Path:
     return root
 
 
-def dispatched_result(agent: Agent, content: str) -> SimpleNamespace:
-    return SimpleNamespace(
-        final_output=content,
-        new_items=[ToolCallItem(agent=agent, raw_item={"name": "analyse_repository"})],
-    )
-
-
-def analyse_repository(workflow: RepositoryAnalysisWorkflow, project_id: int, root: Path):
-    return workflow.analyse(
-        project_id=project_id,
-        commit_sha="a" * 40,
-        repository_root=root,
-        generated_assets_root=root.parent / f"assets-{project_id}",
-    )
+def agent_context(tmp_path: Path, project_id: int = 4) -> AgentContext:
+    root = write_repository(tmp_path)
+    return AgentContext(project_id, "a" * 40, root, tmp_path / "assets", EvidenceRetriever(root))
 
 
 def test_navigation_lists_and_reads_contained_text_files(tmp_path: Path) -> None:
@@ -159,39 +153,304 @@ def test_git_metadata_uses_bounded_argv_and_repository_root(tmp_path: Path) -> N
     ]
 
 
-def test_agents_have_the_required_models_and_tool_boundary() -> None:
-    worker = build_repository_analysis_agent()
-    worker_tool = repository_analysis_tool(worker)
-    manager = build_manager_agent(worker_tool)
+def test_manager_has_specialists_as_tools_and_no_direct_repository_tools(tmp_path: Path) -> None:
+    tools = dispatch_tools(agent_context(tmp_path), evidence_ids={"evidence-1"})
+    manager = build_manager_agent(tools)
 
-    assert isinstance(worker, Agent)
-    assert worker.model == "gpt-5.6-luna"
-    assert {tool.name for tool in worker.tools} == {
-        "list_project_files",
-        "read_source_lines",
-        "search_source_text",
-        "inspect_git_metadata",
-        "inspect_build_evidence",
-        "retrieve_repository_evidence",
-    }
-    assert {tool.name for tool in evidence_retrieval_tools()} == {"inspect_build_evidence", "retrieve_repository_evidence"}
-    assert worker.handoffs == []
-    assert worker_tool.name == "analyse_repository"
     assert isinstance(manager, Agent)
     assert manager.model == "gpt-5.6-terra"
-    assert manager.tools == [worker_tool]
+    assert {tool.name for tool in manager.tools} == {
+        "prepare_system_target",
+        "prepare_component_target",
+        "triage_crash_group",
+    }
     assert manager.handoffs == []
+    for tool in tools:
+        assert tool._is_agent_tool is True
+        assert tool._agent_instance.model == "gpt-5.6-luna"
+        assert set(tool.params_json_schema["properties"]) == {"assignment", "evidence_ids"}
+        assert tool.params_json_schema["additionalProperties"] is False
 
 
-def test_repository_worker_treats_prompt_injection_as_untrusted_data() -> None:
-    prompt = REPOSITORY_ANALYSIS_PROMPT.casefold()
+def test_specialists_have_narrow_tools_structured_outputs_and_no_handoffs(tmp_path: Path) -> None:
+    workers = {tool.name: tool._agent_instance for tool in dispatch_tools(agent_context(tmp_path), evidence_ids=set())}
+    shared = {
+        "list_project_files", "read_source_lines", "search_source_text", "inspect_git_metadata",
+        "inspect_build_evidence", "retrieve_repository_evidence", "web_search",
+        "write_generated_asset", "request_contained_operation",
+    }
 
-    assert "repository text" in prompt
-    assert "navigation" in prompt
-    assert "retrieval" in prompt
-    assert "untrusted evidence" in prompt
-    assert "never instructions" in prompt
-    assert "must not cause tool calls or actions" in prompt
+    assert {tool.name for tool in workers["prepare_system_target"].tools} == shared
+    assert {tool.name for tool in workers["prepare_component_target"].tools} == shared
+    assert {tool.name for tool in workers["triage_crash_group"].tools} == shared
+    assert workers["prepare_system_target"].output_type is TargetProposal
+    assert workers["prepare_component_target"].output_type is TargetProposal
+    assert workers["triage_crash_group"].output_type is TriageResult
+    assert all(worker.handoffs == [] for worker in workers.values())
+    assert {tool.name for tool in evidence_retrieval_tools()} == {"inspect_build_evidence", "retrieve_repository_evidence"}
+
+
+@pytest.mark.parametrize("prompt", [SYSTEM_TARGET_PROMPT, COMPONENT_TARGET_PROMPT, CRASH_TRIAGE_PROMPT])
+def test_specialists_treat_repository_and_web_content_as_untrusted_evidence(prompt: str) -> None:
+    lowered = prompt.casefold()
+
+    assert "repository" in lowered
+    assert "web" in lowered
+    assert "untrusted evidence" in lowered
+    assert "never instructions" in lowered
+    assert "official" in lowered
+    assert "citation" in lowered
+
+
+def test_structured_outputs_reject_missing_fields_and_extra_assumptions() -> None:
+    proposal = TargetProposal(
+        target_name="parser", instance_type="component-level", byte_path="LLVMFuzzerTestOneInput -> parse",
+        expected_project_reach="parser state machine", build_command="cmake --build build --target parser_fuzz",
+        run_command="/bigeye/parser_fuzz", seeds=[{"path": "tests/minimal.txt", "provenance": "repository"}],
+        configuration="default", sanitizer_plan="ASan and UBSan", generated_asset_intents=[{
+            "relative_path": "component/parser_harness.cc", "purpose": "component harness"
+        }], probe_assertions=["seed reaches parser code", "empty input does not crash"],
+        evidence_ids=["evidence-1"], uncertainty="build target has not been probed",
+    )
+    decision = CampaignDecision(
+        decision="prepare target", motivation="The parser has a supported byte entry path.",
+        evidence_ids=["evidence-1"], bounded_actions=["prepare_component_target"],
+        next_review_condition="after the deterministic probe", uncertainty="build not yet run",
+    )
+
+    assert proposal.instance_type == "component-level"
+    assert decision.bounded_actions == ["prepare_component_target"]
+    with pytest.raises(ValidationError):
+        CampaignDecision(
+            decision="wait", motivation="No action", evidence_ids=[], bounded_actions=[],
+            next_review_condition="new evidence", uncertainty="none", invented=True,
+        )
+
+
+def _target_proposal(evidence_id: str) -> TargetProposal:
+    return TargetProposal(
+        target_name="parser", instance_type="system-level", byte_path="stdin -> parser",
+        expected_project_reach="parser state machine", build_command="cmake --build build --target parser",
+        run_command="/src/build/parser", seeds=[{"path": "tests/minimal.txt", "provenance": "repository"}],
+        configuration="default", sanitizer_plan="ASan and UBSan", generated_asset_intents=[{
+            "relative_path": "system/parser/Dockerfile", "purpose": "target layer"
+        }], probe_assertions=["seed reaches parser code"], evidence_ids=[evidence_id],
+        uncertainty="runtime path has not been probed",
+    )
+
+
+def test_luna_specialist_retries_once_with_terra_only_after_validation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = agent_context(tmp_path)
+    calls: list[str] = []
+
+    class Result:
+        interruptions = []
+        new_items = []
+        raw_responses = []
+
+        def __init__(self, output):
+            self.final_output = output
+
+        def to_input_list(self):
+            return [{"role": "user", "content": "prepare the parser target"}]
+
+    async def runner(starting_agent=None, input=None, **kwargs):
+        agent = starting_agent
+        calls.append(agent.model)
+        return Result(_target_proposal("unknown") if agent.model == "gpt-5.6-luna" else _target_proposal("known"))
+
+    from agents import Runner
+
+    monkeypatch.setattr(Runner, "run", runner)
+    tool = next(item for item in dispatch_tools(context, evidence_ids={"known"}) if item.name == "prepare_system_target")
+    tool_context = ToolContext(
+        context, tool_name=tool.name, tool_call_id="call-1",
+        tool_arguments='{"assignment":"prepare parser","evidence_ids":["known"]}', run_config=RunConfig(),
+    )
+    output = asyncio.run(tool.on_invoke_tool(
+        tool_context, '{"assignment":"prepare parser","evidence_ids":["known"]}'
+    ))
+
+    assert calls == ["gpt-5.6-luna", "gpt-5.6-terra"]
+    assert output.evidence_ids == ["known"]
+
+
+def test_specialist_accepts_only_source_evidence_returned_by_its_retrieval_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = agent_context(tmp_path)
+    calls = []
+    tool = next(item for item in dispatch_tools(context, evidence_ids=set()) if item.name == "prepare_system_target")
+    retrieval = next(item for item in tool._agent_instance.tools if item.name == "retrieve_repository_evidence")
+    retrieval_context = ToolContext(
+        context, tool_name=retrieval.name, tool_call_id="retrieve-1",
+        tool_arguments='{"question":"println","limit":2}', run_config=RunConfig(),
+    )
+    excerpts = asyncio.run(retrieval.on_invoke_tool(
+        retrieval_context, '{"question":"println","limit":2}'
+    ))
+    evidence_id = excerpts[0]["evidence_id"]
+
+    class Result:
+        interruptions = []
+        new_items = []
+        raw_responses = []
+        input = "prepare parser"
+        final_output = _target_proposal(evidence_id)
+
+        def to_input_list(self):
+            return []
+
+    async def runner(starting_agent=None, input=None, **kwargs):
+        calls.append(starting_agent.model)
+        return Result()
+
+    from agents import Runner
+
+    monkeypatch.setattr(Runner, "run", runner)
+    parent_context = ToolContext(
+        context, tool_name=tool.name, tool_call_id="call-1",
+        tool_arguments='{"assignment":"prepare parser","evidence_ids":[]}', run_config=RunConfig(),
+    )
+    output = asyncio.run(tool.on_invoke_tool(
+        parent_context, '{"assignment":"prepare parser","evidence_ids":[]}'
+    ))
+
+    assert calls == ["gpt-5.6-luna"]
+    assert output.evidence_ids == [evidence_id]
+
+
+def test_specialist_accepts_only_web_citation_returned_by_its_model_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = agent_context(tmp_path)
+    citation = "https://official.example.org/reference/parser"
+
+    class Result:
+        interruptions = []
+        new_items = []
+        input = "prepare parser"
+        final_output = _target_proposal(citation)
+        raw_responses = [SimpleNamespace(output=[{
+            "type": "message", "content": [{"type": "output_text", "text": "docs", "annotations": [{
+                "type": "url_citation", "url": citation,
+            }]}],
+        }])]
+
+        def to_input_list(self):
+            return []
+
+    calls = []
+
+    async def runner(starting_agent=None, input=None, **kwargs):
+        calls.append(starting_agent.model)
+        return Result()
+
+    from agents import Runner
+
+    monkeypatch.setattr(Runner, "run", runner)
+    tool = next(item for item in dispatch_tools(context, evidence_ids=set()) if item.name == "prepare_system_target")
+    parent_context = ToolContext(
+        context, tool_name=tool.name, tool_call_id="call-1",
+        tool_arguments='{"assignment":"prepare parser","evidence_ids":[]}', run_config=RunConfig(),
+    )
+
+    output = asyncio.run(tool.on_invoke_tool(
+        parent_context, '{"assignment":"prepare parser","evidence_ids":[]}'
+    ))
+
+    assert calls == ["gpt-5.6-luna"]
+    assert output.evidence_ids == [citation]
+
+
+def test_specialist_transport_failure_is_not_retried(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    context = agent_context(tmp_path)
+    calls = 0
+
+    async def runner(starting_agent=None, input=None, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("transport unavailable")
+
+    from agents import Runner
+
+    monkeypatch.setattr(Runner, "run", runner)
+    tool = next(item for item in dispatch_tools(context, evidence_ids=set()) if item.name == "prepare_system_target")
+    tool_context = ToolContext(
+        context, tool_name=tool.name, tool_call_id="call-1",
+        tool_arguments='{"assignment":"prepare parser","evidence_ids":[]}', run_config=RunConfig(),
+    )
+
+    with pytest.raises(RuntimeError, match="transport unavailable"):
+        asyncio.run(tool.on_invoke_tool(
+            tool_context, '{"assignment":"prepare parser","evidence_ids":[]}'
+        ))
+    assert calls == 1
+
+
+def test_generated_asset_writes_only_inside_draft_root_with_compare_and_swap(tmp_path: Path) -> None:
+    context = agent_context(tmp_path)
+
+    created = write_asset_file(context, "component/parser/harness.cc", "int target() { return 0; }\n", None)
+    updated = write_asset_file(
+        context, "component/parser/harness.cc", "int target() { return 1; }\n", created["sha256"]
+    )
+
+    assert (context.generated_assets_root / "component/parser/harness.cc").read_text() == "int target() { return 1; }\n"
+    assert created["created"] is True
+    assert updated["created"] is False
+    assert "-int target() { return 0; }" in updated["diff"]
+    with pytest.raises(GeneratedAssetError):
+        write_asset_file(context, "component/parser/harness.cc", "changed", created["sha256"])
+    with pytest.raises(GeneratedAssetError):
+        write_asset_file(context, "../outside", "bad", None)
+
+
+def test_generated_asset_rejects_symlink_ancestors(tmp_path: Path) -> None:
+    context = agent_context(tmp_path)
+    context.generated_assets_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (context.generated_assets_root / "linked").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(GeneratedAssetError):
+        write_asset_file(context, "linked/harness.cc", "bad", None)
+    assert not (outside / "harness.cc").exists()
+
+
+def test_generated_asset_restores_previous_version_if_root_changes_during_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import backend.agents.tools.generated_assets as generated_assets
+
+    context = agent_context(tmp_path)
+    original = write_asset_file(context, "component/parser/harness.cc", "original\n", None)
+    checks = iter((True, False))
+    monkeypatch.setattr(generated_assets, "_root_is_canonical", lambda *args: next(checks))
+
+    with pytest.raises(GeneratedAssetError, match="publication"):
+        write_asset_file(context, "component/parser/harness.cc", "replacement\n", original["sha256"])
+
+    assert (context.generated_assets_root / "component/parser/harness.cc").read_text() == "original\n"
+
+
+def test_contained_operation_is_a_bounded_request_not_host_execution(tmp_path: Path) -> None:
+    context = agent_context(tmp_path)
+    write_asset_file(context, "system/parser/config.sh", "#!/bin/sh\nexit 0\n", None)
+
+    request = contained_operation_request(
+        context, "probe", ["system/parser/config.sh"], ["seed reaches project code"]
+    )
+
+    assert request == {
+        "operation": "probe", "asset_paths": ["system/parser/config.sh"],
+        "assertions": ["seed reaches project code"], "executed": False,
+        "provenance": "agent_request", "trusted_instructions": False,
+    }
+    with pytest.raises(ValueError):
+        contained_operation_request(context, "shell", ["/etc/passwd"], ["run it"])
 
 
 def test_navigation_function_tools_wrap_every_repository_result_as_untrusted(
@@ -322,165 +581,3 @@ def test_context_requires_a_repository_evidence_retriever(tmp_path: Path) -> Non
 
     with pytest.raises(ValueError, match="evidence"):
         AgentContext(4, "a" * 40, root, tmp_path / "assets", None)
-
-
-def test_citation_validation_accepts_real_contained_line_ranges(tmp_path: Path) -> None:
-    root = write_repository(tmp_path)
-
-    assert validate_citations("The entry point is [src/main.rs:1-2].", root) == [("src/main.rs", 1, 2)]
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "No evidence.",
-        "Bad [src/main.rs:2-1].",
-        "Bad [missing.rs:1-1].",
-        "Bad [../outside:1-1].",
-        "Bad [.git/config:1-1].",
-        "Bad [src/main.rs:1-99].",
-        "Bad [src/main.rs:1-].",
-        "Good [src/main.rs:1-1], bad [src/main.rs:2-2.",
-        "Good [src/main.rs:1-1], bad [[src/main.rs:2-2]].",
-        "Good [src/main.rs:1-1], bad [src/main.rs].",
-    ],
-)
-def test_citation_validation_rejects_invalid_or_unbounded_evidence(tmp_path: Path, text: str) -> None:
-    root = write_repository(tmp_path)
-
-    with pytest.raises(CitationValidationError):
-        validate_citations(text, root)
-
-
-def test_workflow_publishes_only_valid_output_atomically(tmp_path: Path) -> None:
-    root = write_repository(tmp_path)
-    workspace = tmp_path / "workspace"
-    calls = []
-
-    async def runner(agent, prompt, *, context):
-        calls.append((agent, prompt, context))
-        return dispatched_result(agent, "The entry point is [src/main.rs:1-2].")
-
-    path = asyncio.run(analyse_repository(RepositoryAnalysisWorkflow(workspace, runner=runner), 7, root))
-
-    assert path == workspace / "projects" / "7" / "analysis" / "repository.md"
-    assert path.read_text(encoding="utf-8") == "The entry point is [src/main.rs:1-2]."
-    assert len(calls) == 1
-    assert calls[0][0].model == "gpt-5.6-terra"
-    assert calls[0][0].tools[0].name == "analyse_repository"
-
-
-def test_workflow_retries_once_with_terra_worker_only_after_invalid_citations(tmp_path: Path) -> None:
-    root = write_repository(tmp_path)
-    outputs = iter(["No citation.", "Entry point [src/main.rs:1-1]."])
-    calls = []
-
-    async def runner(agent, prompt, *, context):
-        calls.append(agent)
-        return dispatched_result(agent, next(outputs))
-
-    path = asyncio.run(analyse_repository(RepositoryAnalysisWorkflow(tmp_path / "workspace", runner=runner), 8, root))
-
-    assert path.read_text(encoding="utf-8") == "Entry point [src/main.rs:1-1]."
-    assert len(calls) == 2
-    assert calls[0].tools[0]._agent_instance.model == "gpt-5.6-luna"
-    assert calls[1].tools[0]._agent_instance.model == "gpt-5.6-terra"
-
-
-def test_workflow_retries_and_rejects_outputs_without_dispatch_evidence(tmp_path: Path) -> None:
-    root = write_repository(tmp_path)
-    calls = []
-
-    async def runner(agent, prompt, *, context):
-        calls.append(agent)
-        return SimpleNamespace(final_output="Entry point [src/main.rs:1-1].", new_items=[])
-
-    with pytest.raises(CitationValidationError, match="dispatch"):
-        asyncio.run(analyse_repository(RepositoryAnalysisWorkflow(tmp_path / "workspace", runner=runner), 10, root))
-    assert len(calls) == 2
-    assert calls[0].tools[0]._agent_instance.model == "gpt-5.6-luna"
-    assert calls[1].tools[0]._agent_instance.model == "gpt-5.6-terra"
-
-
-def test_workflow_accepts_actual_agent_tool_call_item_evidence(tmp_path: Path) -> None:
-    root = write_repository(tmp_path)
-
-    async def runner(agent, prompt, *, context):
-        return dispatched_result(agent, "Entry point [src/main.rs:1-1].")
-
-    path = asyncio.run(analyse_repository(RepositoryAnalysisWorkflow(tmp_path / "workspace", runner=runner), 11, root))
-    assert path.is_file()
-
-
-def test_workflow_rejects_symlinked_publication_parent(tmp_path: Path) -> None:
-    root = write_repository(tmp_path)
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (workspace / "projects").symlink_to(outside, target_is_directory=True)
-
-    async def runner(agent, prompt, *, context):
-        return dispatched_result(agent, "Entry point [src/main.rs:1-1].")
-
-    with pytest.raises(CitationValidationError):
-        asyncio.run(analyse_repository(RepositoryAnalysisWorkflow(workspace, runner=runner), 12, root))
-
-
-def test_workflow_rejects_symlinked_workspace_root(tmp_path: Path) -> None:
-    root = write_repository(tmp_path)
-    workspace = tmp_path / "workspace"
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    workspace.symlink_to(outside, target_is_directory=True)
-
-    async def runner(agent, prompt, *, context):
-        return dispatched_result(agent, "Entry point [src/main.rs:1-1].")
-
-    with pytest.raises(CitationValidationError):
-        asyncio.run(analyse_repository(RepositoryAnalysisWorkflow(workspace, runner=runner), 13, root))
-
-
-def test_workflow_rejects_ancestor_symlinked_workspace_without_external_publish(tmp_path: Path) -> None:
-    root = write_repository(tmp_path)
-    trusted = tmp_path / "trusted"
-    trusted.mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (trusted / "parent-link").symlink_to(outside, target_is_directory=True)
-    workspace = trusted / "parent-link" / "workspace"
-
-    async def runner(agent, prompt, *, context):
-        return dispatched_result(agent, "Entry point [src/main.rs:1-1].")
-
-    with pytest.raises(CitationValidationError):
-        asyncio.run(analyse_repository(RepositoryAnalysisWorkflow(workspace, runner=runner), 14, root))
-    assert not (outside / "workspace").exists()
-
-
-def test_workflow_does_not_retry_runner_errors_or_publish_two_invalid_outputs(tmp_path: Path) -> None:
-    root = write_repository(tmp_path)
-    workspace = tmp_path / "workspace"
-    existing = workspace / "projects" / "9" / "analysis" / "repository.md"
-    existing.parent.mkdir(parents=True)
-    existing.write_text("Existing [src/main.rs:1-1].", encoding="utf-8")
-    calls = 0
-
-    async def failing_runner(agent, prompt, *, context):
-        nonlocal calls
-        calls += 1
-        raise RuntimeError("runner failure")
-
-    with pytest.raises(RuntimeError, match="runner failure"):
-        asyncio.run(analyse_repository(RepositoryAnalysisWorkflow(workspace, runner=failing_runner), 9, root))
-    assert calls == 1
-    assert existing.read_text(encoding="utf-8") == "Existing [src/main.rs:1-1]."
-
-    outputs = iter(["No citations.", "Still none."])
-
-    async def invalid_runner(agent, prompt, *, context):
-        return SimpleNamespace(final_output=next(outputs))
-
-    with pytest.raises(CitationValidationError):
-        asyncio.run(analyse_repository(RepositoryAnalysisWorkflow(workspace, runner=invalid_runner), 9, root))
-    assert existing.read_text(encoding="utf-8") == "Existing [src/main.rs:1-1]."
