@@ -5,7 +5,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
-from backend.api.controllers import events, projects, settings, tasks
+from backend.api.controllers import coverage, events, findings, projects, settings, tasks
 from backend.api.dependencies import build_services
 from backend.database.connection import create_pool
 
@@ -34,6 +34,8 @@ def create_app(services=None, workspace: Path | None = None) -> FastAPI:
     app.include_router(events.router, prefix="/api")
     app.include_router(tasks.router, prefix="/api")
     app.include_router(settings.router, prefix="/api")
+    app.include_router(coverage.router, prefix="/api")
+    app.include_router(findings.router, prefix="/api")
     return app
 
 
