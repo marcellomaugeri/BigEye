@@ -59,11 +59,11 @@ class FuzzContainerService:
         final_log_max_bytes: int = 1_048_576,
         final_log_timeout_seconds: float = 2.0,
     ):
-        if isinstance(stop_timeout_seconds, bool) or not 1 <= stop_timeout_seconds <= 30:
+        if type(stop_timeout_seconds) is not int or not 1 <= stop_timeout_seconds <= 30:
             raise ValueError("stop_timeout_seconds must be between 1 and 30")
-        if isinstance(final_log_max_bytes, bool) or not 1 <= final_log_max_bytes <= 16 * 1_048_576:
+        if type(final_log_max_bytes) is not int or not 1 <= final_log_max_bytes <= 16 * 1_048_576:
             raise ValueError("final_log_max_bytes must be between 1 and 16777216")
-        if isinstance(final_log_timeout_seconds, bool) or not 0 < final_log_timeout_seconds <= 10:
+        if type(final_log_timeout_seconds) is not float or not 0 < final_log_timeout_seconds <= 10:
             raise ValueError("final_log_timeout_seconds must be between 0 and 10")
         self._client = client
         self._workspace = CampaignWorkspace(workspace_root)
@@ -84,18 +84,20 @@ class FuzzContainerService:
         with self._workspace.open_campaign(campaign.project_id, campaign.id, create=True) as directory:
             self._after_campaign_opened(directory.descriptor, directory.path)
             self._require_canonical(campaign, directory)
-            volumes = self._workspace.prepare_mounts(directory, root_fallback=os.getuid() == 0)
+            mounts = self._workspace.prepare_mounts(directory, root_fallback=os.getuid() == 0)
             self._require_canonical(campaign, directory)
             user_id, group_id = _unprivileged_user()
             contract = build_runtime_contract(
                 self._client,
                 campaign,
                 invocation,
-                volumes,
+                mounts.volumes,
+                mounts.identities,
                 f"{user_id}:{group_id}",
                 (directory.device, directory.inode),
                 directory.path,
             )
+            self._require_runtime_paths(campaign, directory, contract)
             container = self._client.containers.create(
                 invocation.image_id,
                 list(invocation.command),
@@ -103,6 +105,11 @@ class FuzzContainerService:
                 platform=PLATFORM,
                 network_disabled=True,
                 network_mode="none",
+                ipc_mode="private",
+                cgroupns="private",
+                runtime="runc",
+                restart_policy={"Name": "no"},
+                publish_all_ports=False,
                 privileged=False,
                 read_only=True,
                 cap_drop=["ALL"],
@@ -112,7 +119,7 @@ class FuzzContainerService:
                 mem_limit=f"{invocation.memory_limit_mb}m",
                 nano_cpus=1_000_000_000,
                 tmpfs=dict(TMPFS),
-                volumes=volumes,
+                volumes=mounts.volumes,
                 environment=dict(invocation.environment),
                 labels=_service_labels(contract),
                 auto_remove=False,
@@ -125,7 +132,7 @@ class FuzzContainerService:
                 verify_runtime(container, contract)
                 if _container_state(container) != "running":
                     raise ContainerContractMismatch("started fuzz container is not running")
-                self._require_canonical(campaign, directory)
+                self._require_runtime_paths(campaign, directory, contract)
             except BaseException as error:
                 try:
                     self._cleanup_created(container, campaign, directory)
@@ -143,7 +150,7 @@ class FuzzContainerService:
     def stream_logs(self, identity: ContainerIdentity, sink, follow: bool = True) -> None:
         contract = self._known_contract(identity)
         with self._open_owned_campaign(contract) as directory:
-            container = self._owned_container(identity, contract)
+            container = self._owned_container(identity, contract, directory)
             for chunk in container.logs(stream=True, follow=follow, stdout=True, stderr=True):
                 sink(_text(chunk))
 
@@ -156,31 +163,66 @@ class FuzzContainerService:
         contract = self._known_contract(identity)
         with self._open_owned_campaign(contract) as directory:
             self._workspace.validate_log_destination(directory)
-            container = self._owned_container(identity, contract)
+            container = self._owned_container(identity, contract, directory)
             state = _container_state(container)
+            primary_error = None
             if state in ACTIVE_STATES:
-                container.stop(timeout=self._stop_timeout_seconds)
-                container.reload()
+                try:
+                    container.stop(timeout=self._stop_timeout_seconds)
+                except Exception as error:
+                    primary_error = error
+                try:
+                    container.reload()
+                except Exception as error:
+                    if primary_error is not None:
+                        primary_error.add_note(f"state reload after graceful stop also failed: {error}")
+                        raise primary_error
+                    raise
                 state = _container_state(container)
                 if state in ACTIVE_STATES:
-                    container.kill()
-                    container.reload()
+                    try:
+                        container.kill()
+                    except Exception as error:
+                        if primary_error is not None:
+                            primary_error.add_note(f"forced kill also failed: {error}")
+                        else:
+                            primary_error = error
+                    try:
+                        container.reload()
+                    except Exception as error:
+                        if primary_error is not None:
+                            primary_error.add_note(f"state reload after forced kill also failed: {error}")
+                            raise primary_error
+                        raise
                     state = _container_state(container)
             if state in ACTIVE_STATES:
-                raise ContainerStillRunning(f"container {identity.container_id} did not stop")
-            log_descriptor = self._workspace.open_log(directory)
+                still_running = ContainerStillRunning(f"container {identity.container_id} did not stop")
+                if primary_error is not None:
+                    primary_error.add_note(str(still_running))
+                    raise primary_error
+                raise still_running
             try:
-                persist_bounded_logs(
-                    container,
-                    log_descriptor,
-                    self._final_log_max_bytes,
-                    self._final_log_timeout_seconds,
-                )
-            finally:
-                os.close(log_descriptor)
-            self._require_contract_canonical(contract)
-            container.remove(force=False)
+                self._require_contract_paths(contract, directory)
+                log_descriptor = self._workspace.open_log(directory)
+                try:
+                    persist_bounded_logs(
+                        container,
+                        log_descriptor,
+                        self._final_log_max_bytes,
+                        self._final_log_timeout_seconds,
+                    )
+                finally:
+                    os.close(log_descriptor)
+                self._require_contract_paths(contract, directory)
+                container.remove(force=False)
+            except Exception as error:
+                if primary_error is not None:
+                    primary_error.add_note(f"post-stop cleanup also failed: {error}")
+                    raise primary_error
+                raise
             del self._owned[identity.container_id]
+            if primary_error is not None:
+                raise primary_error
 
     def _find(self, campaign: FuzzCampaign, invocation: ContainerInvocation, running_only: bool) -> ContainerIdentity | None:
         self._validate_campaign(campaign)
@@ -189,23 +231,25 @@ class FuzzContainerService:
         if not candidates:
             return None
         with self._workspace.open_campaign(campaign.project_id, campaign.id, create=False) as directory:
-            volumes = self._workspace.existing_mounts(directory)
+            mounts = self._workspace.existing_mounts(directory)
             self._workspace.prepare_logs(directory)
             user_id, group_id = _unprivileged_user()
             contract = build_runtime_contract(
                 self._client,
                 campaign,
                 invocation,
-                volumes,
+                mounts.volumes,
+                mounts.identities,
                 f"{user_id}:{group_id}",
                 (directory.device, directory.inode),
                 directory.path,
             )
-            self._require_canonical(campaign, directory)
+            self._require_runtime_paths(campaign, directory, contract)
             matches = []
             for container in candidates:
                 container.reload()
                 verify_runtime(container, contract)
+                self._require_runtime_paths(campaign, directory, contract)
                 state = _container_state(container)
                 if not running_only or state == "running":
                     matches.append((container, state))
@@ -228,10 +272,12 @@ class FuzzContainerService:
             raise ContainerOwnershipMismatch("container identity does not match service-owned campaign evidence")
         return contract
 
-    def _owned_container(self, identity: ContainerIdentity, contract: RuntimeContract):
+    def _owned_container(self, identity: ContainerIdentity, contract: RuntimeContract, directory: CampaignDirectory):
+        self._require_contract_paths(contract, directory)
         container = self._client.containers.get(identity.container_id)
         container.reload()
         verify_runtime(container, contract)
+        self._require_contract_paths(contract, directory)
         return container
 
     @contextmanager
@@ -239,6 +285,7 @@ class FuzzContainerService:
         with self._workspace.open_campaign(contract.project_id, contract.campaign_id, create=False) as directory:
             if (directory.device, directory.inode) != (contract.device, contract.inode):
                 raise ValueError("canonical campaign workspace changed after ownership was established")
+            self._workspace.require_mount_identities(directory, contract.mount_identities)
             yield directory
 
     def _cleanup_created(self, container, campaign: FuzzCampaign, directory: CampaignDirectory) -> None:
@@ -280,6 +327,19 @@ class FuzzContainerService:
     def _require_contract_canonical(self, contract: RuntimeContract) -> None:
         if not self._workspace.is_canonical(contract.project_id, contract.campaign_id, (contract.device, contract.inode)):
             raise ValueError("canonical campaign workspace changed during log persistence")
+
+    def _require_runtime_paths(
+        self,
+        campaign: FuzzCampaign,
+        directory: CampaignDirectory,
+        contract: RuntimeContract,
+    ) -> None:
+        self._require_canonical(campaign, directory)
+        self._workspace.require_mount_identities(directory, contract.mount_identities)
+
+    def _require_contract_paths(self, contract: RuntimeContract, directory: CampaignDirectory) -> None:
+        self._require_contract_canonical(contract)
+        self._workspace.require_mount_identities(directory, contract.mount_identities)
 
     @staticmethod
     def _validate_campaign(campaign: FuzzCampaign) -> None:

@@ -29,9 +29,9 @@ def validate_common(spec: EngineSpec, engine: str, input_modes: frozenset[str]) 
         raise ValueError("corpus_path and output_path must be different")
     if not ROLE_PATTERN.fullmatch(spec.role):
         raise ValueError("role must contain only letters, digits, underscore, or hyphen")
-    if isinstance(spec.timeout_ms, bool) or spec.timeout_ms <= 0:
+    if type(spec.timeout_ms) is not int or spec.timeout_ms <= 0:
         raise ValueError("timeout_ms must be positive")
-    if isinstance(spec.memory_limit_mb, bool) or spec.memory_limit_mb <= 0:
+    if type(spec.memory_limit_mb) is not int or spec.memory_limit_mb <= 0:
         raise ValueError("memory_limit_mb must be positive")
     validate_environment(spec.sanitizer_environment)
     validate_labels(spec.campaign_labels)
@@ -73,8 +73,10 @@ def validate_image_id(image_id: str) -> None:
 
 
 def validate_afl_asan_environment(environment: Mapping[str, str]) -> None:
+    if "ASAN_OPTIONS" not in environment:
+        return
     options = {}
-    for item in environment.get("ASAN_OPTIONS", "").split(":"):
+    for item in environment["ASAN_OPTIONS"].split(":"):
         if not item:
             continue
         key, separator, value = item.partition("=")

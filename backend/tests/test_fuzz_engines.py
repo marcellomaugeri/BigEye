@@ -46,6 +46,21 @@ class TestAflCommand:
         assert invocation.read_only_source is True
         assert invocation.environment["ASAN_OPTIONS"] == "abort_on_error=1:symbolize=0"
 
+    @pytest.mark.parametrize(
+        "environment",
+        [
+            {},
+            {"UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1"},
+        ],
+    )
+    def test_unsanitized_and_ubsan_only_commands_keep_docker_managed_memory(self, environment) -> None:
+        from backend.fuzzing.engines.afl.command import AflCommand
+
+        invocation = AflCommand.build(_spec(sanitizer_environment=environment))
+
+        assert invocation.command[9:11] == ["-m", "0"]
+        assert "ASAN_OPTIONS" not in invocation.environment
+
     def test_secondary_stdin_dictionary_and_grammar_are_rendered_without_a_shell(self) -> None:
         from backend.fuzzing.engines.afl.command import AflCommand
 
@@ -81,6 +96,21 @@ class TestAflCommand:
         from backend.fuzzing.engines.afl.command import AflCommand
 
         with pytest.raises(ValueError, match=message):
+            AflCommand.build(_spec(**change))
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"timeout_ms": True},
+            {"timeout_ms": 1.5},
+            {"memory_limit_mb": False},
+            {"memory_limit_mb": 768.0},
+        ],
+    )
+    def test_rejects_non_integer_resource_values(self, change) -> None:
+        from backend.fuzzing.engines.afl.command import AflCommand
+
+        with pytest.raises(ValueError):
             AflCommand.build(_spec(**change))
 
 

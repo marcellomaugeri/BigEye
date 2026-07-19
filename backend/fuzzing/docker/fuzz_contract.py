@@ -23,9 +23,24 @@ PROJECT_LABEL = "com.bigeye.project-id"
 COMMIT_LABEL = "com.bigeye.commit-sha"
 IMAGE_LABEL = "com.bigeye.image-id"
 ENGINE_LABEL = "com.bigeye.engine"
+MOUNT_LABEL_PREFIX = "com.bigeye.mount."
 RESERVED_LABELS = frozenset({MANAGED_LABEL, CAMPAIGN_LABEL, PROJECT_LABEL, COMMIT_LABEL, IMAGE_LABEL, ENGINE_LABEL})
 TMPFS = {"/tmp": "rw,nosuid,nodev,noexec,size=64m,mode=1777"}
 SHELL_NAMES = frozenset({"sh", "bash", "dash", "zsh", "ksh", "fish", "env"})
+EMPTY_HOST_FIELDS = (
+    "Devices",
+    "DeviceRequests",
+    "Dns",
+    "DnsOptions",
+    "DnsSearch",
+    "ExtraHosts",
+    "Links",
+    "GroupAdd",
+    "DeviceCgroupRules",
+    "Sysctls",
+    "Ulimits",
+    "VolumesFrom",
+)
 
 
 class ContainerContractMismatch(RuntimeError):
@@ -44,6 +59,7 @@ class RuntimeContract:
     labels: tuple[tuple[str, str], ...]
     requested_labels: tuple[tuple[str, str], ...]
     mounts: tuple[tuple[str, str, str], ...]
+    mount_identities: tuple[tuple[str, int, int], ...]
     user: str
     memory_bytes: int
     device: int
@@ -58,7 +74,16 @@ class RuntimeContract:
         return dict(self.labels)
 
 
-def build_runtime_contract(client, campaign, invocation: ContainerInvocation, volumes, user: str, identity, campaign_path) -> RuntimeContract:
+def build_runtime_contract(
+    client,
+    campaign,
+    invocation: ContainerInvocation,
+    volumes,
+    mount_identities,
+    user: str,
+    identity,
+    campaign_path,
+) -> RuntimeContract:
     validate_invocation(invocation)
     image = client.api.inspect_image(invocation.image_id)
     if image.get("Id") != invocation.image_id or image.get("Os") != "linux" or image.get("Architecture") != "amd64":
@@ -66,7 +91,7 @@ def build_runtime_contract(client, campaign, invocation: ContainerInvocation, vo
     image_config = image.get("Config") or {}
     environment = _environment(image_config.get("Env") or [])
     environment.update(invocation.environment)
-    requested_labels = _required_labels(campaign, invocation)
+    requested_labels = _required_labels(campaign, invocation, mount_identities)
     labels = dict(image_config.get("Labels") or {})
     labels.update(requested_labels)
     mounts = tuple(sorted((source, mount["bind"], mount["mode"]) for source, mount in volumes.items()))
@@ -81,6 +106,7 @@ def build_runtime_contract(client, campaign, invocation: ContainerInvocation, vo
         labels=tuple(sorted(labels.items())),
         requested_labels=tuple(sorted(requested_labels.items())),
         mounts=mounts,
+        mount_identities=tuple(mount_identities),
         user=user,
         memory_bytes=invocation.memory_limit_mb * 1024 * 1024,
         device=identity[0],
@@ -107,21 +133,40 @@ def verify_runtime(container, contract: RuntimeContract) -> None:
         raise ContainerContractMismatch("container runtime contract ownership labels changed")
     if config.get("User") != contract.user or _user_id(contract.user) == 0:
         raise ContainerContractMismatch("container runtime contract user is not the expected non-root user")
-    exact_host = (
-        host.get("NetworkMode") == "none"
-        and host.get("Privileged") is False
-        and host.get("ReadonlyRootfs") is True
-        and host.get("CapDrop") == ["ALL"]
-        and (host.get("CapAdd") or []) == []
-        and host.get("SecurityOpt") == ["no-new-privileges"]
-        and host.get("PidsLimit") == 256
-        and host.get("Memory") == contract.memory_bytes
-        and host.get("NanoCpus") == 1_000_000_000
-        and host.get("Tmpfs") == TMPFS
-        and host.get("AutoRemove") is False
-    )
-    if not exact_host:
-        raise ContainerContractMismatch("container runtime contract isolation or resources changed")
+    if config.get("ExposedPorts") not in (None, {}):
+        raise ContainerContractMismatch("container runtime contract exposes ports")
+    host_checks = {
+        "network mode": host.get("NetworkMode") == "none",
+        "privileged mode": host.get("Privileged") is False,
+        "read-only root": host.get("ReadonlyRootfs") is True,
+        "dropped capabilities": host.get("CapDrop") == ["ALL"],
+        "added capabilities": (host.get("CapAdd") or []) == [],
+        "security options": host.get("SecurityOpt") == ["no-new-privileges"],
+        "process limit": host.get("PidsLimit") == 256,
+        "memory limit": host.get("Memory") == contract.memory_bytes,
+        "CPU limit": host.get("NanoCpus") == 1_000_000_000,
+        "temporary filesystem": host.get("Tmpfs") == TMPFS,
+        "automatic removal": host.get("AutoRemove") is False,
+        "host devices and overrides": all((host.get(field) or []) == [] for field in EMPTY_HOST_FIELDS),
+        "port bindings": (host.get("PortBindings") or {}) == {},
+        "published ports": host.get("PublishAllPorts") is False,
+        "restart policy": host.get("RestartPolicy") == {"MaximumRetryCount": 0, "Name": "no"},
+        "PID namespace": host.get("PidMode") == "",
+        "IPC namespace": host.get("IpcMode") == "private",
+        "UTS namespace": host.get("UTSMode") == "",
+        "user namespace": host.get("UsernsMode") == "",
+        "cgroup namespace": host.get("CgroupnsMode") == "private",
+        "runtime": host.get("Runtime") == "runc",
+        "OOM policy": host.get("OomKillDisable") in (None, False),
+        "cgroup parent": host.get("CgroupParent") == "",
+        "isolation mode": host.get("Isolation") == "",
+        "init process": host.get("Init") in (None, False),
+    }
+    mismatches = [name for name, matches in host_checks.items() if not matches]
+    if mismatches:
+        raise ContainerContractMismatch(
+            f"container runtime contract isolation or resources changed: {', '.join(mismatches)}"
+        )
     networks = (attrs.get("NetworkSettings") or {}).get("Networks")
     if networks not in ({}, None):
         raise ContainerContractMismatch("container runtime contract unexpectedly has a network")
@@ -147,9 +192,9 @@ def validate_invocation(invocation: ContainerInvocation) -> None:
     validate_labels(invocation.campaign_labels)
     if any(key in RESERVED_LABELS or key.startswith("com.bigeye.") for key in invocation.campaign_labels):
         raise ValueError("campaign labels cannot override reserved BigEye labels")
-    if isinstance(invocation.memory_limit_mb, bool) or not 64 <= invocation.memory_limit_mb <= 65_536:
+    if type(invocation.memory_limit_mb) is not int or not 64 <= invocation.memory_limit_mb <= 65_536:
         raise ValueError("memory_limit_mb must be between 64 and 65536")
-    if isinstance(invocation.timeout_ms, bool) or invocation.timeout_ms <= 0:
+    if type(invocation.timeout_ms) is not int or invocation.timeout_ms <= 0:
         raise ValueError("timeout_ms must be positive")
     if not invocation.command or any(
         not isinstance(item, str) or not item or "\x00" in item or "\n" in item for item in invocation.command
@@ -216,7 +261,7 @@ def _contained_path(path: str, root: str) -> bool:
     return parsed.as_posix() == path and parsed != root_path and parsed.parts[:len(root_path.parts)] == root_path.parts and ".." not in parsed.parts
 
 
-def _required_labels(campaign, invocation) -> dict[str, str]:
+def _required_labels(campaign, invocation, mount_identities) -> dict[str, str]:
     labels = {
         MANAGED_LABEL: "fuzz-campaign",
         CAMPAIGN_LABEL: str(campaign.id),
@@ -225,6 +270,7 @@ def _required_labels(campaign, invocation) -> dict[str, str]:
         IMAGE_LABEL: invocation.image_id,
         ENGINE_LABEL: invocation.engine,
     }
+    labels.update({f"{MOUNT_LABEL_PREFIX}{name}": f"{device}:{inode}" for name, device, inode in mount_identities})
     labels.update(invocation.campaign_labels)
     return labels
 

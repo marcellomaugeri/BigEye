@@ -18,6 +18,12 @@ class CampaignDirectory:
     inode: int
 
 
+@dataclass(frozen=True)
+class CampaignMounts:
+    volumes: dict[str, dict[str, str]]
+    identities: tuple[tuple[str, int, int], ...]
+
+
 class CampaignWorkspace:
     """Open every project/campaign path one component at a time without symlinks."""
 
@@ -56,27 +62,49 @@ class CampaignWorkspace:
         except (OSError, ValueError):
             return False
 
-    def prepare_mounts(self, campaign: CampaignDirectory, root_fallback: bool) -> dict[str, dict[str, str]]:
+    def prepare_mounts(self, campaign: CampaignDirectory, root_fallback: bool) -> CampaignMounts:
         volumes = {}
+        identities = []
         for name, mode in (("corpus", "rw"), ("output", "rw"), ("config", "ro")):
             descriptor = _open_component(campaign.descriptor, name, create=True)
             try:
                 if root_fallback:
                     os.fchmod(descriptor, 0o755 if mode == "ro" else 0o777)
                 os.fsync(descriptor)
+                current = os.fstat(descriptor)
+                identities.append((name, current.st_dev, current.st_ino))
             finally:
                 os.close(descriptor)
             volumes[str(campaign.path / name)] = {"bind": f"/campaign/{name}", "mode": mode}
         self.prepare_logs(campaign)
-        return volumes
+        return CampaignMounts(volumes, tuple(identities))
 
-    def existing_mounts(self, campaign: CampaignDirectory) -> dict[str, dict[str, str]]:
+    def existing_mounts(self, campaign: CampaignDirectory) -> CampaignMounts:
         volumes = {}
+        identities = []
         for name, mode in (("corpus", "rw"), ("output", "rw"), ("config", "ro")):
             descriptor = _open_component(campaign.descriptor, name, create=False)
-            os.close(descriptor)
+            try:
+                current = os.fstat(descriptor)
+                identities.append((name, current.st_dev, current.st_ino))
+            finally:
+                os.close(descriptor)
             volumes[str(campaign.path / name)] = {"bind": f"/campaign/{name}", "mode": mode}
-        return volumes
+        return CampaignMounts(volumes, tuple(identities))
+
+    @staticmethod
+    def require_mount_identities(
+        campaign: CampaignDirectory,
+        expected: tuple[tuple[str, int, int], ...],
+    ) -> None:
+        for name, expected_device, expected_inode in expected:
+            descriptor = _open_component(campaign.descriptor, name, create=False)
+            try:
+                current = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+            if (current.st_dev, current.st_ino) != (expected_device, expected_inode):
+                raise ValueError(f"campaign mount directory {name} changed after ownership was established")
 
     @staticmethod
     def prepare_logs(campaign: CampaignDirectory) -> None:

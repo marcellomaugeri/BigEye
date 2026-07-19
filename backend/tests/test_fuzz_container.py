@@ -148,9 +148,11 @@ class FakeContainers:
                 "Labels": labels,
                 "User": options["user"],
                 "NetworkDisabled": options["network_disabled"],
+                "ExposedPorts": None,
             },
             "HostConfig": {
                 "NetworkMode": options["network_mode"],
+                "Runtime": options["runtime"],
                 "Privileged": options["privileged"],
                 "ReadonlyRootfs": options["read_only"],
                 "CapDrop": list(options["cap_drop"]),
@@ -161,6 +163,29 @@ class FakeContainers:
                 "NanoCpus": options["nano_cpus"],
                 "Tmpfs": dict(options["tmpfs"]),
                 "AutoRemove": options["auto_remove"],
+                "Devices": None,
+                "DeviceRequests": None,
+                "PortBindings": {},
+                "PublishAllPorts": options["publish_all_ports"],
+                "RestartPolicy": {"MaximumRetryCount": 0, **options["restart_policy"]},
+                "PidMode": "",
+                "IpcMode": options["ipc_mode"],
+                "UTSMode": "",
+                "UsernsMode": "",
+                "CgroupnsMode": options["cgroupns"],
+                "Dns": None,
+                "DnsOptions": None,
+                "DnsSearch": None,
+                "ExtraHosts": None,
+                "Links": None,
+                "GroupAdd": None,
+                "OomKillDisable": False,
+                "CgroupParent": "",
+                "Isolation": "",
+                "DeviceCgroupRules": None,
+                "Sysctls": None,
+                "Ulimits": None,
+                "VolumesFrom": None,
             },
             "Mounts": mounts,
             "NetworkSettings": {"Networks": {}},
@@ -222,12 +247,21 @@ class TestFuzzContainerStart:
 
         image, command, options, container = client.containers.created[0]
         workspace = _campaign_path(_workspace(tmp_path))
+        mount_labels = {}
+        for name in ("corpus", "output", "config"):
+            mount_stat = (workspace / name).stat()
+            mount_labels[f"com.bigeye.mount.{name}"] = f"{mount_stat.st_dev}:{mount_stat.st_ino}"
         assert image == IMAGE_ID and command == _invocation().command
         assert options == {
             "name": "bigeye-campaign-3",
             "platform": "linux/amd64",
             "network_disabled": True,
             "network_mode": "none",
+            "ipc_mode": "private",
+            "cgroupns": "private",
+            "runtime": "runc",
+            "restart_policy": {"Name": "no"},
+            "publish_all_ports": False,
             "privileged": False,
             "read_only": True,
             "cap_drop": ["ALL"],
@@ -251,6 +285,7 @@ class TestFuzzContainerStart:
                 "com.bigeye.image-id": IMAGE_ID,
                 "com.bigeye.engine": "afl",
                 "bigeye.configuration": "basic",
+                **mount_labels,
             },
             "auto_remove": False,
             "detach": True,
@@ -376,6 +411,46 @@ class TestWorkspaceContainment:
 
         assert client.containers.created == []
 
+    def test_rechecks_mount_inodes_immediately_before_container_create(self, tmp_path: Path, monkeypatch) -> None:
+        service, client = _service(tmp_path)
+        original = service._workspace.require_mount_identities
+
+        def swap_before_check(directory, expected):
+            corpus = directory.path / "corpus"
+            corpus.rename(corpus.with_name("corpus-moved"))
+            corpus.mkdir()
+            original(directory, expected)
+
+        monkeypatch.setattr(service._workspace, "require_mount_identities", swap_before_check)
+
+        with pytest.raises(ValueError, match="mount.*changed"):
+            service.start(_campaign(), _invocation())
+
+        assert client.containers.created == []
+
+    def test_rechecks_mount_inodes_after_container_start(self, tmp_path: Path, monkeypatch) -> None:
+        service, client = _service(tmp_path)
+        original = service._workspace.require_mount_identities
+        checks = 0
+
+        def swap_on_second_check(directory, expected):
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                output = directory.path / "output"
+                output.rename(output.with_name("output-moved"))
+                output.mkdir()
+            original(directory, expected)
+
+        monkeypatch.setattr(service._workspace, "require_mount_identities", swap_on_second_check)
+
+        with pytest.raises(ValueError, match="mount.*changed"):
+            service.start(_campaign(), _invocation())
+
+        container = client.containers.created[0][3]
+        assert ("stop", 10) in container.calls
+        assert container.calls[-1] == ("remove", False)
+
     def test_workspace_swap_after_adoption_blocks_stop_and_log_writes(self, tmp_path: Path) -> None:
         service, client = _service(tmp_path)
         identity = service.start(_campaign(), _invocation())
@@ -387,6 +462,30 @@ class TestWorkspaceContainment:
             service.stop(identity)
 
         assert not any(call[0] in {"stop", "kill", "remove", "logs"} for call in client.containers.created[0][3].calls[2:])
+
+    def test_mount_directory_swap_blocks_every_container_control(self, tmp_path: Path) -> None:
+        service, client = _service(tmp_path)
+        identity = service.start(_campaign(), _invocation())
+        corpus = _campaign_path(_workspace(tmp_path)) / "corpus"
+        corpus.rename(corpus.with_name("corpus-moved"))
+        corpus.mkdir()
+
+        with pytest.raises(ValueError, match="mount.*changed"):
+            service.stream_logs(identity, lambda _: None, follow=False)
+
+        container = client.containers.created[0][3]
+        assert not any(call[0] in {"logs", "stop", "kill", "remove"} for call in container.calls[2:])
+
+    def test_mount_directory_swap_blocks_fresh_adoption(self, tmp_path: Path) -> None:
+        service, client = _service(tmp_path)
+        service.start(_campaign(), _invocation())
+        output = _campaign_path(_workspace(tmp_path)) / "output"
+        output.rename(output.with_name("output-moved"))
+        output.mkdir()
+        recovered, _ = _service(tmp_path, client)
+
+        with pytest.raises(Exception, match="mount.*changed|contract"):
+            recovered.recover(_campaign(), _invocation())
 
     def test_symlinked_final_log_is_rejected_without_touching_target(self, tmp_path: Path) -> None:
         service, client = _service(tmp_path)
@@ -441,6 +540,23 @@ class TestFuzzContainerRecovery:
             ("tmpfs", {}),
             ("environment", ["PATH=/usr/local/bin:/usr/bin"]),
             ("name", "/forged-name"),
+            ("devices", [{"PathOnHost": "/dev/kvm"}]),
+            ("device_requests", [{"Driver": "nvidia"}]),
+            ("exposed_ports", {"8080/tcp": {}}),
+            ("port_bindings", {"8080/tcp": [{"HostPort": "8080"}]}),
+            ("publish_ports", True),
+            ("restart", {"MaximumRetryCount": 0, "Name": "always"}),
+            ("pid_mode", "host"),
+            ("ipc_mode", "host"),
+            ("uts_mode", "host"),
+            ("userns_mode", "host"),
+            ("cgroupns_mode", "host"),
+            ("dns", ["8.8.8.8"]),
+            ("extra_hosts", ["host.docker.internal:host-gateway"]),
+            ("links", ["database:database"]),
+            ("runtime", "kata-runtime"),
+            ("sysctls", {"kernel.shm_rmid_forced": "0"}),
+            ("device_rules", ["c 10:200 rwm"]),
         ],
     )
     def test_rejects_any_runtime_contract_drift(self, tmp_path: Path, field: str, value) -> None:
@@ -463,6 +579,23 @@ class TestFuzzContainerRecovery:
         elif field == "tmpfs": container.attrs["HostConfig"]["Tmpfs"] = value
         elif field == "environment": container.attrs["Config"]["Env"] = value
         elif field == "name": container.attrs["Name"] = value
+        elif field == "devices": container.attrs["HostConfig"]["Devices"] = value
+        elif field == "device_requests": container.attrs["HostConfig"]["DeviceRequests"] = value
+        elif field == "exposed_ports": container.attrs["Config"]["ExposedPorts"] = value
+        elif field == "port_bindings": container.attrs["HostConfig"]["PortBindings"] = value
+        elif field == "publish_ports": container.attrs["HostConfig"]["PublishAllPorts"] = value
+        elif field == "restart": container.attrs["HostConfig"]["RestartPolicy"] = value
+        elif field == "pid_mode": container.attrs["HostConfig"]["PidMode"] = value
+        elif field == "ipc_mode": container.attrs["HostConfig"]["IpcMode"] = value
+        elif field == "uts_mode": container.attrs["HostConfig"]["UTSMode"] = value
+        elif field == "userns_mode": container.attrs["HostConfig"]["UsernsMode"] = value
+        elif field == "cgroupns_mode": container.attrs["HostConfig"]["CgroupnsMode"] = value
+        elif field == "dns": container.attrs["HostConfig"]["Dns"] = value
+        elif field == "extra_hosts": container.attrs["HostConfig"]["ExtraHosts"] = value
+        elif field == "links": container.attrs["HostConfig"]["Links"] = value
+        elif field == "runtime": container.attrs["HostConfig"]["Runtime"] = value
+        elif field == "sysctls": container.attrs["HostConfig"]["Sysctls"] = value
+        elif field == "device_rules": container.attrs["HostConfig"]["DeviceCgroupRules"] = value
         recovered, _ = _service(tmp_path, client)
 
         with pytest.raises(Exception, match="contract"):
@@ -554,6 +687,95 @@ class TestFuzzContainerLifecycle:
         assert ("stop", 2) in container.calls
         assert ("kill",) in container.calls
         assert container.calls[-1] == ("remove", False)
+
+    def test_stop_error_is_preserved_after_kill_and_safe_cleanup(self, tmp_path: Path) -> None:
+        service, client = _service(tmp_path)
+        identity = service.start(_campaign(), _invocation())
+        container = client.containers.created[0][3]
+
+        def failing_stop(timeout):
+            container.calls.append(("stop", timeout))
+            raise RuntimeError("graceful stop failed")
+
+        container.stop = failing_stop
+
+        with pytest.raises(RuntimeError, match="graceful stop failed"):
+            service.stop(identity)
+
+        assert ("kill",) in container.calls
+        assert container.calls[-1] == ("remove", False)
+
+    def test_stop_error_after_exit_is_preserved_after_safe_cleanup_without_kill(self, tmp_path: Path) -> None:
+        service, client = _service(tmp_path)
+        identity = service.start(_campaign(), _invocation())
+        container = client.containers.created[0][3]
+
+        def exited_then_errored(timeout):
+            container.calls.append(("stop", timeout))
+            container.status = "exited"
+            raise RuntimeError("daemon reply was lost")
+
+        container.stop = exited_then_errored
+
+        with pytest.raises(RuntimeError, match="daemon reply was lost"):
+            service.stop(identity)
+
+        assert ("kill",) not in container.calls
+        assert container.calls[-1] == ("remove", False)
+
+    def test_stop_and_kill_errors_are_combined_without_unsafe_cleanup(self, tmp_path: Path) -> None:
+        service, client = _service(tmp_path)
+        identity = service.start(_campaign(), _invocation())
+        container = client.containers.created[0][3]
+
+        def failing_stop(timeout):
+            container.calls.append(("stop", timeout))
+            raise RuntimeError("graceful stop failed")
+
+        def failing_kill():
+            container.calls.append(("kill",))
+            raise RuntimeError("forced kill failed")
+
+        container.stop = failing_stop
+        container.kill = failing_kill
+
+        with pytest.raises(RuntimeError, match="graceful stop failed") as error:
+            service.stop(identity)
+
+        assert any("forced kill failed" in note for note in getattr(error.value, "__notes__", []))
+        assert not any(call[0] in {"logs", "remove"} for call in container.calls[2:])
+
+    @pytest.mark.parametrize(
+        "settings",
+        [
+            {"stop_timeout_seconds": True},
+            {"stop_timeout_seconds": 1.0},
+            {"final_log_max_bytes": False},
+            {"final_log_max_bytes": 8.0},
+            {"final_log_timeout_seconds": True},
+            {"final_log_timeout_seconds": 1},
+        ],
+    )
+    def test_service_rejects_wrong_numeric_types(self, tmp_path: Path, settings) -> None:
+        with pytest.raises(ValueError):
+            _service(tmp_path, **settings)
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"timeout_ms": True},
+            {"timeout_ms": 1000.0},
+            {"memory_limit_mb": False},
+            {"memory_limit_mb": 512.0},
+        ],
+    )
+    def test_service_rejects_non_integer_invocation_resources(self, tmp_path: Path, change) -> None:
+        service, client = _service(tmp_path)
+
+        with pytest.raises(ValueError):
+            service.start(_campaign(), _invocation(**change))
+
+        assert client.containers.created == []
 
     def test_stop_refuses_runtime_changed_after_adoption(self, tmp_path: Path) -> None:
         service, client = _service(tmp_path)
