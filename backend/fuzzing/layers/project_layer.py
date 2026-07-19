@@ -15,6 +15,9 @@ from backend.fuzzing.layers.policy import validate_generated_dockerfile
 from backend.fuzzing.assets.validation import collection_hash
 
 
+_CONTENT_HASH_SENTINEL = "__BIGEYE_CONTENT_HASH_SENTINEL__"
+
+
 class _GeneratedLayerService:
     """Shared implementation for content-addressed generated build contexts."""
 
@@ -39,11 +42,13 @@ class _GeneratedLayerService:
         parent = self._verify_parent(parent_manifest, project_id, commit_sha)
         assets = tuple(assets)
         asset_digest = self._assets_digest(project_id, assets)
-        dockerfile_template = self._asset_dockerfile(project_id, assets, dockerfile_template, parent.image_id, project_id, commit_sha)
-        template = dockerfile_template.format(parent=parent_manifest.tag, content_hash="{content_hash}")
+        starter = dockerfile_template.format(parent=parent_manifest.tag, content_hash=_CONTENT_HASH_SENTINEL)
+        template = self._asset_dockerfile(project_id, assets, starter, parent.image_id, project_id, commit_sha)
+        if template.count(_CONTENT_HASH_SENTINEL) != 1:
+            raise ValueError("generated Dockerfile content hash sentinel is invalid")
         content_hash = self._digest(parent.image_id, commit_sha, template, asset_digest)
         kind = self._kind
-        dockerfile_text = dockerfile_template.format(parent=parent_manifest.tag, content_hash=content_hash)
+        dockerfile_text = template.replace(_CONTENT_HASH_SENTINEL, content_hash)
         validate_generated_dockerfile(dockerfile_text, parent_manifest.tag, allow_network=self._network_allowed)
         tag_hash = self._digest(parent.image_id, commit_sha, dockerfile_text, asset_digest)
         tag = f"bigeye-{kind}:{tag_hash[:20]}"
@@ -122,15 +127,17 @@ class _GeneratedLayerService:
         if candidate.is_symlink() or not candidate.is_file():
             raise ValueError("asset Dockerfile must be a regular file")
         text = candidate.read_text(encoding="utf-8")
+        if _CONTENT_HASH_SENTINEL in text:
+            raise ValueError("asset Dockerfile uses a reserved BigEye sentinel")
         return (
             text.rstrip() + "\n"
             f"LABEL bigeye.project=\"{project}\" bigeye.commit=\"{commit}\" "
-            f"bigeye.layer=\"{self._kind}\" bigeye.content-hash=\"{{content_hash}}\" "
+            f"bigeye.layer=\"{self._kind}\" bigeye.content-hash=\"{_CONTENT_HASH_SENTINEL}\" "
             f"bigeye.parent-image=\"{parent_image}\"\n"
         )
 
     def _asset_path(self, project_id: int, asset) -> Path:
-        if not isinstance(asset.id, int) or asset.id <= 0:
+        if isinstance(asset.id, bool) or not isinstance(asset.id, int) or asset.id <= 0:
             raise ValueError("asset ID must be positive")
         return self._workspace / "projects" / str(project_id) / "assets" / str(asset.id)
 
@@ -154,7 +161,7 @@ class _GeneratedLayerService:
 
     @staticmethod
     def _project_id(project) -> int:
-        if not isinstance(project.id, int) or project.id <= 0:
+        if isinstance(project.id, bool) or not isinstance(project.id, int) or project.id <= 0:
             raise ValueError("project ID must be positive")
         return project.id
 

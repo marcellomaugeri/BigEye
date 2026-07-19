@@ -161,3 +161,40 @@ def test_source_content_changed_after_validation_does_not_publish_new_bytes_unde
 
     assert not (workspace / "projects/7/assets/1").exists()
     assert repository.errors
+
+
+def test_symlinked_projects_component_is_rejected_before_reading_external_source(tmp_path: Path) -> None:
+    from backend.fuzzing.assets.store import AssetStore
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external = tmp_path / "external"
+    source = external / "7/drafts/adapter.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("external-only\n")
+    (workspace / "projects").symlink_to(external, target_is_directory=True)
+    repository = _Assets()
+
+    with pytest.raises(OSError):
+        run(AssetStore(workspace, repository).create(7, "adapter", "adapter.py", {"adapter.py": workspace / "projects/7/drafts/adapter.py"}, None))
+
+    assert repository.created == []
+
+
+def test_symlinked_assets_component_never_receives_published_asset(tmp_path: Path) -> None:
+    from backend.fuzzing.assets.store import AssetStore
+
+    workspace = tmp_path / "workspace"
+    source = workspace / "projects/7/drafts/adapter.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("safe\n")
+    external = tmp_path / "external-assets"
+    external.mkdir()
+    (workspace / "projects/7/assets").symlink_to(external, target_is_directory=True)
+    repository = _Assets()
+
+    with pytest.raises(OSError):
+        run(AssetStore(workspace, repository).create(7, "adapter", "adapter.py", {"adapter.py": source}, None))
+
+    assert list(external.iterdir()) == []
+    assert repository.validated == []

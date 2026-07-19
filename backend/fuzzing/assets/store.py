@@ -15,7 +15,7 @@ class AssetStore:
     """Persist only descriptor-verified, project-contained generated files."""
 
     def __init__(self, workspace: Path, repository):
-        self._workspace = Path(workspace).resolve()
+        self._workspace = Path(os.path.abspath(workspace))
         self._repository = repository
 
     async def create(self, project_id: int, kind: str, name: str, files, parent_id: int | None):
@@ -31,7 +31,8 @@ class AssetStore:
         staging: Path | None = None
         try:
             root = self._asset_root(project_id)
-            root.mkdir(parents=True, exist_ok=True)
+            assets_descriptor = self._open_assets_directory(project_id, create=True)
+            os.close(assets_descriptor)
             self._fsync_directory(root)
             staging = root / f"{asset.id}.staging"
             destination = root / str(asset.id)
@@ -119,7 +120,7 @@ class AssetStore:
     def _open_source(self, project_id: int, source: Path):
         root = self._project_root(project_id)
         relative = Path(os.path.abspath(source)).relative_to(root)
-        directory_descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        directory_descriptor = self._open_project_directory(project_id, create=False)
         try:
             for component in relative.parts[:-1]:
                 next_descriptor = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_descriptor)
@@ -155,12 +156,42 @@ class AssetStore:
         return digest.hexdigest()
 
     def _project_root(self, project_id: int) -> Path:
-        if not isinstance(project_id, int) or project_id <= 0:
+        if isinstance(project_id, bool) or not isinstance(project_id, int) or project_id <= 0:
             raise ValueError("project ID must be positive")
         return self._workspace / "projects" / str(project_id)
 
     def _asset_root(self, project_id: int) -> Path:
         return self._project_root(project_id) / "assets"
+
+    def _open_project_directory(self, project_id: int, create: bool) -> int:
+        self._project_root(project_id)
+        descriptor = os.open(self._workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            for component in ("projects", str(project_id)):
+                next_descriptor = self._open_directory_component(descriptor, component, create)
+                os.close(descriptor)
+                descriptor = next_descriptor
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def _open_assets_directory(self, project_id: int, create: bool) -> int:
+        descriptor = self._open_project_directory(project_id, create)
+        try:
+            assets_descriptor = self._open_directory_component(descriptor, "assets", create)
+        finally:
+            os.close(descriptor)
+        return assets_descriptor
+
+    @staticmethod
+    def _open_directory_component(parent_descriptor: int, component: str, create: bool) -> int:
+        if create:
+            try:
+                os.mkdir(component, mode=0o700, dir_fd=parent_descriptor)
+            except FileExistsError:
+                pass
+        return os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_descriptor)
 
     @classmethod
     def _lock_down(cls, root: Path, kind: str) -> None:

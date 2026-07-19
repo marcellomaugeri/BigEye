@@ -152,6 +152,24 @@ def test_policy_rejects_run_network_and_security_even_for_project_layers(text: s
         validate_generated_dockerfile(text, "base:latest", allow_network=True)
 
 
+def test_agent_dockerfile_keeps_shell_and_json_braces_literal(tmp_path: Path) -> None:
+    from backend.fuzzing.layers.project_layer import ProjectLayerService
+
+    project = SimpleNamespace(id=7, commit_sha="a" * 40)
+    parent = _manifest(tmp_path, "repository", "repository:tag")
+    asset = SimpleNamespace(id=1, content_hash="asset", name="build.sh", kind="build", project_id=7, validated_at=object(), error=None)
+    _asset(tmp_path, 7, asset, "build.sh", "#!/bin/sh\ntrue\n")
+    dockerfile = tmp_path / "projects/7/assets/1/Dockerfile"
+    dockerfile.write_text("FROM repository:tag\nWORKDIR /src\nCOPY build/ /bigeye/build/\nRUN printf \"${HOME} {\\\"mode\\\":\\\"safe\\\"}\" >/dev/null\n")
+    _rehash_asset(asset, dockerfile.parent)
+    builder = _Builder()
+    inspector = SimpleNamespace(inspect=lambda tag: SimpleNamespace(image_id="sha256:parent", os="linux", architecture="amd64"))
+
+    manifest = ProjectLayerService(tmp_path, builder, inspector).prepare(project, parent, asset, lambda text: None)
+
+    assert "${HOME} {\\\"mode\\\":\\\"safe\\\"}" in manifest.dockerfile.read_text()
+
+
 class _Builder:
     def __init__(self):
         self.network_modes: list[str | None] = []
