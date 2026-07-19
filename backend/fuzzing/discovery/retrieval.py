@@ -26,6 +26,29 @@ MAX_RESULTS = 12
 MAX_EXCERPT_CHARS = 600
 MAX_MATCHED_LINES = 4_096
 MAX_CANDIDATES = 256
+MAX_SEARCH_INVENTORY_INPUTS = 256
+
+
+def _bounded_inventory_paths(values: object) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)):
+        return ()
+    try:
+        iterator = iter(values)
+    except TypeError:
+        return ()
+    paths: list[str] = []
+    try:
+        for value in islice(iterator, MAX_SEARCH_INVENTORY_INPUTS):
+            if not isinstance(value, str):
+                continue
+            try:
+                _relative_parts(value)
+            except CodeNavigationError:
+                continue
+            paths.append(value)
+    except Exception:
+        pass
+    return tuple(sorted(set(paths)))
 
 
 @dataclass(frozen=True)
@@ -71,9 +94,11 @@ class EvidenceRetriever:
         remaining = MAX_EVIDENCE_BYTES
         remaining_lines = MAX_MATCHED_LINES
         remaining_candidates = MAX_CANDIDATES
+        text_files = _bounded_inventory_paths(self.inventory.text_files)
+        build_files = frozenset(_bounded_inventory_paths(self.inventory.build_files))
         try:
             with _opened_repository_root(self.repository_root) as (_, descriptor):
-                for relative_path in sorted(self.inventory.text_files)[:256]:
+                for relative_path in text_files:
                     if remaining_lines <= 0 or remaining_candidates <= 0:
                         break
                     content, consumed = self._bounded_text(descriptor, relative_path, remaining)
@@ -86,6 +111,7 @@ class EvidenceRetriever:
                         terms,
                         remaining_lines,
                         remaining_candidates,
+                        relative_path in build_files,
                     )
                     candidates.extend(matched)
                     remaining_lines -= examined
@@ -119,6 +145,7 @@ class EvidenceRetriever:
         terms: tuple[str, ...],
         line_limit: int,
         candidate_limit: int,
+        is_build_file: bool,
     ) -> tuple[list[tuple[int, str, int, int, str, str]], int]:
         path_lower = relative_path.casefold()
         path_terms = tuple(term for term in terms if term in path_lower)
@@ -140,7 +167,7 @@ class EvidenceRetriever:
                 reason_parts.append("path/name match: " + ", ".join(path_terms))
             if line_terms:
                 reason_parts.append("literal text match: " + ", ".join(line_terms))
-            if relative_path in self.inventory.build_files:
+            if is_build_file:
                 score += 15
                 reason_parts.append("build evidence")
             if Path(relative_path).suffix.casefold() in {".c", ".cc", ".cpp", ".cxx", ".rs", ".go", ".java", ".kt", ".swift", ".py"}:

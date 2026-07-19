@@ -135,7 +135,11 @@ def test_build_evidence_is_a_validated_untrusted_envelope(fixture_repository: Pa
 
 
 def test_build_evidence_omits_non_string_external_inventory_entries(fixture_repository: Path) -> None:
-    inventory = Inventory(build_files=("CMakeLists.txt", 42), compile_commands=(None, "clang -c src/parser.c"))  # type: ignore[arg-type]
+    inventory = Inventory(
+        build_files=("CMakeLists.txt", 42),
+        compile_commands=(None, "clang -c src/parser.c"),
+        executables=42,
+    )  # type: ignore[arg-type]
 
     envelope = inspect_build_evidence(EvidenceRetriever(fixture_repository, inventory))
 
@@ -154,8 +158,10 @@ def test_retrieval_caps_candidate_allocation_and_examined_lines_for_repeated_mat
     original = EvidenceRetriever._matches
     observed: list[tuple[int, int]] = []
 
-    def recording_matches(self, relative_path, content, terms, line_limit, candidate_limit):
-        matches, examined = original(self, relative_path, content, terms, line_limit, candidate_limit)
+    def recording_matches(self, relative_path, content, terms, line_limit, candidate_limit, is_build_file):
+        matches, examined = original(
+            self, relative_path, content, terms, line_limit, candidate_limit, is_build_file
+        )
         observed.append((len(matches), examined))
         return matches, examined
 
@@ -213,3 +219,60 @@ def test_inventory_extracts_cross_build_targets_without_filename_guesses(tmp_pat
     assert {"main", "libghost", "worker", "driver"} <= set(inventory.components)
     assert "ghost" not in inventory.libraries
     assert "main" not in inventory.executables
+
+
+def test_retrieval_bounds_hostile_inventory_before_sorting(fixture_repository: Path) -> None:
+    from backend.fuzzing.discovery.retrieval import MAX_SEARCH_INVENTORY_INPUTS
+
+    class CountingPaths:
+        def __init__(self) -> None:
+            self.examined = 0
+
+        def __iter__(self):
+            for index in range(10_000):
+                self.examined += 1
+                yield "src/parser.c" if index % 3 == 0 else (index if index % 3 == 1 else None)
+
+    paths = CountingPaths()
+    retriever = EvidenceRetriever(fixture_repository, Inventory(text_files=paths))  # type: ignore[arg-type]
+
+    excerpts = retriever.search("parser input")
+
+    assert paths.examined <= MAX_SEARCH_INVENTORY_INPUTS
+    assert excerpts and all(excerpt.path == "src/parser.c" for excerpt in excerpts)
+
+
+def test_retrieval_tolerates_huge_mixed_tuple_without_sort_type_errors(fixture_repository: Path) -> None:
+    mixed = tuple(value for _ in range(4_000) for value in ("src/parser.c", 7, None, "../outside"))
+    retriever = EvidenceRetriever(fixture_repository, Inventory(text_files=mixed))  # type: ignore[arg-type]
+
+    assert retriever.search("parser input")
+
+
+def test_build_evidence_globally_bounds_hostile_inventory_iteration(fixture_repository: Path) -> None:
+    from backend.agents.tools.evidence_retrieval import MAX_BUILD_EVIDENCE_INPUTS
+
+    class CountingValues:
+        def __init__(self, valid: str) -> None:
+            self.valid = valid
+            self.examined = 0
+
+        def __iter__(self):
+            for index in range(10_000):
+                self.examined += 1
+                yield self.valid if index % 2 == 0 else index
+
+    paths = CountingValues("CMakeLists.txt")
+    commands = CountingValues("clang -c src/parser.c")
+    inventory = Inventory(
+        build_files=paths,  # type: ignore[arg-type]
+        compile_commands=commands,  # type: ignore[arg-type]
+        executables=42,  # type: ignore[arg-type]
+    )
+
+    envelope = inspect_build_evidence(EvidenceRetriever(fixture_repository, inventory))
+
+    assert paths.examined + commands.examined <= MAX_BUILD_EVIDENCE_INPUTS
+    assert envelope["provenance"] == "repository"
+    assert envelope["truncated"] is True
+    assert all(item["trusted_instructions"] is False for item in envelope["items"])

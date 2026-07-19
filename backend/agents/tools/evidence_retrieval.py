@@ -1,5 +1,6 @@
 """Bounded function tools for structural and local repository evidence."""
 
+from itertools import islice
 import re
 
 from agents import RunContextWrapper, function_tool
@@ -10,8 +11,25 @@ from backend.fuzzing.discovery.retrieval import EvidenceRetriever
 
 
 MAX_BUILD_EVIDENCE_ITEMS = 256
+MAX_BUILD_EVIDENCE_INPUTS = 512
 MAX_BUILD_EVIDENCE_BYTES = 64_000
 MAX_BUILD_EVIDENCE_VALUE_CHARS = 500
+
+_INVENTORY_CATEGORIES = (
+    "build_files",
+    "compile_commands",
+    "executables",
+    "libraries",
+    "components",
+    "public_headers",
+    "test_files",
+    "example_files",
+    "fixture_files",
+    "sample_inputs",
+    "help_files",
+    "fuzz_harnesses",
+    "text_files",
+)
 
 _PATH_CATEGORIES = frozenset(
     {
@@ -36,30 +54,49 @@ def inspect_build_evidence(evidence: EvidenceRetriever) -> dict[str, object]:
         safe_paths = set(list_project_files(evidence.repository_root))
     except CodeNavigationError:
         safe_paths = set()
+    examined = 0
+    bounded_values: list[tuple[str, str]] = []
+    truncated = False
+    for category in _INVENTORY_CATEGORIES:
+        if examined >= MAX_BUILD_EVIDENCE_INPUTS:
+            truncated = True
+            break
+        values = getattr(evidence.inventory, category, ())
+        if isinstance(values, (str, bytes)):
+            continue
+        try:
+            iterator = iter(values)
+        except TypeError:
+            continue
+        try:
+            for value in islice(iterator, MAX_BUILD_EVIDENCE_INPUTS - examined):
+                examined += 1
+                if isinstance(value, str) and _valid_inventory_value(category, value, safe_paths):
+                    bounded_values.append((category, value))
+        except Exception:
+            continue
+        if examined >= MAX_BUILD_EVIDENCE_INPUTS:
+            truncated = True
+            break
+
+    category_order = {category: index for index, category in enumerate(_INVENTORY_CATEGORIES)}
+    unique_values = sorted(set(bounded_values), key=lambda item: (category_order[item[0]], item[1]))
     items: list[dict[str, str | bool]] = []
     emitted_bytes = 0
-    truncated = False
-    inventory = evidence.inventory.as_dict()
-    for category in evidence.inventory.__dataclass_fields__:
-        values = sorted({value for value in inventory[category] if isinstance(value, str)})
-        for value in values:
-            if not _valid_inventory_value(category, value, safe_paths):
-                continue
-            value_bytes = len(value.encode("utf-8"))
-            if len(items) >= MAX_BUILD_EVIDENCE_ITEMS or emitted_bytes + value_bytes > MAX_BUILD_EVIDENCE_BYTES:
-                truncated = True
-                break
-            items.append(
-                {
-                    "category": category,
-                    "value": value,
-                    "provenance": "repository",
-                    "trusted_instructions": False,
-                }
-            )
-            emitted_bytes += value_bytes
-        if truncated:
+    for category, value in unique_values:
+        value_bytes = len(value.encode("utf-8"))
+        if len(items) >= MAX_BUILD_EVIDENCE_ITEMS or emitted_bytes + value_bytes > MAX_BUILD_EVIDENCE_BYTES:
+            truncated = True
             break
+        items.append(
+            {
+                "category": category,
+                "value": value,
+                "provenance": "repository",
+                "trusted_instructions": False,
+            }
+        )
+        emitted_bytes += value_bytes
     return {
         "provenance": "repository",
         "trusted_instructions": False,
