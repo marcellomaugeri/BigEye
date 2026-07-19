@@ -1,11 +1,15 @@
 import type { CreateProjectRequest, Project } from '../models/project';
-import type { Settings } from '../models/settings';
+import type { ProjectSettings, Settings, UpdateProjectSettingsRequest } from '../models/settings';
 import type { Task, TaskLog } from '../models/task';
 
 export interface BigEyeApi {
   createProject(request: CreateProjectRequest): Promise<Project>;
   listProjects(): Promise<Project[]>;
   getProject(projectId: string): Promise<Project>;
+  getProjectSettings(projectId: string): Promise<ProjectSettings>;
+  updateProjectSettings(projectId: string, request: UpdateProjectSettingsRequest): Promise<ProjectSettings>;
+  pauseProject(projectId: string): Promise<Project>;
+  resumeProject(projectId: string): Promise<Project>;
   listTasks(projectId: string): Promise<Task[]>;
   getTaskLog(taskId: string, after?: number): Promise<TaskLog>;
   getSettings(): Promise<Settings>;
@@ -28,6 +32,26 @@ export class ApiClient implements BigEyeApi {
 
   getProject(projectId: string): Promise<Project> {
     return this.request(`/api/projects/${encodeURIComponent(projectId)}`);
+  }
+
+  getProjectSettings(projectId: string): Promise<ProjectSettings> {
+    return this.request(`/api/projects/${encodeURIComponent(projectId)}/settings`);
+  }
+
+  updateProjectSettings(projectId: string, request: UpdateProjectSettingsRequest): Promise<ProjectSettings> {
+    return this.request(`/api/projects/${encodeURIComponent(projectId)}/settings`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request)
+    });
+  }
+
+  pauseProject(projectId: string): Promise<Project> {
+    return this.request(`/api/projects/${encodeURIComponent(projectId)}/pause`, { method: 'POST' });
+  }
+
+  resumeProject(projectId: string): Promise<Project> {
+    return this.request(`/api/projects/${encodeURIComponent(projectId)}/resume`, { method: 'POST' });
   }
 
   listTasks(projectId: string): Promise<Task[]> {

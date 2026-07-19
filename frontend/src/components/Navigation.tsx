@@ -1,10 +1,11 @@
-import type { Page } from '../controllers/useBigEyeController';
+export type Page = 'projects' | 'overview' | 'source' | 'findings' | 'activity' | 'settings';
 
 const pages: { id: Page; label: string }[] = [
   { id: 'projects', label: 'Projects' },
-  { id: 'tasks', label: 'Tasks' },
+  { id: 'overview', label: 'Overview' },
+  { id: 'source', label: 'Source' },
   { id: 'findings', label: 'Findings' },
-  { id: 'logs', label: 'Logs' },
+  { id: 'activity', label: 'Activity' },
   { id: 'settings', label: 'Settings' }
 ];
 

@@ -1,58 +1,41 @@
-import { StatusMessage } from '../components/StatusMessage';
-import { MAX_WORKER_COUNT, type Project } from '../models/project';
+import { Button } from '../components/design-system/Button';
+import { Disclosure } from '../components/design-system/Disclosure';
+import { TextField } from '../components/design-system/Field';
+import { StatusText } from '../components/design-system/StatusText';
+import { MAX_WORKER_COUNT } from '../models/project';
 
 interface ProjectsViewProps {
   repositoryUrl: string;
+  revision: string;
   workerCount: string;
+  privateRepository: boolean;
+  repositoryToken: string;
   loading: boolean;
   error: string | null;
   onRepositoryUrlChange: (value: string) => void;
+  onRevisionChange: (value: string) => void;
   onWorkerCountChange: (value: string) => void;
+  onPrivateRepositoryChange: () => void;
+  onRepositoryTokenChange: (value: string) => void;
   onSubmit: () => void;
-  selectedProject: Project | null;
 }
 
 export function ProjectsView(props: ProjectsViewProps) {
-  const state = props.selectedProject?.error ? 'Failed' : props.selectedProject?.finished_at ? 'Complete' : 'Running';
   return (
-    <section aria-labelledby="projects-heading" className="panel">
-      <h2 id="projects-heading">Projects</h2>
-      <p>Start a repository campaign with the number of fuzzer workers to prepare.</p>
+    <section aria-labelledby="projects-heading" className="panel project-start">
+      <p className="eyebrow">Projects</p>
+      <h2 id="projects-heading">Start a project</h2>
+      <p>Connect a repository and choose the revision to prepare for analysis.</p>
       <form noValidate onSubmit={(event) => { event.preventDefault(); props.onSubmit(); }}>
-        <label>
-          Repository URL
-          <input
-            name="repository-url"
-            onChange={(event) => props.onRepositoryUrlChange(event.target.value)}
-            placeholder="https://github.com/owner/repository.git"
-            required
-            type="url"
-            value={props.repositoryUrl}
-          />
-        </label>
-        <label>
-          Fuzzer workers
-          <input
-            name="worker-count"
-            onChange={(event) => props.onWorkerCountChange(event.target.value)}
-            required
-            max={MAX_WORKER_COUNT}
-            min="1"
-            step="1"
-            type="number"
-            value={props.workerCount}
-          />
-        </label>
-        {props.error && <StatusMessage tone="error">{props.error}</StatusMessage>}
-        <button disabled={props.loading} type="submit">{props.loading ? 'Creating project…' : 'Create project'}</button>
+        <TextField label="Repository URL" name="repository-url" onChange={(event) => props.onRepositoryUrlChange(event.target.value)} placeholder="https://github.com/owner/repository.git" required type="url" value={props.repositoryUrl} />
+        <TextField label="Revision" name="revision" onChange={(event) => props.onRevisionChange(event.target.value)} required value={props.revision} />
+        <TextField label="Worker count" max={MAX_WORKER_COUNT} min="1" name="worker-count" onChange={(event) => props.onWorkerCountChange(event.target.value)} required step="1" type="number" value={props.workerCount} />
+        <Disclosure label="Private repository" onToggle={props.onPrivateRepositoryChange} open={props.privateRepository}>
+          <TextField autoComplete="off" label="Read-only access token" name="repository-token" onChange={(event) => props.onRepositoryTokenChange(event.target.value)} type="password" value={props.repositoryToken} />
+        </Disclosure>
+        {props.error && <StatusText tone="error">{props.error}</StatusText>}
+        <Button disabled={props.loading} type="submit">{props.loading ? 'Starting project…' : 'Start project'}</Button>
       </form>
-      {props.selectedProject && <aside aria-label="Selected project summary">
-        <h3>Selected project</h3>
-        <p>{props.selectedProject.repository_url}</p>
-        <p>{props.selectedProject.worker_count} worker{props.selectedProject.worker_count === 1 ? '' : 's'} · {state}</p>
-        {props.selectedProject.commit_sha && <p>{props.selectedProject.commit_sha}</p>}
-        {props.selectedProject.error && <StatusMessage tone="error">{props.selectedProject.error}</StatusMessage>}
-      </aside>}
     </section>
   );
 }

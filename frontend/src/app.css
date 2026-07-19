@@ -1,27 +1,61 @@
-:root { color: #172031; background: #f4f6f8; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+:root {
+  --color-black: #101010;
+  --color-white: #ffffff;
+  --color-red: #c81e2a;
+  --color-warm: #f5f2ed;
+  --color-grey: #737373;
+  --focus-ring: 0 0 0 3px rgba(200, 30, 42, 0.28);
+  color: var(--color-black);
+  background: var(--color-warm);
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+}
+
 * { box-sizing: border-box; }
-body { margin: 0; }
+body { margin: 0; min-width: 20rem; }
 button, input, select { font: inherit; }
-button { cursor: pointer; background: #1e4b84; border: 0; border-radius: .35rem; color: white; font-weight: 700; padding: .65rem 1rem; }
-button:disabled, select:disabled { cursor: not-allowed; opacity: .6; }
-input, select { border: 1px solid #aeb8c7; border-radius: .3rem; padding: .55rem; width: 100%; }
-input:focus, select:focus, a:focus, button:focus { outline: 3px solid #75a7e8; outline-offset: 2px; }
-.app-shell { margin: 0 auto; max-width: 70rem; padding: 2rem 1.25rem 3rem; }
-.app-header { align-items: end; display: flex; gap: 2rem; justify-content: space-between; margin-bottom: 1.5rem; }
-.app-header h1 { font-size: clamp(1.5rem, 4vw, 2.25rem); margin: .1rem 0 0; }
-.eyebrow { color: #40628f; font-size: .8rem; font-weight: 800; letter-spacing: .08em; margin: 0; text-transform: uppercase; }
-.project-picker { min-width: min(100%, 25rem); }
-.project-picker span, label { display: grid; font-size: .9rem; font-weight: 700; gap: .35rem; }
-.navigation { border-bottom: 1px solid #cbd3dd; display: flex; flex-wrap: wrap; gap: .25rem; margin-bottom: 1.5rem; }
-.navigation a { border-bottom: 3px solid transparent; color: #34435a; padding: .65rem .8rem; text-decoration: none; }
-.navigation a[aria-current="page"] { border-color: #1e4b84; color: #102f55; font-weight: 800; }
-.panel { background: white; border: 1px solid #d7dee7; border-radius: .55rem; box-shadow: 0 2px 10px #1720310d; padding: clamp(1rem, 3vw, 2rem); }
-.panel h2 { margin-top: 0; }
-form { display: grid; gap: 1rem; margin-top: 1.25rem; max-width: 38rem; }
-.status-message { background: #eef2f6; border-radius: .3rem; margin: 1rem 0; padding: .7rem; }
-.status-message.error { background: #fdecec; color: #8b1c1c; }
-.record-list { list-style: none; margin: 1rem 0 0; padding: 0; }
-.record-list li { border-top: 1px solid #e3e8ee; display: grid; gap: .3rem; grid-template-columns: 1fr auto; padding: .8rem 0; }
-.record-list small { grid-column: 1 / -1; color: #8b1c1c; }
-pre { background: #121b29; border-radius: .35rem; color: #e7edf6; max-height: 32rem; overflow: auto; padding: 1rem; white-space: pre-wrap; }
-@media (max-width: 42rem) { .app-header { align-items: stretch; flex-direction: column; gap: 1rem; } .project-picker { min-width: 0; } }
+button { cursor: pointer; }
+button:disabled, select:disabled { cursor: not-allowed; opacity: .55; }
+button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible { box-shadow: var(--focus-ring); outline: 0; }
+
+.app-shell { display: grid; grid-template-columns: 15rem minmax(0, 1fr); min-height: 100vh; }
+.sidebar { background: var(--color-black); color: var(--color-white); display: flex; flex-direction: column; padding: 1.5rem 1rem; }
+.brand { border-bottom: 1px solid var(--color-grey); display: grid; gap: .35rem; padding: .2rem .55rem 1.4rem; }
+.brand span { font-size: 1.2rem; font-weight: 800; letter-spacing: -.03em; }
+.brand small { color: var(--color-warm); font-size: .7rem; letter-spacing: .08em; text-transform: uppercase; }
+.navigation { display: grid; gap: .2rem; margin-top: 1.25rem; }
+.navigation a { border-left: 2px solid transparent; color: var(--color-white); font-size: .9rem; padding: .6rem .55rem; text-decoration: none; }
+.navigation a:hover, .navigation a[aria-current="page"] { border-color: var(--color-red); color: var(--color-white); }
+.navigation a[aria-current="page"] { font-weight: 800; }
+.work-surface { background: var(--color-white); margin: 1rem 1rem 1rem 0; min-width: 0; padding: clamp(1.25rem, 4vw, 3.5rem); }
+.app-header { align-items: end; border-bottom: 1px solid var(--color-grey); display: flex; gap: 1.5rem; justify-content: space-between; margin-bottom: 2rem; padding-bottom: 1rem; }
+.app-header h1 { font-size: clamp(1.7rem, 4vw, 2.7rem); letter-spacing: -.045em; margin: .15rem 0 0; }
+.eyebrow { color: var(--color-grey); font-size: .7rem; font-weight: 800; letter-spacing: .1em; margin: 0; text-transform: uppercase; }
+.project-picker { display: grid; font-size: .78rem; font-weight: 700; gap: .4rem; min-width: min(100%, 23rem); }
+input, select { background: var(--color-white); border: 1px solid var(--color-grey); border-radius: 0; color: var(--color-black); min-height: 2.6rem; padding: .55rem .65rem; width: 100%; }
+.panel, .empty-state { max-width: 48rem; }
+.panel h2, .empty-state h2 { font-size: 1.65rem; letter-spacing: -.03em; margin: .25rem 0 .6rem; }
+.panel > p, .empty-state > p { color: var(--color-grey); line-height: 1.55; }
+form { display: grid; gap: 1rem; margin-top: 1.75rem; max-width: 34rem; }
+.field { display: grid; font-size: .86rem; font-weight: 750; gap: .45rem; }
+.field-hint { color: var(--color-grey); font-size: .84rem; margin: -.45rem 0 0; }
+.button { border: 1px solid var(--color-black); border-radius: 0; font-weight: 800; min-height: 2.6rem; padding: .55rem .8rem; width: fit-content; }
+.button-primary { background: var(--color-black); color: var(--color-white); }
+.button-primary:hover { background: var(--color-red); border-color: var(--color-red); }
+.button-secondary { background: var(--color-white); color: var(--color-black); }
+.button-secondary:hover { border-color: var(--color-red); color: var(--color-red); }
+.disclosure { display: grid; gap: .8rem; }
+.status-text { border-left: 2px solid var(--color-grey); color: var(--color-grey); margin: 1rem 0; padding: .25rem 0 .25rem .7rem; }
+.status-text.error { border-color: var(--color-red); color: var(--color-red); }
+.empty-state { border-top: 1px solid var(--color-grey); padding-top: 1.5rem; }
+
+@media (max-width: 48rem) {
+  .app-shell { display: block; }
+  .sidebar { padding: 1rem; }
+  .brand { padding-bottom: .8rem; }
+  .navigation { display: flex; flex-wrap: wrap; margin-top: .8rem; }
+  .navigation a { border-bottom: 2px solid transparent; border-left: 0; }
+  .navigation a:hover, .navigation a[aria-current="page"] { border-bottom-color: var(--color-red); }
+  .work-surface { margin: 0; min-height: calc(100vh - 10rem); }
+  .app-header { align-items: stretch; flex-direction: column; }
+  .project-picker { min-width: 0; }
+}
