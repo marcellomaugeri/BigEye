@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import shutil
 import subprocess
 import threading
@@ -222,6 +223,46 @@ class TestContainerRunner:
             release.set()
             assert await asyncio.to_thread(removed.wait, 1)
             assert cleaned == [("stop", 0), ("kill",), ("remove", True)]
+        run(scenario())
+
+    def test_late_cancelled_worker_exception_is_observed(self) -> None:
+        from backend.fuzzing.docker.container_runner import ContainerRunner
+
+        entered, release, removed = threading.Event(), threading.Event(), threading.Event()
+        class Container:
+            id = "container-observed"
+            def start(self): pass
+            def wait(self, timeout): return {"StatusCode": 0}
+            def logs(self, **kwargs): return iter(())
+            def stop(self, timeout=0): pass
+            def kill(self): pass
+            def remove(self, force=False): removed.set()
+        class Containers:
+            def create(self, *args, **kwargs):
+                entered.set()
+                assert release.wait(1)
+                return Container()
+
+        async def scenario():
+            loop = asyncio.get_running_loop()
+            contexts = []
+            previous = loop.get_exception_handler()
+            loop.set_exception_handler(lambda loop, context: contexts.append(context))
+            try:
+                operation = asyncio.create_task(ContainerRunner(SimpleNamespace(containers=Containers())).run("image", ["true"], 10, lambda text: None))
+                assert await asyncio.to_thread(entered.wait, 1)
+                operation.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await operation
+                release.set()
+                assert await asyncio.to_thread(removed.wait, 1)
+                for _ in range(2):
+                    await asyncio.sleep(0)
+                gc.collect()
+                await asyncio.sleep(0)
+            finally:
+                loop.set_exception_handler(previous)
+            assert not contexts
         run(scenario())
 
 

@@ -39,8 +39,9 @@ class ContainerRunner:
             raise ValueError("timeout must be positive")
         holder: dict[str, object] = {"cancel_requested": False, "cleanup_started": False, "lock": threading.Lock()}
         worker = asyncio.create_task(asyncio.to_thread(self._run_blocking, holder, image, command, timeout, sink))
+        worker.add_done_callback(self._observe_worker)
         try:
-            return await asyncio.wait_for(asyncio.shield(worker), timeout=timeout)
+            return await asyncio.wait_for(worker, timeout=timeout)
         except asyncio.TimeoutError as error:
             self._request_cancellation(holder)
             await self._cleanup_holder(holder, stop=True)
@@ -90,6 +91,11 @@ class ContainerRunner:
     def _request_cancellation(holder) -> None:
         with holder["lock"]:
             holder["cancel_requested"] = True
+
+    @staticmethod
+    def _observe_worker(worker: asyncio.Task) -> None:
+        if not worker.cancelled():
+            worker.exception()
 
     def _cleanup_holder_blocking(self, holder, stop: bool) -> None:
         with holder["lock"]:
