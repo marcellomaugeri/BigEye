@@ -18,8 +18,8 @@ from backend.fuzzing.corpus.admission import (
     _same_directory_path,
 )
 from backend.fuzzing.corpus.quiescence import (
+    CampaignCorpusOwnership,
     CampaignQuiescenceService,
-    CampaignWriterIdentity,
 )
 
 
@@ -28,6 +28,8 @@ class CorpusCampaign:
     engine: str
     corpus_dir: Path
     target_command: tuple[str, ...]
+    id: int | None = None
+    project_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -54,7 +56,9 @@ class NativeCorpusRunner(Protocol):
 class _PublicationOperation:
     run_callback: Callable[[], int]
     commit_callback: Callable[[], None]
+    verify_commit_callback: Callable[[], None]
     rollback_callback: Callable[[], None]
+    verify_rollback_callback: Callable[[], None]
 
     def run(self) -> int:
         return self.run_callback()
@@ -62,8 +66,14 @@ class _PublicationOperation:
     def commit(self) -> None:
         self.commit_callback()
 
+    def verify_commit(self) -> None:
+        self.verify_commit_callback()
+
     def rollback(self) -> None:
         self.rollback_callback()
+
+    def verify_rollback(self) -> None:
+        self.verify_rollback_callback()
 
 
 class CorpusMinimiser:
@@ -77,7 +87,6 @@ class CorpusMinimiser:
         max_file_bytes: int = 1_048_576,
         max_total_bytes: int = 256 * 1_048_576,
         quiescence_service: CampaignQuiescenceService | None = None,
-        campaign_identity: CampaignWriterIdentity | None = None,
     ):
         limits = (max_entries, max_directories, max_depth, max_file_bytes, max_total_bytes)
         if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in limits):
@@ -90,7 +99,6 @@ class CorpusMinimiser:
         self._max_file_bytes = max_file_bytes
         self._max_total_bytes = max_total_bytes
         self._quiescence_service = quiescence_service
-        self._campaign_identity = campaign_identity
 
     def minimise(self, campaign: CorpusCampaign) -> CorpusResult:
         corpus = Path(os.path.abspath(campaign.corpus_dir))
@@ -222,7 +230,7 @@ class CorpusMinimiser:
                     len(candidate_manifest),
                     tuple(commands),
                 )
-            if self._quiescence_service is None or self._campaign_identity is None:
+            if self._quiescence_service is None:
                 return CorpusResult(
                     False,
                     "corpus publication requires external-writer quiescence",
@@ -230,6 +238,15 @@ class CorpusMinimiser:
                     len(candidate_manifest),
                     tuple(commands),
                 )
+            if campaign.id is None or campaign.project_id is None:
+                raise ValueError("campaign and project identities are required for corpus publication")
+            ownership = CampaignCorpusOwnership(
+                campaign.id,
+                campaign.project_id,
+                corpus,
+                corpus_identity[0],
+                corpus_identity[1],
+            )
             retired_name = f".{corpus.name}.retired-{uuid4().hex}"
             publication = _PublicationOperation(
                 lambda: self._publish_candidate(
@@ -252,6 +269,18 @@ class CorpusMinimiser:
                     corpus_identity,
                     retired_name,
                 ),
+                lambda: self._verify_committed_candidate(
+                    parent_path,
+                    parent_descriptor,
+                    parent_identity,
+                    corpus.name,
+                    corpus_descriptor,
+                    corpus_identity,
+                    candidate_descriptor,
+                    candidate_identity,
+                    candidate_manifest,
+                    retired_name,
+                ),
                 lambda: self._rollback_candidate(
                     parent_descriptor,
                     corpus.name,
@@ -259,8 +288,17 @@ class CorpusMinimiser:
                     corpus_identity,
                     retired_name,
                 ),
+                lambda: self._verify_rolled_back_candidate(
+                    parent_path,
+                    parent_descriptor,
+                    parent_identity,
+                    corpus.name,
+                    corpus_descriptor,
+                    corpus_identity,
+                    retired_name,
+                ),
             )
-            after_count = self._quiescence_service.execute(self._campaign_identity, publication)
+            after_count = self._quiescence_service.execute(ownership, publication)
             return CorpusResult(
                 True,
                 "clean coverage preserved",
@@ -348,6 +386,39 @@ class CorpusMinimiser:
         os.replace(backup_name, retired_name, src_dir_fd=parent_descriptor, dst_dir_fd=parent_descriptor)
         os.fsync(parent_descriptor)
 
+    def _verify_committed_candidate(
+        self,
+        parent_path: Path,
+        parent_descriptor: int,
+        parent_identity: tuple[int, int],
+        corpus_name: str,
+        original_descriptor: int,
+        original_identity: tuple[int, int],
+        candidate_descriptor: int,
+        candidate_identity: tuple[int, int],
+        candidate_manifest: tuple[CorpusFile, ...],
+        retired_name: str,
+    ) -> None:
+        backup_name = f".{corpus_name}.before-minimisation"
+        if self._entry_exists(parent_descriptor, backup_name):
+            raise ValueError("corpus backup was not durably retired")
+        self._require_parent(parent_path, parent_identity)
+        self._require_named_directory(
+            parent_descriptor,
+            corpus_name,
+            candidate_descriptor,
+            candidate_identity,
+            "published corpus",
+        )
+        self._require_named_directory(
+            parent_descriptor,
+            retired_name,
+            original_descriptor,
+            original_identity,
+            "retired corpus",
+        )
+        self._require_manifest(candidate_descriptor, candidate_manifest, "published corpus")
+
     def _rollback_candidate(
         self,
         parent_descriptor: int,
@@ -378,6 +449,28 @@ class CorpusMinimiser:
         if failed_name is not None:
             self._remove_entry_at(parent_descriptor, failed_name)
             os.fsync(parent_descriptor)
+
+    def _verify_rolled_back_candidate(
+        self,
+        parent_path: Path,
+        parent_descriptor: int,
+        parent_identity: tuple[int, int],
+        corpus_name: str,
+        original_descriptor: int,
+        original_identity: tuple[int, int],
+        retired_name: str,
+    ) -> None:
+        backup_name = f".{corpus_name}.before-minimisation"
+        self._require_parent(parent_path, parent_identity)
+        self._require_named_directory(
+            parent_descriptor,
+            corpus_name,
+            original_descriptor,
+            original_identity,
+            "rolled-back corpus",
+        )
+        if self._entry_exists(parent_descriptor, backup_name) or self._entry_exists(parent_descriptor, retired_name):
+            raise ValueError("corpus rollback left a recovery marker")
 
     def _recover_interrupted_publication(self, parent_descriptor: int, corpus_name: str) -> None:
         backup = f".{corpus_name}.before-minimisation"

@@ -243,16 +243,51 @@ class _NativeRunner:
 
 
 class _FakeContainerController:
-    def __init__(self, *, active=True, stop_verified=True):
+    def __init__(
+        self,
+        corpus,
+        *,
+        active=True,
+        stop_verified=True,
+        campaign_id=7,
+        project_id=3,
+        identity_path=None,
+        quiesce_error=None,
+        inspect_after_quiesce_error=None,
+        resume_error=None,
+    ):
+        from backend.fuzzing.corpus.quiescence import CampaignWriterIdentity
+
+        self._identity_type = CampaignWriterIdentity
+        self._campaign_id = campaign_id
+        self._project_id = project_id
+        self._identity_path = Path(os.path.abspath(identity_path or corpus))
+        self._follow_canonical_path = identity_path is None
+        self._refresh_identity()
         self.active = active
         self.stop_verified = stop_verified
+        self.state = "running" if active else "stopped"
+        self.quiesce_error = quiesce_error
+        self.inspect_after_quiesce_error = inspect_after_quiesce_error
+        self.resume_error = resume_error
         self.calls = []
         self.writer_gate = threading.Lock()
         self._gate_held = False
+        self._quiesce_failed = False
 
-    def is_active(self, identity):
-        self.calls.append(("is_active", identity))
-        return self.active
+    def resolve(self, project_id, campaign_id):
+        self.calls.append(("resolve", project_id, campaign_id))
+        if self._follow_canonical_path:
+            self._refresh_identity()
+        return self.identity
+
+    def inspect(self, identity):
+        from backend.fuzzing.corpus.quiescence import CampaignWriterState
+
+        self.calls.append(("inspect", identity))
+        if self._quiesce_failed and self.inspect_after_quiesce_error is not None:
+            raise self.inspect_after_quiesce_error
+        return CampaignWriterState(self.identity, self.state, self.active)
 
     def quiesce(self, identity):
         self.calls.append(("quiesce", identity))
@@ -260,26 +295,49 @@ class _FakeContainerController:
             self.writer_gate.acquire()
             self._gate_held = True
             self.active = False
+            self.state = "stopped"
+        if self.quiesce_error is not None:
+            self._quiesce_failed = True
+            raise self.quiesce_error
 
-    def resume(self, identity):
-        self.calls.append(("resume", identity))
-        self.active = True
+    def resume(self, identity, prior_state):
+        self.calls.append(("resume", identity, prior_state))
+        if self.resume_error is not None:
+            raise self.resume_error
+        self.active = prior_state.active
+        self.state = prior_state.state
         if self._gate_held:
             self._gate_held = False
             self.writer_gate.release()
 
+    def _refresh_identity(self):
+        identity_stat = os.stat(self._identity_path, follow_symlinks=False)
+        self.identity = self._identity_type(
+            self._campaign_id,
+            self._project_id,
+            "container-7",
+            self._identity_path,
+            identity_stat.st_dev,
+            identity_stat.st_ino,
+        )
 
-def _quiesced_minimiser(runner, coverage, controller=None):
+
+def _quiesced_minimiser(runner, coverage, corpus, controller=None):
     from backend.fuzzing.corpus.minimisation import CorpusMinimiser
-    from backend.fuzzing.corpus.quiescence import CampaignQuiescenceService, CampaignWriterIdentity
+    from backend.fuzzing.corpus.quiescence import CampaignQuiescenceService
 
-    controller = controller or _FakeContainerController()
+    controller = controller or _FakeContainerController(corpus)
     return CorpusMinimiser(
         runner,
         coverage,
         quiescence_service=CampaignQuiescenceService(controller),
-        campaign_identity=CampaignWriterIdentity(7, "container-7"),
     )
+
+
+def _owned_campaign(engine, corpus, target_command):
+    from backend.fuzzing.corpus.minimisation import CorpusCampaign
+
+    return CorpusCampaign(engine, corpus, target_command, id=7, project_id=3)
 
 
 def test_afl_minimisation_uses_native_tools_and_replaces_only_after_coverage_preservation(tmp_path: Path) -> None:
@@ -289,9 +347,9 @@ def test_afl_minimisation_uses_native_tools_and_replaces_only_after_coverage_pre
     corpus.mkdir(parents=True)
     (corpus / "keep").write_bytes(b"keep")
     (corpus / "drop").write_bytes(b"drop")
-    campaign = CorpusCampaign("afl++", corpus, ("/opt/bigeye/target", "@@"))
+    campaign = _owned_campaign("afl++", corpus, ("/opt/bigeye/target", "@@"))
     runner = _NativeRunner()
-    minimiser = _quiesced_minimiser(runner, lambda _campaign, _corpus: frozenset({"parser.c:12"}))
+    minimiser = _quiesced_minimiser(runner, lambda _campaign, _corpus: frozenset({"parser.c:12"}), corpus)
 
     result = minimiser.minimise(campaign)
 
@@ -396,8 +454,8 @@ def test_minimisation_restores_original_when_candidate_publication_fails(tmp_pat
     corpus = tmp_path / "campaign/corpus"
     corpus.mkdir(parents=True)
     (corpus / "keep").write_bytes(b"original")
-    campaign = module.CorpusCampaign("libfuzzer", corpus, ("/target",))
-    controller = _FakeContainerController()
+    campaign = _owned_campaign("libfuzzer", corpus, ("/target",))
+    controller = _FakeContainerController(corpus)
     real_replace = module.os.replace
     failed = False
 
@@ -414,7 +472,6 @@ def test_minimisation_restores_original_when_candidate_publication_fails(tmp_pat
             _NativeRunner(),
             lambda _campaign, _path: frozenset({"a.c:1"}),
             quiescence_service=module.CampaignQuiescenceService(controller),
-            campaign_identity=module.CampaignWriterIdentity(7, "container-7"),
         ).minimise(campaign)
 
     assert (corpus / "keep").read_bytes() == b"original"
@@ -432,8 +489,12 @@ def test_minimisation_recovers_original_after_interrupted_post_publish_cleanup(t
     (corpus / "keep").write_bytes(b"unverified-candidate")
     (backup / "keep").write_bytes(b"original")
 
-    result = _quiesced_minimiser(_NativeRunner(), lambda _campaign, _path: frozenset({"a.c:1"})).minimise(
-        CorpusCampaign("libfuzzer", corpus, ("/target",)),
+    result = _quiesced_minimiser(
+        _NativeRunner(),
+        lambda _campaign, _path: frozenset({"a.c:1"}),
+        corpus,
+    ).minimise(
+        _owned_campaign("libfuzzer", corpus, ("/target",)),
     )
 
     assert result.replaced is True
@@ -447,7 +508,7 @@ def test_minimisation_serialises_operations_for_one_corpus(tmp_path: Path) -> No
     corpus = tmp_path / "campaign/corpus"
     corpus.mkdir(parents=True)
     (corpus / "keep").write_bytes(b"keep")
-    campaign = CorpusCampaign("libfuzzer", corpus, ("/target",))
+    campaign = _owned_campaign("libfuzzer", corpus, ("/target",))
 
     class ConcurrentRunner(_NativeRunner):
         def __init__(self):
@@ -468,7 +529,7 @@ def test_minimisation_serialises_operations_for_one_corpus(tmp_path: Path) -> No
                     self.active -= 1
 
     runner = ConcurrentRunner()
-    minimiser = _quiesced_minimiser(runner, lambda _campaign, _path: frozenset({"a.c:1"}))
+    minimiser = _quiesced_minimiser(runner, lambda _campaign, _path: frozenset({"a.c:1"}), corpus)
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = tuple(executor.map(lambda _index: minimiser.minimise(campaign), range(2)))
 
@@ -570,17 +631,16 @@ def test_minimisation_without_quiescence_service_evaluates_but_never_replaces(tm
 
 
 def test_quiescence_does_not_run_publication_when_container_stop_is_not_verified(tmp_path: Path) -> None:
-    from backend.fuzzing.corpus.minimisation import CorpusCampaign, CorpusMinimiser
+    from backend.fuzzing.corpus.minimisation import CorpusMinimiser
     from backend.fuzzing.corpus.quiescence import (
         CampaignQuiescenceService,
-        CampaignWriterIdentity,
         CampaignWriterStillActive,
     )
 
     corpus = tmp_path / "campaign/corpus"
     corpus.mkdir(parents=True)
     (corpus / "keep").write_bytes(b"original")
-    controller = _FakeContainerController(stop_verified=False)
+    controller = _FakeContainerController(corpus, stop_verified=False)
 
     class ObservedMinimiser(CorpusMinimiser):
         publication_started = False
@@ -592,26 +652,26 @@ def test_quiescence_does_not_run_publication_when_container_stop_is_not_verified
         _NativeRunner(),
         lambda _campaign, _path: frozenset({"a.c:1"}),
         quiescence_service=CampaignQuiescenceService(controller),
-        campaign_identity=CampaignWriterIdentity(7, "container-7"),
     )
 
     with pytest.raises(CampaignWriterStillActive, match="campaign writer is still active"):
-        minimiser.minimise(CorpusCampaign("libfuzzer", corpus, ("/target",)))
+        minimiser.minimise(_owned_campaign("libfuzzer", corpus, ("/target",)))
 
     assert minimiser.publication_started is False
     assert (corpus / "keep").read_bytes() == b"original"
-    assert [call[0] for call in controller.calls].count("resume") == 1
+    assert [call[0] for call in controller.calls].count("resume") == 0
 
 
 @pytest.mark.parametrize("injection", ["during_manifest", "before_replace"])
 def test_minimisation_detects_writer_when_provider_does_not_actually_quiesce(tmp_path: Path, injection: str) -> None:
-    from backend.fuzzing.corpus.minimisation import CorpusCampaign, CorpusMinimiser
-    from backend.fuzzing.corpus.quiescence import CampaignQuiescenceService, CampaignWriterIdentity
+    from backend.fuzzing.corpus.minimisation import CorpusMinimiser
+    from backend.fuzzing.corpus.quiescence import CampaignQuiescenceService
 
     corpus = tmp_path / "campaign/corpus"
     corpus.mkdir(parents=True)
     keep = corpus / "keep"
     keep.write_bytes(b"original")
+    controller = _FakeContainerController(corpus)
 
     class InjectingMinimiser(CorpusMinimiser):
         armed = False
@@ -632,9 +692,8 @@ def test_minimisation_detects_writer_when_provider_does_not_actually_quiesce(tmp
         InjectingMinimiser(
             _NativeRunner(),
             lambda _campaign, _path: frozenset({"a.c:1"}),
-            quiescence_service=CampaignQuiescenceService(_FakeContainerController()),
-            campaign_identity=CampaignWriterIdentity(7, "container-7"),
-        ).minimise(CorpusCampaign("libfuzzer", corpus, ("/target",)))
+            quiescence_service=CampaignQuiescenceService(controller),
+        ).minimise(_owned_campaign("libfuzzer", corpus, ("/target",)))
 
     if injection == "during_manifest":
         assert (corpus / "late-during-manifest").read_bytes() == b"late"
@@ -643,10 +702,9 @@ def test_minimisation_detects_writer_when_provider_does_not_actually_quiesce(tmp
 
 
 def test_inactive_writer_lost_after_publication_rolls_back_original_before_resume(tmp_path: Path) -> None:
-    from backend.fuzzing.corpus.minimisation import CorpusCampaign, CorpusMinimiser
+    from backend.fuzzing.corpus.minimisation import CorpusMinimiser
     from backend.fuzzing.corpus.quiescence import (
         CampaignQuiescenceService,
-        CampaignWriterIdentity,
         CampaignWriterStillActive,
     )
 
@@ -654,20 +712,20 @@ def test_inactive_writer_lost_after_publication_rolls_back_original_before_resum
     corpus.mkdir(parents=True)
     keep = corpus / "keep"
     keep.write_bytes(b"original")
-    controller = _FakeContainerController()
+    controller = _FakeContainerController(corpus)
 
     class RestartingWriterMinimiser(CorpusMinimiser):
         def _after_candidate_publication(self, _corpus):
             controller.active = True
+            controller.state = "restarting"
 
     minimiser = RestartingWriterMinimiser(
         _NativeRunner(),
         lambda _campaign, _path: frozenset({"a.c:1"}),
         quiescence_service=CampaignQuiescenceService(controller),
-        campaign_identity=CampaignWriterIdentity(7, "container-7"),
     )
     with pytest.raises(CampaignWriterStillActive, match="campaign writer is still active"):
-        minimiser.minimise(CorpusCampaign("libfuzzer", corpus, ("/target",)))
+        minimiser.minimise(_owned_campaign("libfuzzer", corpus, ("/target",)))
 
     assert keep.read_bytes() == b"original"
     assert [call[0] for call in controller.calls].count("resume") == 1
@@ -681,7 +739,7 @@ def test_commit_fsync_failure_restores_original_before_writer_resumes(tmp_path: 
     corpus.mkdir(parents=True)
     keep = corpus / "keep"
     keep.write_bytes(b"original")
-    controller = _FakeContainerController()
+    controller = _FakeContainerController(corpus)
     real_fsync = module.os.fsync
     failed = False
 
@@ -698,23 +756,200 @@ def test_commit_fsync_failure_restores_original_before_writer_resumes(tmp_path: 
         _NativeRunner(),
         lambda _campaign, _path: frozenset({"a.c:1"}),
         quiescence_service=module.CampaignQuiescenceService(controller),
-        campaign_identity=module.CampaignWriterIdentity(7, "container-7"),
     )
 
     with pytest.raises(OSError, match="forced commit fsync failure"):
-        minimiser.minimise(module.CorpusCampaign("libfuzzer", corpus, ("/target",)))
+        minimiser.minimise(_owned_campaign("libfuzzer", corpus, ("/target",)))
 
     assert keep.read_bytes() == b"original"
     assert [call[0] for call in controller.calls].count("resume") == 1
     assert not tuple(corpus.parent.glob(".corpus.retired-*"))
 
 
-def test_quiescence_service_serialises_publication_transitions_per_campaign() -> None:
-    from backend.fuzzing.corpus.quiescence import CampaignQuiescenceService, CampaignWriterIdentity
+@pytest.mark.parametrize("mismatch", ["campaign", "project", "corpus"])
+def test_quiescence_rejects_foreign_writer_identity_and_corpus_before_transition(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    from backend.fuzzing.corpus.minimisation import CorpusMinimiser
+    from backend.fuzzing.corpus.quiescence import CampaignOwnershipMismatch, CampaignQuiescenceService
 
-    controller = _FakeContainerController()
+    corpus = tmp_path / "campaign/corpus"
+    corpus.mkdir(parents=True)
+    (corpus / "keep").write_bytes(b"original")
+    foreign = tmp_path / "foreign-corpus"
+    foreign.mkdir()
+    controller = _FakeContainerController(
+        corpus,
+        campaign_id=8 if mismatch == "campaign" else 7,
+        project_id=4 if mismatch == "project" else 3,
+        identity_path=foreign if mismatch == "corpus" else corpus,
+    )
+
+    with pytest.raises(CampaignOwnershipMismatch, match="does not own the requested campaign corpus"):
+        CorpusMinimiser(
+            _NativeRunner(),
+            lambda _campaign, _path: frozenset({"a.c:1"}),
+            quiescence_service=CampaignQuiescenceService(controller),
+        ).minimise(_owned_campaign("libfuzzer", corpus, ("/target",)))
+
+    assert (corpus / "keep").read_bytes() == b"original"
+    assert not any(call[0] in {"quiesce", "resume"} for call in controller.calls)
+
+
+def test_partial_quiesce_failure_resumes_only_after_safe_stopped_state_is_verified(tmp_path: Path) -> None:
+    from backend.fuzzing.corpus.minimisation import CorpusMinimiser
+    from backend.fuzzing.corpus.quiescence import CampaignQuiescenceService
+
+    corpus = tmp_path / "campaign/corpus"
+    corpus.mkdir(parents=True)
+    (corpus / "keep").write_bytes(b"original")
+    primary = RuntimeError("stop failed after stopping")
+    controller = _FakeContainerController(corpus, quiesce_error=primary)
+
+    with pytest.raises(RuntimeError, match="stop failed after stopping") as caught:
+        CorpusMinimiser(
+            _NativeRunner(),
+            lambda _campaign, _path: frozenset({"a.c:1"}),
+            quiescence_service=CampaignQuiescenceService(controller),
+        ).minimise(_owned_campaign("libfuzzer", corpus, ("/target",)))
+
+    assert caught.value is primary
+    assert (corpus / "keep").read_bytes() == b"original"
+    assert [call[0] for call in controller.calls].count("resume") == 1
+
+
+def test_partial_quiesce_with_unknown_state_never_resumes_writer(tmp_path: Path) -> None:
+    from backend.fuzzing.corpus.minimisation import CorpusMinimiser
+    from backend.fuzzing.corpus.quiescence import CampaignQuiescenceRecoveryError, CampaignQuiescenceService
+
+    corpus = tmp_path / "campaign/corpus"
+    corpus.mkdir(parents=True)
+    (corpus / "keep").write_bytes(b"original")
+    primary = RuntimeError("partial stop")
+    inspection = RuntimeError("state unavailable")
+    controller = _FakeContainerController(
+        corpus,
+        quiesce_error=primary,
+        inspect_after_quiesce_error=inspection,
+    )
+
+    with pytest.raises(CampaignQuiescenceRecoveryError) as caught:
+        CorpusMinimiser(
+            _NativeRunner(),
+            lambda _campaign, _path: frozenset({"a.c:1"}),
+            quiescence_service=CampaignQuiescenceService(controller),
+        ).minimise(_owned_campaign("libfuzzer", corpus, ("/target",)))
+
+    assert caught.value.primary_error is primary
+    assert caught.value.recovery_error is inspection
+    assert caught.value.recovery_required is True
+    assert [call[0] for call in controller.calls].count("resume") == 0
+
+
+def test_partial_quiesce_preserves_both_stop_and_resume_failures(tmp_path: Path) -> None:
+    from backend.fuzzing.corpus.minimisation import CorpusMinimiser
+    from backend.fuzzing.corpus.quiescence import CampaignQuiescenceRecoveryError, CampaignQuiescenceService
+
+    corpus = tmp_path / "campaign/corpus"
+    corpus.mkdir(parents=True)
+    (corpus / "keep").write_bytes(b"original")
+    primary = RuntimeError("partial stop")
+    resume = RuntimeError("resume failed")
+    controller = _FakeContainerController(
+        corpus,
+        quiesce_error=primary,
+        resume_error=resume,
+    )
+
+    with pytest.raises(CampaignQuiescenceRecoveryError) as caught:
+        CorpusMinimiser(
+            _NativeRunner(),
+            lambda _campaign, _path: frozenset({"a.c:1"}),
+            quiescence_service=CampaignQuiescenceService(controller),
+        ).minimise(_owned_campaign("libfuzzer", corpus, ("/target",)))
+
+    assert caught.value.primary_error is primary
+    assert caught.value.resume_error is resume
+    assert [call[0] for call in controller.calls].count("resume") == 1
+
+
+@pytest.mark.parametrize("failure_at", ["rollback", "verification"])
+def test_rollback_failure_marks_recovery_required_and_leaves_writer_stopped(
+    tmp_path: Path,
+    failure_at: str,
+) -> None:
+    from backend.fuzzing.corpus.minimisation import CorpusMinimiser
+    from backend.fuzzing.corpus.quiescence import CampaignQuiescenceRecoveryError, CampaignQuiescenceService
+
+    corpus = tmp_path / "campaign/corpus"
+    corpus.mkdir(parents=True)
+    (corpus / "keep").write_bytes(b"original")
+    controller = _FakeContainerController(corpus)
+    primary = RuntimeError("post-publication verification failed")
+    rollback = OSError("rollback failed")
+
+    class BrokenRollbackMinimiser(CorpusMinimiser):
+        def _after_candidate_publication(self, _corpus):
+            raise primary
+
+        def _rollback_candidate(self, *args):
+            if failure_at == "rollback":
+                raise rollback
+            return super()._rollback_candidate(*args)
+
+        def _verify_rolled_back_candidate(self, *args):
+            if failure_at == "verification":
+                raise rollback
+            return super()._verify_rolled_back_candidate(*args)
+
+    with pytest.raises(CampaignQuiescenceRecoveryError) as caught:
+        BrokenRollbackMinimiser(
+            _NativeRunner(),
+            lambda _campaign, _path: frozenset({"a.c:1"}),
+            quiescence_service=CampaignQuiescenceService(controller),
+        ).minimise(_owned_campaign("libfuzzer", corpus, ("/target",)))
+
+    assert caught.value.primary_error is primary
+    assert caught.value.recovery_error is rollback
+    assert caught.value.recovery_required is True
+    assert controller.active is False
+    assert [call[0] for call in controller.calls].count("resume") == 0
+
+
+def test_resume_failure_is_surfaced_after_durably_verified_commit(tmp_path: Path) -> None:
+    from backend.fuzzing.corpus.minimisation import CorpusMinimiser
+    from backend.fuzzing.corpus.quiescence import CampaignQuiescenceRecoveryError, CampaignQuiescenceService
+
+    corpus = tmp_path / "campaign/corpus"
+    corpus.mkdir(parents=True)
+    (corpus / "keep").write_bytes(b"original")
+    resume = RuntimeError("resume failed")
+    controller = _FakeContainerController(corpus, resume_error=resume)
+
+    with pytest.raises(CampaignQuiescenceRecoveryError) as caught:
+        CorpusMinimiser(
+            _NativeRunner(),
+            lambda _campaign, _path: frozenset({"a.c:1"}),
+            quiescence_service=CampaignQuiescenceService(controller),
+        ).minimise(_owned_campaign("libfuzzer", corpus, ("/target",)))
+
+    assert caught.value.primary_error is None
+    assert caught.value.resume_error is resume
+    assert caught.value.recovery_required is False
+    assert controller.active is False
+    assert [call[0] for call in controller.calls].count("resume") == 1
+
+
+def test_quiescence_service_serialises_publication_transitions_per_campaign(tmp_path: Path) -> None:
+    from backend.fuzzing.corpus.quiescence import CampaignCorpusOwnership, CampaignQuiescenceService
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    corpus_stat = corpus.stat()
+    ownership = CampaignCorpusOwnership(7, 3, corpus, corpus_stat.st_dev, corpus_stat.st_ino)
+    controller = _FakeContainerController(corpus)
     service = CampaignQuiescenceService(controller)
-    identity = CampaignWriterIdentity(7, "container-7")
     active_operations = 0
     maximum_active = 0
     entered = threading.Event()
@@ -741,10 +976,16 @@ def test_quiescence_service_serialises_publication_transitions_per_campaign() ->
             with state_lock:
                 active_operations -= 1
 
+        def verify_commit(self):
+            pass
+
+        def verify_rollback(self):
+            pass
+
     with ThreadPoolExecutor(max_workers=2) as executor:
-        first = executor.submit(service.execute, identity, Operation())
+        first = executor.submit(service.execute, ownership, Operation())
         assert entered.wait(1)
-        second = executor.submit(service.execute, identity, Operation())
+        second = executor.submit(service.execute, ownership, Operation())
         time.sleep(0.02)
         assert maximum_active == 1
         release.set()
@@ -757,13 +998,13 @@ def test_quiescence_service_serialises_publication_transitions_per_campaign() ->
 
 
 def test_quiescence_blocks_late_writer_until_publication_is_committed(tmp_path: Path) -> None:
-    from backend.fuzzing.corpus.minimisation import CorpusCampaign, CorpusMinimiser
-    from backend.fuzzing.corpus.quiescence import CampaignQuiescenceService, CampaignWriterIdentity
+    from backend.fuzzing.corpus.minimisation import CorpusMinimiser
+    from backend.fuzzing.corpus.quiescence import CampaignQuiescenceService
 
     corpus = tmp_path / "campaign/corpus"
     corpus.mkdir(parents=True)
     (corpus / "keep").write_bytes(b"original")
-    controller = _FakeContainerController()
+    controller = _FakeContainerController(corpus)
 
     class BlockingWriterMinimiser(CorpusMinimiser):
         writer = None
@@ -785,9 +1026,8 @@ def test_quiescence_blocks_late_writer_until_publication_is_committed(tmp_path: 
         _NativeRunner(),
         lambda _campaign, _path: frozenset({"a.c:1"}),
         quiescence_service=CampaignQuiescenceService(controller),
-        campaign_identity=CampaignWriterIdentity(7, "container-7"),
     )
-    result = minimiser.minimise(CorpusCampaign("libfuzzer", corpus, ("/target",)))
+    result = minimiser.minimise(_owned_campaign("libfuzzer", corpus, ("/target",)))
     minimiser.writer.join(1)
 
     assert result.replaced is True
