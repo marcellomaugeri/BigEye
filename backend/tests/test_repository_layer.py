@@ -250,6 +250,86 @@ def test_invalid_published_context_is_rebuilt_before_image_reuse(tmp_path: Path)
     assert len(builder.calls) == 1
 
 
+def test_dangling_internal_symlinks_are_preserved_rebased_and_hashed(tmp_path: Path) -> None:
+    from backend.fuzzing.layers.repository_layer import RepositoryLayerService
+
+    repository = tmp_path / "checkout"
+    repository.mkdir()
+    relative_link = repository / "generated-header"
+    absolute_link = repository / "absolute-generated-header"
+    relative_link.symlink_to("generated/later.h")
+    absolute_link.symlink_to(repository / "generated/absolute-later.h")
+    service = RepositoryLayerService(tmp_path / "workspace", _Builder(), _Inspector())
+
+    first = service.prepare(7, repository, "4" * 40, "bigeye-toolchain:test", lambda text: None)
+    copied = first.context_dir / "repository"
+    relative_link.unlink()
+    relative_link.symlink_to("generated/other.h")
+    changed = service.prepare(7, repository, "4" * 40, "bigeye-toolchain:test", lambda text: None)
+
+    assert os.readlink(copied / "generated-header") == "generated/later.h"
+    assert os.readlink(copied / "absolute-generated-header") == "generated/absolute-later.h"
+    assert first.tag != changed.tag
+
+
+def test_in_tree_symlink_cycle_is_preserved_without_resolution(tmp_path: Path) -> None:
+    from backend.fuzzing.layers.repository_layer import RepositoryLayerService
+
+    repository = tmp_path / "checkout"
+    repository.mkdir()
+    (repository / "first").symlink_to("second")
+    (repository / "second").symlink_to("first")
+
+    manifest = RepositoryLayerService(tmp_path / "workspace", _Builder(), _Inspector()).prepare(
+        7, repository, "5" * 40, "bigeye-toolchain:test", lambda text: None
+    )
+    copied = manifest.context_dir / "repository"
+
+    assert os.readlink(copied / "first") == "second"
+    assert os.readlink(copied / "second") == "first"
+
+
+def test_symlink_with_lexical_repository_escape_is_excluded(tmp_path: Path) -> None:
+    from backend.fuzzing.layers.repository_layer import RepositoryLayerService
+
+    repository = tmp_path / "checkout"
+    repository.mkdir()
+    outside = tmp_path / "outside"
+    outside.write_text("not repository content\n")
+    (repository / "escape").symlink_to("../outside")
+
+    manifest = RepositoryLayerService(tmp_path / "workspace", _Builder(), _Inspector()).prepare(
+        7, repository, "6" * 40, "bigeye-toolchain:test", lambda text: None
+    )
+
+    assert not (manifest.context_dir / "repository/escape").exists()
+    assert not (manifest.context_dir / "repository/escape").is_symlink()
+
+
+def test_dangling_and_cyclic_link_digest_matches_validated_context(tmp_path: Path) -> None:
+    from backend.fuzzing.layers.repository_layer import RepositoryLayerService
+
+    repository = tmp_path / "checkout"
+    repository.mkdir()
+    (repository / "dangling").symlink_to("generated/output")
+    (repository / "cycle-a").symlink_to("cycle-b")
+    (repository / "cycle-b").symlink_to("cycle-a")
+    builder = _Builder()
+    service = RepositoryLayerService(tmp_path / "workspace", builder, _Inspector())
+
+    manifest = service.prepare(7, repository, "7" * 40, "bigeye-toolchain:test", lambda text: None)
+    source_digest = service._context_digest(repository)
+    copied = manifest.context_dir / "repository"
+
+    assert service._context_digest(copied) == source_digest
+    assert service._valid_context(manifest.context_dir, manifest.dockerfile.read_text(), source_digest)
+    (copied / "dangling").unlink()
+    (copied / "dangling").symlink_to("../../escape")
+    builder.reuse = True
+    repaired = service.prepare(7, repository, "7" * 40, "bigeye-toolchain:test", lambda text: None)
+    assert os.readlink(repaired.context_dir / "repository/dangling") == "generated/output"
+
+
 class _Inspector:
     def __init__(self, image_id: str = "sha256:parent"):
         self.image_id = image_id

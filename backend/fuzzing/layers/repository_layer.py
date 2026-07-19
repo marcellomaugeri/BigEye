@@ -108,12 +108,9 @@ class RepositoryLayerService:
             if cls._is_excluded(relative):
                 continue
             if path.is_symlink():
-                try:
-                    resolved = path.resolve(strict=True)
-                    resolved.relative_to(root)
-                except (FileNotFoundError, ValueError):
+                link_target = cls._lexical_link_target(root, path, allow_absolute=True)
+                if link_target is None:
                     continue
-                link_target = Path(os.path.relpath(resolved, start=path.parent)).as_posix()
                 yield "symlink", relative, path, None, link_target
             elif path.is_dir():
                 yield "directory", relative, path, stat.S_IMODE(path.stat().st_mode), ""
@@ -132,6 +129,24 @@ class RepositoryLayerService:
             or relative.name in _EXCLUDED_FILE_NAMES
             or relative.name.endswith(_EXCLUDED_SUFFIXES)
         )
+
+    @staticmethod
+    def _lexical_link_target(root: Path, link: Path, allow_absolute: bool) -> str | None:
+        raw_target = os.readlink(link)
+        link_relative = link.relative_to(root)
+        if os.path.isabs(raw_target):
+            if not allow_absolute:
+                return None
+            absolute_target = Path(os.path.normpath(raw_target))
+            try:
+                repository_target = absolute_target.relative_to(root)
+            except ValueError:
+                return None
+        else:
+            repository_target = Path(os.path.normpath(os.path.join(link_relative.parent, raw_target)))
+            if repository_target.is_absolute() or (repository_target.parts and repository_target.parts[0] == ".."):
+                return None
+        return Path(os.path.relpath(repository_target, start=link_relative.parent)).as_posix()
 
     @classmethod
     def _valid_context(cls, context_dir: Path, dockerfile_text: str, expected_digest: str) -> bool:
@@ -163,11 +178,7 @@ class RepositoryLayerService:
             if cls._is_excluded(relative):
                 return False
             if path.is_symlink():
-                if os.path.isabs(os.readlink(path)):
-                    return False
-                try:
-                    path.resolve(strict=True).relative_to(root)
-                except (FileNotFoundError, ValueError):
+                if cls._lexical_link_target(root, path, allow_absolute=False) is None:
                     return False
             elif not (path.is_dir() or path.is_file()):
                 return False
