@@ -954,10 +954,12 @@ def test_docker_crash_replay_feeds_afl_stdin_bytes_without_adding_an_argv_path(
             self.sent = bytearray()
             self.shutdown_mode = None
             self.closed = False
+            self.events = []
+            self._response = SimpleNamespace(close=lambda: self.events.append("response"))
 
         def sendall(self, value): self.sent.extend(value)
         def shutdown(self, value): self.shutdown_mode = value
-        def close(self): self.closed = True
+        def close(self): self.events.append("socket"); self.closed = True
 
     class Container:
         def __init__(self): self.socket = AttachedSocket()
@@ -984,12 +986,141 @@ def test_docker_crash_replay_feeds_afl_stdin_bytes_without_adding_an_argv_path(
     ), b"boom", "original"))
 
     assert containers.kwargs[0][1] == ["/opt/bigeye/stdin-parser", "--encrypted"]
+    assert containers.kwargs[1]["detach"] is False
     assert containers.kwargs[1]["stdin_open"] is True
     assert containers.kwargs[1]["volumes"] == {}
     assert bytes(containers.container.socket.sent) == b"boom"
     assert containers.container.socket.shutdown_mode == socket.SHUT_WR
     assert containers.container.socket.closed is True
+    assert containers.container.socket.events == ["response", "socket"]
     assert result.crashed is True
+
+
+@pytest.mark.parametrize("timeout_shape", ["direct", "wrapped"])
+def test_docker_crash_replay_retains_sanitizer_evidence_when_wait_transport_times_out(
+    tmp_path: Path, timeout_shape: str,
+) -> None:
+    from requests.exceptions import ConnectionError as RequestsConnectionError
+    from requests.exceptions import ReadTimeout
+    from urllib3.exceptions import ReadTimeoutError
+
+    from backend.fuzzing.crashes.quarantine import CrashObservation
+    from backend.services.campaigns.production_evidence_factory import DockerCrashReplayExecutor
+
+    class AttachedSocket:
+        def __init__(self): self._sock = self
+        def sendall(self, _value): pass
+        def shutdown(self, _value): pass
+        def close(self): pass
+
+    class Container:
+        def __init__(self): self.socket = AttachedSocket(); self.removed = False
+        def attach_socket(self, params): return self.socket
+        def start(self): pass
+        def wait(self, timeout):
+            if timeout_shape == "direct":
+                raise ReadTimeout("emulated target did not exit")
+            raise RequestsConnectionError(
+                ReadTimeoutError(None, None, "emulated target did not exit"),
+            )
+        def logs(self, **_kwargs):
+            return [
+                b"ERROR: AddressSanitizer: stack-buffer-overflow\n",
+                b"#0 0x123 in process_payload /src/src/main.c:20\n",
+            ]
+        def remove(self, force=False): self.removed = force
+
+    container = Container()
+    result = asyncio.run(DockerCrashReplayExecutor(
+        SimpleNamespace(containers=SimpleNamespace(create=lambda *_args, **_kwargs: container)),
+        tmp_path,
+    ).replay(CrashObservation(
+        project_id=7, campaign_id=9, commit_sha=COMMIT, engine="afl",
+        image_id=IMAGE_ID, target_asset_id=31, sanitizer="address+undefined",
+        command=("/opt/bigeye/stdin-parser",), input_bytes=b"boom", input_mode="stdin",
+    ), b"boom", "original"))
+
+    assert result.crashed is True
+    assert result.exit_code is None
+    assert result.sanitizer == "address"
+    assert result.source_location == "src/main.c:20"
+    assert result.error is None
+    assert container.removed is True
+
+
+def test_docker_crash_replay_preserves_wait_transport_failure_without_crash_evidence(
+    tmp_path: Path,
+) -> None:
+    from requests.exceptions import ConnectionError as RequestsConnectionError
+
+    from backend.fuzzing.crashes.quarantine import CrashObservation
+    from backend.services.campaigns.production_evidence_factory import DockerCrashReplayExecutor
+
+    class AttachedSocket:
+        def __init__(self): self._sock = self
+        def sendall(self, _value): pass
+        def shutdown(self, _value): pass
+        def close(self): pass
+
+    class Container:
+        def __init__(self): self.socket = AttachedSocket()
+        def attach_socket(self, params): return self.socket
+        def start(self): pass
+        def wait(self, timeout): raise RequestsConnectionError("Docker transport unavailable")
+        def logs(self, **_kwargs): return [b"target is still running\n"]
+        def remove(self, force=False): pass
+
+    with pytest.raises(RequestsConnectionError, match="Docker transport unavailable"):
+        asyncio.run(DockerCrashReplayExecutor(
+            SimpleNamespace(containers=SimpleNamespace(
+                create=lambda *_args, **_kwargs: Container(),
+            )),
+            tmp_path,
+        ).replay(CrashObservation(
+            project_id=7, campaign_id=9, commit_sha=COMMIT, engine="afl",
+            image_id=IMAGE_ID, target_asset_id=31, sanitizer="address+undefined",
+            command=("/opt/bigeye/stdin-parser",), input_bytes=b"boom", input_mode="stdin",
+        ), b"boom", "original"))
+
+
+def test_docker_crash_replay_does_not_accept_logs_after_a_non_timeout_connection_failure(
+    tmp_path: Path,
+) -> None:
+    from requests.exceptions import ConnectionError as RequestsConnectionError
+
+    from backend.fuzzing.crashes.quarantine import CrashObservation
+    from backend.services.campaigns.production_evidence_factory import DockerCrashReplayExecutor
+
+    class AttachedSocket:
+        def __init__(self): self._sock = self
+        def sendall(self, _value): pass
+        def shutdown(self, _value): pass
+        def close(self): pass
+
+    class Container:
+        def __init__(self): self.socket = AttachedSocket(); self.logs_read = False
+        def attach_socket(self, params): return self.socket
+        def start(self): pass
+        def wait(self, timeout): raise RequestsConnectionError("Docker connection closed")
+        def logs(self, **_kwargs):
+            self.logs_read = True
+            return [b"ERROR: AddressSanitizer: stale output\n"]
+        def remove(self, force=False): pass
+
+    container = Container()
+    with pytest.raises(RequestsConnectionError, match="Docker connection closed"):
+        asyncio.run(DockerCrashReplayExecutor(
+            SimpleNamespace(containers=SimpleNamespace(
+                create=lambda *_args, **_kwargs: container,
+            )),
+            tmp_path,
+        ).replay(CrashObservation(
+            project_id=7, campaign_id=9, commit_sha=COMMIT, engine="afl",
+            image_id=IMAGE_ID, target_asset_id=31, sanitizer="address+undefined",
+            command=("/opt/bigeye/stdin-parser",), input_bytes=b"boom", input_mode="stdin",
+        ), b"boom", "original"))
+
+    assert container.logs_read is False
 
 
 def test_native_corpus_runner_uses_the_complete_bounded_container_contract(tmp_path: Path) -> None:

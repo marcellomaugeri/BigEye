@@ -16,6 +16,9 @@ from tempfile import mkdtemp
 from uuid import uuid4
 
 from agents import Runner
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import ReadTimeout as RequestsReadTimeout
+from urllib3.exceptions import ReadTimeoutError
 
 from backend.agents.outputs.triage_result import TriageResult
 from backend.agents.specialists.crash_triage import build_crash_triage_agent
@@ -42,7 +45,7 @@ from backend.fuzzing.crashes.replay import ReplayResult
 from backend.fuzzing.crashes.triage import CrashPipeline
 from backend.fuzzing.docker.fuzz_container import FuzzCampaign, FuzzContainerService
 from backend.fuzzing.docker.image_builder import PLATFORM
-from backend.fuzzing.docker.stdin import send_exact_stdin
+from backend.fuzzing.docker.stdin import close_attached_stdin, send_exact_stdin
 from backend.services.campaigns.production_artifacts import (
     CampaignCoverageTargetResolver,
     ProductionCorpusArtifactHandler,
@@ -521,19 +524,28 @@ class DockerCrashReplayExecutor:
                 stdin_open=stdin_mode,
                 tty=False,
                 auto_remove=False,
-                detach=True,
+                detach=not stdin_mode,
             )
             if stdin_mode:
                 attached = container.attach_socket(params={"stdin": 1, "stream": 1})
             container.start()
             if attached is not None:
                 send_exact_stdin(attached, input_bytes, self._timeout)
-            result = container.wait(timeout=self._timeout)
-            exit_code = int(result["StatusCode"])
+            wait_error = None
+            try:
+                result = container.wait(timeout=self._timeout)
+                exit_code = int(result["StatusCode"])
+            except (RequestsConnectionError, RequestsReadTimeout, TimeoutError) as error:
+                if not _wait_timed_out(error):
+                    raise
+                wait_error = error
+                exit_code = None
             output = _bounded_container_output(container)
             sanitizer = _sanitizer(output)
-            signal = _signal(exit_code)
+            signal = _signal(exit_code) if exit_code is not None else None
             crashed = sanitizer is not None or signal is not None or _engine_fatal(crash.engine, output)
+            if wait_error is not None and not crashed:
+                raise wait_error
             return ReplayResult(
                 variant=variant,
                 crashed=crashed,
@@ -547,15 +559,12 @@ class DockerCrashReplayExecutor:
                 output=output,
                 error=(
                     f"target exited {exit_code} without validated crash evidence"
-                    if exit_code != 0 and not crashed else None
+                    if exit_code is not None and exit_code != 0 and not crashed else None
                 ),
             )
         finally:
             if attached is not None:
-                try:
-                    attached.close()
-                except Exception:
-                    pass
+                close_attached_stdin(attached)
             if container is not None:
                 try:
                     container.remove(force=True)
@@ -688,6 +697,12 @@ def _bounded_container_output(container) -> str:
             raise OverflowError("bounded campaign command output exceeded its limit")
         output.extend(encoded)
     return output.decode("utf-8", errors="replace")
+
+
+def _wait_timed_out(error: BaseException) -> bool:
+    return isinstance(error, (RequestsReadTimeout, TimeoutError)) or any(
+        isinstance(value, ReadTimeoutError) for value in error.args
+    )
 
 
 def _replay_environment(sanitizer: str) -> dict[str, str]:

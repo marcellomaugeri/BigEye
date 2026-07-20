@@ -347,6 +347,48 @@ def test_flaky_crash_is_retained_and_cannot_be_promoted_to_vulnerability(tmp_pat
     assert service.artifacts.read_reproducer(finding)
 
 
+@pytest.mark.parametrize("transport_error", ["connection", "read-timeout"])
+def test_replay_transport_failure_is_reprocessed_without_a_duplicate_quarantine_occurrence(
+    tmp_path: Path, transport_error: str,
+):
+    from requests.exceptions import ConnectionError as RequestsConnectionError
+    from requests.exceptions import ReadTimeout
+
+    error_type = RequestsConnectionError if transport_error == "connection" else ReadTimeout
+
+    class TransportFailureReplay(Replay):
+        def __init__(self):
+            super().__init__()
+            self.transport_available = False
+
+        async def replay(self, crash, input_bytes, variant):
+            if not self.transport_available:
+                raise error_type("Docker transport unavailable")
+            return await super().replay(crash, input_bytes, variant)
+
+    replay = TransportFailureReplay()
+    specialist = Specialist()
+    service, repository, native = pipeline(
+        tmp_path, replay=replay, specialist=specialist,
+    )
+
+    with pytest.raises(error_type, match="Docker transport unavailable"):
+        run(service.process(observation()))
+
+    assert repository.calls == []
+    assert specialist.calls == []
+    assert native.calls == []
+    assert list(tmp_path.rglob("metadata.json")) == []
+
+    replay.transport_available = True
+    finding = run(service.process(observation()))
+
+    assert finding.occurrence_count == 1
+    metadata = list(tmp_path.rglob("metadata.json"))
+    assert len(metadata) == 1
+    assert metadata[0].parent.name == "1"
+
+
 def test_fabricated_correction_dictionary_cannot_classify_a_false_positive(tmp_path: Path):
     class Correction:
         def __init__(self):

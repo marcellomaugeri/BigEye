@@ -356,10 +356,12 @@ def test_real_linux_amd64_probe_uses_the_application_sanitizer_runtime(tmp_path:
 
 def test_real_linux_amd64_target_and_coverage_stdin_reach_eof(tmp_path: Path) -> None:
     from backend.fuzzing.coverage.llvm_coverage import DockerCoverageExecutor
+    from backend.fuzzing.crashes.quarantine import CrashObservation
     from backend.fuzzing.docker.container_runner import ContainerRunner
     from backend.fuzzing.docker.image_builder import ImageBuilder
     from backend.fuzzing.docker.image_inspector import ImageInspector
     from backend.fuzzing.sanitizer_environment import BASELINE_SANITIZER_ENVIRONMENT
+    from backend.services.campaigns.production_evidence_factory import DockerCrashReplayExecutor
     from backend.fuzzing.toolchain.builder import ToolchainBuilder
 
     client = _docker_client()
@@ -408,6 +410,24 @@ def test_real_linux_amd64_target_and_coverage_stdin_reach_eof(tmp_path: Path) ->
             )
             assert coverage_output.endswith(b"\n")
             assert (profile_directory / profile_name).is_file()
+
+        crash_input = b"BIGEYE!" + b"x" * 16
+        replay = asyncio.run(DockerCrashReplayExecutor(
+            client, tmp_path, timeout_seconds=10,
+        ).replay(CrashObservation(
+            project_id=PROJECT_ID,
+            campaign_id=1,
+            commit_sha=COMMIT,
+            engine="afl",
+            image_id=target_image,
+            target_asset_id=1,
+            sanitizer="address+undefined",
+            command=("/opt/bigeye/bigeye_system_fixture", "--mode", "plain"),
+            input_bytes=crash_input,
+            input_mode="stdin",
+        ), crash_input, "original"))
+        assert replay.crashed is True
+        assert replay.error is None
 
         for image_id in image_ids:
             inspected = client.api.inspect_image(image_id)

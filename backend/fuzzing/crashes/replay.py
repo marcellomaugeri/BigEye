@@ -6,6 +6,9 @@ from dataclasses import dataclass
 import re
 from typing import Protocol
 
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import ReadTimeout as RequestsReadTimeout
+
 from backend.fuzzing.crashes.quarantine import CrashObservation, _source_reference
 
 
@@ -135,6 +138,10 @@ class CrashReplay:
             if result.image_id != expected_image:
                 raise ValueError("replay executor returned evidence from a different image")
             return result
+        except (
+            RequestsConnectionError, RequestsReadTimeout, ConnectionError, TimeoutError,
+        ):
+            raise
         except Exception as error:
             return ReplayResult(
                 variant=variant, crashed=False, signal=None, stack="", sanitizer=None,

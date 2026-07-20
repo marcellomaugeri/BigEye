@@ -64,7 +64,6 @@ class CrashPipeline:
         self._events = events
 
     async def process(self, observation: CrashObservation) -> Finding | None:
-        quarantined = self.quarantine.persist(observation)
         original = await self._replay.collect_original(observation, observation.input_bytes)
         minimum = await self._minimiser.minimise(
             observation, observation.input_bytes, original.expected_signature, self._replayer,
@@ -75,6 +74,7 @@ class CrashPipeline:
             representative = self._observation_result(observation)
         fingerprint = crash_fingerprint(representative)
         correction = await self._correction_experiment(observation, fingerprint, minimum, replay)
+        quarantined = self.quarantine.persist(observation)
         evidence = self._evidence(observation, fingerprint, replay, minimum, correction, representative, quarantined)
         forced = self._deterministic_classification(observation, replay, correction)
         triage = await self._triage(evidence)
