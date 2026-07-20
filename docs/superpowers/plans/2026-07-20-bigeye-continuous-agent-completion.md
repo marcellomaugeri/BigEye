@@ -185,7 +185,6 @@ git commit -m "feat: persist manager review deadlines"
 **Files:**
 
 - Create: `backend/services/campaigns/execution_slots.py`
-- Modify: `backend/repositories/campaign_repository.py`
 - Modify: `backend/services/campaigns/production_preparation.py`
 - Modify: `backend/services/campaigns/production_runtime.py`
 - Modify: `backend/services/campaigns/project_coordinator.py`
@@ -206,12 +205,15 @@ The public service contract is:
 class ProjectExecutionSlots:
     @asynccontextmanager
     async def compilation(self, project, operation_id: str):
-        """Reserve one heavy-job slot for a bounded compilation transaction."""
+        """Reserve one heavy-job slot and allow atomic promotion to a running fuzzer."""
 
-    async def wait_for_fuzzing_start(
-        self, project, campaign_id: int | None = None,
+    async def try_fuzzing_start(self, project, campaign_id: int):
+        """Return one atomic start reservation, or None when every slot is occupied."""
+
+    async def observe_running(
+        self, project_id: int, campaign_ids: frozenset[int],
     ) -> None:
-        """Wait until one active-fuzzing slot is available."""
+        """Reconstruct active fuzzing identity from deterministic Docker observation."""
 
     def notify(self, project_id: int) -> None:
         """Re-evaluate waiters after a heavy job changes state."""
@@ -225,20 +227,22 @@ backend/.venv/bin/python -m pytest backend/tests/test_execution_slots.py -q
 
 Expected: failure because no slot service exists.
 
-### Step 2: Implement one process-local compilation ledger plus durable active-fuzzer counts
+### Step 2: Implement one process-local ledger reconstructed from Docker observations
 
 `ProjectExecutionSlots` must:
 
 - validate a positive project ID and limit;
 - serialize admission decisions per project with `asyncio.Condition`;
-- ask `CampaignRepository.count_active(project_id, excluding_campaign_id=None)` for unstopped campaigns;
-- count in-flight compilation leases in memory;
+- count in-flight compilation leases, pending start reservations, and Docker-observed running campaigns in memory;
 - admit work only when `active_fuzzers + compilation_leases < project.worker_count`;
 - release compilation leases in `finally`, including cancellation and build failure;
-- clear process-local compilation leases naturally on process restart; active fuzzers are reconstructed from campaign/container reconciliation;
+- allow a successful compilation lease to atomically replace itself with its exact running campaign ID after the container starts;
+- make each recovery/start reservation exclusive until the caller either records a successful start or exits after failure;
+- clear the complete process-local ledger naturally on process restart, then reconstruct active fuzzers from the existing deterministic Docker inspection before attempting any restart;
+- treat persisted-but-not-running campaigns as queued, not active;
 - never be imported by agent runner/dispatch code.
 
-Do not add an execution-lease database table. Compilation processes die with the host process; active fuzzers already have durable campaign/container identity.
+Do not add an execution-lease database table. Compilation processes die with the host process; active fuzzer identity is re-attested from owned Docker containers during reconciliation.
 
 ### Step 3: Gate all heavy start points
 
@@ -252,9 +256,9 @@ async with self._execution_slots.compilation(
     campaign = await self._publish_and_start(project, record, prepared)
 ```
 
-Holding the compilation lease through campaign start prevents the completed build and new fuzzer from briefly exceeding the limit. The lease is then replaced by the active campaign count.
+Holding the compilation lease through campaign start prevents the completed build and new fuzzer from briefly exceeding the limit. After exact container start, mark the lease as promoted to that campaign; exiting the context atomically replaces the compilation identity with the running fuzzer identity.
 
-Before runtime recovery/resume/replacement starts a stopped campaign container, call `wait_for_fuzzing_start(project, campaign.id)`. Existing active campaigns must not acquire a second slot. Every campaign stop, terminal container observation, completed build, or settings limit change calls `notify(project_id)`.
+Before runtime recovery starts stopped campaign containers, call `observe_running` with the full set of currently attested running owned containers. For each non-running recoverable campaign, obtain `try_fuzzing_start`; if no reservation is available, leave that campaign durably queued and continue reconciliation without blocking. Existing active campaigns do not acquire a second slot. Every campaign stop, terminal container observation, completed build, or settings limit change updates the observed set or calls `notify(project_id)`.
 
 In the coordinator, compute `free_slots` from the slot service's heavy-job snapshot, not from OpenAI runs. Rename local variables from `worker` to `job` where they represent Docker work, without renaming the stored `worker_count` compatibility field.
 
@@ -271,13 +275,12 @@ backend/.venv/bin/python -m pytest \
   backend/tests/test_coordinator_production_wiring.py -q
 ```
 
-Expected: four total heavy jobs are admitted; a fifth waits; agent calls do not consume slots; slot cancellation does not leak capacity.
+Expected: four total heavy jobs are admitted; a fifth compilation waits; recovery starts only available queued campaigns and returns without deadlock; concurrent start reservations cannot over-admit; agent calls do not consume slots; cancellation does not leak capacity.
 
 ### Step 5: Commit
 
 ```bash
 git add backend/services/campaigns/execution_slots.py \
-  backend/repositories/campaign_repository.py \
   backend/services/campaigns/production_preparation.py \
   backend/services/campaigns/production_runtime.py \
   backend/services/campaigns/project_coordinator.py backend/api/dependencies.py \
