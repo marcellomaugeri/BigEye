@@ -149,6 +149,12 @@ def test_redaction_removes_credential_shaped_names_and_values() -> None:
         "AWS_ACCESS_KEY_ID": "aws-secret",
         "DATABASE_URL": "postgresql://user:password@db/bigeye",
         "DATABASE_QUERY_URL": "postgresql://db/bigeye?user=admin&password=secret",
+        "ENCODED_BEARER_URL": "https://example.test/?payload=Bearer%20must-not-persist",
+        "NESTED_CREDENTIAL_URL": (
+            "https://example.test/?next="
+            "https%3A%2F%2Fuser%3Apass%40internal.test%2F"
+        ),
+        "EMPTY_PASSWORD_URL": "https://example.test/?%70assword=",
         "authentication": "Bearer bearer-secret",
         "signing_material": "-----BEGIN PRIVATE KEY-----\nprivate-secret",
         "BIGEYE_MODE": "encrypted",
@@ -160,6 +166,9 @@ def test_redaction_removes_credential_shaped_names_and_values() -> None:
         "AWS_ACCESS_KEY_ID": "[REDACTED]",
         "DATABASE_URL": "[REDACTED]",
         "DATABASE_QUERY_URL": "[REDACTED]",
+        "ENCODED_BEARER_URL": "[REDACTED]",
+        "NESTED_CREDENTIAL_URL": "[REDACTED]",
+        "EMPTY_PASSWORD_URL": "[REDACTED]",
         "authentication": "[REDACTED]",
         "signing_material": "[REDACTED]",
         "BIGEYE_MODE": "encrypted",
@@ -170,7 +179,10 @@ def test_redaction_removes_credential_shaped_names_and_values() -> None:
 def test_redaction_preserves_benign_url_query_configuration() -> None:
     from backend.services.observability.redaction import redact
 
-    value = "https://example.test/path?user=reader&mode=encrypted&ssl=true"
+    value = (
+        "https://example.test/path?user=reader&mode=encrypted&ssl=true&next="
+        "https%3A%2F%2Fdocs.example.test%2Fguide%3Fmode%3Dencrypted"
+    )
 
     assert redact({"REMOTE_ENDPOINT": value}) == {"REMOTE_ENDPOINT": value}
 

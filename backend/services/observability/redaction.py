@@ -15,6 +15,8 @@ _BEARER_CREDENTIAL = re.compile(r"\bbearer\s+\S+", re.IGNORECASE)
 _PRIVATE_KEY_MATERIAL = re.compile(
     r"-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----", re.IGNORECASE,
 )
+_MAX_URL_QUERY_FIELDS = 64
+_MAX_DECODED_QUERY_VALUES = 256
 
 
 def is_secret_key(key: object) -> bool:
@@ -33,21 +35,41 @@ def is_secret_key(key: object) -> bool:
 def is_secret_value(value: object) -> bool:
     if not isinstance(value, str):
         return False
-    candidate = value.strip()
-    if _BEARER_CREDENTIAL.search(candidate) or _PRIVATE_KEY_MATERIAL.search(candidate):
-        return True
-    try:
-        parsed = urlsplit(candidate)
+    pending = [value]
+    inspected = 0
+    while pending:
+        inspected += 1
+        if inspected > _MAX_DECODED_QUERY_VALUES:
+            return True
+        candidate = pending.pop().strip()
+        if _BEARER_CREDENTIAL.search(candidate) or _PRIVATE_KEY_MATERIAL.search(candidate):
+            return True
+        try:
+            parsed = urlsplit(candidate)
+        except ValueError:
+            if "://" in candidate and "@" in candidate:
+                return True
+            continue
         if not parsed.scheme or not parsed.netloc:
-            return False
+            continue
         if parsed.username is not None or parsed.password is not None:
             return True
-        return any(
-            bool(item) and is_secret_key(key)
-            for key, item in parse_qsl(parsed.query, keep_blank_values=True)
-        )
-    except ValueError:
-        return "://" in candidate and "@" in candidate
+        try:
+            query = parse_qsl(
+                parsed.query,
+                keep_blank_values=True,
+                max_num_fields=_MAX_URL_QUERY_FIELDS,
+            )
+        except ValueError:
+            return True
+        for key, item in query:
+            if is_secret_key(key):
+                return True
+            if item:
+                if inspected + len(pending) >= _MAX_DECODED_QUERY_VALUES:
+                    return True
+                pending.append(item)
+    return False
 
 
 def redact_environment(value):

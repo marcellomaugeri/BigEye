@@ -105,6 +105,7 @@ def test_line_evidence_response_redacts_credential_shaped_environment_defensivel
                 "GITHUB_PAT": "github-secret",
                 "DATABASE_URL": "postgresql://user:password@db/bigeye",
                 "DATABASE_QUERY_URL": "postgresql://db/bigeye?user=admin&password=secret",
+                "ENCODED_AUTH_URL": "https://example.test/?payload=Bearer%20must-not-persist",
                 "authentication": "Bearer bearer-secret",
             }
             return result
@@ -120,6 +121,7 @@ def test_line_evidence_response_redacts_credential_shaped_environment_defensivel
         "GITHUB_PAT": "[REDACTED]",
         "DATABASE_URL": "[REDACTED]",
         "DATABASE_QUERY_URL": "[REDACTED]",
+        "ENCODED_AUTH_URL": "[REDACTED]",
         "authentication": "[REDACTED]",
     }
 
