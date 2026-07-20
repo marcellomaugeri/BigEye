@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -161,6 +162,83 @@ def test_source_content_changed_after_validation_does_not_publish_new_bytes_unde
 
     assert not (workspace / "projects/7/assets/1").exists()
     assert repository.errors
+
+
+@pytest.mark.parametrize("reuse_hit", (False, True))
+def test_reusable_asset_revalidates_declared_source_after_lookup_await(
+    tmp_path: Path, reuse_hit: bool,
+) -> None:
+    from types import SimpleNamespace
+
+    from backend.agents.tools.generated_assets import read_asset_file, write_asset_file
+    from backend.fuzzing.assets.store import AssetStore
+
+    workspace = tmp_path / "workspace"
+    repository_root = workspace / "projects/7/repository"
+    repository_root.mkdir(parents=True)
+    context = SimpleNamespace(
+        repository_root=repository_root,
+        generated_assets_root=repository_root.parent / "drafts",
+    )
+    created = write_asset_file(
+        context,
+        "project-dependencies.sh",
+        "#!/bin/sh\nset -eu\nexit 0\n",
+        None,
+    )
+    source = context.generated_assets_root / "project-dependencies.sh"
+    binding = (source, created["sha256"])
+
+    class RacingAssets(_Assets):
+        async def mark_validated(self, asset_id):
+            self.validated.append(asset_id)
+            index = next(index for index, asset in enumerate(self.created) if asset.id == asset_id)
+            asset = replace(self.created[index], validated_at=datetime.now(UTC))
+            self.created[index] = asset
+            return asset
+
+        async def find_validated(
+            self, project_id, kind, name, content_hash, parent_id,
+        ):
+            await asyncio.sleep(0)
+            current = read_asset_file(context, "project-dependencies.sh")
+            write_asset_file(
+                context,
+                "project-dependencies.sh",
+                "#!/bin/sh\nset -eu\nexit 2\n",
+                current["sha256"],
+            )
+            if not reuse_hit:
+                return None
+            return next(
+                asset for asset in self.created
+                if (
+                    asset.project_id, asset.kind, asset.name,
+                    asset.content_hash, asset.parent_id,
+                ) == (project_id, kind, name, content_hash, parent_id)
+            )
+
+    repository = RacingAssets()
+    store = AssetStore(workspace, repository)
+    if reuse_hit:
+        run(store.create(
+            7, "script", "project-dependencies.sh",
+            {"project-dependencies.sh": binding}, None,
+        ))
+    count_before_lookup = len(repository.created)
+
+    with pytest.raises(ValueError, match="declared hash"):
+        run(store.create_reusable(
+            7, "script", "project-dependencies.sh",
+            {"project-dependencies.sh": binding}, None,
+        ))
+
+    assert len(repository.created) == count_before_lookup
+    published = workspace / "projects/7/assets"
+    if reuse_hit:
+        assert [path.name for path in published.iterdir()] == ["1"]
+    else:
+        assert not published.exists()
 
 
 def test_symlinked_projects_component_is_rejected_before_reading_external_source(tmp_path: Path) -> None:

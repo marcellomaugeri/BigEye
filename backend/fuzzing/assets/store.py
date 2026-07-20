@@ -94,14 +94,20 @@ class AssetStore:
     ):
         """Reuse one validated content-identical asset when the repository supports lookup."""
         safe_relative_name(name)
-        normalised = self._normalise(project_id, kind, files)
+        preserved = dict(files) if isinstance(files, dict) else files
+        normalised = self._normalise(project_id, kind, preserved)
         content_hash = self._collection_hash(self._hash_sources(project_id, kind, normalised))
         finder = getattr(self._repository, "find_validated", None)
         if finder is not None:
             existing = await finder(project_id, kind, name, content_hash, parent_id)
+            current = self._normalise(project_id, kind, preserved)
+            if self._collection_hash(
+                self._hash_sources(project_id, kind, current)
+            ) != content_hash:
+                raise ValueError("asset source changed during reusable lookup")
             if existing is not None and self._existing_matches(project_id, existing):
                 return existing
-        return await self.create(project_id, kind, name, normalised, parent_id)
+        return await self.create(project_id, kind, name, preserved, parent_id)
 
     def _existing_matches(self, project_id: int, asset) -> bool:
         if (
