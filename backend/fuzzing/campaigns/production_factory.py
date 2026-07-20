@@ -496,15 +496,58 @@ def _reject_agent_compiler_policy(arguments: list[str]) -> None:
             for marker in ("SANIT", "ASAN", "UBSAN", "MSAN", "TSAN")
         )
         if (
-            upper.startswith((
-                "-FSANITIZE", "-FNO-SANITIZE", "-FOMIT-FRAME-POINTER",
-                "-FNO-PROFILE-INSTR-GENERATE", "-FNO-COVERAGE-MAPPING",
-            ))
+            _is_compiler_policy_override(argument)
             or argument.startswith("@")
             or sanitizer_option
             or any(upper.startswith(prefix) for prefix in controlled_assignments)
         ):
             raise ValueError("target build command cannot override BigEye compiler or sanitizer policy")
+
+
+def _is_compiler_policy_override(argument: str) -> bool:
+    upper = argument.upper()
+    if upper.startswith((
+        "-FSANITIZE", "-FNO-SANITIZE", "-FOMIT-FRAME-POINTER",
+        "-FPROFILE-INSTR", "-FNO-PROFILE-INSTR",
+        "-FCOVERAGE-MAPPING", "-FNO-COVERAGE-MAPPING",
+        "-MLLVM", "-XCLANG", "-XLINKER",
+        "-FPLUGIN", "-FPASS-PLUGIN",
+        "-SPECS=", "--SPECS=", "-FUSE-LD=", "-WRAPPER",
+    )):
+        return True
+    if upper.startswith("-WL,"):
+        linker_arguments = upper.removeprefix("-WL,").split(",")
+        return any(
+            value.startswith(("-PLUGIN", "--PLUGIN", "-PLUGIN-OPT", "--PLUGIN-OPT"))
+            or value.startswith(("@", "-WRAP", "--WRAP"))
+            for value in linker_arguments
+        )
+    return False
+
+
+_CMAKE_POLICY_VALUE = re.compile(
+    r"(?:^|[\s;,:=>])(?:"
+    r"@|"
+    r"-f(?:no-)?sanitize(?:[=-]|(?=$|[\s;,:>]))|"
+    r"-fomit-frame-pointer(?:=|(?=$|[\s;,:>]))|"
+    r"-f(?:no-)?profile-instr(?:[=-]|(?=$|[\s;,:>]))|"
+    r"-f(?:no-)?coverage-mapping(?:=|(?=$|[\s;,:>]))|"
+    r"-mllvm(?==|$|[\s;,:>])|-Xclang(?==|$|[\s;,:>])|"
+    r"-Xlinker(?==|$|[\s;,:>])|"
+    r"-fplugin(?:[=-]|(?=$|[\s;,:>]))|"
+    r"-fpass-plugin(?:[=-]|(?=$|[\s;,:>]))|"
+    r"-{1,2}specs=|-fuse-ld=|-wrapper(?==|$|[\s;,:>])|"
+    r"-B(?:[=/]|(?=$|[\s;,:>]))|"
+    r"LINKER:(?:SHELL:)?(?:-{1,2}(?:plugin|wrap)(?:[=,]|(?=$|[\s;:>]))|@)|"
+    r"-Wl,(?:-{1,2}plugin(?:[=,]|(?=$|[\s;:>]))|"
+    r"-{1,2}wrap(?:[=,]|(?=$|[\s;:>]))|@)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _cmake_value_overrides_compiler_policy(value: str) -> bool:
+    return _CMAKE_POLICY_VALUE.search(value) is not None
 
 
 def _instrument_cmake_build(
@@ -650,6 +693,7 @@ def _validate_cmake_project_options(options: list[str]) -> list[str]:
         if match is None:
             raise ValueError("CMake accepts only explicit project -D options")
         key = match.group(1).upper()
+        value = match.group(3)
         if key.startswith("CMAKE_"):
             raise ValueError("CMake application-owned options cannot be overridden")
         if (
@@ -657,6 +701,7 @@ def _validate_cmake_project_options(options: list[str]) -> list[str]:
             or key.endswith(("_CC", "_CXX", "_CFLAGS", "_CXXFLAGS", "_LDFLAGS"))
             or "COMPILER" in key
             or any(marker in key for marker in ("SANIT", "ASAN", "UBSAN", "MSAN", "TSAN"))
+            or _cmake_value_overrides_compiler_policy(value)
         ):
             raise ValueError("target build command cannot override BigEye compiler or sanitizer policy")
         validated.append(option)
@@ -735,6 +780,8 @@ def _instrument_direct_compiler(
         raise ValueError("target build command must use a supported build frontend")
     if any(argument in _SHELL_OPERATOR_TOKENS for argument in arguments):
         raise ValueError("direct compiler build command must be shell-free")
+    if any(argument == "-B" or argument.startswith("-B") for argument in arguments[1:]):
+        raise ValueError("target build command cannot override BigEye compiler or sanitizer policy")
 
     cxx = "++" in compiler_name
     if coverage or instance_type == "component-level":

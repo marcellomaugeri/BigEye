@@ -166,6 +166,103 @@ def test_cmake_project_descriptions_may_name_compilers_without_overriding_them(t
 
 
 @pytest.mark.parametrize(
+    "project_option",
+    (
+        "-DEXTRA_C_FLAGS:STRING=-fno-sanitize=all",
+        "-DEXTRA_OPTIONS:STRING=-mllvm;-asan-stack=0",
+        "-DLINK_OPTIONS:STRING=-Xlinker;-plugin;/src/replace-sanitizer.so",
+        "-DPASS_OPTIONS:STRING=-fpass-plugin=/src/replace-sanitizer.so",
+        "-DEXTRA_LINK_OPTIONS:STRING=LINKER:--wrap=__asan_report_load1",
+        "-DEXTRA_LINK_OPTIONS:STRING=SHELL:-Wl,--wrap=__ubsan_handle_type_mismatch_v1",
+    ),
+)
+def test_cmake_project_option_values_cannot_weaken_instrumentation(
+    tmp_path, project_option: str,
+) -> None:
+    with pytest.raises(ValueError, match="compiler or sanitizer policy"):
+        _generated_scripts(
+            tmp_path,
+            instance_type="system-level",
+            build_command=(
+                f"cmake -S /src -B /opt/bigeye/build {project_option} && "
+                "cmake --build /opt/bigeye/build --target fuzz-target"
+            ),
+        )
+
+
+def test_real_cmake_late_target_flags_cannot_disable_baseline_sanitizers(tmp_path) -> None:
+    _cmake, clang, clangxx = _host_cmake_and_clang()
+    source = tmp_path / "late-flags-source"
+    source.mkdir()
+    (source / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\n"
+        "project(bigeye_late_flags C)\n"
+        "set(EXTRA_C_FLAGS \"\" CACHE STRING \"project target flags\")\n"
+        "separate_arguments(EXTRA_C_FLAGS)\n"
+        "add_executable(fuzz-target main.c)\n"
+        "target_compile_options(fuzz-target PRIVATE ${EXTRA_C_FLAGS})\n"
+        "target_link_options(fuzz-target PRIVATE ${EXTRA_C_FLAGS})\n",
+        encoding="utf-8",
+    )
+    (source / "main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+
+    wrappers = tmp_path / "late-flags-wrappers"
+    wrappers.mkdir()
+    for name, delegate in (("afl-clang-fast", clang), ("afl-clang-fast++", clangxx)):
+        wrapper = wrappers / name
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            f"exec {delegate} \"$@\"\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+
+    target, _coverage = _generated_scripts(
+        tmp_path,
+        instance_type="system-level",
+        build_command=(
+            "cmake -S /src -B /opt/bigeye/build -DEXTRA_C_FLAGS:STRING=-g && "
+            "cmake --build /opt/bigeye/build --target fuzz-target"
+        ),
+    )
+    script = tmp_path / "late-flags-target-build.sh"
+    script.write_text(target, encoding="utf-8")
+    build_root = tmp_path / "late-flags-builds"
+    subprocess.run(
+        ["/bin/sh", str(script)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{wrappers}{os.pathsep}{os.environ['PATH']}",
+            "BIGEYE_SOURCE_DIR": str(source),
+            "BIGEYE_BUILD_ROOT": str(build_root),
+        },
+    )
+
+    actual_build = build_root / "build-system-target"
+    compile_command = json.loads((actual_build / "compile_commands.json").read_text())[0][
+        "command"
+    ]
+    link_command = (actual_build / "CMakeFiles/fuzz-target.dir/link.txt").read_text()
+    assert "-fsanitize=address,undefined" in compile_command
+    assert "-fsanitize=address,undefined" in link_command
+    assert " -g" in compile_command
+
+    with pytest.raises(ValueError, match="compiler or sanitizer policy"):
+        _generated_scripts(
+            tmp_path / "hostile-option",
+            instance_type="system-level",
+            build_command=(
+                "cmake -S /src -B /opt/bigeye/build "
+                "-DEXTRA_C_FLAGS:STRING=-fno-sanitize=all && "
+                "cmake --build /opt/bigeye/build --target fuzz-target"
+            ),
+        )
+
+
+@pytest.mark.parametrize(
     "build_directory",
     ("build", "~/build", "${PWD}/build", "/opt/bigeye/../build", "/tmp/build"),
 )
@@ -269,6 +366,43 @@ def test_benign_source_path_with_gcc_directory_is_not_a_compiler_bypass(tmp_path
     )
 
     assert "src/tools/gcc/parser.c" in target.splitlines()[-1]
+
+
+@pytest.mark.parametrize(
+    "build_command",
+    (
+        "clang -mllvm -asan-stack=0 harness.c -o /opt/bigeye/fuzz-target",
+        "clang -Xclang -load -Xclang /src/replace-sanitizer.so harness.c -o /opt/bigeye/fuzz-target",
+        "clang -fpass-plugin=/src/replace-sanitizer.so harness.c -o /opt/bigeye/fuzz-target",
+        "clang -fplugin=/src/replace-sanitizer.so harness.c -o /opt/bigeye/fuzz-target",
+        "clang -Xlinker -plugin -Xlinker /src/replace-sanitizer.so harness.c -o /opt/bigeye/fuzz-target",
+        "clang -Wl,-plugin,/src/replace-sanitizer.so harness.c -o /opt/bigeye/fuzz-target",
+    ),
+)
+def test_direct_compiler_rejects_backend_plugin_and_pass_through_policy(
+    tmp_path, build_command: str,
+) -> None:
+    with pytest.raises(ValueError, match="compiler or sanitizer policy"):
+        _generated_scripts(
+            tmp_path,
+            instance_type="system-level",
+            build_command=build_command,
+        )
+
+
+def test_direct_compiler_allows_benign_paths_named_after_backend_options(tmp_path) -> None:
+    target, _coverage = _generated_scripts(
+        tmp_path,
+        instance_type="system-level",
+        build_command=(
+            "clang src/mllvm/parser.c src/plugins/fpass-plugin/registry.c "
+            "-o /opt/bigeye/fuzz-target"
+        ),
+    )
+
+    command = target.splitlines()[-1]
+    assert "src/mllvm/parser.c" in command
+    assert "src/plugins/fpass-plugin/registry.c" in command
 
 
 @pytest.mark.parametrize(
