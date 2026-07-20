@@ -1,6 +1,6 @@
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { App } from './App';
 import type { BigEyeApi } from './services/apiClient';
 
@@ -38,6 +38,11 @@ function apiDouble(overrides: Record<string, unknown> = {}) {
     listTasks: vi.fn().mockResolvedValue([]),
     getTaskLog: vi.fn(),
     getSettings: vi.fn(),
+    listCampaigns: vi.fn().mockResolvedValue({ project_id: 7, campaigns: [], assets: [] }),
+    getCoverageTree: vi.fn().mockResolvedValue({ project_id: 7, commit_sha: activeProject.commit_sha, files: [], pagination: { limit: 1000, offset: 0, total: 0 } }),
+    getSourceFile: vi.fn(),
+    getLineEvidence: vi.fn(),
+    listFindings: vi.fn().mockResolvedValue({ items: [], next_cursor: null }),
     ...overrides
   } as BigEyeApi & Record<string, ReturnType<typeof vi.fn>>;
 }
@@ -53,6 +58,8 @@ function deferred<T>() {
 }
 
 describe('App journey', () => {
+  afterEach(() => { window.history.replaceState(null, '', '/'); });
+
   it('keeps implementation names out of primary navigation', async () => {
     render(<App api={apiDouble()} />);
 

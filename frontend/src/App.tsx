@@ -1,24 +1,54 @@
-import { useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Navigation, type Page } from './components/Navigation';
 import { ProjectPicker } from './components/ProjectPicker';
 import { EmptyState } from './components/design-system/EmptyState';
 import { StatusText } from './components/design-system/StatusText';
+import { useProjectOverview } from './controllers/useProjectOverview';
 import { useProjectSettings } from './controllers/useProjectSettings';
 import { useProjects } from './controllers/useProjects';
+import { useSourceAssurance } from './controllers/useSourceAssurance';
 import { createApiClient, type BigEyeApi } from './services/apiClient';
+import { createEventStream, type ProjectEventStream } from './services/eventStream';
+import { OverviewView } from './views/OverviewView';
 import { ProjectsView } from './views/ProjectsView';
 import { SettingsView } from './views/SettingsView';
+import { SourceAssuranceView } from './views/SourceAssuranceView';
 import './app.css';
 
 interface AppProps {
   api?: BigEyeApi;
+  events?: ProjectEventStream;
 }
 
-export function App({ api }: AppProps) {
+const pages: Page[] = ['projects', 'overview', 'source', 'findings', 'activity', 'settings'];
+
+function pageFromLocation(): Page {
+  const candidate = window.location.hash.slice(1);
+  return pages.includes(candidate as Page) ? candidate as Page : 'projects';
+}
+
+export function App({ api, events }: AppProps) {
   const apiClient = useMemo(() => api ?? createApiClient(), [api]);
-  const [page, setPage] = useState<Page>('projects');
-  const projects = useProjects(apiClient, () => setPage('overview'));
+  const eventStream = useMemo(() => events ?? createEventStream(), [events]);
+  const [page, setPage] = useState<Page>(pageFromLocation);
+  const navigate = useCallback((nextPage: Page) => {
+    setPage(nextPage);
+    window.history.replaceState(null, '', `#${nextPage}`);
+  }, []);
+  useEffect(() => {
+    const onHashChange = () => setPage(pageFromLocation());
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, []);
+
+  const projects = useProjects(apiClient, () => navigate('overview'));
   const projectSettings = useProjectSettings(apiClient, projects.selectedProject, page === 'settings', projects.replaceProject);
+  const overview = useProjectOverview(
+    apiClient, eventStream, projects.selectedProject, page === 'overview', projects.replaceProject,
+  );
+  const sourceAssurance = useSourceAssurance(
+    apiClient, eventStream, projects.selectedProject, page === 'source',
+  );
 
   const content = {
     projects: <ProjectsView
@@ -36,8 +66,8 @@ export function App({ api }: AppProps) {
       revision={projects.revision}
       workerCount={projects.workerCount}
     />,
-    overview: <EmptyState title="Overview">Project evidence is not available yet.</EmptyState>,
-    source: <EmptyState title="Source">Source details are unavailable until repository preparation completes.</EmptyState>,
+    overview: <OverviewView model={overview} />,
+    source: <SourceAssuranceView model={sourceAssurance} />,
     findings: <EmptyState title="Findings">Findings are unavailable until crash processing produces evidence.</EmptyState>,
     activity: <EmptyState title="Activity">Activity is unavailable until project events are recorded.</EmptyState>,
     settings: <SettingsView
@@ -58,7 +88,7 @@ export function App({ api }: AppProps) {
   return <main className="app-shell">
     <aside className="sidebar">
       <div className="brand"><span>BigEye</span><small>Repository intelligence</small></div>
-      <Navigation activePage={page} onNavigate={setPage} />
+      <Navigation activePage={page} onNavigate={navigate} />
     </aside>
     <div className="work-surface">
       <header className="app-header">

@@ -45,6 +45,7 @@ class Services:
     analysis: object | None = None
     project_settings: object | None = None
     observability: object | None = None
+    campaigns: object | None = None
     coverage: object | None = None
     findings: object | None = None
     finding_artifacts: object | None = None
@@ -87,5 +88,5 @@ def build_services(pool, workspace: Path) -> Services:
         settings=SettingsService(pool, toolchain.docker_available, toolchain.toolchain_available),
         recovery=backbone, analysis=AnalysisReader(workspace),
         project_settings=ProjectSettingsService(projects, backbone), observability=observability,
-        coverage=coverage, findings=findings, finding_artifacts=finding_artifacts,
+        campaigns=campaigns, coverage=coverage, findings=findings, finding_artifacts=finding_artifacts,
     )

@@ -1,11 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { MAX_WORKER_COUNT, type Project } from '../models/project';
 import type { ProjectSettings } from '../models/settings';
-import type { BigEyeApi } from '../services/apiClient';
-
-function message(error: unknown, fallback: string) {
-  return error instanceof Error ? error.message : fallback;
-}
+import { friendlyApiError, type BigEyeApi } from '../services/apiClient';
 
 export function useProjectSettings(api: BigEyeApi, project: Project | null, enabled: boolean, onProjectChange: (project: Project) => void) {
   const [settings, setSettings] = useState<ProjectSettings | null>(null);
@@ -29,7 +25,7 @@ export function useProjectSettings(api: BigEyeApi, project: Project | null, enab
       setWorkerCount(String(value.worker_count));
       setRepositoryToken('');
     } catch (requestError) {
-      if (generation === requestGeneration.current) setError(message(requestError, 'Could not load project settings.'));
+      if (generation === requestGeneration.current) setError(friendlyApiError(requestError, 'Could not load project settings.'));
     } finally {
       if (generation === requestGeneration.current) setLoading(false);
     }
@@ -64,7 +60,7 @@ export function useProjectSettings(api: BigEyeApi, project: Project | null, enab
       setRepositoryToken('');
     } catch (requestError) {
       if (generation === requestGeneration.current && selectedProjectIdRef.current === projectId) {
-        setError(message(requestError, 'Could not save project settings.'));
+        setError(friendlyApiError(requestError, 'Could not save project settings.'));
       }
     } finally {
       if (generation === requestGeneration.current && selectedProjectIdRef.current === projectId) setSaving(false);
@@ -78,7 +74,7 @@ export function useProjectSettings(api: BigEyeApi, project: Project | null, enab
     try {
       onProjectChange(paused ? await api.pauseProject(project.id) : await api.resumeProject(project.id));
     } catch (requestError) {
-      setError(message(requestError, paused ? 'Could not pause the project.' : 'Could not resume the project.'));
+      setError(friendlyApiError(requestError, paused ? 'Could not pause the project.' : 'Could not resume the project.'));
     } finally {
       setSaving(false);
     }

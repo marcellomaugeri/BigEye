@@ -1,6 +1,8 @@
 import type { CreateProjectRequest, Project } from '../models/project';
 import type { ProjectSettings, Settings, UpdateProjectSettingsRequest } from '../models/settings';
 import type { Task, TaskLog } from '../models/task';
+import type { CampaignList, FindingPageSummary } from '../models/campaign';
+import type { CoverageTree, LineEvidencePage, SourceFile } from '../models/coverage';
 
 export interface BigEyeApi {
   createProject(request: CreateProjectRequest): Promise<Project>;
@@ -13,6 +15,11 @@ export interface BigEyeApi {
   listTasks(projectId: string): Promise<Task[]>;
   getTaskLog(taskId: string, after?: number): Promise<TaskLog>;
   getSettings(): Promise<Settings>;
+  listCampaigns(projectId: string): Promise<CampaignList>;
+  getCoverageTree(projectId: string): Promise<CoverageTree>;
+  getSourceFile(projectId: string, path: string, startLine?: number, endLine?: number): Promise<SourceFile>;
+  getLineEvidence(projectId: string, path: string, lineNumber: number): Promise<LineEvidencePage>;
+  listFindings(projectId: string, cursor?: string): Promise<FindingPageSummary>;
 }
 
 export class ApiClient implements BigEyeApi {
@@ -66,11 +73,41 @@ export class ApiClient implements BigEyeApi {
     return this.request('/api/settings');
   }
 
+  listCampaigns(projectId: string): Promise<CampaignList> {
+    return this.request(`/api/projects/${encodeURIComponent(projectId)}/campaigns`);
+  }
+
+  getCoverageTree(projectId: string): Promise<CoverageTree> {
+    return this.request(`/api/projects/${encodeURIComponent(projectId)}/coverage/tree`);
+  }
+
+  getSourceFile(projectId: string, path: string, startLine = 1, endLine = 500): Promise<SourceFile> {
+    const query = new URLSearchParams({ path, start_line: String(startLine), end_line: String(endLine) });
+    return this.request(`/api/projects/${encodeURIComponent(projectId)}/coverage/source?${query}`);
+  }
+
+  getLineEvidence(projectId: string, path: string, lineNumber: number): Promise<LineEvidencePage> {
+    const query = new URLSearchParams({ path });
+    return this.request(`/api/projects/${encodeURIComponent(projectId)}/coverage/lines/${lineNumber}?${query}`);
+  }
+
+  listFindings(projectId: string, cursor?: string): Promise<FindingPageSummary> {
+    const query = cursor ? `?${new URLSearchParams({ cursor })}` : '';
+    return this.request(`/api/projects/${encodeURIComponent(projectId)}/findings${query}`);
+  }
+
   private async request<T>(path: string, init?: RequestInit): Promise<T> {
     const response = await fetch(`${this.baseUrl}${path}`, init);
-    if (!response.ok) throw new Error(`Request failed (${response.status}).`);
+    if (!response.ok) throw new Error('BigEye local services are temporarily unavailable.');
     return response.json() as Promise<T>;
   }
+}
+
+export function friendlyApiError(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message && !/request failed\s*\(\d+\)/i.test(error.message)) {
+    return error.message;
+  }
+  return fallback;
 }
 
 export function createApiClient(baseUrl?: string): BigEyeApi {

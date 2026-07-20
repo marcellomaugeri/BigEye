@@ -1,9 +1,12 @@
 """SQL access for campaigns only."""
 
+from backend.models.asset import CampaignAsset
 from backend.models.campaign import Campaign
 
 
 class CampaignRepository:
+    _MAX_PROJECT_ASSETS = 1_000
+
     def __init__(self, pool):
         self._pool = pool
 
@@ -24,6 +27,21 @@ class CampaignRepository:
             project_id,
         )
         return [self._campaign(row) for row in rows]
+
+    async def list_with_assets_for_project(
+        self, project_id: int,
+    ) -> tuple[list[Campaign], list[CampaignAsset]]:
+        """Read campaign state and its project-owned names without adding persistence state."""
+        campaigns = await self.list_for_project(project_id)
+        rows = await self._pool.fetch(
+            """SELECT id, project_id, kind, name, content_hash, parent_id, created_at, validated_at, error
+               FROM assets WHERE project_id = $1 ORDER BY created_at, id LIMIT $2""",
+            project_id,
+            self._MAX_PROJECT_ASSETS + 1,
+        )
+        if len(rows) > self._MAX_PROJECT_ASSETS:
+            raise OverflowError("campaign asset read limit exceeded")
+        return campaigns, [CampaignAsset(**dict(row)) for row in rows]
 
     @staticmethod
     def _campaign(row) -> Campaign:

@@ -1,10 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { MAX_WORKER_COUNT, type Project } from '../models/project';
-import type { BigEyeApi } from '../services/apiClient';
-
-function message(error: unknown, fallback: string) {
-  return error instanceof Error ? error.message : fallback;
-}
+import { friendlyApiError, type BigEyeApi } from '../services/apiClient';
 
 export function useProjects(api: BigEyeApi, onProjectCreated: () => void) {
   const [projects, setProjects] = useState<Project[]>([]);
@@ -35,7 +31,7 @@ export function useProjects(api: BigEyeApi, onProjectCreated: () => void) {
       replaceProject(project);
     } catch (requestError) {
       if (generation === projectRequestGeneration.current && selectedProjectIdRef.current === projectId) {
-        setError(message(requestError, 'Could not refresh the project.'));
+        setError(friendlyApiError(requestError, 'BigEye local services are temporarily unavailable.'));
       }
     }
   }, [api, replaceProject]);
@@ -63,7 +59,7 @@ export function useProjects(api: BigEyeApi, onProjectCreated: () => void) {
       setSelectedProjectId(nextId);
       if (nextId && nextProjects.some((project) => project.id === nextId)) void refreshProject(nextId);
     }).catch((requestError: unknown) => {
-      if (active) setError(message(requestError, 'Could not load projects.'));
+      if (active) setError(friendlyApiError(requestError, 'BigEye local services are temporarily unavailable.'));
     }).finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [api, refreshProject]);
@@ -105,7 +101,7 @@ export function useProjects(api: BigEyeApi, onProjectCreated: () => void) {
       setRepositoryToken('');
       onProjectCreated();
     } catch (requestError) {
-      setError(message(requestError, 'Could not start the project.'));
+      setError(friendlyApiError(requestError, 'Could not start the project.'));
     } finally {
       setCreating(false);
     }

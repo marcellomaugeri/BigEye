@@ -1,0 +1,187 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { CampaignList } from '../models/campaign';
+import type { CoverageTree, LineEvidencePage, SourceFile } from '../models/coverage';
+import type { Project } from '../models/project';
+import { friendlyApiError, type BigEyeApi } from '../services/apiClient';
+import type { ProjectEventStream, ProjectInvalidation } from '../services/eventStream';
+
+const UNAVAILABLE = 'BigEye local services are temporarily unavailable.';
+
+export interface SourceAssuranceModel {
+  project: Project | null;
+  tree: CoverageTree | null;
+  source: SourceFile | null;
+  campaigns: CampaignList | null;
+  evidence: LineEvidencePage | null;
+  selectedPath: string | null;
+  selectedLine: number | null;
+  strategyFilter: string;
+  loading: boolean;
+  error: string | null;
+  onSelectPath: (path: string) => void;
+  onSelectLine: (line: number) => void;
+  onStrategyFilter: (strategyId: string) => void;
+}
+
+export function useSourceAssurance(
+  api: BigEyeApi,
+  events: ProjectEventStream,
+  project: Project | null,
+  enabled: boolean,
+): SourceAssuranceModel {
+  const [tree, setTree] = useState<CoverageTree | null>(null);
+  const [source, setSource] = useState<SourceFile | null>(null);
+  const [campaigns, setCampaigns] = useState<CampaignList | null>(null);
+  const [evidence, setEvidence] = useState<LineEvidencePage | null>(null);
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [selectedLine, setSelectedLine] = useState<number | null>(null);
+  const [strategyFilter, setStrategyFilter] = useState('all');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const projectGeneration = useRef(0);
+  const sourceGeneration = useRef(0);
+  const evidenceGeneration = useRef(0);
+  const currentProjectId = useRef<string | null>(project?.id ?? null);
+  const selectedPathRef = useRef<string | null>(null);
+  const selectedLineRef = useRef<number | null>(null);
+
+  const reportError = useCallback((requestError: unknown) => {
+    setError(friendlyApiError(requestError, UNAVAILABLE));
+  }, []);
+
+  const loadSource = useCallback(async (projectId: string, path: string) => {
+    const requestGeneration = ++sourceGeneration.current;
+    setSource(null);
+    setEvidence(null);
+    try {
+      const value = await api.getSourceFile(projectId, path);
+      if (
+        requestGeneration !== sourceGeneration.current ||
+        currentProjectId.current !== projectId || selectedPathRef.current !== path
+      ) return;
+      setSource(value);
+      const firstLine = value.lines[0]?.number ?? null;
+      selectedLineRef.current = firstLine;
+      setSelectedLine(firstLine);
+    } catch (requestError) {
+      if (requestGeneration === sourceGeneration.current && currentProjectId.current === projectId) {
+        reportError(requestError);
+      }
+    }
+  }, [api, reportError]);
+
+  const loadEvidence = useCallback(async (projectId: string, path: string, line: number) => {
+    const requestGeneration = ++evidenceGeneration.current;
+    setEvidence(null);
+    try {
+      const value = await api.getLineEvidence(projectId, path, line);
+      if (
+        requestGeneration !== evidenceGeneration.current || currentProjectId.current !== projectId ||
+        selectedPathRef.current !== path || selectedLineRef.current !== line
+      ) return;
+      setEvidence(value);
+    } catch (requestError) {
+      if (requestGeneration === evidenceGeneration.current && currentProjectId.current === projectId) {
+        reportError(requestError);
+      }
+    }
+  }, [api, reportError]);
+
+  useEffect(() => {
+    currentProjectId.current = project?.id ?? null;
+    const generation = ++projectGeneration.current;
+    sourceGeneration.current += 1;
+    evidenceGeneration.current += 1;
+
+    if (!enabled || project === null) {
+      setTree(null);
+      setSource(null);
+      setCampaigns(null);
+      setEvidence(null);
+      setSelectedPath(null);
+      setSelectedLine(null);
+      selectedPathRef.current = null;
+      selectedLineRef.current = null;
+      setLoading(false);
+      setError(null);
+      return;
+    }
+
+    const projectId = project.id;
+    const isCurrent = () => projectGeneration.current === generation && currentProjectId.current === projectId;
+    const loadTree = async () => {
+      try {
+        const value = await api.getCoverageTree(projectId);
+        if (!isCurrent()) return;
+        setTree(value);
+        const nextPath = selectedPathRef.current && value.files.some((file) => file.path === selectedPathRef.current)
+          ? selectedPathRef.current
+          : (value.files[0]?.path ?? null);
+        if (nextPath !== selectedPathRef.current) {
+          selectedPathRef.current = nextPath;
+          setSelectedPath(nextPath);
+        }
+        if (nextPath) void loadSource(projectId, nextPath);
+      } catch (requestError) {
+        if (isCurrent()) reportError(requestError);
+      }
+    };
+    const loadCampaigns = async () => {
+      try {
+        const value = await api.listCampaigns(projectId);
+        if (isCurrent()) setCampaigns(value);
+      } catch (requestError) {
+        if (isCurrent()) reportError(requestError);
+      }
+    };
+
+    setTree(null);
+    setSource(null);
+    setCampaigns(null);
+    setEvidence(null);
+    selectedPathRef.current = null;
+    selectedLineRef.current = null;
+    setSelectedPath(null);
+    setSelectedLine(null);
+    setStrategyFilter('all');
+    setError(null);
+    setLoading(true);
+    void Promise.allSettled([loadTree(), loadCampaigns()]).finally(() => {
+      if (isCurrent()) setLoading(false);
+    });
+
+    const unsubscribe = events.subscribe(projectId, (name: ProjectInvalidation) => {
+      if (name === 'coverage') void loadTree();
+      if (name === 'campaigns') void loadCampaigns();
+    });
+    return () => unsubscribe();
+  }, [api, enabled, events, loadSource, project, reportError]);
+
+  useEffect(() => {
+    if (!enabled || !project || !selectedPath || selectedLine === null) return;
+    selectedPathRef.current = selectedPath;
+    selectedLineRef.current = selectedLine;
+    void loadEvidence(project.id, selectedPath, selectedLine);
+  }, [enabled, loadEvidence, project, selectedLine, selectedPath]);
+
+  const onSelectPath = useCallback((path: string) => {
+    if (!project || path === selectedPathRef.current) return;
+    selectedPathRef.current = path;
+    selectedLineRef.current = null;
+    setSelectedPath(path);
+    setSelectedLine(null);
+    setStrategyFilter('all');
+    void loadSource(project.id, path);
+  }, [loadSource, project]);
+
+  const onSelectLine = useCallback((line: number) => {
+    selectedLineRef.current = line;
+    setSelectedLine(line);
+  }, []);
+
+  return {
+    project, tree, source, campaigns, evidence, selectedPath, selectedLine,
+    strategyFilter, loading, error, onSelectPath, onSelectLine,
+    onStrategyFilter: setStrategyFilter,
+  };
+}
