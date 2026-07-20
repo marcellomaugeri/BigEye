@@ -1074,7 +1074,7 @@ def test_terra_repair_edits_exactly_one_isolated_existing_draft(tmp_path) -> Non
     proposal = TargetProposal(
         target_name="parser", instance_type="component-level",
         byte_path="bytes to parser", expected_project_reach="parser.c",
-        build_command="clang++ harness.cc", run_command="/opt/bigeye/parser {input}",
+        build_command="clang++ harness.cc", run_command="/opt/bigeye/parser",
         seeds=[{"path": "parser.c", "provenance": "repository"}],
         configuration="default", sanitizer_plan="address and undefined",
         generated_asset_intents=[{
