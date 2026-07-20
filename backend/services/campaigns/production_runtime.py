@@ -17,6 +17,10 @@ from backend.agents.context import AgentContext
 from backend.agents.outputs.campaign_review import RetirementActionRecord
 from backend.fuzzing.discovery.inventory import RepositoryInventory
 from backend.fuzzing.discovery.retrieval import EvidenceRetriever
+from backend.fuzzing.campaigns.monitor import (
+    CampaignArtifactObservation,
+    collect_campaign_sample,
+)
 from backend.fuzzing.docker.campaign_workspace import CampaignWorkspace
 from backend.fuzzing.docker.client import DockerClient
 from backend.fuzzing.docker.fuzz_container import FuzzCampaign, FuzzContainerService
@@ -44,6 +48,9 @@ class CampaignProgressObservation:
     crash_files: int
     evidence_id: str
     container_id: str
+    executions: int = 0
+    executions_per_second: float = 0.0
+    artifacts: tuple[CampaignArtifactObservation, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -58,6 +65,14 @@ class CampaignProgressObservation:
             or len(self.evidence_id) > 256
             or not isinstance(self.container_id, str) or not self.container_id
             or len(self.container_id) > 128
+            or type(self.executions) is not int or self.executions < 0
+            or isinstance(self.executions_per_second, bool)
+            or not isinstance(self.executions_per_second, (int, float))
+            or not math.isfinite(self.executions_per_second)
+            or self.executions_per_second < 0
+            or not isinstance(self.artifacts, tuple)
+            or len(self.artifacts) > 1_024
+            or any(not isinstance(item, CampaignArtifactObservation) for item in self.artifacts)
         ):
             raise ValueError("campaign progress observation is invalid")
 
@@ -104,6 +119,7 @@ class DockerCampaignMonitor:
     def __init__(self, workspace: Path, clock=None):
         self._workspace = CampaignWorkspace(Path(workspace))
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._artifact_cursors: dict[tuple[int, int, str], str] = {}
 
     def observe(self, client, project, campaign, identity, invocation) -> CampaignProgressObservation:
         container = client.containers.get(identity.container_id)
@@ -115,21 +131,36 @@ class DockerCampaignMonitor:
         if type(total_usage) is not int or total_usage < 0:
             raise ValueError("Docker campaign CPU statistics are invalid")
         with self._workspace.open_campaign(project.id, campaign.id, create=False) as directory:
-            if invocation.engine == "afl":
-                queue = _count_files(directory.descriptor, ("output", "main", "queue"), 100_000)
-                crashes = _count_files(
-                    directory.descriptor, ("output", "main", "crashes"), 10_000,
-                    ignored=frozenset({"README.txt"}),
-                )
-            else:
-                queue = _count_files(directory.descriptor, ("corpus",), 100_000)
-                crashes = _count_files(directory.descriptor, ("output",), 10_000)
+            logs_reader = getattr(container, "logs", None)
+            logs = logs_reader(tail=200, stdout=True, stderr=True) if logs_reader is not None else b""
+            sample = collect_campaign_sample(
+                directory.descriptor,
+                invocation.engine,
+                logs,
+                {
+                    name: value
+                    for name in ("queue", "crashes")
+                    if (value := self._artifact_cursors.get((project.id, campaign.id, name)))
+                    is not None
+                },
+            )
+            for name, value in sample.next_artifact_cursors:
+                self._artifact_cursors[(project.id, campaign.id, name)] = value
         digest = sha256(
-            f"{project.id}\0{campaign.id}\0{identity.container_id}\0{total_usage}\0{queue}\0{crashes}".encode()
+            (
+                f"{project.id}\0{campaign.id}\0{identity.container_id}\0{total_usage}\0"
+                f"{sample.executions}\0{sample.executions_per_second}\0"
+                + "\0".join(
+                    f"{item.kind}:{item.relative_path}:{item.content_sha256}"
+                    for item in sample.artifacts
+                )
+            ).encode()
         ).hexdigest()
         return CampaignProgressObservation(
-            campaign.id, total_usage / 1_000_000_000, self._clock(), queue, crashes,
+            campaign.id, total_usage / 1_000_000_000, self._clock(),
+            sample.queue_files, sample.crash_files,
             f"campaign-progress:{campaign.id}:{digest}", identity.container_id,
+            sample.executions, sample.executions_per_second, sample.artifacts,
         )
 
 
@@ -415,7 +446,16 @@ class RepositoryCampaignRuntime:
         self, *, tasks, assets, campaigns, discovery, containers, events=None, clock=None,
         exposure=None, coverage_history=None, overlap=None, invocations=None,
         cpu_counters=None, crash_groups=None, campaign_contexts=None,
+        monitor_interval_seconds: float = 5.0,
+        evidence_processor=None,
     ):
+        if (
+            isinstance(monitor_interval_seconds, bool)
+            or not isinstance(monitor_interval_seconds, (int, float))
+            or not math.isfinite(monitor_interval_seconds)
+            or not 0 < monitor_interval_seconds <= 300
+        ):
+            raise ValueError("campaign monitor interval must be between zero and 300 seconds")
         self._tasks = tasks
         self._assets = assets
         self._campaigns = campaigns
@@ -430,6 +470,10 @@ class RepositoryCampaignRuntime:
         self._cpu_counters = cpu_counters
         self._crash_groups = crash_groups
         self._campaign_contexts = campaign_contexts
+        self._monitor_interval_seconds = float(monitor_interval_seconds)
+        self._evidence_processor = evidence_processor
+        if evidence_processor is not None and invocations is None:
+            raise ValueError("campaign evidence processing requires the invocation store")
         self._observations: dict[int, ContainerObservation] = {}
         self._persisted_campaigns: dict[int, tuple] = {}
         self._persisted_assets: dict[int, dict[int, object]] = {}
@@ -464,6 +508,48 @@ class RepositoryCampaignRuntime:
             observation = replace(
                 observation, progress=tuple(cumulative), evidence=evidence,
             )
+        processing_evidence: list[dict] = []
+        processing_corpus = False
+        processing_crashes = False
+        processing_failures: set[int] = set()
+        if self._evidence_processor is not None:
+            from backend.services.campaigns.production_evidence import CampaignProcessingResult
+
+            campaign_by_id = {campaign.id: campaign for campaign in campaigns}
+            for progress in observation.progress:
+                campaign = campaign_by_id.get(progress.campaign_id)
+                if campaign is None:
+                    raise ValueError("observed campaign is absent from persisted project state")
+                try:
+                    result = await _await(self._evidence_processor.process(
+                        project=project,
+                        campaign=campaign,
+                        invocation=self._invocations.load(project.id, campaign.id),
+                        progress=progress,
+                        assets=tuple(assets),
+                    ))
+                    if not isinstance(result, CampaignProcessingResult):
+                        raise TypeError("campaign evidence processor returned an invalid result")
+                except Exception as error:
+                    processing_failures.add(campaign.id)
+                    processing_evidence.append({
+                        "evidence_id": f"campaign-processing-error:{campaign.id}:{type(error).__name__}",
+                        "project_id": project.id,
+                        "campaign_id": campaign.id,
+                        "error_type": type(error).__name__,
+                        "provenance": "deterministic_campaign_artifact_processing",
+                        "trusted_instructions": False,
+                    })
+                    if self._events is not None:
+                        await self._events.append(project.id, "debug", {
+                            "event": "campaign.artifact_processing_failed",
+                            "campaign_id": campaign.id,
+                            "error_type": type(error).__name__,
+                        })
+                    continue
+                processing_corpus = result.corpus_opportunity or processing_corpus
+                processing_crashes = result.replayed_crash or processing_crashes
+                processing_evidence.extend(result.evidence)
         self._observations[project.id] = observation
         self._persisted_campaigns[project.id] = tuple(campaigns)
         self._persisted_assets[project.id] = {asset.id: asset for asset in assets}
@@ -510,7 +596,12 @@ class RepositoryCampaignRuntime:
             "provenance": "persisted_campaign_context",
             "trusted_instructions": False,
         } for campaign_id, value in sorted(contexts.items()))
-        evidence = tuple(self._discovery.evidence(project.id)) + context_evidence + observation.evidence
+        evidence = (
+            tuple(processing_evidence)
+            + tuple(self._discovery.evidence(project.id))
+            + context_evidence
+            + observation.evidence
+        )
         if len(evidence) > _MAX_REVIEW_EVIDENCE:
             evidence = evidence[:_MAX_REVIEW_EVIDENCE]
         self._review_evidence[project.id] = evidence
@@ -523,9 +614,13 @@ class RepositoryCampaignRuntime:
             initial_supervision_complete=initial_complete,
             review_due=any(deadline <= self._now() for deadline in deadlines),
             next_review_after=min(deadlines) if deadlines else None,
-            unhealthy_worker=bool(observation.unhealthy_campaign_ids),
+            corpus_opportunity=processing_corpus,
+            replayed_crash=processing_crashes,
+            unhealthy_worker=bool(observation.unhealthy_campaign_ids or processing_failures),
             free_slots=max(project.worker_count - len(active_campaigns), 0),
-            material_change=previous_state is not None and previous_state != state,
+            material_change=(
+                previous_state is not None and previous_state != state
+            ) or processing_corpus or processing_crashes,
         )
 
     async def review_context(self, project, _snapshot: CampaignSnapshot) -> AgentContext:
@@ -652,10 +747,9 @@ class RepositoryCampaignRuntime:
         return tuple(self._overlap.compare(histories))
 
     async def wait_for_change(self, _project_id: int, signal: asyncio.Event, deadline) -> None:
-        if deadline is None:
-            await signal.wait()
-            return
-        timeout = max((deadline - self._now()).total_seconds(), 0.0)
+        timeout = self._monitor_interval_seconds
+        if deadline is not None:
+            timeout = min(timeout, max((deadline - self._now()).total_seconds(), 0.0))
         try:
             async with asyncio.timeout(timeout):
                 await signal.wait()
