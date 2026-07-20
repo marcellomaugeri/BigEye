@@ -15,6 +15,7 @@ from backend.services.campaigns.wake_rules import CampaignSnapshot, ReviewTrigge
 
 
 MANAGER_RETRY_DELAY_SECONDS = 30
+MANAGER_FAILURE_BACKOFF_SECONDS = 300
 MAX_MANAGER_REVIEW_ATTEMPTS = 2
 MANAGER_REVIEW_TIMEOUT_SECONDS = 120
 
@@ -227,12 +228,22 @@ class ProjectCoordinator:
                 raise
             except Exception as error:
                 attempts = (pending.attempts if pending is not None else 0) + 1
-                retry_at = now + timedelta(seconds=MANAGER_RETRY_DELAY_SECONDS)
+                retry_delay = (
+                    MANAGER_RETRY_DELAY_SECONDS
+                    if attempts < MAX_MANAGER_REVIEW_ATTEMPTS
+                    else MANAGER_FAILURE_BACKOFF_SECONDS
+                )
+                retry_at = now + timedelta(seconds=retry_delay)
                 retry_evidence = tuple(dict(item) for item in evidence)
                 if isinstance(error, ActionExecutionFailed):
                     retry_evidence = (*retry_evidence, error.evidence)
+                retry_reason = (
+                    f"Retry after {type(error).__name__}: {trigger.reason}"
+                    if attempts < MAX_MANAGER_REVIEW_ATTEMPTS
+                    else f"Failure backoff after {type(error).__name__}: {trigger.reason}"
+                )
                 await self.projects.schedule_manager_review(
-                    project_id, retry_at, f"Retry after {type(error).__name__}: {trigger.reason}",
+                    project_id, retry_at, retry_reason,
                 )
                 if attempts < MAX_MANAGER_REVIEW_ATTEMPTS:
                     self._pending_reviews[project_id] = _PendingReview(
@@ -407,5 +418,5 @@ def _retirement_action(candidate: RetirementCandidate) -> RetirementActionRecord
 
 def _consumed_snapshot(snapshot: CampaignSnapshot, trigger: ReviewTrigger) -> CampaignSnapshot:
     if trigger.reason == "review window expired" and not snapshot.review_due:
-        return replace(snapshot, review_due=True)
+        return replace(snapshot, manager_wake_at=None)
     return snapshot

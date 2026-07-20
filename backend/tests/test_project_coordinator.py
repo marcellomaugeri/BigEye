@@ -327,6 +327,70 @@ def test_successful_manager_review_persists_the_manager_selected_deadline() -> N
     )
 
 
+def test_successive_manager_deadlines_wake_after_each_selected_delay() -> None:
+    project_value = project(manager_wake_at=NOW)
+    manager = AsyncMock()
+    manager.review.side_effect = [
+        SimpleNamespace(decision=SimpleNamespace(
+            next_review_delay_seconds=900,
+            next_review_reason="Recheck clean coverage slope.",
+        )),
+        SimpleNamespace(decision=SimpleNamespace(
+            next_review_delay_seconds=1_200,
+            next_review_reason="Recheck corpus growth.",
+        )),
+    ]
+    current_time = [NOW]
+    subject = coordinator(value=project_value, manager=manager)
+    subject._clock = lambda: current_time[0]
+    subject.decision_executor.execute.return_value = []
+
+    async def schedule(project_id, wake_at, reason):
+        assert project_id == 7
+        project_value.manager_wake_at = wake_at
+
+    subject.projects.schedule_manager_review.side_effect = schedule
+
+    run(subject.tick(7, healthy_snapshot()))
+    current_time[0] += timedelta(seconds=900)
+    run(subject.tick(7, healthy_snapshot()))
+
+    assert manager.review.await_count == 2
+    assert project_value.manager_wake_at == NOW + timedelta(seconds=2_100)
+
+
+def test_second_manager_failure_starts_a_durable_five_minute_backoff() -> None:
+    project_value = project()
+    manager = AsyncMock()
+    manager.review.side_effect = RuntimeError("unavailable")
+    current_time = [NOW]
+    subject = coordinator(value=project_value, manager=manager)
+    subject._clock = lambda: current_time[0]
+    observation = healthy_snapshot(corpus_opportunity=True)
+
+    async def schedule(project_id, wake_at, reason):
+        assert project_id == 7
+        project_value.manager_wake_at = wake_at
+
+    subject.projects.schedule_manager_review.side_effect = schedule
+
+    run(subject.tick(7, observation))
+    current_time[0] += timedelta(seconds=30)
+    run(subject.tick(7, observation))
+
+    assert manager.review.await_count == 2
+    assert project_value.manager_wake_at == NOW + timedelta(seconds=330)
+    assert subject._previous[7].manager_wake_at == NOW + timedelta(seconds=330)
+
+    current_time[0] += timedelta(seconds=30)
+    assert run(subject.tick(7, observation)) is None
+    assert manager.review.await_count == 2
+
+    current_time[0] += timedelta(seconds=270)
+    run(subject.tick(7, observation))
+    assert manager.review.await_count == 3
+
+
 def test_current_deterministic_progression_is_a_prepared_manager_action() -> None:
     from backend.agents.outputs.campaign_review import ProgressionActionRecord
     from backend.services.campaigns.production_runtime import RepositoryCampaignRuntime
