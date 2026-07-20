@@ -75,10 +75,104 @@ class TestImageBuilder:
                     },
                 },))
 
-        with pytest.raises(ImageCompilationFailed, match="did not complete successfully"):
+        with pytest.raises(ImageCompilationFailed, match="did not complete successfully") as captured:
             ImageBuilder(SimpleNamespace(api=Api())).build(
                 dockerfile, "bigeye-target:test", lambda _text: None,
             )
+        assert captured.value.detail.phase == "build-command"
+        assert captured.value.detail.exit_code == 2
+
+    @pytest.mark.parametrize("message", [
+        "failed to solve: dockerfile parse error on line 3: unknown instruction: RNU",
+        "failed to solve with frontend dockerfile.v0: failed to read dockerfile: failed to parse stage name",
+        "COPY failed: file not found in build context or excluded by .dockerignore",
+    ])
+    def test_build_classifies_real_frontend_and_generated_config_shapes_as_repairable(
+        self, tmp_path: Path, message: str,
+    ) -> None:
+        from backend.fuzzing.docker.image_builder import ImageBuilder, ImageCompilationFailed
+
+        dockerfile = tmp_path / "Dockerfile"
+        dockerfile.write_text("FROM ubuntu:24.04\n")
+
+        class Api:
+            def build(self, **kwargs):
+                return iter(({"error": message, "errorDetail": {"message": message}},))
+
+        with pytest.raises(ImageCompilationFailed) as captured:
+            ImageBuilder(SimpleNamespace(api=Api())).build(
+                dockerfile, "bigeye-target:test", lambda _text: None,
+            )
+
+        assert captured.value.detail.phase in {"dockerfile-frontend", "generated-build-config"}
+        assert captured.value.detail.message == message
+
+    def test_structured_build_command_exit_is_repairable_without_message_guessing(self, tmp_path: Path) -> None:
+        from backend.fuzzing.docker.image_builder import ImageBuilder, ImageCompilationFailed
+
+        dockerfile = tmp_path / "Dockerfile"
+        dockerfile.write_text("FROM ubuntu:24.04\n")
+
+        class Api:
+            def build(self, **kwargs):
+                return iter(({
+                    "type": "error",
+                    "error": "generated build step failed",
+                    "errorDetail": {"phase": "build-command", "exitCode": 23, "code": "STEP_FAILED"},
+                },))
+
+        with pytest.raises(ImageCompilationFailed) as captured:
+            ImageBuilder(SimpleNamespace(api=Api())).build(
+                dockerfile, "bigeye-target:test", lambda _text: None,
+            )
+
+        assert captured.value.detail.exit_code == 23
+        assert captured.value.detail.code == "STEP_FAILED"
+        assert captured.value.detail.stream_type == "error"
+
+    @pytest.mark.parametrize(("message", "phase"), [
+        ("Cannot connect to the Docker daemon at unix:///var/run/docker.sock", "engine"),
+        ("failed to resolve source metadata for docker.io/library/ubuntu: i/o timeout", "network"),
+        ("failed to solve: process /bin/sh -c make did not complete successfully: exit code: 137: out of memory", "resource"),
+        ("failed to solve: no space left on device", "resource"),
+    ])
+    def test_daemon_registry_network_and_resource_shapes_remain_fatal(
+        self, tmp_path: Path, message: str, phase: str,
+    ) -> None:
+        from backend.fuzzing.docker.image_builder import ImageBuildFailed, ImageBuilder, ImageCompilationFailed
+
+        dockerfile = tmp_path / "Dockerfile"
+        dockerfile.write_text("FROM ubuntu:24.04\n")
+
+        class Api:
+            def build(self, **kwargs):
+                return iter(({"error": message, "errorDetail": {"message": message}},))
+
+        with pytest.raises(ImageBuildFailed) as captured:
+            ImageBuilder(SimpleNamespace(api=Api())).build(
+                dockerfile, "bigeye-target:test", lambda _text: None,
+            )
+
+        assert not isinstance(captured.value, ImageCompilationFailed)
+        assert captured.value.detail.phase == phase
+
+    def test_docker_api_transport_exception_is_wrapped_as_fatal_build_failure(self, tmp_path: Path) -> None:
+        from backend.fuzzing.docker.image_builder import ImageBuildFailed, ImageBuilder, ImageCompilationFailed
+
+        dockerfile = tmp_path / "Dockerfile"
+        dockerfile.write_text("FROM ubuntu:24.04\n")
+
+        class Api:
+            def build(self, **kwargs):
+                raise ConnectionError("Docker daemon disconnected")
+
+        with pytest.raises(ImageBuildFailed, match="request failed") as captured:
+            ImageBuilder(SimpleNamespace(api=Api())).build(
+                dockerfile, "bigeye-target:test", lambda _text: None,
+            )
+
+        assert not isinstance(captured.value, ImageCompilationFailed)
+        assert captured.value.detail.phase == "engine"
 
     def test_cancellation_closes_active_build_stream_and_joins_cleanly(self, tmp_path: Path) -> None:
         from backend.fuzzing.docker.image_builder import (

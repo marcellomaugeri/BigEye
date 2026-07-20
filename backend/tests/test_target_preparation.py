@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from hashlib import sha256
 import threading
 import time
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from backend.fuzzing.campaigns.probe import (
     ProbeExecutionEvidence,
     ProbeInputEvidence,
     ProbeInvocation,
+    ProbeEvidenceMismatch,
     ProbePolicy,
     ProbeProcessObservation,
     ProbeRunner,
@@ -221,9 +223,12 @@ def test_probe_runs_empty_minimum_and_real_seed_twice_and_records_exact_evidence
     target = SimpleNamespace(
         image="sha256:" + "b" * 64,
         probe_invocations=(
-            ProbeInvocation("empty", "empty", ("/opt/bigeye/probe", "empty")),
-            ProbeInvocation("minimum", "minimum", ("/opt/bigeye/probe", "minimum")),
-            ProbeInvocation("seed:message.bin", "seed", ("/opt/bigeye/probe", "tests/data/message.bin")),
+            ProbeInvocation("empty", "empty", ("/opt/bigeye/probe", "empty"), b""),
+            ProbeInvocation("minimum", "minimum", ("/opt/bigeye/probe", "minimum"), b"\x00"),
+            ProbeInvocation(
+                "seed:message.bin", "seed",
+                ("/opt/bigeye/probe", "tests/data/message.bin"), b"seed-message",
+            ),
         ),
     )
 
@@ -231,7 +236,7 @@ def test_probe_runs_empty_minimum_and_real_seed_twice_and_records_exact_evidence
     target.commit_sha = "a" * 40
     target.coverage_image_id = "sha256:" + "c" * 64
     evidence = run(ProbeService(
-        ProbeRunner(runner), _CleanCoverage([_attested() for _ in range(6)]), timeout_seconds=2.0,
+        ProbeRunner(runner), _CleanCoverage(_attestations_for(target)), timeout_seconds=2.0,
     ).run(target))
 
     assert [call[1][-1] for call in runner.calls] == [
@@ -253,9 +258,9 @@ def test_probe_timeout_is_retained_as_evidence_instead_of_retried_as_transport()
     target = SimpleNamespace(
         image="sha256:" + "b" * 64,
         probe_invocations=(
-            ProbeInvocation("empty", "empty", ("/opt/bigeye/probe", "empty")),
-            ProbeInvocation("minimum", "minimum", ("/opt/bigeye/probe", "minimum")),
-            ProbeInvocation("seed", "seed", ("/opt/bigeye/probe", "seed")),
+            ProbeInvocation("empty", "empty", ("/opt/bigeye/probe", "empty"), b""),
+            ProbeInvocation("minimum", "minimum", ("/opt/bigeye/probe", "minimum"), b"\x00"),
+            ProbeInvocation("seed", "seed", ("/opt/bigeye/probe", "seed"), b"seed"),
         ),
     )
 
@@ -263,7 +268,7 @@ def test_probe_timeout_is_retained_as_evidence_instead_of_retried_as_transport()
     target.commit_sha = "a" * 40
     target.coverage_image_id = "sha256:" + "c" * 64
     evidence = run(ProbeService(
-        ProbeRunner(runner), _CleanCoverage([_attested() for _ in range(6)]), timeout_seconds=1.0,
+        ProbeRunner(runner), _CleanCoverage(_attestations_for(target)), timeout_seconds=1.0,
     ).run(target))
 
     assert evidence.timed_out is True
@@ -278,9 +283,9 @@ def test_probe_preserves_sanitizer_report_emitted_outside_the_result_record() ->
     target = SimpleNamespace(
         image="sha256:" + "b" * 64,
         probe_invocations=(
-            ProbeInvocation("empty", "empty", ("/opt/bigeye/probe", "empty")),
-            ProbeInvocation("minimum", "minimum", ("/opt/bigeye/probe", "minimum")),
-            ProbeInvocation("seed", "seed", ("/opt/bigeye/probe", "seed")),
+            ProbeInvocation("empty", "empty", ("/opt/bigeye/probe", "empty"), b""),
+            ProbeInvocation("minimum", "minimum", ("/opt/bigeye/probe", "minimum"), b"\x00"),
+            ProbeInvocation("seed", "seed", ("/opt/bigeye/probe", "seed"), b"seed"),
         ),
     )
 
@@ -288,7 +293,7 @@ def test_probe_preserves_sanitizer_report_emitted_outside_the_result_record() ->
     target.commit_sha = "a" * 40
     target.coverage_image_id = "sha256:" + "c" * 64
     evidence = run(ProbeService(
-        ProbeRunner(runner), _CleanCoverage([_attested() for _ in range(6)]), timeout_seconds=1.0,
+        ProbeRunner(runner), _CleanCoverage(_attestations_for(target)), timeout_seconds=1.0,
     ).run(target))
 
     assert "runtime error" in evidence.sanitizer_output
@@ -343,9 +348,9 @@ class _Planner:
                 "coverage_configuration": _existing_asset(103, "script", "coverage.sh"),
             },
             probe_invocations=(
-                ProbeInvocation("empty", "empty", ("/opt/bigeye/probe", "empty")),
-                ProbeInvocation("minimum", "minimum", ("/opt/bigeye/probe", "minimum")),
-                ProbeInvocation("seed", "seed", ("/opt/bigeye/probe", "seed")),
+                ProbeInvocation("empty", "empty", ("/opt/bigeye/probe", "empty"), b""),
+                ProbeInvocation("minimum", "minimum", ("/opt/bigeye/probe", "minimum"), b"\x00"),
+                ProbeInvocation("seed", "seed", ("/opt/bigeye/probe", "seed"), b"seed"),
             ),
         )
 
@@ -409,9 +414,13 @@ class _CoverageLayers:
 
     def prepare(
         self, selected_project, project_manifest, adapter, configuration, sink,
+        *, target_asset_id, configuration_asset_id, coverage_asset_id,
         cancellation_signal=None,
     ):
-        self.calls.append((selected_project.id, adapter.id, configuration.id))
+        self.calls.append((
+            selected_project.id, adapter.id, configuration.id,
+            target_asset_id, configuration_asset_id, coverage_asset_id,
+        ))
         return _manifest("coverage", f"bigeye-coverage:{adapter.id}")
 
 
@@ -500,7 +509,9 @@ def test_preparation_plan_requires_empty_minimum_and_real_seed_probes() -> None:
                 "coverage_adapter": _existing_asset(102, "adapter", "adapter.cc"),
                 "coverage_configuration": _existing_asset(103, "script", "coverage.sh"),
             },
-            probe_invocations=(ProbeInvocation("seed", "seed", ("/opt/bigeye/probe", "seed")),),
+            probe_invocations=(
+                ProbeInvocation("seed", "seed", ("/opt/bigeye/probe", "seed"), b"seed"),
+            ),
         )
 
 
@@ -638,9 +649,9 @@ class _ExistingAssetPlanner:
             asset_versions=(),
             existing_assets=self.assets,
             probe_invocations=(
-                ProbeInvocation("empty", "empty", ("/opt/bigeye/probe", "empty")),
-                ProbeInvocation("minimum", "minimum", ("/opt/bigeye/probe", "minimum")),
-                ProbeInvocation("seed", "seed", ("/opt/bigeye/probe", "seed")),
+                ProbeInvocation("empty", "empty", ("/opt/bigeye/probe", "empty"), b""),
+                ProbeInvocation("minimum", "minimum", ("/opt/bigeye/probe", "minimum"), b"\x00"),
+                ProbeInvocation("seed", "seed", ("/opt/bigeye/probe", "seed"), b"seed"),
             ),
         )
 
@@ -669,26 +680,47 @@ def _existing_proposal(target_name="parser", instance_type="component-level"):
     })
 
 
-def test_preparation_lock_is_derived_from_persisted_assets_and_full_target_identity() -> None:
+def test_identical_proposals_serialize_before_publishing_distinct_asset_versions() -> None:
+    assets = _AssetStore()
     target_layers = _ConcurrentTargetLayers()
-    service = preparation(planner=_ExistingAssetPlanner(), target_layers=target_layers)
+    service = preparation(asset_store=assets, target_layers=target_layers)
 
     async def same_target():
         await asyncio.gather(
-            service.prepare(project(), _existing_proposal()),
-            service.prepare(project(), _existing_proposal()),
+            service.prepare(project(), proposal()),
+            service.prepare(project(), proposal()),
         )
 
     run(same_target())
+
+    assert len({asset.id for asset in assets.created}) == 2
+    assert assets.max_active == 1
     assert target_layers.max_active == 1
 
+
+def test_distinct_target_configurations_with_distinct_assets_prepare_in_parallel() -> None:
+    class DistinctAssetPlanner(_ExistingAssetPlanner):
+        def plan(self, selected_project, selected_proposal):
+            offset = 100 if selected_proposal.configuration == "first-config" else 200
+            self.assets = {
+                "target": _existing_asset(offset, "harness", "harness.cc"),
+                "configuration": _existing_asset(offset + 1, "script", "build.sh"),
+                "coverage_adapter": _existing_asset(offset + 2, "adapter", "adapter.cc"),
+                "coverage_configuration": _existing_asset(offset + 3, "script", "coverage.sh"),
+            }
+            return super().plan(selected_project, selected_proposal)
+
     target_layers = _ConcurrentTargetLayers()
-    service = preparation(planner=_ExistingAssetPlanner(), target_layers=target_layers)
+    service = preparation(planner=DistinctAssetPlanner(), target_layers=target_layers)
 
     async def distinct_target_identity():
         await asyncio.gather(
-            service.prepare(project(), _existing_proposal("parser-component", "component-level")),
-            service.prepare(project(), _existing_proposal("parser-system", "system-level")),
+            service.prepare(
+                project(), _existing_proposal().model_copy(update={"configuration": "first-config"}),
+            ),
+            service.prepare(
+                project(), _existing_proposal().model_copy(update={"configuration": "second-config"}),
+            ),
         )
 
     run(distinct_target_identity())
@@ -906,11 +938,45 @@ def _probe_target():
         image="sha256:" + "b" * 64,
         coverage_image_id="sha256:" + "c" * 64,
         probe_invocations=(
-            ProbeInvocation("empty", "empty", ("/opt/bigeye/probe", "empty")),
-            ProbeInvocation("minimum", "minimum", ("/opt/bigeye/probe", "minimum")),
-            ProbeInvocation("seed", "seed", ("/opt/bigeye/probe", "seed")),
+            ProbeInvocation("empty", "empty", ("/opt/bigeye/probe", "empty"), b""),
+            ProbeInvocation("minimum", "minimum", ("/opt/bigeye/probe", "minimum"), b"\x00"),
+            ProbeInvocation("seed", "seed", ("/opt/bigeye/probe", "seed"), b"seed"),
         ),
     )
+
+
+def _attestations_for(target, project_lines=frozenset({"src/parser.cc:12"})):
+    return [
+        _attested(project_lines, input_digest=invocation.testcase_sha256)
+        for invocation in target.probe_invocations
+        for _execution in range(2)
+    ]
+
+
+def test_probe_invocation_derives_exact_empty_minimum_and_seed_digests() -> None:
+    invocations = _probe_target().probe_invocations
+
+    assert [item.testcase_sha256 for item in invocations] == [
+        sha256(b"").hexdigest(),
+        sha256(b"\x00").hexdigest(),
+        sha256(b"seed").hexdigest(),
+    ]
+
+
+@pytest.mark.parametrize("invocation_index", [0, 1, 2])
+def test_probe_rejects_swapped_or_stale_testcase_attestation(invocation_index: int) -> None:
+    target = _probe_target()
+    coverage = _attestations_for(target)
+    wrong_invocation = target.probe_invocations[(invocation_index + 1) % 3]
+    coverage[invocation_index * 2 + 1] = _attested(
+        input_digest=wrong_invocation.testcase_sha256,
+    )
+    runner = _ProbeRunner([ContainerResult(0, "healthy\n") for _ in range(6)])
+
+    with pytest.raises(ProbeEvidenceMismatch, match="exact testcase"):
+        run(ProbeService(
+            ProbeRunner(runner), _CleanCoverage(coverage), timeout_seconds=1.0,
+        ).run(target))
 
 
 def test_forged_target_probe_json_cannot_replace_clean_coverage_attestation() -> None:
@@ -921,9 +987,10 @@ def test_forged_target_probe_json_cannot_replace_clean_coverage_attestation() ->
         '"invalid_api_use":false,"sanitizer_output":""}\n',
     )
     runner = ProbeRunner(_ProbeRunner([forged for _ in range(6)]))
-    coverage = _CleanCoverage([_attested(frozenset()) for _ in range(6)])
+    target = _probe_target()
+    coverage = _CleanCoverage(_attestations_for(target, frozenset()))
 
-    evidence = run(ProbeService(runner, coverage, timeout_seconds=1.0).run(_probe_target()))
+    evidence = run(ProbeService(runner, coverage, timeout_seconds=1.0).run(target))
 
     assert evidence.project_lines == frozenset()
     assert "project code" in ProbePolicy.accept(evidence).reason
@@ -933,9 +1000,10 @@ def test_replay_only_crash_is_preserved_and_rejects_target() -> None:
     healthy = ContainerResult(0, "target output\n")
     replay_crash = ContainerResult(139, "ERROR: AddressSanitizer: heap-buffer-overflow\n")
     bounded = _ProbeRunner([healthy, healthy, healthy, healthy, healthy, replay_crash])
-    coverage = _CleanCoverage([_attested() for _ in range(6)])
+    target = _probe_target()
+    coverage = _CleanCoverage(_attestations_for(target))
 
-    evidence = run(ProbeService(ProbeRunner(bounded), coverage, timeout_seconds=1.0).run(_probe_target()))
+    evidence = run(ProbeService(ProbeRunner(bounded), coverage, timeout_seconds=1.0).run(target))
 
     seed = next(item for item in evidence.inputs if item.role == "seed")
     assert seed.first.immediate_crash is False

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import PurePosixPath
 from typing import Protocol
 
@@ -18,6 +19,7 @@ _SANITIZER_MARKERS = (
 _SIGNAL_EXIT_CODES = frozenset({128 + value for value in range(1, 32)})
 _MAX_COMMAND_PARTS = 64
 _MAX_COMMAND_PART_CHARS = 4_096
+_MAX_TESTCASE_BYTES = 16 * 1024 * 1024
 _MAX_SANITIZER_CHARS = 32_768
 _MAX_COVERAGE_LINES = 1_000_000
 
@@ -46,6 +48,8 @@ class ProbeInvocation:
     name: str
     role: str
     command: tuple[str, ...]
+    testcase_bytes: bytes = field(repr=False)
+    testcase_sha256: str = field(init=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip() or len(self.name) > 500:
@@ -67,6 +71,9 @@ class ProbeInvocation:
             or executable.parts[:3] != ("/", "opt", "bigeye")
         ):
             raise ValueError("probe executable must be a contained BigEye target")
+        if not isinstance(self.testcase_bytes, bytes) or len(self.testcase_bytes) > _MAX_TESTCASE_BYTES:
+            raise ValueError("probe testcase bytes are invalid")
+        object.__setattr__(self, "testcase_sha256", sha256(self.testcase_bytes).hexdigest())
 
 
 @dataclass(frozen=True)
@@ -178,6 +185,10 @@ class CleanCoverageCollector(Protocol):
         invocation: ProbeInvocation,
         process: ProbeProcessObservation,
     ) -> AttestedCoverage: ...
+
+
+class ProbeEvidenceMismatch(RuntimeError):
+    """Clean replay evidence does not belong to the exact supervised testcase."""
 
 
 @dataclass(frozen=True)
@@ -394,8 +405,11 @@ class ProbeService:
             provenance.project_id != target.project_id
             or provenance.commit_sha != target.commit_sha
             or provenance.clean_image_id != target.coverage_image_id
+            or provenance.testcase_sha256 != invocation.testcase_sha256
         ):
-            raise ValueError("clean coverage provenance does not match the prepared target")
+            raise ProbeEvidenceMismatch(
+                "clean coverage provenance does not match the prepared target or exact testcase",
+            )
         accepted = (
             process.alive and not process.timed_out and not process.immediate_crash
             and process.exit_code == 0 and coverage.contract_valid

@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from hashlib import sha256
 import inspect
 from pathlib import PurePosixPath
 from types import MappingProxyType
 from typing import Hashable, Mapping
+import unicodedata
 
 from backend.agents.outputs.campaign_review import TargetProposalRecord
 from backend.agents.outputs.target_proposal import TargetProposal
@@ -202,8 +204,8 @@ class _LockRecord:
     users: int = 0
 
 
-class _AssetLockPool:
-    """Keep per-service locks only while a preparation or waiter uses them."""
+class _LockPool:
+    """Keep canonical service locks only while an operation or waiter uses them."""
 
     def __init__(self) -> None:
         self._guard = asyncio.Lock()
@@ -211,21 +213,35 @@ class _AssetLockPool:
 
     @asynccontextmanager
     async def acquire(self, key: Hashable):
+        async with self.acquire_many((key,)):
+            yield
+
+    @asynccontextmanager
+    async def acquire_many(self, keys: tuple[Hashable, ...]):
+        canonical_keys = tuple(sorted(set(keys), key=repr))
+        if not canonical_keys:
+            yield
+            return
         async with self._guard:
-            record = self._records.setdefault(key, _LockRecord(asyncio.Lock()))
-            record.users += 1
-        acquired = False
+            records = []
+            for key in canonical_keys:
+                record = self._records.setdefault(key, _LockRecord(asyncio.Lock()))
+                record.users += 1
+                records.append((key, record))
+        acquired: list[_LockRecord] = []
         try:
-            await record.lock.acquire()
-            acquired = True
+            for _key, record in records:
+                await record.lock.acquire()
+                acquired.append(record)
             yield
         finally:
-            if acquired:
+            for record in reversed(acquired):
                 record.lock.release()
             async with self._guard:
-                record.users -= 1
-                if record.users == 0:
-                    self._records.pop(key, None)
+                for key, record in records:
+                    record.users -= 1
+                    if record.users == 0:
+                        self._records.pop(key, None)
 
 
 class TargetPreparationService:
@@ -255,8 +271,8 @@ class TargetPreparationService:
         self._repairer = repairer
         self._activity = activity
         self._sink = sink or (lambda _text: None)
-        self._locks = _AssetLockPool()
-        self._validated: dict[tuple[int, str, str, str], PreparedTarget] = {}
+        self._locks = _LockPool()
+        self._validated: dict[tuple[int, str], PreparedTarget] = {}
 
     async def prepare(self, project, proposal: TargetProposal | TargetProposalRecord) -> PreparedTarget:
         self._validate_project(project)
@@ -272,7 +288,11 @@ class TargetPreparationService:
             model = initial_model if not attempts else _TERRA
             attempts.append(model)
             try:
-                prepared = await self._prepare_once(project, project_manifest, candidate, tuple(attempts))
+                identity_key = self._target_identity_lock_key(project.id, candidate)
+                async with self._locks.acquire(identity_key):
+                    prepared = await self._prepare_once(
+                        project, project_manifest, candidate, tuple(attempts),
+                    )
             except DeterministicPreparationError as error:
                 retained = self._validated.get(self._target_key(project, candidate))
                 await self._record_activity(
@@ -361,8 +381,10 @@ class TargetPreparationService:
                 )
                 self._validate_published_asset(project.id, asset)
                 assets[request.role] = asset
-            lock_key = self._preparation_key(project.id, proposal, tuple(assets.values()))
-            async with self._locks.acquire(lock_key):
+            asset_lock_keys = tuple(
+                ("asset", project.id, asset.id) for asset in assets.values()
+            )
+            async with self._locks.acquire_many(asset_lock_keys):
                 target_manifest = await self._run_layer(
                     self._target_layers.prepare,
                     project,
@@ -379,6 +401,9 @@ class TargetPreparationService:
                     assets["coverage_adapter"],
                     assets["coverage_configuration"],
                     self._sink,
+                    target_asset_id=assets["target"].id,
+                    configuration_asset_id=assets["configuration"].id,
+                    coverage_asset_id=assets["coverage_adapter"].id,
                 )
                 self._validate_manifest(target_manifest, "target")
                 self._validate_manifest(coverage_manifest, "coverage")
@@ -421,13 +446,15 @@ class TargetPreparationService:
             raise DeterministicPreparationError(str(error)) from error
 
     @staticmethod
-    async def _run_layer(method, *arguments):
+    async def _run_layer(method, *arguments, **keywords):
         cancellation_signal = BuildCancellationSignal()
         if inspect.iscoroutinefunction(method):
-            worker = asyncio.create_task(method(*arguments, cancellation_signal=cancellation_signal))
+            worker = asyncio.create_task(method(
+                *arguments, **keywords, cancellation_signal=cancellation_signal,
+            ))
         else:
             worker = asyncio.create_task(asyncio.to_thread(
-                method, *arguments, cancellation_signal=cancellation_signal,
+                method, *arguments, **keywords, cancellation_signal=cancellation_signal,
             ))
         try:
             return await asyncio.shield(worker)
@@ -532,17 +559,30 @@ class TargetPreparationService:
     def _proposal_identity(proposal: TargetProposal) -> tuple[str, str, str]:
         return proposal.target_name, proposal.instance_type, proposal.configuration
 
-    @staticmethod
-    def _target_key(project, proposal: TargetProposal) -> tuple[int, str, str, str]:
-        return project.id, proposal.target_name, proposal.instance_type, proposal.configuration
+    @classmethod
+    def _target_key(cls, project, proposal: TargetProposal) -> tuple[int, str]:
+        return project.id, cls._target_identity_digest(proposal)
+
+    @classmethod
+    def _target_identity_lock_key(cls, project_id: int, proposal: TargetProposal) -> tuple[str, int, str]:
+        return "target", project_id, cls._target_identity_digest(proposal)
 
     @staticmethod
-    def _preparation_key(project_id: int, proposal: TargetProposal, assets: tuple[object, ...]) -> tuple:
-        asset_ids = tuple(sorted(asset.id for asset in assets))
-        return (
-            project_id,
-            asset_ids,
-            proposal.target_name,
+    def _target_identity_digest(proposal: TargetProposal) -> str:
+        fields = (
             proposal.instance_type,
+            proposal.target_name,
+            proposal.byte_path,
             proposal.configuration,
+            proposal.build_command,
+            proposal.run_command,
         )
+        digest = sha256()
+        for value in fields:
+            normalized = unicodedata.normalize("NFKC", value).strip()
+            if not normalized:
+                raise ValueError("target identity fields must not be blank")
+            encoded = normalized.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+        return digest.hexdigest()
