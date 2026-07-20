@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 from tempfile import mkdtemp
@@ -456,13 +457,16 @@ def _build_script(command: str, *, instance_type: str, coverage: bool) -> str:
         compile_flags=compile_flags,
         link_flags=link_flags,
     )
-    direct_command = _instrument_direct_compiler(
-        arguments,
-        instance_type=instance_type,
-        coverage=coverage,
-        compile_flags=compile_flags,
-        link_flags=link_flags,
-    )
+    if cmake_command is None:
+        selected_command = _instrument_direct_compiler(
+            arguments,
+            instance_type=instance_type,
+            coverage=coverage,
+            compile_flags=compile_flags,
+            link_flags=link_flags,
+        )
+    else:
+        selected_command = cmake_command
     flags = (
         f"export CC={compiler}\n"
         f"export CXX={cxx_compiler}\n"
@@ -472,7 +476,7 @@ def _build_script(command: str, *, instance_type: str, coverage: bool) -> str:
     )
     if coverage:
         flags += 'export RUSTFLAGS="-C instrument-coverage"\n'
-    return "#!/bin/sh\nset -eu\n" + flags + (cmake_command or direct_command) + "\n"
+    return "#!/bin/sh\nset -eu\n" + flags + selected_command + "\n"
 
 
 def _reject_agent_compiler_policy(arguments: list[str]) -> None:
@@ -485,33 +489,20 @@ def _reject_agent_compiler_policy(arguments: list[str]) -> None:
         "-DCMAKE_MODULE_LINKER_FLAGS",
         "-DCMAKE_TOOLCHAIN_FILE", "--TOOLCHAIN",
     )
-    direct_compilers = {
-        "cc", "c++", "gcc", "g++", "clang", "clang-18", "clang++", "clang++-18",
-        "afl-clang-fast", "afl-clang-fast++",
-    }
-    wrappers = {"sh", "bash", "dash", "zsh", "env", "python", "python3", "perl", "ruby"}
-    if Path(arguments[0]).name in wrappers:
-        raise ValueError("target build command cannot override BigEye compiler or sanitizer policy")
-    for index, argument in enumerate(arguments):
+    for argument in arguments:
         upper = argument.upper()
-        compiler_token = Path(argument).name
-        assigned_value = argument.rsplit("=", 1)[-1] if "=" in argument else ""
         sanitizer_option = upper.startswith("-D") and any(
             marker in upper.split("=", 1)[0]
             for marker in ("SANIT", "ASAN", "UBSAN", "MSAN", "TSAN")
         )
         if (
-            "-FSANITIZE" in upper
-            or "-FNO-SANITIZE" in upper
+            upper.startswith((
+                "-FSANITIZE", "-FNO-SANITIZE", "-FOMIT-FRAME-POINTER",
+                "-FNO-PROFILE-INSTR-GENERATE", "-FNO-COVERAGE-MAPPING",
+            ))
+            or argument.startswith("@")
             or sanitizer_option
             or any(upper.startswith(prefix) for prefix in controlled_assignments)
-            or (
-                index != 0
-                and (
-                    compiler_token in direct_compilers
-                    or Path(assigned_value).name in direct_compilers
-                )
-            )
         ):
             raise ValueError("target build command cannot override BigEye compiler or sanitizer policy")
 
@@ -526,11 +517,7 @@ def _instrument_cmake_build(
     compile_flags: str,
     link_flags: str,
 ) -> str | None:
-    cmake_builds = tuple(
-        index for index, argument in enumerate(arguments[:-1])
-        if Path(argument).name == "cmake" and arguments[index + 1] == "--build"
-    )
-    if not cmake_builds:
+    if arguments[0] != "cmake":
         return None
     operators = tuple(
         (index, value) for index, value in enumerate(arguments)
@@ -538,16 +525,16 @@ def _instrument_cmake_build(
     )
     configure_options: list[str] = []
     source_expression = "$BIGEYE_SOURCE_DIR"
-    if cmake_builds == (0,) and not operators:
+    if len(arguments) >= 2 and arguments[1] == "--build" and not operators:
         build_arguments = arguments
         original_build_directory = _cmake_build_directory(build_arguments)
         cache_guard = _cmake_cache_guard(original_build_directory)
-    elif (
-        len(cmake_builds) == 1
-        and operators == ((cmake_builds[0] - 1, "&&"),)
-    ):
-        configure_arguments = arguments[: cmake_builds[0] - 1]
-        build_arguments = arguments[cmake_builds[0] :]
+    elif len(operators) == 1 and operators[0][1] == "&&":
+        separator = operators[0][0]
+        configure_arguments = arguments[:separator]
+        build_arguments = arguments[separator + 1:]
+        if len(build_arguments) < 2 or build_arguments[:2] != ["cmake", "--build"]:
+            raise ValueError("CMake configuration must be followed by one cmake --build command")
         source_directory, configured_build_directory, configure_options = (
             _parse_cmake_configuration(configure_arguments)
         )
@@ -595,16 +582,19 @@ def _instrument_cmake_build(
 def _cmake_build_directory(arguments: list[str]) -> str:
     if (
         len(arguments) < 3
-        or Path(arguments[0]).name != "cmake"
+        or arguments[0] != "cmake"
         or arguments[1] != "--build"
-        or arguments[2].startswith("-")
     ):
         raise ValueError("CMake build command must provide one build directory")
-    return arguments[2]
+    directory = arguments[2]
+    if directory != "/opt/bigeye/build":
+        raise ValueError("CMake requires the canonical /opt/bigeye/build directory")
+    _validate_cmake_build_options(arguments[3:])
+    return directory
 
 
 def _parse_cmake_configuration(arguments: list[str]) -> tuple[str, str, list[str]]:
-    if not arguments or Path(arguments[0]).name != "cmake":
+    if not arguments or arguments[0] != "cmake":
         raise ValueError("CMake configuration must start with cmake")
     source = None
     build = None
@@ -631,7 +621,7 @@ def _parse_cmake_configuration(arguments: list[str]) -> tuple[str, str, list[str
         index += 1
     if source is None or build is None:
         raise ValueError("explicit CMake configuration requires both -S and -B")
-    return source, build, options
+    return source, build, _validate_cmake_project_options(options)
 
 
 def _cmake_source_expression(source: str) -> str:
@@ -639,10 +629,78 @@ def _cmake_source_expression(source: str) -> str:
         return "$BIGEYE_SOURCE_DIR"
     if source.startswith("/src/"):
         relative = source.removeprefix("/src/")
-        if not relative or any(part in {"", ".", ".."} for part in relative.split("/")):
+        if (
+            not relative
+            or any(part in {"", ".", ".."} for part in relative.split("/"))
+            or any(character in relative for character in "$~\\`")
+        ):
             raise ValueError("CMake source directory must stay inside /src")
         return "$BIGEYE_SOURCE_DIR/" + relative
     raise ValueError("CMake source directory must stay inside /src")
+
+
+def _validate_cmake_project_options(options: list[str]) -> list[str]:
+    validated: list[str] = []
+    pattern = re.compile(
+        r"-D([A-Za-z][A-Za-z0-9_]*)(?::(BOOL|STRING|PATH|FILEPATH))?=(.*)",
+        re.DOTALL,
+    )
+    for option in options:
+        match = pattern.fullmatch(option)
+        if match is None:
+            raise ValueError("CMake accepts only explicit project -D options")
+        key = match.group(1).upper()
+        if key.startswith("CMAKE_"):
+            raise ValueError("CMake application-owned options cannot be overridden")
+        if (
+            key in {"CC", "CXX", "CFLAGS", "CXXFLAGS", "LDFLAGS", "RUSTFLAGS"}
+            or key.endswith(("_CC", "_CXX", "_CFLAGS", "_CXXFLAGS", "_LDFLAGS"))
+            or "COMPILER" in key
+            or any(marker in key for marker in ("SANIT", "ASAN", "UBSAN", "MSAN", "TSAN"))
+        ):
+            raise ValueError("target build command cannot override BigEye compiler or sanitizer policy")
+        validated.append(option)
+    return validated
+
+
+def _validate_cmake_build_options(options: list[str]) -> None:
+    index = 0
+    while index < len(options):
+        option = options[index]
+        if option == "--target":
+            index += 1
+            start = index
+            while index < len(options) and not options[index].startswith("-"):
+                if re.fullmatch(r"[A-Za-z0-9_.:+/-]+", options[index]) is None:
+                    raise ValueError("CMake target name is invalid")
+                index += 1
+            if index == start:
+                raise ValueError("CMake --target requires at least one target")
+            continue
+        if option == "--parallel":
+            index += 1
+            if index < len(options) and not options[index].startswith("-"):
+                if not options[index].isdigit() or not 1 <= int(options[index]) <= 128:
+                    raise ValueError("CMake parallelism must be between 1 and 128")
+                index += 1
+            continue
+        if option.startswith("--parallel="):
+            value = option.removeprefix("--parallel=")
+            if not value.isdigit() or not 1 <= int(value) <= 128:
+                raise ValueError("CMake parallelism must be between 1 and 128")
+            index += 1
+            continue
+        if option == "--config":
+            if index + 1 >= len(options) or re.fullmatch(
+                r"[A-Za-z0-9_.-]+", options[index + 1]
+            ) is None:
+                raise ValueError("CMake --config value is invalid")
+            index += 2
+            continue
+        if option in {"--clean-first", "--verbose"}:
+            index += 1
+            continue
+        raise ValueError("CMake build option is not supported")
 
 
 def _cmake_cache_guard(build_directory: str) -> str:
@@ -667,14 +725,14 @@ def _instrument_direct_compiler(
     compile_flags: str,
     link_flags: str,
 ) -> str:
-    compiler_name = Path(arguments[0]).name
-    direct_compilers = {
-        "clang", "clang-18", "clang++", "clang++-18",
-        "afl-clang-fast", "afl-clang-fast++",
-        "cc", "c++", "gcc", "g++",
-    }
-    if compiler_name not in direct_compilers:
-        return shlex.join(arguments)
+    compiler_name = arguments[0]
+    if re.fullmatch(
+        r"(?:cc|c\+\+|gcc(?:-[0-9]+(?:\.[0-9]+)*)?|g\+\+(?:-[0-9]+(?:\.[0-9]+)*)?"
+        r"|clang(?:-[0-9]+(?:\.[0-9]+)*)?|clang\+\+(?:-[0-9]+(?:\.[0-9]+)*)?"
+        r"|afl-clang-fast(?:\+\+)?)",
+        compiler_name,
+    ) is None:
+        raise ValueError("target build command must use a supported build frontend")
     if any(argument in _SHELL_OPERATOR_TOKENS for argument in arguments):
         raise ValueError("direct compiler build command must be shell-free")
 

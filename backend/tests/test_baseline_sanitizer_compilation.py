@@ -70,6 +70,8 @@ def test_target_specialists_receive_the_supported_explicit_cmake_form(prompt: st
     assert "-B" in prompt
     assert "project -D options" in prompt
     assert "&& cmake --build" in prompt
+    assert "direct Clang or GCC" in prompt
+    assert "Do not use make, Ninja, a script" in prompt
 
 
 def test_system_target_uses_afl_compilers_and_baseline_sanitizers(tmp_path) -> None:
@@ -124,29 +126,84 @@ def test_explicit_cmake_configuration_options_are_replayed_in_fresh_tree(tmp_pat
     assert "/opt/bigeye/build" not in configure
 
 
-def test_build_only_cmake_command_refuses_to_guess_existing_cache_options(tmp_path) -> None:
-    legacy = tmp_path / "legacy-build"
-    legacy.mkdir()
-    (legacy / "CMakeCache.txt").write_text("ENABLE_ENCRYPTION:BOOL=ON\n", encoding="utf-8")
+@pytest.mark.parametrize(
+    "configure_override",
+    (
+        "-DCMAKE_C_COMPILE_OBJECT=/bin/echo",
+        "-DCMAKE_C_LINK_EXECUTABLE=/bin/echo",
+        "-DCMAKE_PROJECT_INCLUDE=/src/override.cmake",
+        "-C /src/override.cmake",
+        "--preset hostile",
+    ),
+)
+def test_cmake_configuration_rejects_rule_include_and_preset_overrides(
+    tmp_path, configure_override: str,
+) -> None:
+    with pytest.raises(ValueError, match="CMake.*option"):
+        _generated_scripts(
+            tmp_path,
+            instance_type="system-level",
+            build_command=(
+                f"cmake -S /src -B /opt/bigeye/build {configure_override} && "
+                "cmake --build /opt/bigeye/build --target fuzz-target"
+            ),
+        )
+
+
+def test_cmake_project_descriptions_may_name_compilers_without_overriding_them(tmp_path) -> None:
     target, _coverage = _generated_scripts(
         tmp_path,
         instance_type="system-level",
-        build_command=f"cmake --build {legacy} --target fuzz-target",
+        build_command=(
+            "cmake -S /src -B /opt/bigeye/build "
+            "-DTOOL_DESCRIPTION:STRING=clang -DSOURCE_HINT=src/tools/gcc && "
+            "cmake --build /opt/bigeye/build --target fuzz-target"
+        ),
     )
 
-    assert "CMakeCache.txt" in target
-    assert "explicit cmake -S ... -B ... && cmake --build" in target
-    script = tmp_path / "build-only.sh"
-    script.write_text(target, encoding="utf-8")
-    result = subprocess.run(
-        ["/bin/sh", str(script)],
-        capture_output=True,
-        text=True,
-        env={**os.environ, "BIGEYE_BUILD_ROOT": str(tmp_path / "new-builds")},
+    assert "-DTOOL_DESCRIPTION:STRING=clang" in target
+    assert "-DSOURCE_HINT=src/tools/gcc" in target
+
+
+@pytest.mark.parametrize(
+    "build_directory",
+    ("build", "~/build", "${PWD}/build", "/opt/bigeye/../build", "/tmp/build"),
+)
+def test_cmake_requires_the_canonical_application_build_directory(
+    tmp_path, build_directory: str,
+) -> None:
+    with pytest.raises(ValueError, match="canonical.*build directory"):
+        _generated_scripts(
+            tmp_path,
+            instance_type="system-level",
+            build_command=f"cmake --build {build_directory} --target fuzz-target",
+        )
+
+
+@pytest.mark.parametrize("source_directory", ("/src/${PWD}", "/src/~/project", "/src/../project"))
+def test_cmake_source_directory_rejects_expansion_and_traversal(
+    tmp_path, source_directory: str,
+) -> None:
+    with pytest.raises(ValueError, match="inside /src"):
+        _generated_scripts(
+            tmp_path,
+            instance_type="system-level",
+            build_command=(
+                f"cmake -S {source_directory} -B /opt/bigeye/build && "
+                "cmake --build /opt/bigeye/build --target fuzz-target"
+            ),
+        )
+
+
+def test_build_only_cmake_command_refuses_to_guess_existing_cache_options(tmp_path) -> None:
+    target, _coverage = _generated_scripts(
+        tmp_path,
+        instance_type="system-level",
+        build_command="cmake --build /opt/bigeye/build --target fuzz-target",
     )
-    assert result.returncode == 2
-    assert "existing CMake configuration requires explicit" in result.stderr
-    assert not (tmp_path / "new-builds/build-system-target").exists()
+
+    assert "/opt/bigeye/build/CMakeCache.txt" in target
+    assert "explicit cmake -S ... -B ... && cmake --build" in target
 
 
 @pytest.mark.parametrize(
@@ -162,7 +219,7 @@ def test_build_only_cmake_command_refuses_to_guess_existing_cache_options(tmp_pa
         "cmake -S /src -B build -DENABLE_ASAN=OFF && cmake --build build",
         "cmake -S /src -B build -DHOST_CC=/usr/bin/gcc && cmake --build build",
         "cmake -S /src -B build -DCMAKE_TOOLCHAIN_FILE=other.cmake && cmake --build build",
-        "sh -c 'gcc harness.c -o /opt/bigeye/fuzz-target'",
+        "clang @agent-flags.rsp harness.c -o /opt/bigeye/fuzz-target",
     ),
 )
 def test_agent_build_command_cannot_override_compiler_or_sanitizer_policy(
@@ -202,6 +259,53 @@ def test_benign_source_path_with_cc_directory_is_not_a_compiler_bypass(tmp_path)
     )
 
     assert "src/cc/parser.c" in target.splitlines()[-1]
+
+
+def test_benign_source_path_with_gcc_directory_is_not_a_compiler_bypass(tmp_path) -> None:
+    target, _coverage = _generated_scripts(
+        tmp_path,
+        instance_type="system-level",
+        build_command="clang src/tools/gcc/parser.c -o /opt/bigeye/fuzz-target",
+    )
+
+    assert "src/tools/gcc/parser.c" in target.splitlines()[-1]
+
+
+@pytest.mark.parametrize(
+    "build_command",
+    (
+        "make -C build",
+        "/src/build.sh",
+        "ninja -C build",
+        "sh -c 'gcc harness.c'",
+        "/usr/bin/gcc-13 harness.c -o /opt/bigeye/fuzz-target",
+    ),
+)
+def test_unattested_build_frontends_are_rejected(tmp_path, build_command: str) -> None:
+    with pytest.raises(ValueError, match="supported build frontend"):
+        _generated_scripts(
+            tmp_path,
+            instance_type="system-level",
+            build_command=build_command,
+        )
+
+
+@pytest.mark.parametrize(
+    ("agent_compiler", "application_compiler"),
+    (("gcc-13", "afl-clang-fast"), ("g++-13", "afl-clang-fast++"), ("clang-19", "afl-clang-fast"), ("clang++-19", "afl-clang-fast++")),
+)
+def test_versioned_direct_compiler_is_rewritten(
+    tmp_path, agent_compiler: str, application_compiler: str,
+) -> None:
+    target, _coverage = _generated_scripts(
+        tmp_path,
+        instance_type="system-level",
+        build_command=f"{agent_compiler} harness.c -o /opt/bigeye/fuzz-target",
+    )
+
+    assert target.splitlines()[-1].startswith(
+        f"{application_compiler} -fsanitize=address,undefined -fno-omit-frame-pointer "
+    )
 
 
 def test_real_cmake_reconfiguration_compiles_and_links_with_system_policy(tmp_path) -> None:
@@ -247,8 +351,8 @@ def test_real_cmake_reconfiguration_compiles_and_links_with_system_policy(tmp_pa
         tmp_path,
         instance_type="system-level",
         build_command=(
-            f"cmake -S /src -B {legacy} -DBIGEYE_FEATURE=ON && "
-            f"cmake --build {legacy} --target fuzz-target"
+            "cmake -S /src -B /opt/bigeye/build -DBIGEYE_FEATURE=ON && "
+            "cmake --build /opt/bigeye/build --target fuzz-target"
         ),
     )
     script = tmp_path / "target-build.sh"
