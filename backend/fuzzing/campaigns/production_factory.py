@@ -270,9 +270,12 @@ class PreparedCleanCoverageCollector:
         replay_command = list(invocation.command)
         if not replay_command:
             raise ValueError("clean probe command is empty")
-        if not replay_command[-1].startswith(("/bigeye/target/", "/src/")):
-            raise ValueError("clean probe requires an explicit file input path")
-        replay_command[-1] = "{input}"
+        if replay_command[-1] == "{stdin}":
+            pass
+        elif replay_command[-1].startswith(("/bigeye/target/", "/src/")):
+            replay_command[-1] = "{input}"
+        else:
+            raise ValueError("clean probe requires one file or stdin input marker")
         context = self._discovery.context(prepared.project_id)
         root = self._workspace / "projects" / str(prepared.project_id) / "probe-inputs"
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -850,11 +853,15 @@ def _probe_invocations(context, proposal) -> tuple[ProbeInvocation, ...]:
         raise ValueError("target run command must start with an /opt/bigeye executable")
     if any(item in _SHELL_OPERATOR_TOKENS for item in command):
         raise ValueError("target run command cannot contain shell operators")
+    if any("{stdin}" in item for item in command):
+        raise ValueError("target run command cannot contain the application-owned stdin marker")
     command = tuple("{input}" if value == "@@" else value for value in command)
     if command.count("{input}") > 1:
         raise ValueError("target run command may contain one input placeholder")
     if "{input}" not in command and proposal.instance_type == "component-level":
         command = (*command, "{input}")
+    if "{input}" not in command and proposal.instance_type == "system-level":
+        command = (*command, "{stdin}")
 
     values = [
         ("empty", "empty", b"", "/bigeye/target/probe/empty.txt"),

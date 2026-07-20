@@ -243,7 +243,15 @@ def test_afl_stdin_crash_adapter_preserves_the_validated_stdin_contract(tmp_path
             return finding
 
     pipeline = Pipeline()
-    handler = ProductionCrashArtifactHandler(tmp_path, Journal(), pipeline)
+    handler = ProductionCrashArtifactHandler(
+        tmp_path, Journal(), pipeline,
+        SimpleNamespace(resolve=lambda **_values: SimpleNamespace(
+            clean_image_id="sha256:" + "c" * 64,
+            replay_command=(
+                "/opt/bigeye/stdin-parser-clean", "--encrypted", "{stdin}",
+            ),
+        )),
+    )
     asyncio.run(handler.process(
         project=SimpleNamespace(id=7, commit_sha=COMMIT),
         campaign=SimpleNamespace(id=9, target_asset_id=31, configuration_asset_id=32),
@@ -258,6 +266,9 @@ def test_afl_stdin_crash_adapter_preserves_the_validated_stdin_contract(tmp_path
 
     assert pipeline.observation.command == ("/opt/bigeye/stdin-parser", "--encrypted")
     assert pipeline.observation.input_mode == "stdin"
+    assert pipeline.observation.clean_command == (
+        "/opt/bigeye/stdin-parser-clean", "--encrypted",
+    )
 
 
 def test_minimisation_adapter_invokes_existing_corpus_minimiser_only_at_threshold(
@@ -364,6 +375,69 @@ def test_clean_coverage_contract_survives_restart_and_resolves_exact_validated_a
     assert target.coverage_asset_id == 34
     assert target.repository_root == repository
     assert campaign_root.joinpath("config/coverage.json").is_file()
+
+
+def test_stdin_clean_coverage_contract_survives_restart_without_argv_input_path(
+    tmp_path: Path,
+) -> None:
+    from backend.fuzzing.campaigns.probe import ProbeInvocation
+    from backend.services.campaigns.production_runtime import CampaignInvocationStore
+
+    _workspace(tmp_path)
+    prepared = SimpleNamespace(
+        project_id=7,
+        commit_sha=COMMIT,
+        coverage_image_id="sha256:" + "c" * 64,
+        coverage_manifest=SimpleNamespace(
+            content_hash="d" * 64,
+            labels={
+                "bigeye.parent-image": IMAGE_ID,
+                "bigeye.configuration-asset-id": "32",
+                "bigeye.coverage-asset-id": "34",
+            },
+        ),
+        target_manifest=SimpleNamespace(labels={"bigeye.target-asset": "31"}),
+        probe_invocations=(
+            ProbeInvocation(
+                "seed", "seed",
+                ("/opt/bigeye/stdin-parser", "--mode", "plain", "{stdin}"),
+                b"seed",
+            ),
+        ),
+    )
+    store = CampaignInvocationStore(tmp_path)
+
+    asyncio.run(store.publish_coverage(7, 9, COMMIT, prepared))
+
+    contract = store.load_coverage(7, 9)
+    assert contract.binary_path == "/opt/bigeye/stdin-parser"
+    assert contract.replay_command == (
+        "/opt/bigeye/stdin-parser", "--mode", "plain", "{stdin}",
+    )
+
+
+@pytest.mark.parametrize(
+    "replay_command",
+    [
+        ("/opt/bigeye/parser", "{stdin}", "{stdin}"),
+        ("/opt/bigeye/parser", "{input}", "{stdin}"),
+        ("/opt/bigeye/parser", "{input}", "--mode={stdin}"),
+        ("/opt/bigeye/parser", "--file={input}", "{stdin}"),
+        ("/opt/bigeye/parser", "plain"),
+    ],
+)
+def test_campaign_coverage_contract_requires_one_application_input_marker(replay_command) -> None:
+    from backend.fuzzing.campaigns.coverage_contract import CampaignCoverageContract
+
+    with pytest.raises(ValueError, match="contract"):
+        CampaignCoverageContract(
+            project_id=7, commit_sha=COMMIT,
+            clean_image_id="sha256:" + "c" * 64,
+            clean_content_hash="d" * 64, clean_parent_image_id=IMAGE_ID,
+            target_asset_id=31, configuration_asset_id=32,
+            clean_build_configuration_asset_id=32, coverage_asset_id=34,
+            binary_path="/opt/bigeye/parser", replay_command=replay_command,
+        )
 
 
 def test_campaign_configuration_files_are_descriptor_published_with_the_invocation(

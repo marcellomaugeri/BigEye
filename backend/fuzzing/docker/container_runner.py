@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from requests.exceptions import ReadTimeout
 
 from backend.fuzzing.docker.image_builder import PLATFORM
+from backend.fuzzing.docker.stdin import MAX_STDIN_BYTES, send_exact_stdin
 
 
 class ContainerTimedOut(RuntimeError):
@@ -34,11 +35,20 @@ class ContainerRunner:
     def __init__(self, client):
         self._client = client
 
-    async def run(self, image: str, command: list[str], timeout: float, sink) -> ContainerResult:
+    async def run(
+        self, image: str, command: list[str], timeout: float, sink, *,
+        stdin_bytes: bytes | None = None,
+    ) -> ContainerResult:
         if timeout <= 0:
             raise ValueError("timeout must be positive")
+        if stdin_bytes is not None and (
+            not isinstance(stdin_bytes, bytes) or len(stdin_bytes) > MAX_STDIN_BYTES
+        ):
+            raise ValueError("container stdin exceeds its byte bound")
         holder: dict[str, object] = {"cancel_requested": False, "cleanup_started": False, "lock": threading.Lock()}
-        worker = asyncio.create_task(asyncio.to_thread(self._run_blocking, holder, image, command, timeout, sink))
+        worker = asyncio.create_task(asyncio.to_thread(
+            self._run_blocking, holder, image, command, timeout, sink, stdin_bytes,
+        ))
         worker.add_done_callback(self._observe_worker)
         try:
             return await asyncio.wait_for(worker, timeout=timeout)
@@ -51,21 +61,42 @@ class ContainerRunner:
             await self._cleanup_holder(holder, stop=True)
             raise
 
-    def _run_blocking(self, holder, image: str, command: list[str], timeout: float, sink) -> ContainerResult:
-        container = self._client.containers.create(
-            image, command, platform=PLATFORM, network_disabled=True, read_only=True,
-            cap_drop=["ALL"], security_opt=["no-new-privileges"], pids_limit=64,
-            mem_limit="512m", nano_cpus=1_000_000_000, detach=True,
-            tmpfs={"/tmp": "rw,nosuid,nodev,exec,size=64m,mode=1777"},
-        )
+    def _run_blocking(
+        self, holder, image: str, command: list[str], timeout: float, sink,
+        stdin_bytes: bytes | None,
+    ) -> ContainerResult:
+        options = {
+            "platform": PLATFORM, "network_disabled": True, "read_only": True,
+            "cap_drop": ["ALL"], "security_opt": ["no-new-privileges"], "pids_limit": 64,
+            "mem_limit": "512m", "nano_cpus": 1_000_000_000, "detach": True,
+            "tmpfs": {"/tmp": "rw,nosuid,nodev,exec,size=64m,mode=1777"},
+        }
+        if stdin_bytes is not None:
+            options.update({"stdin_open": True, "tty": False})
+        container = self._client.containers.create(image, command, **options)
         with holder["lock"]:
             holder["container"] = container
             cancelled = holder["cancel_requested"]
         failed = True
+        attached = None
         try:
             if cancelled:
                 raise ContainerCancelled(f"container {container.id} was cancelled before start")
+            if stdin_bytes is not None:
+                attached = container.attach_socket(params={"stdin": 1, "stream": 1})
+                with holder["lock"]:
+                    holder["attached"] = attached
+                    cancelled = holder["cancel_requested"] or holder["cleanup_started"]
+                if cancelled:
+                    try:
+                        attached.close()
+                    finally:
+                        raise ContainerCancelled(
+                            f"container {container.id} was cancelled during stdin attachment"
+                        )
             container.start()
+            if attached is not None:
+                send_exact_stdin(attached, stdin_bytes, timeout)
             try:
                 waited = container.wait(timeout=timeout)
             except (TimeoutError, ReadTimeout) as error:
@@ -103,6 +134,12 @@ class ContainerRunner:
             if container is None or holder["cleanup_started"]:
                 return
             holder["cleanup_started"] = True
+            attached = holder.get("attached")
+        if attached is not None:
+            try:
+                attached.close()
+            except Exception:
+                pass
         self._cleanup(container, stop)
 
     @staticmethod

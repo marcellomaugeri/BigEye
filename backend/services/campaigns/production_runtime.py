@@ -325,9 +325,14 @@ class CampaignInvocationStore:
             if getattr(probe, "role", None) != "seed":
                 continue
             command = tuple(getattr(probe, "command", ()))
-            if not command or not command[-1].startswith(("/src/", "/bigeye/target/")):
+            if not command:
                 raise ValueError("prepared coverage probe has no explicit input")
-            commands.append((*command[:-1], "{input}"))
+            if command[-1] == "{stdin}":
+                commands.append(command)
+            elif command[-1].startswith(("/src/", "/bigeye/target/")):
+                commands.append((*command[:-1], "{input}"))
+            else:
+                raise ValueError("prepared coverage probe has no explicit input")
         if not commands or len(set(commands)) != 1:
             raise ValueError("prepared coverage probes do not share one replay contract")
         replay_command = commands[0]

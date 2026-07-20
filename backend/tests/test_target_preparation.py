@@ -250,6 +250,146 @@ def test_probe_runs_empty_minimum_and_real_seed_twice_and_records_exact_evidence
     assert ProbePolicy.accept(evidence).accepted is True
 
 
+def test_probe_runner_strips_internal_stdin_marker_and_feeds_exact_testcase_bytes() -> None:
+    class BoundedRunner:
+        async def run(self, image, command, timeout, sink, *, stdin_bytes=None):
+            self.call = (image, command, timeout, stdin_bytes)
+            return ContainerResult(0, "")
+
+    bounded = BoundedRunner()
+    invocation = ProbeInvocation(
+        "seed", "seed", ("/opt/bigeye/stdin-parser", "--mode", "plain", "{stdin}"),
+        b"\x00seed\xff",
+    )
+
+    result = run(ProbeRunner(bounded).run(
+        "sha256:" + "b" * 64, invocation, 2.0, lambda _text: None,
+    ))
+
+    assert result.exit_code == 0
+    assert bounded.call == (
+        "sha256:" + "b" * 64,
+        ["/opt/bigeye/stdin-parser", "--mode", "plain"],
+        2.0,
+        b"\x00seed\xff",
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("/opt/bigeye/parser", "{stdin}", "{stdin}"),
+        ("/opt/bigeye/parser", "{input}", "{stdin}"),
+    ],
+)
+def test_probe_invocation_rejects_multiple_or_mixed_internal_markers(command) -> None:
+    with pytest.raises(ValueError, match="input marker"):
+        ProbeInvocation("seed", "seed", command, b"seed")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("/opt/bigeye/parser", "--input={stdin}"),
+        ("/opt/bigeye/parser", "{stdin}", "--plain"),
+    ],
+)
+def test_probe_invocation_rejects_nonstandalone_or_nonfinal_stdin_marker(command) -> None:
+    with pytest.raises(ValueError, match="input marker"):
+        ProbeInvocation("seed", "seed", command, b"seed")
+
+
+def test_probe_invocation_preserves_ordinary_file_mode_command() -> None:
+    command = ("/opt/bigeye/parser", "--file", "/src/tests/seed.bin")
+
+    invocation = ProbeInvocation("seed", "seed", command, b"seed")
+
+    assert invocation.command == command
+
+
+def test_system_stdin_planning_adds_one_internal_marker_and_file_mode_stays_concrete(
+    tmp_path,
+) -> None:
+    from backend.fuzzing.campaigns.production_factory import _probe_invocations
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "seed.bin").write_bytes(b"exact-seed")
+    context = SimpleNamespace(repository_root=repository)
+    seed = proposal().seeds[0].model_copy(update={
+        "path": "seed.bin", "provenance": "repository",
+    })
+    stdin_proposal = proposal().model_copy(update={
+        "instance_type": "system-level",
+        "run_command": "/opt/bigeye/parser --plain",
+        "seeds": [seed],
+    })
+    file_proposal = stdin_proposal.model_copy(update={
+        "run_command": "/opt/bigeye/parser --file @@",
+    })
+
+    stdin = _probe_invocations(context, stdin_proposal)
+    file_mode = _probe_invocations(context, file_proposal)
+
+    assert all(item.command[-1] == "{stdin}" for item in stdin)
+    assert all(item.command.count("{stdin}") == 1 for item in stdin)
+    assert [item.command[-1] for item in file_mode] == [
+        "/bigeye/target/probe/empty.txt",
+        "/bigeye/target/probe/minimum.txt",
+        "/src/seed.bin",
+    ]
+    assert all("{stdin}" not in item.command for item in file_mode)
+
+
+def test_clean_probe_coverage_replays_same_stdin_bytes_without_an_argv_path(
+    tmp_path, monkeypatch,
+) -> None:
+    from backend.fuzzing.campaigns.production_factory import PreparedCleanCoverageCollector
+    from backend.fuzzing.coverage.llvm_coverage import LlvmCoverage
+
+    repository = tmp_path / "projects/7/repository"
+    repository.mkdir(parents=True)
+    captured = {}
+
+    def replay(_self, campaign, inputs):
+        captured["command"] = campaign.replay_command
+        captured["bytes"] = inputs[0].read_bytes()
+        return SimpleNamespace(lines=())
+
+    monkeypatch.setattr(LlvmCoverage, "replay", replay)
+    prepared = SimpleNamespace(
+        project_id=7,
+        commit_sha="a" * 40,
+        coverage_image_id="sha256:" + "c" * 64,
+        target_manifest=SimpleNamespace(labels={"bigeye.target-asset": "31"}),
+        coverage_manifest=SimpleNamespace(
+            tag="bigeye-coverage:test",
+            content_hash="d" * 64,
+            labels={
+                "bigeye.configuration-asset-id": "32",
+                "bigeye.coverage-asset-id": "34",
+                "bigeye.parent-image": "sha256:" + "e" * 64,
+            },
+        ),
+    )
+    invocation = ProbeInvocation(
+        "seed", "seed", ("/opt/bigeye/stdin-parser", "--plain", "{stdin}"),
+        b"\x00exact-clean\xff",
+    )
+    collector = PreparedCleanCoverageCollector(
+        SimpleNamespace(), tmp_path,
+        SimpleNamespace(context=lambda _project_id: SimpleNamespace(repository_root=repository)),
+    )
+
+    evidence = run(collector.collect(prepared, invocation, SimpleNamespace()))
+
+    assert captured == {
+        "command": ("/opt/bigeye/stdin-parser", "--plain", "{stdin}"),
+        "bytes": b"\x00exact-clean\xff",
+    }
+    assert evidence.provenance.testcase_sha256 == invocation.testcase_sha256
+
+
 def test_probe_timeout_is_retained_as_evidence_instead_of_retried_as_transport() -> None:
     runner = _ProbeRunner([
         _probe_output(), _probe_output(), _probe_output(), _probe_output(),

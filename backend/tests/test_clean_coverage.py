@@ -359,6 +359,122 @@ def test_docker_executor_is_isolated_and_returns_stdout_only(tmp_path: Path):
         )
 
 
+def test_docker_coverage_executor_feeds_exact_stdin_without_mounting_input(tmp_path: Path):
+    import socket
+
+    from backend.fuzzing.coverage.llvm_coverage import DockerCoverageExecutor
+
+    class AttachedSocket:
+        def __init__(self): self._sock = self; self.sent = bytearray(); self.closed = False
+        def sendall(self, value): self.sent.extend(value)
+        def shutdown(self, value): self.shutdown_mode = value
+        def close(self): self.closed = True
+
+    class Container:
+        def __init__(self): self.socket = AttachedSocket()
+        def attach_socket(self, params): return self.socket
+        def start(self): pass
+        def wait(self, timeout): return {"StatusCode": 0}
+        def logs(self, **kwargs): return []
+        def remove(self, force): pass
+
+    container = Container()
+    class Containers:
+        def create(self, *args, **kwargs): self.command = args[1]; self.kwargs = kwargs; return container
+
+    containers = Containers()
+    result = DockerCoverageExecutor(
+        SimpleNamespace(containers=containers), timeout_seconds=30,
+    ).run(
+        CLEAN_IMAGE_ID, ("/opt/bigeye/stdin-parser", "--mode", "plain"), {}, tmp_path,
+        stdin_bytes=b"\x00coverage\xff",
+    )
+
+    assert result == b""
+    assert containers.command == ["/opt/bigeye/stdin-parser", "--mode", "plain"]
+    assert containers.kwargs["volumes"] == {
+        str(tmp_path.resolve()): {"bind": "/coverage/profiles", "mode": "rw"},
+    }
+    assert containers.kwargs["stdin_open"] is True
+    assert bytes(container.socket.sent) == b"\x00coverage\xff"
+    assert container.socket.shutdown_mode == socket.SHUT_WR
+    assert container.socket.closed is True
+
+
+def test_docker_coverage_executor_removes_container_when_stdin_attach_fails(tmp_path: Path):
+    from backend.fuzzing.coverage.llvm_coverage import DockerCoverageExecutor
+
+    removed = []
+
+    class Container:
+        def attach_socket(self, params): raise RuntimeError("attach failed")
+        def remove(self, force): removed.append(force)
+
+    class Containers:
+        def create(self, *args, **kwargs): return Container()
+
+    with pytest.raises(RuntimeError, match="attach failed"):
+        DockerCoverageExecutor(
+            SimpleNamespace(containers=Containers()), timeout_seconds=30,
+        ).run(
+            CLEAN_IMAGE_ID, ("/opt/bigeye/stdin-parser",), {}, tmp_path,
+            stdin_bytes=b"exact",
+        )
+
+    assert removed == [True]
+
+
+def test_llvm_coverage_stdin_replay_strips_marker_and_preserves_input_identity(tmp_path: Path):
+    from backend.fuzzing.coverage.llvm_coverage import LlvmCoverage
+
+    repository = tmp_path / "repository"
+    (repository / "src").mkdir(parents=True)
+    (repository / "src/a.c").write_bytes(b"int parse(void) { return 1; }\n")
+    seed = tmp_path / "seed"
+    seed.write_bytes(b"\x00stdin-seed\xff")
+
+    class Executor(_CoverageExecutor):
+        def run(self, image_id, command, environment, profile_directory, input_file=None, stdin_bytes=None):
+            self.stdin_calls = getattr(self, "stdin_calls", [])
+            if "LLVM_PROFILE_FILE" in environment:
+                self.stdin_calls.append((command, input_file, stdin_bytes))
+            return super().run(image_id, command, environment, profile_directory, input_file)
+
+    executor = Executor(
+        {"input-000000": _export(), "merged": _export()},
+        {"/src/src/a.c": b"int parse(void) { return 1; }\n"},
+    )
+    snapshot = LlvmCoverage(_client(), executor, tmp_path / "work").replay(
+        _campaign(tmp_path, replay_command=("/src/build/clean-target", "--plain", "{stdin}")),
+        (seed,),
+    )
+
+    assert executor.stdin_calls == [
+        (("/src/build/clean-target", "--plain"), None, b"\x00stdin-seed\xff"),
+    ]
+    assert snapshot.replay_command == ("/src/build/clean-target", "--plain", "{stdin}")
+    assert snapshot.hits[0].testcase == b"\x00stdin-seed\xff"
+
+
+@pytest.mark.parametrize(
+    "replay_command",
+    [
+        ("/src/build/clean-target", "{stdin}", "{stdin}"),
+        ("/src/build/clean-target", "{input}", "{stdin}"),
+        ("/src/build/clean-target", "{input}", "--mode={stdin}"),
+        ("/src/build/clean-target", "--file={input}", "{stdin}"),
+        ("/src/build/clean-target", "plain"),
+    ],
+)
+def test_llvm_coverage_rejects_invalid_input_marker_contract(tmp_path: Path, replay_command) -> None:
+    from backend.fuzzing.coverage.llvm_coverage import LlvmCoverage
+
+    with pytest.raises(ValueError, match="input marker"):
+        LlvmCoverage(_client(), _CoverageExecutor({}), tmp_path / "work").replay(
+            _campaign(tmp_path, replay_command=replay_command), (),
+        )
+
+
 def test_fuzz_patch_paths_cannot_enter_reported_coverage(tmp_path: Path):
     from backend.fuzzing.coverage.llvm_coverage import CoverageIntegrityError
     from backend.fuzzing.coverage.traceability import TraceabilityService

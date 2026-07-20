@@ -64,6 +64,13 @@ class ProbeInvocation:
             )
         ):
             raise ValueError("probe command is invalid")
+        markers = self.command.count("{input}") + self.command.count("{stdin}")
+        if (
+            markers > 1
+            or any("{stdin}" in part and part != "{stdin}" for part in self.command)
+            or ("{stdin}" in self.command and self.command[-1] != "{stdin}")
+        ):
+            raise ValueError("probe command input marker is invalid")
         executable = PurePosixPath(self.command[0])
         if (
             not executable.is_absolute() or executable.name.casefold() in _SHELL_NAMES
@@ -150,9 +157,16 @@ class ProbeRunner:
     async def run(self, image_id: str, invocation: ProbeInvocation, timeout: float, sink) -> ProbeProcessObservation:
         _exact_image_id(image_id, "probe image")
         try:
-            result = await self._bounded_runner.run(
-                image_id, list(invocation.command), timeout, sink,
-            )
+            if "{stdin}" in invocation.command:
+                command = [part for part in invocation.command if part != "{stdin}"]
+                result = await self._bounded_runner.run(
+                    image_id, command, timeout, sink,
+                    stdin_bytes=invocation.testcase_bytes,
+                )
+            else:
+                result = await self._bounded_runner.run(
+                    image_id, list(invocation.command), timeout, sink,
+                )
         except ContainerTimedOut:
             return ProbeProcessObservation(None, False, True, False, "")
         exit_code = getattr(result, "exit_code", None)

@@ -153,6 +153,10 @@ def _validate_run_command(value: str, expected_type: str) -> None:
             "specialist run_command must be shell-free argv without shell operators, "
             "redirection, pipes, or command substitution"
         )
+    if any("{stdin}" in argument for argument in arguments):
+        raise SpecialistValidationError(
+            "specialist run_command cannot contain the application-owned stdin marker"
+        )
     placeholders = tuple(
         argument for argument in arguments if "@@" in argument or "{input}" in argument
     )

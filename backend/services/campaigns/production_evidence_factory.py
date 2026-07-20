@@ -11,7 +11,6 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
-import socket
 import stat
 from tempfile import mkdtemp
 from uuid import uuid4
@@ -43,6 +42,7 @@ from backend.fuzzing.crashes.replay import ReplayResult
 from backend.fuzzing.crashes.triage import CrashPipeline
 from backend.fuzzing.docker.fuzz_container import FuzzCampaign, FuzzContainerService
 from backend.fuzzing.docker.image_builder import PLATFORM
+from backend.fuzzing.docker.stdin import send_exact_stdin
 from backend.services.campaigns.production_artifacts import (
     CampaignCoverageTargetResolver,
     ProductionCorpusArtifactHandler,
@@ -527,7 +527,7 @@ class DockerCrashReplayExecutor:
                 attached = container.attach_socket(params={"stdin": 1, "stream": 1})
             container.start()
             if attached is not None:
-                _send_stdin(attached, input_bytes, self._timeout)
+                send_exact_stdin(attached, input_bytes, self._timeout)
             result = container.wait(timeout=self._timeout)
             exit_code = int(result["StatusCode"])
             output = _bounded_container_output(container)
@@ -725,17 +725,6 @@ def _engine_fatal(engine: str, output: str) -> bool:
     return engine == "libfuzzer" and any(
         marker in output for marker in ("libFuzzer: deadly signal", "libFuzzer: fuzz target exited")
     )
-
-
-def _send_stdin(attached, content: bytes, timeout_seconds: int) -> None:
-    if not isinstance(content, bytes) or len(content) > 16 * 1024 * 1024:
-        raise ValueError("crash replay stdin exceeds its byte bound")
-    raw = getattr(attached, "_sock", attached)
-    settimeout = getattr(raw, "settimeout", None)
-    if settimeout is not None:
-        settimeout(timeout_seconds)
-    raw.sendall(content)
-    raw.shutdown(socket.SHUT_WR)
 
 
 def _unprivileged_user() -> str:

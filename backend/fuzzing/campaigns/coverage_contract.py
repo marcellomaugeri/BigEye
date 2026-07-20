@@ -50,7 +50,7 @@ class CampaignCoverageContract:
             or not isinstance(self.replay_command, tuple)
             or not 1 <= len(self.replay_command) <= 256
             or self.replay_command[0] != self.binary_path
-            or self.replay_command.count("{input}") != 1
+            or not valid_replay_command_markers(self.replay_command)
             or any(
                 not isinstance(value, str) or not value or "\x00" in value or len(value) > 4_096
                 for value in self.replay_command
@@ -58,6 +58,19 @@ class CampaignCoverageContract:
             or not valid_replay_environment(self.replay_environment)
         ):
             raise ValueError("campaign clean-coverage contract is invalid")
+
+
+def valid_replay_command_markers(values) -> bool:
+    if not isinstance(values, tuple) or any(not isinstance(value, str) for value in values):
+        return False
+    markers = {"{input}", "{stdin}"}
+    return (
+        sum(value in markers for value in values) == 1
+        and all(
+            value in markers or ("{input}" not in value and "{stdin}" not in value)
+            for value in values
+        )
+    )
 
 
 def valid_replay_environment(values) -> bool:

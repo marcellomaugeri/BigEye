@@ -220,7 +220,7 @@ class ProductionCrashArtifactHandler:
             clean_command=(
                 tuple(
                     "/bigeye/input/crash" if item == "{input}" else item
-                    for item in clean_target.replay_command
+                    for item in clean_target.replay_command if item != "{stdin}"
                 )
                 if clean_target is not None else ()
             ),

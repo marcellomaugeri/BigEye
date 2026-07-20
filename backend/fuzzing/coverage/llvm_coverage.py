@@ -14,8 +14,12 @@ from pathlib import Path, PurePosixPath
 from tempfile import mkdtemp
 from typing import Protocol
 
-from backend.fuzzing.campaigns.coverage_contract import valid_replay_environment
+from backend.fuzzing.campaigns.coverage_contract import (
+    valid_replay_command_markers,
+    valid_replay_environment,
+)
 from backend.fuzzing.coverage.source_paths import is_forbidden_source_path
+from backend.fuzzing.docker.stdin import MAX_STDIN_BYTES, send_exact_stdin
 
 
 class CoverageIntegrityError(ValueError):
@@ -70,6 +74,7 @@ class CoverageExecutor(Protocol):
         environment: dict[str, str],
         profile_directory: Path,
         input_file: Path | None = None,
+        stdin_bytes: bytes | None = None,
     ) -> bytes: ...
 
 
@@ -85,7 +90,10 @@ class DockerCoverageExecutor:
         self._timeout = timeout_seconds
         self._output_limit = output_limit_bytes
 
-    def run(self, image_id, command, environment, profile_directory, input_file=None) -> bytes:
+    def run(
+        self, image_id, command, environment, profile_directory, input_file=None,
+        stdin_bytes=None,
+    ) -> bytes:
         if not isinstance(command, tuple) or not 1 <= len(command) <= 256:
             raise ValueError("coverage command argument count is invalid")
         if any(not isinstance(argument, str) or not argument or len(argument.encode()) > 4096 for argument in command):
@@ -100,15 +108,18 @@ class DockerCoverageExecutor:
         if profile_directory.is_symlink() or not profile_directory.is_dir():
             raise CoverageIntegrityError("profile directory is not a regular directory")
         volumes = {str(profile_directory): {"bind": "/coverage/profiles", "mode": "rw"}}
+        if stdin_bytes is not None and (
+            not isinstance(stdin_bytes, bytes) or len(stdin_bytes) > MAX_STDIN_BYTES
+            or input_file is not None
+        ):
+            raise ValueError("coverage stdin is invalid or conflicts with a file input")
         if input_file is not None:
             input_file = Path(os.path.abspath(input_file))
             if input_file.is_symlink() or not input_file.is_file():
                 raise CoverageIntegrityError("coverage input is not a regular file")
             volumes[str(input_file)] = {"bind": "/coverage/input", "mode": "ro"}
         user_id, group_id = _unprivileged_user()
-        container = self._client.containers.create(
-            image_id,
-            list(command),
+        options = dict(
             platform="linux/amd64",
             network_disabled=True,
             network_mode="none",
@@ -131,8 +142,20 @@ class DockerCoverageExecutor:
             auto_remove=False,
             detach=True,
         )
+        if stdin_bytes is not None:
+            options.update({"stdin_open": True, "tty": False})
+        container = self._client.containers.create(
+            image_id,
+            list(command),
+            **options,
+        )
+        attached = None
         try:
+            if stdin_bytes is not None:
+                attached = container.attach_socket(params={"stdin": 1, "stream": 1})
             container.start()
+            if attached is not None:
+                send_exact_stdin(attached, stdin_bytes, self._timeout)
             result = container.wait(timeout=self._timeout)
             if int(result["StatusCode"]) != 0:
                 raise CoverageIntegrityError("clean coverage command failed")
@@ -144,6 +167,11 @@ class DockerCoverageExecutor:
                 output.extend(encoded)
             return bytes(output)
         finally:
+            if attached is not None:
+                try:
+                    attached.close()
+                except Exception:
+                    pass
             try:
                 container.remove(force=True)
             except Exception:
@@ -180,13 +208,23 @@ class LlvmCoverage:
                 profile_dir.mkdir(mode=0o700)
                 content, digest, input_path, input_identity = self._stage_input(source, replay_root)
                 stem = f"input-{index:06d}"
-                command = tuple("/coverage/input" if value == "{input}" else value for value in campaign.replay_command)
+                stdin_mode = "{stdin}" in campaign.replay_command
+                command = tuple(
+                    "/coverage/input" if value == "{input}" else value
+                    for value in campaign.replay_command if value != "{stdin}"
+                )
                 profile_pattern = f"/coverage/profiles/{stem}-%p.profraw"
                 replay_environment = dict(getattr(campaign, "replay_environment", ()))
                 replay_environment["LLVM_PROFILE_FILE"] = profile_pattern
-                self._executor.run(
-                    image["id"], command, replay_environment, profile_dir, input_path,
-                )
+                if stdin_mode:
+                    self._executor.run(
+                        image["id"], command, replay_environment, profile_dir,
+                        stdin_bytes=content,
+                    )
+                else:
+                    self._executor.run(
+                        image["id"], command, replay_environment, profile_dir, input_path,
+                    )
                 self._require_file(input_path, input_identity, digest)
                 raw_names = self._profile_names(profile_dir, stem)
                 raw_manifest = self._profile_manifest(profile_dir, raw_names)
@@ -357,8 +395,8 @@ class LlvmCoverage:
             raise ValueError("coverage replay arguments exceed their byte limit")
         if command[0] != binary:
             raise ValueError("coverage replay binary must exactly match the clean binary")
-        if command.count("{input}") != 1:
-            raise ValueError("coverage replay command must contain one input placeholder")
+        if not valid_replay_command_markers(command):
+            raise ValueError("coverage replay command must contain one input marker")
         replay_environment_items = getattr(campaign, "replay_environment", ())
         if not valid_replay_environment(replay_environment_items):
             raise ValueError("coverage replay environment is invalid")

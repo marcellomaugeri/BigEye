@@ -480,6 +480,19 @@ def test_system_target_validator_rejects_invalid_input_placeholder_contract(
         _validate_target(proposal, frozenset({"known"}), "system-level")
 
 
+@pytest.mark.parametrize("instance_type", ["system-level", "component-level"])
+def test_target_validator_rejects_application_owned_stdin_marker(
+    instance_type: str,
+) -> None:
+    proposal = _target_proposal("known").model_copy(update={
+        "instance_type": instance_type,
+        "run_command": "/opt/bigeye/parser {stdin}",
+    })
+
+    with pytest.raises(SpecialistValidationError, match="application-owned"):
+        _validate_target(proposal, frozenset({"known"}), instance_type)
+
+
 @pytest.mark.parametrize("placeholder", ["@@", "{input}", "--file=@@"])
 def test_component_target_validator_rejects_input_placeholders(placeholder: str) -> None:
     proposal = _target_proposal("known").model_copy(update={
@@ -515,6 +528,8 @@ def test_target_prompts_require_shell_free_run_commands_and_afl_input_modes() ->
     assert "omit" in system
     assert "literal @@" in system
     assert "do not use {input}" in system
+    assert "do not use {stdin}" in system
+    assert "application-owned" in system
     component = COMPONENT_TARGET_PROMPT.casefold()
     assert "must not include @@ or {input}" in component
 

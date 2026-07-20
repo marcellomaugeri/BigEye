@@ -344,6 +344,104 @@ class TestContainerRunner:
             run(ContainerRunner(SimpleNamespace(containers=Containers())).run("image", ["true"], 1, lambda text: None))
         assert cleaned == [("stop", 0), ("kill",), ("remove", True)]
 
+    def test_runner_feeds_exact_bounded_stdin_and_closes_socket(self) -> None:
+        import socket
+
+        from backend.fuzzing.docker.container_runner import ContainerRunner
+
+        class AttachedSocket:
+            def __init__(self):
+                self._sock = self
+                self.sent = bytearray()
+                self.shutdown_mode = None
+                self.closed = False
+
+            def sendall(self, value): self.sent.extend(value)
+            def shutdown(self, value): self.shutdown_mode = value
+            def close(self): self.closed = True
+
+        class Container:
+            id = "container-stdin"
+            def __init__(self): self.socket = AttachedSocket()
+            def attach_socket(self, params):
+                assert params == {"stdin": 1, "stream": 1}
+                return self.socket
+            def start(self): pass
+            def wait(self, timeout): return {"StatusCode": 0}
+            def logs(self, **kwargs): return iter(())
+            def remove(self, force=False): pass
+
+        class Containers:
+            def __init__(self): self.container = Container(); self.kwargs = None
+            def create(self, *args, **kwargs): self.kwargs = kwargs; return self.container
+
+        containers = Containers()
+        result = run(ContainerRunner(SimpleNamespace(containers=containers)).run(
+            "image", ["/opt/bigeye/parser"], 2, lambda _text: None,
+            stdin_bytes=b"\x00exact\xff",
+        ))
+
+        assert result.exit_code == 0
+        assert containers.kwargs["stdin_open"] is True
+        assert containers.kwargs["tty"] is False
+        assert bytes(containers.container.socket.sent) == b"\x00exact\xff"
+        assert containers.container.socket.shutdown_mode == socket.SHUT_WR
+        assert containers.container.socket.closed is True
+
+    def test_runner_closes_stdin_socket_when_wait_fails(self) -> None:
+        from backend.fuzzing.docker.container_runner import ContainerRunner
+
+        class AttachedSocket:
+            def __init__(self): self._sock = self; self.closed = False
+            def sendall(self, _value): pass
+            def shutdown(self, _value): pass
+            def close(self): self.closed = True
+
+        class Container:
+            id = "container-stdin-error"
+            def __init__(self): self.socket = AttachedSocket()
+            def attach_socket(self, params): return self.socket
+            def start(self): pass
+            def wait(self, timeout): raise RuntimeError("wait failed")
+            def stop(self, timeout=0): pass
+            def kill(self): pass
+            def remove(self, force=False): pass
+
+        container = Container()
+        class Containers:
+            def create(self, *args, **kwargs): return container
+
+        with pytest.raises(RuntimeError, match="wait failed"):
+            run(ContainerRunner(SimpleNamespace(containers=Containers())).run(
+                "image", ["/opt/bigeye/parser"], 2, lambda _text: None,
+                stdin_bytes=b"exact",
+            ))
+
+        assert container.socket.closed is True
+
+    def test_runner_removes_exact_container_when_stdin_attach_fails(self) -> None:
+        from backend.fuzzing.docker.container_runner import ContainerRunner
+
+        removed = []
+
+        class Container:
+            id = "container-attach-error"
+            def attach_socket(self, params): raise RuntimeError("attach failed")
+            def stop(self, timeout=0): pass
+            def kill(self): pass
+            def remove(self, force=False): removed.append((self.id, force))
+
+        class Containers:
+            def create(self, *args, **kwargs): return Container()
+
+        with pytest.raises(RuntimeError, match="attach failed"):
+            run(ContainerRunner(SimpleNamespace(containers=Containers())).run(
+                "image", ["/opt/bigeye/parser"], 2, lambda _text: None,
+                stdin_bytes=b"exact",
+            ))
+
+        assert removed == [("container-attach-error", True)]
+
     def test_runner_bounds_output_and_cleans_the_exact_container(self) -> None:
         from backend.fuzzing.docker.container_runner import ContainerOutputExceeded, ContainerRunner, MAX_OUTPUT_BYTES
 
