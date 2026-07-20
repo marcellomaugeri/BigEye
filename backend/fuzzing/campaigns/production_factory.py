@@ -423,6 +423,12 @@ def _build_script(command: str, *, instance_type: str, coverage: bool) -> str:
     if instance_type not in {"system-level", "component-level"}:
         raise ValueError("target instance type must be system-level or component-level")
 
+    try:
+        arguments = shlex.split(command, posix=True)
+    except ValueError as error:
+        raise ValueError("target build command is not valid shell syntax") from error
+    _reject_agent_compiler_policy(arguments)
+
     component = instance_type == "component-level"
     compiler = "clang-18" if coverage or component else "afl-clang-fast"
     cxx_compiler = "clang++-18" if coverage or component else "afl-clang-fast++"
@@ -441,8 +447,17 @@ def _build_script(command: str, *, instance_type: str, coverage: bool) -> str:
     if coverage:
         compile_flags += " -fprofile-instr-generate -fcoverage-mapping"
         link_flags += " -fprofile-instr-generate"
+    cmake_command = _instrument_cmake_build(
+        arguments,
+        instance_type=instance_type,
+        coverage=coverage,
+        compiler=compiler,
+        cxx_compiler=cxx_compiler,
+        compile_flags=compile_flags,
+        link_flags=link_flags,
+    )
     direct_command = _instrument_direct_compiler(
-        command,
+        arguments,
         instance_type=instance_type,
         coverage=coverage,
         compile_flags=compile_flags,
@@ -451,34 +466,215 @@ def _build_script(command: str, *, instance_type: str, coverage: bool) -> str:
     flags = (
         f"export CC={compiler}\n"
         f"export CXX={cxx_compiler}\n"
-        f'export CFLAGS="${{CFLAGS:-}} {compile_flags}"\n'
-        f'export CXXFLAGS="${{CXXFLAGS:-}} {compile_flags}"\n'
-        f'export LDFLAGS="${{LDFLAGS:-}} {link_flags}"\n'
+        f'export CFLAGS="{compile_flags}"\n'
+        f'export CXXFLAGS="{compile_flags}"\n'
+        f'export LDFLAGS="{link_flags}"\n'
     )
     if coverage:
-        flags += 'export RUSTFLAGS="${RUSTFLAGS:-} -C instrument-coverage"\n'
-    return "#!/bin/sh\nset -eu\n" + flags + direct_command + "\n"
+        flags += 'export RUSTFLAGS="-C instrument-coverage"\n'
+    return "#!/bin/sh\nset -eu\n" + flags + (cmake_command or direct_command) + "\n"
+
+
+def _reject_agent_compiler_policy(arguments: list[str]) -> None:
+    controlled_assignments = (
+        "CC=", "CXX=", "CFLAGS=", "CXXFLAGS=", "LDFLAGS=", "RUSTFLAGS=",
+        "BIGEYE_SOURCE_DIR=", "BIGEYE_BUILD_ROOT=",
+        "-DCMAKE_C_COMPILER", "-DCMAKE_CXX_COMPILER",
+        "-DCMAKE_C_FLAGS", "-DCMAKE_CXX_FLAGS",
+        "-DCMAKE_EXE_LINKER_FLAGS", "-DCMAKE_SHARED_LINKER_FLAGS",
+        "-DCMAKE_MODULE_LINKER_FLAGS",
+        "-DCMAKE_TOOLCHAIN_FILE", "--TOOLCHAIN",
+    )
+    direct_compilers = {
+        "cc", "c++", "gcc", "g++", "clang", "clang-18", "clang++", "clang++-18",
+        "afl-clang-fast", "afl-clang-fast++",
+    }
+    wrappers = {"sh", "bash", "dash", "zsh", "env", "python", "python3", "perl", "ruby"}
+    if Path(arguments[0]).name in wrappers:
+        raise ValueError("target build command cannot override BigEye compiler or sanitizer policy")
+    for index, argument in enumerate(arguments):
+        upper = argument.upper()
+        compiler_token = Path(argument).name
+        assigned_value = argument.rsplit("=", 1)[-1] if "=" in argument else ""
+        sanitizer_option = upper.startswith("-D") and any(
+            marker in upper.split("=", 1)[0]
+            for marker in ("SANIT", "ASAN", "UBSAN", "MSAN", "TSAN")
+        )
+        if (
+            "-FSANITIZE" in upper
+            or "-FNO-SANITIZE" in upper
+            or sanitizer_option
+            or any(upper.startswith(prefix) for prefix in controlled_assignments)
+            or (
+                index != 0
+                and (
+                    compiler_token in direct_compilers
+                    or Path(assigned_value).name in direct_compilers
+                )
+            )
+        ):
+            raise ValueError("target build command cannot override BigEye compiler or sanitizer policy")
+
+
+def _instrument_cmake_build(
+    arguments: list[str],
+    *,
+    instance_type: str,
+    coverage: bool,
+    compiler: str,
+    cxx_compiler: str,
+    compile_flags: str,
+    link_flags: str,
+) -> str | None:
+    cmake_builds = tuple(
+        index for index, argument in enumerate(arguments[:-1])
+        if Path(argument).name == "cmake" and arguments[index + 1] == "--build"
+    )
+    if not cmake_builds:
+        return None
+    operators = tuple(
+        (index, value) for index, value in enumerate(arguments)
+        if value in _SHELL_OPERATOR_TOKENS
+    )
+    configure_options: list[str] = []
+    source_expression = "$BIGEYE_SOURCE_DIR"
+    if cmake_builds == (0,) and not operators:
+        build_arguments = arguments
+        original_build_directory = _cmake_build_directory(build_arguments)
+        cache_guard = _cmake_cache_guard(original_build_directory)
+    elif (
+        len(cmake_builds) == 1
+        and operators == ((cmake_builds[0] - 1, "&&"),)
+    ):
+        configure_arguments = arguments[: cmake_builds[0] - 1]
+        build_arguments = arguments[cmake_builds[0] :]
+        source_directory, configured_build_directory, configure_options = (
+            _parse_cmake_configuration(configure_arguments)
+        )
+        original_build_directory = _cmake_build_directory(build_arguments)
+        if configured_build_directory != original_build_directory:
+            raise ValueError("CMake configure and build directories must match")
+        source_expression = _cmake_source_expression(source_directory)
+        cache_guard = ""
+    else:
+        raise ValueError(
+            "CMake target compilation must be a build command or one explicit configure-and-build pair"
+        )
+
+    profile = f"{instance_type.removesuffix('-level')}-{'coverage' if coverage else 'target'}"
+    build_directory = f"$BIGEYE_BUILD_ROOT/build-{profile}"
+    definitions = (
+        f"-DCMAKE_C_COMPILER:FILEPATH={compiler}",
+        f"-DCMAKE_CXX_COMPILER:FILEPATH={cxx_compiler}",
+        f"-DCMAKE_C_FLAGS:STRING={compile_flags}",
+        f"-DCMAKE_CXX_FLAGS:STRING={compile_flags}",
+        f"-DCMAKE_EXE_LINKER_FLAGS:STRING={link_flags}",
+        f"-DCMAKE_SHARED_LINKER_FLAGS:STRING={link_flags}",
+        f"-DCMAKE_MODULE_LINKER_FLAGS:STRING={link_flags}",
+        "-DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON",
+        *(
+            ("-DCMAKE_TRY_COMPILE_TARGET_TYPE:STRING=STATIC_LIBRARY",)
+            if instance_type == "component-level"
+            else ()
+        ),
+    )
+    configure = (
+        'BIGEYE_SOURCE_DIR="${BIGEYE_SOURCE_DIR:-/src}"\n'
+        'BIGEYE_BUILD_ROOT="${BIGEYE_BUILD_ROOT:-/opt/bigeye}"\n'
+        + cache_guard
+        + f'rm -rf "{build_directory}"\n'
+        f'cmake -S "{source_expression}" -B "{build_directory}" '
+        + " ".join(shlex.quote(value) for value in (*configure_options, *definitions))
+    )
+    build = f'cmake --build "{build_directory}"'
+    if len(build_arguments) > 3:
+        build += " " + shlex.join(build_arguments[3:])
+    return configure + "\n" + build
+
+
+def _cmake_build_directory(arguments: list[str]) -> str:
+    if (
+        len(arguments) < 3
+        or Path(arguments[0]).name != "cmake"
+        or arguments[1] != "--build"
+        or arguments[2].startswith("-")
+    ):
+        raise ValueError("CMake build command must provide one build directory")
+    return arguments[2]
+
+
+def _parse_cmake_configuration(arguments: list[str]) -> tuple[str, str, list[str]]:
+    if not arguments or Path(arguments[0]).name != "cmake":
+        raise ValueError("CMake configuration must start with cmake")
+    source = None
+    build = None
+    options: list[str] = []
+    index = 1
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in {"-S", "-B"}:
+            if index + 1 >= len(arguments):
+                raise ValueError(f"CMake {argument} requires a directory")
+            value = arguments[index + 1]
+            index += 2
+            if argument == "-S":
+                source = value
+            else:
+                build = value
+            continue
+        if argument.startswith("-S") and len(argument) > 2:
+            source = argument[2:]
+        elif argument.startswith("-B") and len(argument) > 2:
+            build = argument[2:]
+        else:
+            options.append(argument)
+        index += 1
+    if source is None or build is None:
+        raise ValueError("explicit CMake configuration requires both -S and -B")
+    return source, build, options
+
+
+def _cmake_source_expression(source: str) -> str:
+    if source == "/src":
+        return "$BIGEYE_SOURCE_DIR"
+    if source.startswith("/src/"):
+        relative = source.removeprefix("/src/")
+        if not relative or any(part in {"", ".", ".."} for part in relative.split("/")):
+            raise ValueError("CMake source directory must stay inside /src")
+        return "$BIGEYE_SOURCE_DIR/" + relative
+    raise ValueError("CMake source directory must stay inside /src")
+
+
+def _cmake_cache_guard(build_directory: str) -> str:
+    cache = build_directory.rstrip("/") + "/CMakeCache.txt"
+    message = (
+        "existing CMake configuration requires explicit "
+        "cmake -S ... -B ... && cmake --build"
+    )
+    return (
+        f"if [ -f {shlex.quote(cache)} ]; then\n"
+        f"  printf '%s\\n' {shlex.quote(message)} >&2\n"
+        "  exit 2\n"
+        "fi\n"
+    )
 
 
 def _instrument_direct_compiler(
-    command: str,
+    arguments: list[str],
     *,
     instance_type: str,
     coverage: bool,
     compile_flags: str,
     link_flags: str,
 ) -> str:
-    try:
-        arguments = shlex.split(command, posix=True)
-    except ValueError:
-        return command
     compiler_name = Path(arguments[0]).name
     direct_compilers = {
         "clang", "clang-18", "clang++", "clang++-18",
         "afl-clang-fast", "afl-clang-fast++",
+        "cc", "c++", "gcc", "g++",
     }
     if compiler_name not in direct_compilers:
-        return command
+        return shlex.join(arguments)
     if any(argument in _SHELL_OPERATOR_TOKENS for argument in arguments):
         raise ValueError("direct compiler build command must be shell-free")
 
