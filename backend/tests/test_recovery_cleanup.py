@@ -198,7 +198,10 @@ class DockerContainer:
 
 
 class DockerImage:
-    def __init__(self, *, image_id=IMAGE_ID, labels=None, created_at=None):
+    def __init__(
+        self, *, image_id=IMAGE_ID, labels=None, created_at=None,
+        rootfs_layers=("sha256:" + "8" * 64, "sha256:" + "9" * 64),
+    ):
         self.id = image_id
         self.attrs = {
             "Id": image_id,
@@ -206,6 +209,7 @@ class DockerImage:
             "Architecture": "amd64",
             "Created": (created_at or (NOW - timedelta(hours=2))).isoformat().replace("+00:00", "Z"),
             "Config": {"Labels": labels or {}},
+            "RootFS": {"Type": "layers", "Layers": list(rootfs_layers)},
         }
 
 
@@ -253,6 +257,9 @@ class Images:
     def list(self, **_kwargs):
         return list(self.entries)
 
+    def get(self, image_id):
+        return next(image for image in self.entries if image.id == image_id)
+
     def remove(self, image_id, force=False, noprune=False):
         self.removed.append((image_id, force, noprune))
 
@@ -276,6 +283,19 @@ def _temporary_context(workspace: Path, *, project_id=7, commit=COMMIT) -> Path:
     return context
 
 
+def _cleanup_image_identity():
+    from backend.fuzzing.campaigns.cleanup import CleanupAssetIdentity, CleanupImageIdentity
+
+    labels = _image_labels()
+    return CleanupImageIdentity(
+        image_id=IMAGE_ID,
+        layer="target",
+        content_hash=labels["bigeye.content-hash"],
+        parent_image_id=labels["bigeye.parent-image"],
+        asset_identities=(CleanupAssetIdentity("target", 31, TARGET_HASH),),
+    )
+
+
 def test_cleanup_is_idempotent_and_preserves_durable_project_evidence(tmp_path: Path) -> None:
     from backend.fuzzing.campaigns.cleanup import ProjectCleaner
 
@@ -289,12 +309,28 @@ def test_cleanup_is_idempotent_and_preserves_durable_project_evidence(tmp_path: 
     (project / "pending-manager-decision.json").write_text("{}")
     temporary = _temporary_context(workspace)
     container = DockerContainer(labels=_container_labels())
+    parent_id = _image_labels()["bigeye.parent-image"]
+    parent = DockerImage(
+        image_id=parent_id,
+        labels={
+            "bigeye.project": "7", "bigeye.commit": COMMIT,
+            "bigeye.layer": "project", "bigeye.content-hash": "2" * 64,
+            "bigeye.parent-image": "sha256:" + "3" * 64,
+        },
+        rootfs_layers=("sha256:" + "8" * 64,),
+    )
     image = DockerImage(labels=_image_labels())
-    client = DockerClient([container], [image])
+    client = DockerClient([container], [parent, image])
     cleaner = ProjectCleaner(client, workspace, grace_seconds=300, clock=lambda: NOW)
 
-    first = cleaner.clean(7, COMMIT, referenced_image_ids=())
-    second = cleaner.clean(7, COMMIT, referenced_image_ids=())
+    first = cleaner.clean(
+        7, COMMIT, referenced_image_ids=(),
+        persisted_image_identities=(_cleanup_image_identity(),),
+    )
+    second = cleaner.clean(
+        7, COMMIT, referenced_image_ids=(),
+        persisted_image_identities=(_cleanup_image_identity(),),
+    )
 
     assert first.removed_contexts == (temporary.as_posix(),)
     assert first.removed_container_ids == ("container-3",)
@@ -325,6 +361,7 @@ def test_cleanup_ignores_unlabelled_active_or_wrong_commit_resources(tmp_path: P
 
     result = ProjectCleaner(client, workspace, grace_seconds=300, clock=lambda: NOW).clean(
         7, COMMIT, referenced_image_ids=(IMAGE_ID,),
+        persisted_image_identities=(_cleanup_image_identity(),),
     )
 
     assert result.removed_container_ids == result.removed_image_ids == ()
@@ -346,11 +383,133 @@ def test_cleanup_never_follows_a_temporary_context_symlink(tmp_path: Path) -> No
     client = DockerClient([], [])
 
     result = ProjectCleaner(client, workspace, grace_seconds=300, clock=lambda: NOW).clean(
-        7, COMMIT, referenced_image_ids=(),
+        7, COMMIT, referenced_image_ids=(), persisted_image_identities=(),
     )
 
     assert result.removed_contexts == ()
     assert (outside / "keep").read_text() == "outside"
+
+
+def test_cleanup_requires_persisted_asset_identity_and_actual_parent_ancestry(tmp_path: Path) -> None:
+    from backend.fuzzing.campaigns.cleanup import (
+        CleanupAssetIdentity,
+        CleanupImageIdentity,
+        ProjectCleaner,
+    )
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _campaign_workspace(workspace)
+    parent_id = "sha256:" + "1" * 64
+    parent_layers = ("sha256:" + "8" * 64,)
+    parent = DockerImage(
+        image_id=parent_id,
+        labels={
+            "bigeye.project": "7", "bigeye.commit": COMMIT,
+            "bigeye.layer": "project", "bigeye.content-hash": "2" * 64,
+            "bigeye.parent-image": "sha256:" + "3" * 64,
+        },
+        rootfs_layers=parent_layers,
+    )
+    exact = DockerImage(labels=_image_labels(), rootfs_layers=(*parent_layers, "sha256:" + "9" * 64))
+    wrong_asset_id = "sha256:" + "4" * 64
+    wrong_asset = DockerImage(
+        image_id=wrong_asset_id,
+        labels={**_image_labels(), "bigeye.target-content-hash": "5" * 64},
+        rootfs_layers=(*parent_layers, "sha256:" + "6" * 64),
+    )
+    false_parent_id = "sha256:" + "7" * 64
+    false_parent = DockerImage(
+        image_id=false_parent_id,
+        labels=_image_labels(),
+        rootfs_layers=("sha256:" + "0" * 64, "sha256:" + "9" * 64),
+    )
+    identities = (
+        CleanupImageIdentity(
+            IMAGE_ID, "target", "f" * 64, parent_id,
+            (CleanupAssetIdentity("target", 31, TARGET_HASH),),
+        ),
+        CleanupImageIdentity(
+            wrong_asset_id, "target", "f" * 64, parent_id,
+            (CleanupAssetIdentity("target", 31, TARGET_HASH),),
+        ),
+        CleanupImageIdentity(
+            false_parent_id, "target", "f" * 64, parent_id,
+            (CleanupAssetIdentity("target", 31, TARGET_HASH),),
+        ),
+    )
+    client = DockerClient([], [parent, exact, wrong_asset, false_parent])
+
+    result = ProjectCleaner(client, workspace, grace_seconds=300, clock=lambda: NOW).clean(
+        7, COMMIT, referenced_image_ids=(), persisted_image_identities=identities,
+    )
+
+    assert result.removed_image_ids == (IMAGE_ID,)
+    assert client.images.removed == [(IMAGE_ID, False, True)]
+
+
+def test_cleanup_removes_only_persisted_same_hash_raw_corpus_and_duplicate_crash_copies(
+    tmp_path: Path,
+) -> None:
+    from backend.fuzzing.campaigns.cleanup import (
+        DuplicateCrashCopy,
+        ProjectCleaner,
+        RedundantCorpusCopy,
+    )
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    campaign = _campaign_workspace(workspace)
+    queue = campaign / "output" / "main" / "queue"
+    crashes = campaign / "output" / "main" / "crashes"
+    queue.mkdir(parents=True)
+    crashes.mkdir(parents=True)
+    project = workspace / "projects" / "7"
+    finding = project / "findings" / "finding-1"
+    finding.mkdir(parents=True)
+    corpus_bytes = b"admitted-corpus"
+    crash_bytes = b"duplicate-crash"
+    corpus_hash = __import__("hashlib").sha256(corpus_bytes).hexdigest()
+    crash_hash = __import__("hashlib").sha256(crash_bytes).hexdigest()
+    raw_corpus = queue / "id:000001"
+    raw_crash = crashes / "id:000002"
+    raw_corpus.write_bytes(corpus_bytes)
+    raw_crash.write_bytes(crash_bytes)
+    durable_corpus = campaign / "corpus" / corpus_hash
+    durable_crash = finding / "minimal.bin"
+    durable_corpus.write_bytes(corpus_bytes)
+    durable_crash.write_bytes(crash_bytes)
+    unmatched = queue / "id:000003"
+    unmatched.write_bytes(b"keep-unrecorded")
+    client = DockerClient([], [])
+
+    result = ProjectCleaner(client, workspace, grace_seconds=300, clock=lambda: NOW).clean(
+        7,
+        COMMIT,
+        referenced_image_ids=(),
+        persisted_image_identities=(),
+        redundant_corpus_copies=(RedundantCorpusCopy(
+            campaign_id=3,
+            raw_relative_path="output/main/queue/id:000001",
+            durable_relative_path=f"campaigns/3/corpus/{corpus_hash}",
+            content_sha256=corpus_hash,
+            provenance_id="coverage-admission:1",
+        ),),
+        duplicate_crash_copies=(DuplicateCrashCopy(
+            campaign_id=3,
+            raw_relative_path="output/main/crashes/id:000002",
+            durable_relative_path="findings/finding-1/minimal.bin",
+            content_sha256=crash_hash,
+            provenance_id="finding:1:occurrence:2",
+        ),),
+    )
+
+    assert result.removed_raw_corpus_copies == (raw_corpus.as_posix(),)
+    assert result.removed_duplicate_crash_copies == (raw_crash.as_posix(),)
+    assert not raw_corpus.exists() and not raw_crash.exists()
+    assert durable_corpus.read_bytes() == corpus_bytes
+    assert durable_crash.read_bytes() == crash_bytes
+    assert unmatched.read_bytes() == b"keep-unrecorded"
 
 
 def test_first_party_fixture_contracts_are_present_and_bounded() -> None:

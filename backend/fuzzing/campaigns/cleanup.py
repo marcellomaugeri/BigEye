@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import re
 import shutil
 import stat
@@ -29,8 +31,93 @@ _TEMPORARY_MARKER = ".bigeye-temporary.json"
 _MAX_MARKER_BYTES = 4_096
 _MAX_IMAGES = 4_096
 _MAX_CONTAINERS = 4_096
-_LAYER_ORDER = {"coverage": 0, "target": 1, "project": 2, "repository": 3}
+_MAX_COPIES = 20_000
+_MAX_COPY_BYTES = 16 * 1_048_576
+_LAYER_ORDER = {"coverage": 0, "target": 1}
 _ACTIVE_STATES = frozenset({"created", "running", "restarting", "paused"})
+
+
+@dataclass(frozen=True, order=True)
+class CleanupAssetIdentity:
+    """One persisted asset identity used to author a disposable image."""
+
+    role: str
+    asset_id: int
+    content_hash: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.role not in {"target", "configuration", "coverage"}
+            or type(self.asset_id) is not int
+            or self.asset_id <= 0
+            or not isinstance(self.content_hash, str)
+            or _SHA256.fullmatch(self.content_hash) is None
+        ):
+            raise ValueError("cleanup asset identity is invalid")
+
+
+@dataclass(frozen=True)
+class CleanupImageIdentity:
+    """Persisted manifest identity required before deleting one target or coverage image."""
+
+    image_id: str
+    layer: str
+    content_hash: str
+    parent_image_id: str
+    asset_identities: tuple[CleanupAssetIdentity, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.image_id, str)
+            or _IMAGE_ID.fullmatch(self.image_id) is None
+            or self.layer not in _LAYER_ORDER
+            or not isinstance(self.content_hash, str)
+            or _SHA256.fullmatch(self.content_hash) is None
+            or not isinstance(self.parent_image_id, str)
+            or _IMAGE_ID.fullmatch(self.parent_image_id) is None
+            or not isinstance(self.asset_identities, tuple)
+            or not self.asset_identities
+            or len(self.asset_identities) > 3
+            or any(not isinstance(item, CleanupAssetIdentity) for item in self.asset_identities)
+        ):
+            raise ValueError("cleanup image identity is invalid")
+        assets = tuple(sorted(self.asset_identities))
+        if len({item.role for item in assets}) != len(assets):
+            raise ValueError("cleanup image asset roles must be unique")
+        expected_roles = {"target"} if self.layer == "target" else {
+            "target", "configuration", "coverage",
+        }
+        if {item.role for item in assets} != expected_roles:
+            raise ValueError("cleanup image asset roles do not match its layer")
+        object.__setattr__(self, "asset_identities", assets)
+
+
+@dataclass(frozen=True)
+class RedundantCorpusCopy:
+    """Persisted proof that one raw queue file has an exact durable corpus copy."""
+
+    campaign_id: int
+    raw_relative_path: str
+    durable_relative_path: str
+    content_sha256: str
+    provenance_id: str
+
+    def __post_init__(self) -> None:
+        _recorded_copy(self, "queue", "corpus")
+
+
+@dataclass(frozen=True)
+class DuplicateCrashCopy:
+    """Persisted proof that one raw crash has an exact durable finding copy."""
+
+    campaign_id: int
+    raw_relative_path: str
+    durable_relative_path: str
+    content_sha256: str
+    provenance_id: str
+
+    def __post_init__(self) -> None:
+        _recorded_copy(self, "crashes", "finding")
 
 
 @dataclass(frozen=True)
@@ -38,6 +125,8 @@ class CleanupResult:
     removed_contexts: tuple[str, ...]
     removed_container_ids: tuple[str, ...]
     removed_image_ids: tuple[str, ...]
+    removed_raw_corpus_copies: tuple[str, ...] = ()
+    removed_duplicate_crash_copies: tuple[str, ...] = ()
 
 
 class ProjectCleaner:
@@ -61,15 +150,25 @@ class ProjectCleaner:
 
     def clean(
         self, project_id: int, commit_sha: str, *, referenced_image_ids,
+        persisted_image_identities,
+        redundant_corpus_copies=(),
+        duplicate_crash_copies=(),
     ) -> CleanupResult:
         _positive(project_id, "project ID")
         _commit(commit_sha)
         referenced = _image_ids(referenced_image_ids)
+        image_identities = _persisted_images(persisted_image_identities)
+        corpus_copies = _recorded_copies(
+            redundant_corpus_copies, RedundantCorpusCopy, "redundant corpus copies",
+        )
+        crash_copies = _recorded_copies(
+            duplicate_crash_copies, DuplicateCrashCopy, "duplicate crash copies",
+        )
         now = self._clock()
         if not isinstance(now, datetime) or now.tzinfo is None:
             raise ValueError("cleanup clock must return an aware datetime")
 
-        images = self._owned_images(project_id, commit_sha)
+        images = self._owned_images(project_id, commit_sha, image_identities)
         image_by_id = {str(image.id): image for image in images}
         removed_contexts = self._clean_contexts(project_id, commit_sha, now)
         removed_containers = self._clean_containers(
@@ -78,21 +177,33 @@ class ProjectCleaner:
         removed_images = self._clean_images(
             project_id, commit_sha, now, referenced, images,
         )
+        removed_corpus = self._clean_recorded_copies(project_id, corpus_copies)
+        removed_crashes = self._clean_recorded_copies(project_id, crash_copies)
         return CleanupResult(
             tuple(sorted(removed_contexts)),
             tuple(sorted(removed_containers)),
             tuple(sorted(removed_images)),
+            tuple(sorted(removed_corpus)),
+            tuple(sorted(removed_crashes)),
         )
 
-    def _owned_images(self, project_id: int, commit_sha: str) -> tuple:
+    def _owned_images(self, project_id: int, commit_sha: str, identities) -> tuple:
         images = self._client.images.list(filters={"label": [
             f"bigeye.project={project_id}", f"bigeye.commit={commit_sha}",
         ]})
         if not isinstance(images, list) or len(images) > _MAX_IMAGES:
             raise ValueError("cleanup image listing is invalid or exceeds its bound")
+        all_images = {
+            str(getattr(image, "id", "")): image for image in images
+            if self._base_image_matches(image, project_id, commit_sha)
+        }
         return tuple(
             image for image in images
-            if self._image_matches(image, project_id, commit_sha)
+            if (identity := identities.get(str(getattr(image, "id", "")))) is not None
+            and self._image_matches(
+                image, project_id, commit_sha, identity,
+                all_images.get(identity.parent_image_id),
+            )
         )
 
     def _clean_containers(self, project_id: int, commit_sha: str, now: datetime, image_by_id) -> list[str]:
@@ -200,6 +311,61 @@ class ProjectCleaner:
                 os.close(parent)
             os.close(root)
 
+    def _clean_recorded_copies(self, project_id: int, copies) -> list[str]:
+        if not copies:
+            return []
+        root = self._open_workspace()
+        project = None
+        try:
+            projects = _open_component(root, "projects")
+            try:
+                project = _open_component(projects, str(project_id))
+            finally:
+                os.close(projects)
+            removed = []
+            for copy in copies:
+                raw_parts = (
+                    "campaigns", str(copy.campaign_id),
+                    *PurePosixPath(copy.raw_relative_path).parts,
+                )
+                durable_parts = PurePosixPath(copy.durable_relative_path).parts
+                if self._remove_verified_copy(project, raw_parts, durable_parts, copy.content_sha256):
+                    removed.append(self._workspace.joinpath("projects", str(project_id), *raw_parts).as_posix())
+            return removed
+        finally:
+            if project is not None:
+                os.close(project)
+            os.close(root)
+
+    @staticmethod
+    def _remove_verified_copy(project: int, raw_parts, durable_parts, expected_hash: str) -> bool:
+        raw_parent = durable_parent = raw = durable = None
+        try:
+            raw_parent = _open_relative_parent(project, raw_parts[:-1])
+            durable_parent = _open_relative_parent(project, durable_parts[:-1])
+            raw = os.open(raw_parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=raw_parent)
+            durable = os.open(durable_parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=durable_parent)
+            raw_content, raw_identity = _read_bounded_file(raw, _MAX_COPY_BYTES)
+            durable_content, _ = _read_bounded_file(durable, _MAX_COPY_BYTES)
+            if (
+                sha256(raw_content).hexdigest() != expected_hash
+                or sha256(durable_content).hexdigest() != expected_hash
+                or raw_content != durable_content
+            ):
+                return False
+            current = os.stat(raw_parts[-1], dir_fd=raw_parent, follow_symlinks=False)
+            if _file_identity(current) != raw_identity:
+                return False
+            os.unlink(raw_parts[-1], dir_fd=raw_parent)
+            os.fsync(raw_parent)
+            return True
+        except (FileNotFoundError, NotADirectoryError, OSError, ValueError):
+            return False
+        finally:
+            for descriptor in (durable, raw, durable_parent, raw_parent):
+                if descriptor is not None:
+                    os.close(descriptor)
+
     @staticmethod
     def _read_context_marker(directory: int):
         try:
@@ -235,32 +401,53 @@ class ProjectCleaner:
         )
 
     @staticmethod
-    def _image_matches(image, project_id: int, commit_sha: str) -> bool:
+    def _base_image_matches(image, project_id: int, commit_sha: str) -> bool:
         attrs = getattr(image, "attrs", None)
         if not isinstance(attrs, dict) or str(getattr(image, "id", "")) != attrs.get("Id"):
             return False
         labels = (attrs.get("Config") or {}).get("Labels") or {}
-        if (
-            attrs.get("Os") != "linux"
-            or attrs.get("Architecture") != "amd64"
-            or _IMAGE_ID.fullmatch(attrs.get("Id", "")) is None
-            or labels.get("bigeye.project") != str(project_id)
-            or labels.get("bigeye.commit") != commit_sha
-            or labels.get("bigeye.layer") not in _LAYER_ORDER
-            or _SHA256.fullmatch(labels.get("bigeye.content-hash", "")) is None
-            or _IMAGE_ID.fullmatch(labels.get("bigeye.parent-image", "")) is None
+        return (
+            attrs.get("Os") == "linux"
+            and attrs.get("Architecture") == "amd64"
+            and _IMAGE_ID.fullmatch(attrs.get("Id", "")) is not None
+            and labels.get("bigeye.project") == str(project_id)
+            and labels.get("bigeye.commit") == commit_sha
+            and isinstance((attrs.get("RootFS") or {}).get("Layers"), list)
+        )
+
+    @classmethod
+    def _image_matches(cls, image, project_id: int, commit_sha: str, identity, parent) -> bool:
+        if not cls._base_image_matches(image, project_id, commit_sha):
+            return False
+        if parent is None or not cls._base_image_matches(parent, project_id, commit_sha):
+            return False
+        attrs = image.attrs
+        labels = (attrs.get("Config") or {}).get("Labels") or {}
+        expected = {
+            "bigeye.layer": identity.layer,
+            "bigeye.content-hash": identity.content_hash,
+            "bigeye.parent-image": identity.parent_image_id,
+        }
+        if any(labels.get(key) != value for key, value in expected.items()):
+            return False
+        assets = {item.role: item for item in identity.asset_identities}
+        if identity.layer == "target" and (
+            labels.get("bigeye.target-asset") != str(assets["target"].asset_id)
+            or labels.get("bigeye.target-content-hash") != assets["target"].content_hash
         ):
             return False
-        if labels["bigeye.layer"] == "target":
-            return (
-                _positive_text(labels.get("bigeye.target-asset"))
-                and _SHA256.fullmatch(labels.get("bigeye.target-content-hash", "")) is not None
-            )
-        if labels["bigeye.layer"] == "coverage":
-            return all(_positive_text(labels.get(key)) for key in (
-                "bigeye.target-asset-id", "bigeye.configuration-asset-id", "bigeye.coverage-asset-id",
-            ))
-        return True
+        if identity.layer == "coverage" and any(
+            labels.get(f"bigeye.{role}-asset-id") != str(assets[role].asset_id)
+            for role in ("target", "configuration", "coverage")
+        ):
+            return False
+        child_layers = _rootfs_layers(attrs)
+        parent_layers = _rootfs_layers(parent.attrs)
+        return (
+            str(getattr(parent, "id", "")) == identity.parent_image_id
+            and len(child_layers) > len(parent_layers)
+            and child_layers[:len(parent_layers)] == parent_layers
+        )
 
     @staticmethod
     def _container_matches(attrs, project_id: int, commit_sha: str, image_by_id) -> bool:
@@ -336,6 +523,124 @@ def _image_ids(values) -> frozenset[str]:
     ):
         raise ValueError("referenced cleanup image IDs are invalid or exceed their bound")
     return frozenset(values)
+
+
+def _persisted_images(values) -> dict[str, CleanupImageIdentity]:
+    if (
+        not isinstance(values, (tuple, list))
+        or len(values) > _MAX_IMAGES
+        or any(not isinstance(value, CleanupImageIdentity) for value in values)
+    ):
+        raise ValueError("persisted cleanup image identities are invalid or exceed their bound")
+    identities = {value.image_id: value for value in values}
+    if len(identities) != len(values):
+        raise ValueError("persisted cleanup image identities must be unique")
+    return identities
+
+
+def _recorded_copy(value, raw_kind: str, durable_kind: str) -> None:
+    _positive(value.campaign_id, "campaign ID")
+    raw = _safe_relative(value.raw_relative_path, "raw copy path")
+    durable = _safe_relative(value.durable_relative_path, "durable copy path")
+    raw_parts = raw.parts
+    durable_parts = durable.parts
+    if (
+        len(raw_parts) < 4
+        or raw_parts[0] != "output"
+        or raw_kind not in raw_parts[1:-1]
+        or not isinstance(value.content_sha256, str)
+        or _SHA256.fullmatch(value.content_sha256) is None
+        or not isinstance(value.provenance_id, str)
+        or not 1 <= len(value.provenance_id) <= 512
+        or not value.provenance_id.strip()
+        or any(character in value.provenance_id for character in "\x00\r\n")
+    ):
+        raise ValueError("recorded cleanup copy is invalid")
+    if durable_kind == "corpus":
+        expected = ("campaigns", str(value.campaign_id), "corpus")
+        if durable_parts[:3] != expected or len(durable_parts) < 4:
+            raise ValueError("durable corpus copy path is invalid")
+    elif (
+        durable_parts[0] != "findings"
+        and durable_parts[:2] != ("crashes", "quarantine")
+    ):
+        raise ValueError("durable crash copy path is invalid")
+    object.__setattr__(value, "raw_relative_path", raw.as_posix())
+    object.__setattr__(value, "durable_relative_path", durable.as_posix())
+
+
+def _recorded_copies(values, expected_type, label: str) -> tuple:
+    if (
+        not isinstance(values, (tuple, list))
+        or len(values) > _MAX_COPIES
+        or any(not isinstance(value, expected_type) for value in values)
+    ):
+        raise ValueError(f"cleanup {label} are invalid or exceed their bound")
+    paths = [
+        (value.campaign_id, value.raw_relative_path)
+        for value in values
+    ]
+    if len(paths) != len(set(paths)):
+        raise ValueError(f"cleanup {label} must have unique raw paths")
+    return tuple(values)
+
+
+def _safe_relative(value, label: str) -> PurePosixPath:
+    if not isinstance(value, str) or not value or len(value) > 4_096:
+        raise ValueError(f"cleanup {label} is invalid")
+    path = PurePosixPath(value)
+    if (
+        path.is_absolute()
+        or not path.parts
+        or len(path.parts) > 32
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise ValueError(f"cleanup {label} must be contained and relative")
+    return path
+
+
+def _open_relative_parent(root: int, parts) -> int:
+    descriptor = os.dup(root)
+    try:
+        for component in parts:
+            child = _open_component(descriptor, component)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _read_bounded_file(descriptor: int, maximum: int):
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode) or before.st_size > maximum:
+        raise ValueError("cleanup copy is not a bounded regular file")
+    content = bytearray()
+    while len(content) <= maximum:
+        block = os.read(descriptor, min(64 * 1024, maximum + 1 - len(content)))
+        if not block:
+            break
+        content.extend(block)
+    after = os.fstat(descriptor)
+    if len(content) > maximum or _file_identity(before) != _file_identity(after):
+        raise ValueError("cleanup copy changed while being read")
+    return bytes(content), _file_identity(before)
+
+
+def _file_identity(details):
+    return details.st_dev, details.st_ino, details.st_size, details.st_mtime_ns, details.st_ctime_ns
+
+
+def _rootfs_layers(attrs) -> tuple[str, ...]:
+    layers = (attrs.get("RootFS") or {}).get("Layers") if isinstance(attrs, dict) else None
+    if (
+        not isinstance(layers, list)
+        or not layers
+        or any(not isinstance(value, str) or _IMAGE_ID.fullmatch(value) is None for value in layers)
+    ):
+        return ()
+    return tuple(layers)
 
 
 def _positive(value, name: str) -> None:
