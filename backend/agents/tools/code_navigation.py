@@ -249,8 +249,10 @@ def list_project_files(repository_root: Path, limit: int = MAX_FILES) -> list[st
         return _enumerate_project_files(descriptor, limit)
 
 
-def read_source_lines(repository_root: Path, relative_path: str, start_line: int, end_line: int) -> str:
-    """Read a bounded inclusive line range from one contained UTF-8 source file."""
+def _read_source_range(
+    repository_root: Path, relative_path: str, start_line: int, end_line: int,
+) -> tuple[str, int]:
+    """Read one bounded range and return its text plus its clamped inclusive end."""
     if (
         not isinstance(start_line, int)
         or not isinstance(end_line, int)
@@ -264,7 +266,13 @@ def read_source_lines(repository_root: Path, relative_path: str, start_line: int
         lines = _read_relative_text(descriptor, parts).splitlines()
     if start_line > len(lines):
         raise CodeNavigationError("line range is outside the source file")
-    return "\n".join(lines[start_line - 1 : min(end_line, len(lines))])
+    clamped_end = min(end_line, len(lines))
+    return "\n".join(lines[start_line - 1 : clamped_end]), clamped_end
+
+
+def read_source_lines(repository_root: Path, relative_path: str, start_line: int, end_line: int) -> str:
+    """Read a bounded inclusive line range from one contained UTF-8 source file."""
+    return _read_source_range(repository_root, relative_path, start_line, end_line)[0]
 
 
 def search_source_text(repository_root: Path, query: str, limit: int = MAX_SEARCH_RESULTS) -> list[dict[str, int | str]]:
@@ -331,11 +339,13 @@ async def read_contained_source_lines(
     context: RunContextWrapper[AgentContext], relative_path: str, start_line: int, end_line: int
 ) -> SourceLinesResult:
     """Read a bounded source range as explicitly untrusted repository evidence."""
-    text = read_source_lines(context.context.repository_root, relative_path, start_line, end_line)
+    text, clamped_end = _read_source_range(
+        context.context.repository_root, relative_path, start_line, end_line,
+    )
     return {
         "path": relative_path,
         "start_line": start_line,
-        "end_line": start_line + len(text.splitlines()) - 1,
+        "end_line": clamped_end,
         "text": text,
         "provenance": "repository",
         "trusted_instructions": False,

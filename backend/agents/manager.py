@@ -16,7 +16,12 @@ from backend.agents.outputs.campaign_review import (
     RetirementActionRecord,
 )
 from backend.agents.prompts.manager import MANAGER_PROMPT
-from backend.agents.tools.agent_dispatch import SpecialistValidationError, _validate_evidence_ids, dispatch_tools
+from backend.agents.tools.agent_dispatch import (
+    SpecialistValidationError,
+    _reject_operation_request_evidence_ids,
+    _validate_evidence_ids,
+    dispatch_tools,
+)
 from backend.agents.tracing.hooks import AgentTraceHooks
 from backend.agents.tracing.local_trace import LocalTrace
 
@@ -52,6 +57,7 @@ def _bounded_evidence(evidence) -> tuple[list[dict], frozenset[str]]:
         identifiers.append(evidence_id)
     if len(identifiers) != len(set(identifiers)):
         raise ValueError("campaign evidence identifiers must be unique")
+    _reject_operation_request_evidence_ids(identifiers)
     try:
         encoded = json.dumps(items, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError) as error:
@@ -116,6 +122,7 @@ class CampaignManager:
         ):
             raise ValueError("prepared campaign actions are invalid for this review")
         for record in prepared_actions:
+            _reject_operation_request_evidence_ids(record.evidence_ids)
             if isinstance(record, RetirementActionRecord):
                 collection.record_retirement(record)
             else:

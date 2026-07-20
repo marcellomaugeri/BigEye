@@ -75,9 +75,23 @@ def _validate_evidence_ids(values: Iterable[str], allowed: frozenset[str]) -> No
         raise SpecialistValidationError("specialist returned duplicate evidence identifiers")
     if any(not isinstance(value, str) or not value or len(value) > 2_000 for value in values):
         raise SpecialistValidationError("specialist returned an invalid evidence identifier")
+    _reject_operation_request_evidence_ids(values)
     unknown = set(values) - allowed
     if unknown:
         raise SpecialistValidationError("specialist cited evidence outside its assignment")
+
+
+def _reject_operation_request_evidence_ids(values: Iterable[str]) -> None:
+    if any(
+        isinstance(value, str)
+        and len(value) == 34
+        and value.startswith("operation_")
+        and all(character in "0123456789abcdef" for character in value[10:])
+        for value in values
+    ):
+        raise SpecialistValidationError(
+            "operation-request IDs cannot be evidence; cite only assigned evidence IDs"
+        )
 
 
 def _safe_seed_path(value: str) -> None:
@@ -100,16 +114,6 @@ def _validate_target(output, allowed: frozenset[str], expected_type: str) -> Tar
         )
     if proposal.instance_type != expected_type:
         proposal = proposal.model_copy(update={"instance_type": expected_type})
-    if any(
-        isinstance(value, str)
-        and len(value) == 34
-        and value.startswith("operation_")
-        and all(character in "0123456789abcdef" for character in value[10:])
-        for value in proposal.evidence_ids
-    ):
-        raise SpecialistValidationError(
-            "operation-request IDs cannot be evidence; cite only assigned evidence IDs"
-        )
     _validate_evidence_ids(proposal.evidence_ids, allowed)
     for seed in proposal.seeds:
         _safe_seed_path(seed.path)

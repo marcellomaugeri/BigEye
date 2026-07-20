@@ -22,7 +22,13 @@ from backend.agents.outputs.campaign_review import (
     ContainedOperationRequestRecord,
     SpecialistInvocation,
 )
-from backend.agents.tools.agent_dispatch import SpecialistValidationError, _validate_target, dispatch_tools
+from backend.agents.tools.agent_dispatch import (
+    SpecialistValidationError,
+    _validate_evidence_ids,
+    _validate_target,
+    _validate_triage,
+    dispatch_tools,
+)
 from backend.agents.tools.contained_operations import contained_operation_request, contained_operation_tools
 from backend.agents.tools.generated_assets import (
     GeneratedAssetError,
@@ -83,6 +89,46 @@ def test_navigation_clamps_a_valid_requested_range_to_source_eof(tmp_path: Path)
     assert read_source_lines(root, "src/main.rs", 2, 50) == '    println!("hello");\n}'
     with pytest.raises(CodeNavigationError, match="outside the source file"):
         read_source_lines(root, "src/main.rs", 4, 50)
+
+
+def test_navigation_tool_preserves_blank_lines_when_reporting_clamped_eof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import backend.agents.tools.code_navigation as navigation
+
+    root = write_repository(tmp_path)
+    (root / "blank.txt").write_text("a\n\n", encoding="utf-8")
+    context = AgentContext(4, "a" * 40, root, tmp_path / "assets", EvidenceRetriever(root))
+    reads = 0
+    original_read = navigation._read_relative_text
+
+    def counted_read(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(navigation, "_read_relative_text", counted_read)
+
+    def invoke(relative_path: str, start_line: int, end_line: int):
+        arguments = (
+            '{"relative_path":"' + relative_path + '","start_line":'
+            + str(start_line) + ',"end_line":' + str(end_line) + "}"
+        )
+        return asyncio.run(read_contained_source_lines.on_invoke_tool(ToolContext(
+            context, tool_name=read_contained_source_lines.name, tool_call_id="read-lines",
+            tool_arguments=arguments, run_config=RunConfig(),
+        ), arguments))
+
+    assert invoke("blank.txt", 1, 50) == {
+        "path": "blank.txt", "start_line": 1, "end_line": 2, "text": "a\n",
+        "provenance": "repository", "trusted_instructions": False,
+    }
+    assert invoke("blank.txt", 2, 50) == {
+        "path": "blank.txt", "start_line": 2, "end_line": 2, "text": "",
+        "provenance": "repository", "trusted_instructions": False,
+    }
+    assert invoke("src/main.rs", 2, 50)["end_line"] == 3
+    assert reads == 3
 
 
 @pytest.mark.parametrize(
@@ -1159,6 +1205,58 @@ def test_target_proposal_rejects_operation_request_ids_as_evidence() -> None:
 
     with pytest.raises(SpecialistValidationError, match="operation-request IDs cannot be evidence"):
         _validate_target(_target_proposal(request_id), frozenset({request_id}), "system-level")
+
+
+def test_operation_request_ids_are_rejected_across_every_agent_evidence_boundary() -> None:
+    from backend.agents.manager import _bounded_evidence, _decision
+
+    request_id = "operation_" + "a" * 24
+    triage = TriageResult(
+        classification="unresolved", description="requires replay", evidence_ids=[request_id],
+        uncertainty="not reproduced", priority_rationale="unknown",
+        repair_intent="replay the testcase",
+    )
+
+    with pytest.raises(SpecialistValidationError, match="operation-request IDs cannot be evidence"):
+        _validate_evidence_ids([request_id], frozenset({request_id}))
+    with pytest.raises(SpecialistValidationError, match="operation-request IDs cannot be evidence"):
+        _validate_triage(triage, frozenset({request_id}))
+    with pytest.raises(SpecialistValidationError, match="operation-request IDs cannot be evidence"):
+        _decision(CampaignDecision(
+            decision="wait", motivation="malicious evidence", evidence_ids=[request_id],
+            bounded_actions=[], next_review_condition="new evidence", uncertainty="unknown",
+        ), frozenset({request_id}), frozenset())
+    with pytest.raises(SpecialistValidationError, match="operation-request IDs cannot be evidence"):
+        _bounded_evidence([{"evidence_id": request_id}])
+
+    legitimate = "repository:src/operation_parser.c:24"
+    _validate_evidence_ids([legitimate], frozenset({legitimate}))
+    assert _bounded_evidence([{"evidence_id": legitimate}])[1] == frozenset({legitimate})
+
+
+def test_prepared_campaign_actions_reject_operation_request_evidence_before_runner(
+    tmp_path: Path,
+) -> None:
+    from backend.agents.manager import CampaignManager
+    from backend.agents.outputs.campaign_review import ProgressionActionRecord
+
+    request_id = "operation_" + "b" * 24
+    action = ProgressionActionRecord(
+        action_id="campaign-progression:4:9:abcd1234abcd1234",
+        project_id=4, base_campaign_id=9, target_asset_id=31,
+        action_name="enable dictionary", evidence_ids=(request_id,),
+        dictionary_content='token_000="MAGIC"\n',
+    )
+
+    async def runner(*_args, **_kwargs):
+        raise AssertionError("runner must not receive invalid prepared evidence")
+
+    with pytest.raises(SpecialistValidationError, match="operation-request IDs cannot be evidence"):
+        asyncio.run(CampaignManager(runner=runner).review(
+            agent_context(tmp_path),
+            [{"evidence_id": action.action_id}], "campaign progression",
+            prepared_actions=(action,),
+        ))
 
 
 def test_navigation_function_tools_wrap_every_repository_result_as_untrusted(
