@@ -16,10 +16,10 @@ def run(awaitable):
     return asyncio.run(awaitable)
 
 
-def project(*, identifier=7, workers=2, commit="a" * 40, paused_at=None, error=None):
+def project(*, identifier=7, workers=2, commit="a" * 40, manager_wake_at=None, error=None):
     return SimpleNamespace(
         id=identifier, worker_count=workers, commit_sha=commit,
-        paused_at=paused_at, error=error,
+        manager_wake_at=manager_wake_at, error=error,
     )
 
 
@@ -227,6 +227,35 @@ def test_failed_review_sets_one_time_deadline_instead_of_busy_polling() -> None:
     assert isinstance(seen[0][1], asyncio.Event)
     assert seen[0][2] == NOW + timedelta(seconds=30)
     assert manager.review.await_count == 1
+    subject.projects.schedule_manager_review.assert_awaited_once_with(
+        7,
+        NOW + timedelta(seconds=30),
+        "Retry after RuntimeError: validated corpus opportunity",
+    )
+
+
+def test_wait_uses_the_persisted_project_manager_deadline_after_reconstruction() -> None:
+    runtime = AsyncMock()
+    wake_at = NOW + timedelta(seconds=900)
+    subject = coordinator(value=project(manager_wake_at=wake_at), runtime=runtime)
+    seen = []
+
+    async def wait_for_change(project_id, received_signal, deadline):
+        seen.append((project_id, received_signal, deadline))
+
+    runtime.wait_for_change.side_effect = wait_for_change
+
+    run(subject._wait_for_change(7, healthy_snapshot()))
+
+    assert seen[0][0] == 7
+    assert isinstance(seen[0][1], asyncio.Event)
+    assert seen[0][2] == wake_at
+
+
+def test_manager_review_timeout_is_bounded_to_two_minutes() -> None:
+    from backend.services.campaigns.project_coordinator import MANAGER_REVIEW_TIMEOUT_SECONDS
+
+    assert MANAGER_REVIEW_TIMEOUT_SECONDS == 120
 
 
 def test_repeated_manager_failure_is_bounded_to_two_attempts() -> None:
@@ -276,9 +305,12 @@ def test_failed_selected_action_is_retried_once_with_sanitized_failure_evidence(
     assert 7 not in subject._pending_reviews
 
 
-def test_successful_time_slot_review_persists_the_next_review_deadline() -> None:
+def test_successful_manager_review_persists_the_manager_selected_deadline() -> None:
     manager = AsyncMock()
-    manager.review.return_value = object()
+    manager.review.return_value = SimpleNamespace(decision=SimpleNamespace(
+        next_review_delay_seconds=900,
+        next_review_reason="Recheck clean coverage slope and corpus growth.",
+    ))
     runtime = AsyncMock()
     runtime.retirement_candidates.return_value = ()
     runtime.review_context.return_value = SimpleNamespace(project_id=7)
@@ -288,11 +320,11 @@ def test_successful_time_slot_review_persists_the_next_review_deadline() -> None
 
     run(subject.tick(7, healthy_snapshot(review_due=True, next_review_after=NOW)))
 
-    runtime.schedule_next_review.assert_awaited_once()
-    call = runtime.schedule_next_review.await_args
-    assert call.args[0] is subject.projects.get.return_value
-    assert call.args[1] > NOW
-    assert call.args[2] == "periodic campaign supervision"
+    subject.projects.schedule_manager_review.assert_awaited_once_with(
+        7,
+        NOW + timedelta(seconds=900),
+        "Recheck clean coverage slope and corpus growth.",
+    )
 
 
 def test_current_deterministic_progression_is_a_prepared_manager_action() -> None:
@@ -372,27 +404,6 @@ def test_worker_count_decrease_retires_only_excess_lowest_priority_workers() -> 
     run(subject.tick(7, healthy_snapshot(active_workers=4)))
 
     runtime.enforce_worker_count.assert_awaited_once_with(subject.projects.get.return_value, 2)
-
-
-def test_paused_project_gracefully_stops_workers_and_does_not_review() -> None:
-    runtime = AsyncMock()
-    manager = AsyncMock()
-    subject = coordinator(value=project(paused_at=NOW), runtime=runtime, manager=manager)
-
-    run(subject.tick(7, healthy_snapshot(initial_supervision_complete=True)))
-
-    runtime.pause.assert_awaited_once_with(7)
-    manager.review.assert_not_awaited()
-
-
-def test_resume_verifies_commit_and_assets_before_restarting_selected_campaigns() -> None:
-    runtime = AsyncMock()
-    subject = coordinator(runtime=runtime)
-
-    run(subject.resume(7))
-
-    runtime.verify_resume.assert_awaited_once_with(subject.projects.get.return_value)
-    runtime.resume.assert_awaited_once_with(subject.projects.get.return_value)
 
 
 def test_run_holds_advisory_lock_bootstraps_then_discovers_and_waits_for_events() -> None:
@@ -535,8 +546,6 @@ def test_registry_starts_one_task_per_project_signals_changes_and_closes_every_t
         def __init__(self, identifier):
             self.identifier = identifier
             self.changed = Mock()
-            self.paused = AsyncMock()
-            self.resumed = AsyncMock()
 
         async def run(self, identifier):
             assert identifier == self.identifier
@@ -546,9 +555,6 @@ def test_registry_starts_one_task_per_project_signals_changes_and_closes_every_t
         def notify(self, identifier):
             assert identifier == self.identifier
             self.changed()
-
-        async def pause(self, identifier): await self.paused(identifier)
-        async def resume(self, identifier): await self.resumed(identifier)
 
     def factory(identifier):
         value = Coordinator(identifier)
@@ -565,57 +571,12 @@ def test_registry_starts_one_task_per_project_signals_changes_and_closes_every_t
         await asyncio.wait_for(started[2].wait(), 1)
         assert registry.start(1) is False
         await registry.settings_changed(1)
-        await registry.pause(1)
-        await registry.resume(1)
         await registry.close()
         assert not registry.tasks
 
     run(scenario())
 
     coordinators[1].changed.assert_called()
-    coordinators[1].paused.assert_awaited_once_with(1)
-    coordinators[1].resumed.assert_awaited_once_with(1)
-
-
-def test_registry_starts_a_resumed_coordinator_only_after_settings_are_committed() -> None:
-    from backend.services.campaigns.coordinator_registry import CoordinatorRegistry
-
-    started = asyncio.Event()
-
-    class Coordinator:
-        def __init__(self):
-            self.resumed = AsyncMock()
-            self.changed = Mock()
-
-        async def run(self, identifier):
-            assert identifier == 7
-            started.set()
-            await asyncio.Future()
-
-        async def resume(self, identifier):
-            await self.resumed(identifier)
-
-        def notify(self, identifier):
-            assert identifier == 7
-            self.changed()
-
-    coordinator_value = Coordinator()
-    registry = CoordinatorRegistry(AsyncMock(), lambda _identifier: coordinator_value)
-
-    async def scenario():
-        await registry.resume(7)
-        await asyncio.sleep(0)
-        assert not started.is_set()
-        assert 7 not in registry.tasks
-
-        await registry.settings_changed(7)
-        await asyncio.wait_for(started.wait(), 1)
-        await registry.close()
-
-    run(scenario())
-
-    coordinator_value.resumed.assert_awaited_once_with(7)
-    coordinator_value.changed.assert_called_once_with()
 
 
 def test_registry_keeps_concurrent_projects_independent_when_one_fails() -> None:

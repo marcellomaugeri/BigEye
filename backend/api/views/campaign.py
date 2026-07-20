@@ -75,6 +75,5 @@ class CampaignListResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     project_id: int = Field(gt=0)
-    project_paused: bool
     campaigns: list[CampaignResponse]
     assets: list[CampaignAssetResponse]

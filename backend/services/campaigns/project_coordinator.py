@@ -16,7 +16,7 @@ from backend.services.campaigns.wake_rules import CampaignSnapshot, ReviewTrigge
 
 MANAGER_RETRY_DELAY_SECONDS = 30
 MAX_MANAGER_REVIEW_ATTEMPTS = 2
-NEXT_REVIEW_DELAY = timedelta(minutes=30)
+MANAGER_REVIEW_TIMEOUT_SECONDS = 120
 
 
 class ActionExecutionFailed(RuntimeError):
@@ -110,7 +110,7 @@ class ProjectCoordinator:
         return self._manager
 
     async def run(self, project_id: int) -> None:
-        """Own one project until cancellation, pause/error, or another process owns it."""
+        """Own one project until cancellation, error, or another process owns it."""
         _project_id(project_id)
         async with self._advisory_lock.acquire(project_id) as acquired:
             if not acquired:
@@ -119,8 +119,7 @@ class ProjectCoordinator:
             project = await self.projects.get(project_id)
             if project is None or project.error is not None:
                 return
-            if project.paused_at is None:
-                await self._discover(project)
+            await self._discover(project)
             while True:
                 project = await self.projects.get(project_id)
                 if project is None or project.error is not None:
@@ -139,13 +138,10 @@ class ProjectCoordinator:
         project = await self.projects.get(project_id)
         if project is None or project.error is not None:
             return None
+        snapshot = replace(snapshot, manager_wake_at=getattr(project, "manager_wake_at", None))
         action_lock = self._actions.setdefault(project_id, asyncio.Lock())
         async with action_lock:
             await self._apply_cpu_checkpoint(project, snapshot)
-            if project.paused_at is not None:
-                await self._runtime.pause(project_id)
-                self._previous[project_id] = snapshot
-                return None
 
             pending = self._pending_reviews.get(project_id)
             retirement_evidence = ()
@@ -208,80 +204,63 @@ class ProjectCoordinator:
                     if not isinstance(evidence, list):
                         raise TypeError("campaign review evidence must be a list")
                     evidence = [*evidence, *retirement_evidence]
-                if prepared_actions:
-                    decision = await self._manager.review(
-                        context, evidence, trigger.reason,
-                        prepared_actions=prepared_actions,
-                    )
-                else:
-                    decision = await self._manager.review(context, evidence, trigger.reason)
+                async with asyncio.timeout(MANAGER_REVIEW_TIMEOUT_SECONDS):
+                    if prepared_actions:
+                        decision = await self._manager.review(
+                            context, evidence, trigger.reason,
+                            prepared_actions=prepared_actions,
+                        )
+                    else:
+                        decision = await self._manager.review(context, evidence, trigger.reason)
                 results = await self.decision_executor.execute(project, decision)
                 if isinstance(results, list):
                     failures = [result for result in results if getattr(result, "succeeded", True) is False]
                     if failures:
                         raise ActionExecutionFailed(_action_failure_evidence(project_id, failures))
-                schedule = getattr(self._runtime, "schedule_next_review", None)
-                if schedule is not None:
-                    await _await(schedule(
-                        project, now + NEXT_REVIEW_DELAY, "periodic campaign supervision",
-                    ))
+                manager_decision = getattr(decision, "decision", None)
+                if manager_decision is not None:
+                    wake_at = now + timedelta(seconds=manager_decision.next_review_delay_seconds)
+                    await self.projects.schedule_manager_review(
+                        project_id, wake_at, manager_decision.next_review_reason,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 attempts = (pending.attempts if pending is not None else 0) + 1
+                retry_at = now + timedelta(seconds=MANAGER_RETRY_DELAY_SECONDS)
                 retry_evidence = tuple(dict(item) for item in evidence)
                 if isinstance(error, ActionExecutionFailed):
                     retry_evidence = (*retry_evidence, error.evidence)
+                await self.projects.schedule_manager_review(
+                    project_id, retry_at, f"Retry after {type(error).__name__}: {trigger.reason}",
+                )
                 if attempts < MAX_MANAGER_REVIEW_ATTEMPTS:
                     self._pending_reviews[project_id] = _PendingReview(
-                        trigger, attempts,
-                        now + timedelta(seconds=MANAGER_RETRY_DELAY_SECONDS),
+                        trigger, attempts, retry_at,
                         context,
                         retry_evidence,
                         prepared_actions,
                     )
                 else:
                     self._pending_reviews.pop(project_id, None)
-                    self._previous[project_id] = _consumed_snapshot(snapshot, trigger)
-                    if isinstance(error, ActionExecutionFailed):
-                        schedule = getattr(self._runtime, "schedule_next_review", None)
-                        if schedule is not None:
-                            await _await(schedule(
-                                project, now + NEXT_REVIEW_DELAY,
-                                "reconsider failed campaign action",
-                            ))
+                    self._previous[project_id] = replace(
+                        _consumed_snapshot(snapshot, trigger), manager_wake_at=retry_at,
+                    )
                 await self._record_manager_failure(project_id, trigger, error)
             else:
                 self._pending_reviews.pop(project_id, None)
-                self._previous[project_id] = _consumed_snapshot(snapshot, trigger)
+                if manager_decision is not None:
+                    self._previous[project_id] = replace(
+                        _consumed_snapshot(snapshot, trigger), manager_wake_at=wake_at,
+                    )
+                else:
+                    self._previous[project_id] = _consumed_snapshot(snapshot, trigger)
             return trigger
 
     def notify(self, project_id: int) -> None:
         """Wake one event wait after settings, Docker, asset, or evidence changes."""
         _project_id(project_id)
         self._signals.setdefault(project_id, asyncio.Event()).set()
-
-    async def pause(self, project_id: int) -> None:
-        """Gracefully stop project workers while preserving every durable artefact."""
-        _project_id(project_id)
-        action_lock = self._actions.setdefault(project_id, asyncio.Lock())
-        async with action_lock:
-            await self._runtime.pause(project_id)
-        self.notify(project_id)
-
-    async def resume(self, project_id: int) -> None:
-        """Verify immutable identity before restarting the selected campaigns."""
-        _project_id(project_id)
-        project = await self.projects.get(project_id)
-        if project is None:
-            raise KeyError(project_id)
-        if project.commit_sha is None:
-            raise ValueError("project commit must be resolved before campaign resume")
-        action_lock = self._actions.setdefault(project_id, asyncio.Lock())
-        async with action_lock:
-            await self._runtime.verify_resume(project)
-            await self._runtime.resume(project)
-        self.notify(project_id)
 
     async def _discover(self, project) -> None:
         discover = getattr(self._discovery, "discover", None)
@@ -290,7 +269,8 @@ class ProjectCoordinator:
 
     async def _wait_for_change(self, project_id: int, snapshot: CampaignSnapshot) -> None:
         signal = self._signals.setdefault(project_id, asyncio.Event())
-        deadline = snapshot.next_review_after
+        project = await self.projects.get(project_id)
+        deadline = getattr(project, "manager_wake_at", None) if project is not None else None
         now = self._now()
         if deadline is not None and deadline <= now:
             deadline = None
@@ -322,7 +302,7 @@ class ProjectCoordinator:
             "decision": "manager review deferred",
             "motivation": f"Campaign review failed with {type(error).__name__}",
             "evidence_ids": list(trigger.evidence_ids),
-            "next_review_condition": trigger.reason,
+            "next_review_reason": trigger.reason,
         })
 
     async def _apply_cpu_checkpoint(self, project, snapshot: CampaignSnapshot) -> None:

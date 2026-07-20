@@ -74,18 +74,6 @@ class CoordinatorRegistry:
             coordinator = self._coordinators[project_id]
         coordinator.notify(project_id)
 
-    async def pause(self, project_id: int) -> None:
-        coordinator = self._coordinators.get(project_id)
-        if coordinator is not None:
-            await coordinator.pause(project_id)
-
-    async def resume(self, project_id: int) -> None:
-        coordinator = self._coordinators.get(project_id)
-        if coordinator is None:
-            coordinator = self._coordinator_factory(project_id)
-            self._coordinators[project_id] = coordinator
-        await coordinator.resume(project_id)
-
     async def close(self) -> None:
         if self._closed:
             return
@@ -143,6 +131,6 @@ class CoordinatorRegistry:
             except Exception as dependency_error:
                 current_error = dependency_error
                 continue
-            if project is not None and project.error is None and project.paused_at is None:
+            if project is not None and project.error is None:
                 self.start(project_id)
             return

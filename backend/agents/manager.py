@@ -184,7 +184,7 @@ class CampaignManager:
                 )
             trace.activity(
                 decision.decision, decision.motivation, decision.evidence_ids,
-                decision.next_review_condition,
+                decision.next_review_reason,
             )
             return collection.result(decision)
         except Exception as error:

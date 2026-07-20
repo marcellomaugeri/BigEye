@@ -22,7 +22,6 @@ class ProjectResponse(BaseModel):
     commit_sha: str | None
     token_present: bool
     created_at: datetime
-    paused_at: datetime | None
     error: str | None
 
     @classmethod
@@ -35,6 +34,5 @@ class ProjectResponse(BaseModel):
             commit_sha=project.commit_sha,
             token_present=project.token_present,
             created_at=project.created_at,
-            paused_at=project.paused_at,
             error=project.error,
         )

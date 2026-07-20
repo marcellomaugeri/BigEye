@@ -31,7 +31,7 @@ def run(awaitable):
 def project(identifier: int = 7):
     from backend.models.project import Project
 
-    return Project(identifier, "https://github.com/acme/demo.git", "HEAD", 2, None, False, NOW, None, None)
+    return Project(identifier, "https://github.com/acme/demo.git", "HEAD", 2, None, False, NOW, None, None, None)
 
 
 def task(identifier: int = 11, project_id: int = 7, name: str = "repository clone"):
@@ -69,7 +69,7 @@ class TestProjectRepository:
         connection = AsyncMock()
         connection.transaction = MagicMock(return_value=_Transaction())
         connection.fetchrow.side_effect = [
-            {"id": 7, "repository_url": "https://github.com/acme/demo.git", "requested_revision": "HEAD", "worker_count": 2, "commit_sha": None, "token_present": False, "created_at": NOW, "paused_at": None, "error": None},
+            {"id": 7, "repository_url": "https://github.com/acme/demo.git", "requested_revision": "HEAD", "worker_count": 2, "commit_sha": None, "token_present": False, "created_at": NOW, "manager_wake_at": None, "manager_wake_reason": None, "error": None},
         ]
         pool = SimpleNamespace(acquire=lambda: _Acquire(connection))
 
@@ -87,7 +87,7 @@ class TestProjectRepository:
         from backend.repositories.task_repository import TaskRepository
 
         pool = AsyncMock()
-        pool.fetchrow.return_value = {"id": 7, "repository_url": "https://github.com/acme/demo.git", "requested_revision": "HEAD", "worker_count": 2, "commit_sha": None, "token_present": False, "created_at": NOW, "paused_at": None, "error": None}
+        pool.fetchrow.return_value = {"id": 7, "repository_url": "https://github.com/acme/demo.git", "requested_revision": "HEAD", "worker_count": 2, "commit_sha": None, "token_present": False, "created_at": NOW, "manager_wake_at": None, "manager_wake_reason": None, "error": None}
         ProjectRepository(pool).get
         assert run(ProjectRepository(pool).get(7)).id == 7
         assert "$1" in pool.fetchrow.call_args.args[0]
@@ -514,11 +514,11 @@ class TestApi:
             def __init__(self): self.items, self.next_id = {}, 1
             async def create_with_tasks(self, url, workers, names, revision="HEAD", repository_token=None):
                 identifier = self.next_id; self.next_id += 1
-                item = Project(identifier, url, revision, workers, None, bool(repository_token), NOW, None, None); self.items[identifier] = item
+                item = Project(identifier, url, revision, workers, None, bool(repository_token), NOW, None, None, None); self.items[identifier] = item
                 await tasks.add(identifier, names); return item
             async def get(self, identifier): return self.items.get(identifier)
             async def list(self): return list(self.items.values())
-            async def list_unfinished(self): return [item for item in self.items.values() if item.paused_at is None and item.error is None]
+            async def list_unfinished(self): return [item for item in self.items.values() if item.error is None]
             async def set_commit_sha(self, identifier, sha): self.items[identifier] = replace(self.items[identifier], commit_sha=sha)
             async def finish(self, identifier, error=None): self.items[identifier] = replace(self.items[identifier], error=error)
         class Tasks:
@@ -646,7 +646,8 @@ class TestRuntimeContracts:
             return SimpleNamespace(
                 final_output=CampaignDecision(
                     decision="prepare target", motivation="main is a candidate", evidence_ids=[],
-                    bounded_actions=[], next_review_condition="after probe", uncertainty="not probed",
+                    bounded_actions=[], next_review_delay_seconds=900,
+                    next_review_reason="Recheck after the probe", uncertainty="not probed",
                 ), raw_responses=[], new_items=[],
             )
 
@@ -858,7 +859,7 @@ class TestProjectExecution:
         from backend.services.execute_project_backbone import ExecuteProjectBackbone
 
         recovered = project()
-        recovered = type(recovered)(recovered.id, recovered.repository_url, recovered.requested_revision, recovered.worker_count, "a" * 40, recovered.token_present, recovered.created_at, recovered.paused_at, None)
+        recovered = type(recovered)(recovered.id, recovered.repository_url, recovered.requested_revision, recovered.worker_count, "a" * 40, recovered.token_present, recovered.created_at, None, None, None)
         records = [_record(11, 7, "repository clone"), _record(12, 7, "LLVM toolchain preparation", finished_at=NOW), _record(13, 7, "repository analysis", finished_at=NOW)]
         projects, tasks, logs = _execution_repositories(recovered, records)
         clone = SimpleNamespace(verify_committed=AsyncMock(return_value=True), clone=AsyncMock())
@@ -870,8 +871,8 @@ class TestProjectExecution:
     def test_projects_execute_independently_when_one_clone_fails(self, tmp_path: Path) -> None:
         from backend.services.execute_project_backbone import ExecuteProjectBackbone
 
-        first = type(project())(1, "https://github.com/acme/one.git", "HEAD", 1, None, False, NOW, None, None)
-        second = type(project())(2, "https://github.com/acme/two.git", "HEAD", 1, "a" * 40, False, NOW, None, None)
+        first = type(project())(1, "https://github.com/acme/one.git", "HEAD", 1, None, False, NOW, None, None, None)
+        second = type(project())(2, "https://github.com/acme/two.git", "HEAD", 1, "a" * 40, False, NOW, None, None, None)
         first_records = [_record(11, 1, "repository clone"), _record(12, 1, "LLVM toolchain preparation"), _record(13, 1, "repository analysis")]
         second_records = [_record(21, 2, "repository clone"), _record(22, 2, "LLVM toolchain preparation"), _record(23, 2, "repository analysis")]
         first_projects, first_tasks, first_logs = _execution_repositories(first, first_records)

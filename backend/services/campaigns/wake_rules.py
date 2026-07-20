@@ -32,6 +32,7 @@ class CampaignSnapshot:
     initial_supervision_complete: bool = False
     review_due: bool = False
     next_review_after: datetime | None = None
+    manager_wake_at: datetime | None = None
     irrelevant_project_coverage: bool = False
     corpus_opportunity: bool = False
     replayed_crash: bool = False
@@ -60,8 +61,9 @@ class CampaignSnapshot:
         ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name.replace('_', ' ')} must be boolean")
-        if self.next_review_after is not None and self.next_review_after.tzinfo is None:
-            raise ValueError("next review deadline must include a timezone")
+        for deadline in (self.next_review_after, self.manager_wake_at):
+            if deadline is not None and deadline.tzinfo is None:
+                raise ValueError("next review deadline must include a timezone")
 
 
 def _validate_evidence(evidence_ids: tuple[str, ...]) -> None:
@@ -105,8 +107,9 @@ class WakeEvaluator:
             if getattr(current, attribute) and not bool(getattr(previous, attribute, False)):
                 return ReviewTrigger(reason, current.evidence_ids, stop_campaign)
 
-        deadline_due = current.review_due or (
-            current.next_review_after is not None and current.next_review_after <= now
+        deadline_due = current.review_due or any(
+            deadline is not None and deadline <= now
+            for deadline in (current.next_review_after, current.manager_wake_at)
         )
         previous_due = bool(getattr(previous, "review_due", False))
         if deadline_due and not previous_due:

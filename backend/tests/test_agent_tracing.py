@@ -238,7 +238,8 @@ def test_campaign_manager_returns_structured_decision_and_writes_plain_activity(
     context = context_for(tmp_path)
     decision = CampaignDecision(
         decision="prepare target", motivation="The parser accepts untrusted bytes.", evidence_ids=["known"],
-        bounded_actions=[], next_review_condition="after target probe",
+        bounded_actions=[], next_review_delay_seconds=900,
+        next_review_reason="Recheck after the target probe",
         uncertainty="runtime behaviour is not measured yet",
     )
     calls = []
@@ -264,7 +265,7 @@ def test_campaign_manager_returns_structured_decision_and_writes_plain_activity(
     activity = read_payloads(store, "activity")
     assert activity[-1] == {
         "decision": "prepare target", "motivation": "The parser accepts untrusted bytes.",
-        "evidence_ids": ["known"], "next_review_condition": "after target probe",
+        "evidence_ids": ["known"], "next_review_reason": "Recheck after the target probe",
     }
     assert "reasoning" not in json.dumps(activity).casefold()
 
@@ -286,7 +287,8 @@ def test_campaign_manager_accepts_source_evidence_registered_inside_a_specialist
             final_output=CampaignDecision(
                 decision="prepare target", motivation="The executable has a source entry point.",
                 evidence_ids=[evidence_id], bounded_actions=[],
-                next_review_condition="after probe", uncertainty="input path not measured",
+                next_review_delay_seconds=900,
+                next_review_reason="Recheck after the probe", uncertainty="input path not measured",
             ),
             raw_responses=[], new_items=[],
         )
@@ -368,7 +370,8 @@ def test_campaign_manager_returns_selectable_specialist_result_and_audit_operati
                 decision="probe", motivation="proposal ready",
                 evidence_ids=["known", specialist["result_id"]],
                 bounded_actions=[specialist["result_id"]],
-                next_review_condition="after probe", uncertainty="not probed",
+                next_review_delay_seconds=900,
+                next_review_reason="Recheck after the probe", uncertainty="not probed",
             ), raw_responses=[], new_items=[],
         )
 
@@ -417,7 +420,8 @@ def test_campaign_manager_normalizes_selected_prepared_action_ids(
                 decision="apply prepared action", motivation="factual checkpoint supports it",
                 evidence_ids=["checkpoint:1", record.action_id],
                 bounded_actions=[record.action_id],
-                next_review_condition="after deterministic execution", uncertainty="not executed",
+                next_review_delay_seconds=900,
+                next_review_reason="Recheck after deterministic execution", uncertainty="not executed",
             ),
             raw_responses=[], new_items=[],
         )
@@ -465,7 +469,8 @@ def test_campaign_manager_rejects_unselected_prepared_action_ids_as_evidence(
             final_output=CampaignDecision(
                 decision="wait", motivation="action was not selected",
                 evidence_ids=["checkpoint:1", record.action_id], bounded_actions=[],
-                next_review_condition="new evidence", uncertainty="not selected",
+                next_review_delay_seconds=900,
+                next_review_reason="Recheck when new evidence arrives", uncertainty="not selected",
             ),
             raw_responses=[], new_items=[],
         )
@@ -496,7 +501,8 @@ def test_campaign_manager_rejects_nonexistent_or_stale_action_ids(tmp_path: Path
             final_output=CampaignDecision(
                 decision="probe", motivation="unsupported action", evidence_ids=["known"],
                 bounded_actions=["operation_from_another_review"],
-                next_review_condition="after probe", uncertainty="not probed",
+                next_review_delay_seconds=900,
+                next_review_reason="Recheck after the probe", uncertainty="not probed",
             ), raw_responses=[], new_items=[],
         )
 

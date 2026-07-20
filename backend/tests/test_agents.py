@@ -328,9 +328,7 @@ def test_agent_prompts_keep_operation_requests_out_of_decision_and_evidence_ids(
     assert "Evidence IDs contain only factual assigned evidence" in MANAGER_PROMPT
     assert "belong only in bounded actions" in MANAGER_PROMPT
     assert "return application-owned result or operation-request IDs" not in MANAGER_PROMPT
-    assert CampaignDecision.model_fields["bounded_actions"].description == (
-        "Selectable result or application-owned action IDs returned in this review."
-    )
+    assert CampaignDecision.model_fields["bounded_actions"].description is None
     for prompt in (SYSTEM_TARGET_PROMPT, COMPONENT_TARGET_PROMPT, CRASH_TRIAGE_PROMPT):
         assert "exactly build, probe, replay, or coverage" in prompt
         assert "evidence_ids must never contain operation-request IDs" in prompt
@@ -381,7 +379,8 @@ def test_structured_outputs_reject_missing_fields_and_extra_assumptions() -> Non
     decision = CampaignDecision(
         decision="prepare target", motivation="The parser has a supported byte entry path.",
         evidence_ids=["evidence-1"], bounded_actions=["prepare_component_target"],
-        next_review_condition="after the deterministic probe", uncertainty="build not yet run",
+        next_review_delay_seconds=900, next_review_reason="Recheck after the deterministic probe",
+        uncertainty="build not yet run",
     )
 
     assert proposal.instance_type == "component-level"
@@ -389,7 +388,8 @@ def test_structured_outputs_reject_missing_fields_and_extra_assumptions() -> Non
     with pytest.raises(ValidationError):
         CampaignDecision(
             decision="wait", motivation="No action", evidence_ids=[], bounded_actions=[],
-            next_review_condition="new evidence", uncertainty="none", invented=True,
+            next_review_delay_seconds=900, next_review_reason="Recheck when new evidence arrives",
+            uncertainty="none", invented=True,
         )
     with pytest.raises(ValidationError):
         TargetProposal(
@@ -403,6 +403,32 @@ def test_structured_outputs_reject_missing_fields_and_extra_assumptions() -> Non
             classification="unresolved", description="needs replay", evidence_ids=[],
             uncertainty="not replayed", priority_rationale="unknown", repair_intent="replay",
         )
+
+
+def test_campaign_decision_requires_a_bounded_manager_selected_review_delay() -> None:
+    decision = CampaignDecision(
+        decision="Keep the healthy parser campaigns running.",
+        motivation="Coverage is still increasing on the exact clean build.",
+        evidence_ids=["coverage:project:1:checkpoint:3"],
+        bounded_actions=[],
+        next_review_delay_seconds=900,
+        next_review_reason="Recheck the current coverage slope and corpus growth.",
+        uncertainty="The branch denominator is not available yet.",
+    )
+
+    assert decision.next_review_delay_seconds == 900
+
+    for invalid_delay in (59, 3601):
+        with pytest.raises(ValidationError):
+            CampaignDecision(
+                decision="Keep the healthy parser campaigns running.",
+                motivation="Coverage is still increasing on the exact clean build.",
+                evidence_ids=["coverage:project:1:checkpoint:3"],
+                bounded_actions=[],
+                next_review_delay_seconds=invalid_delay,
+                next_review_reason="Recheck the current coverage slope and corpus growth.",
+                uncertainty="The branch denominator is not available yet.",
+            )
 
 
 def _target_proposal(evidence_id: str) -> TargetProposal:
@@ -598,7 +624,8 @@ def test_luna_specialist_retries_once_with_terra_only_after_validation_failure(
     assert output["result"] == _target_proposal("known").model_dump(mode="json")
     review = collection.result(CampaignDecision(
         decision="prepare", motivation="validated retry", evidence_ids=["known"],
-        bounded_actions=[output["result_id"]], next_review_condition="after probe",
+        bounded_actions=[output["result_id"]], next_review_delay_seconds=900,
+        next_review_reason="Recheck after the probe",
         uncertainty="not probed",
     ))
     assert review.known_target_proposals[0].proposal.evidence_ids == ["known"]
@@ -685,7 +712,7 @@ def test_retry_quarantines_luna_requests_and_returns_only_terra_invocation_ids(
     review = collection.result(CampaignDecision(
         decision="select retry", motivation="Terra corrected evidence", evidence_ids=["known"],
         bounded_actions=[output["result_id"]],
-        next_review_condition="after probe", uncertainty="not probed",
+        next_review_delay_seconds=900, next_review_reason="Recheck after the probe", uncertainty="not probed",
     ))
     assert {record.model for record in review.known_operation_requests} == {"gpt-5.6-terra"}
     assert {record.attempt for record in review.known_operation_requests} == {2}
@@ -698,13 +725,13 @@ def test_retry_quarantines_luna_requests_and_returns_only_terra_invocation_ids(
         collection.result(CampaignDecision(
             decision="select audit request", motivation="invalid", evidence_ids=["known"],
             bounded_actions=[operations_by_model["gpt-5.6-terra"]],
-            next_review_condition="never", uncertainty="not executable",
+            next_review_delay_seconds=900, next_review_reason="Recheck the selected evidence", uncertainty="not executable",
         ))
     with pytest.raises(ValueError, match="not selectable"):
         collection.result(CampaignDecision(
             decision="select failed attempt", motivation="invalid", evidence_ids=["known"],
             bounded_actions=[operations_by_model["gpt-5.6-luna"]],
-            next_review_condition="never", uncertainty="failed attempt",
+            next_review_delay_seconds=900, next_review_reason="Recheck the selected evidence", uncertainty="failed attempt",
         ))
 
 
@@ -1000,7 +1027,8 @@ def test_max_turns_isolated_to_one_parallel_specialist_and_its_requests_are_audi
     assert set(valid) == {"result_id", "result"}
     review = collection.result(CampaignDecision(
         decision="prepare valid sibling", motivation="validated target", evidence_ids=["known"],
-        bounded_actions=[valid["result_id"]], next_review_condition="after probe",
+        bounded_actions=[valid["result_id"]], next_review_delay_seconds=900,
+        next_review_reason="Recheck after the probe",
         uncertainty="other specialist exhausted its budget",
     ))
     assert {record.tool_call_id for record in review.known_target_proposals} == {"call-valid"}
@@ -1127,7 +1155,7 @@ def test_parallel_agent_tool_results_and_requests_never_cross_invocations(
     decision = CampaignDecision(
         decision="select first", motivation="first proposal", evidence_ids=["known"],
         bounded_actions=[first["result_id"]],
-        next_review_condition="after probe", uncertainty="not probed",
+        next_review_delay_seconds=900, next_review_reason="Recheck after the probe", uncertainty="not probed",
     )
     review = collection.result(decision)
     assert {record.tool_call_id for record in review.known_target_proposals} == {"call-a", "call-b"}
@@ -1299,7 +1327,8 @@ def test_review_collection_retains_typed_specialist_results_and_operation_reques
     collection.complete_attempt(invocation, accepted=True)
     review = collection.result(CampaignDecision(
         decision="probe target", motivation="proposal is evidence backed", evidence_ids=["known"],
-        bounded_actions=[target_record.result_id], next_review_condition="after probe",
+        bounded_actions=[target_record.result_id], next_review_delay_seconds=900,
+        next_review_reason="Recheck after the probe",
         uncertainty="probe not run",
     ))
 
@@ -1313,7 +1342,8 @@ def test_review_collection_retains_typed_specialist_results_and_operation_reques
     with pytest.raises(ValueError, match="not selectable"):
         collection.result(CampaignDecision(
             decision="run assertion record", motivation="invalid", evidence_ids=["known"],
-            bounded_actions=[operation_record.request_id], next_review_condition="never",
+            bounded_actions=[operation_record.request_id], next_review_delay_seconds=900,
+            next_review_reason="Recheck the selected evidence",
             uncertainty="no deterministic executor",
         ))
     with pytest.raises(SpecialistValidationError, match="outside this review"):
@@ -1321,7 +1351,7 @@ def test_review_collection_retains_typed_specialist_results_and_operation_reques
             CampaignDecision(
                 decision="select hidden request", motivation="malicious runner",
                 evidence_ids=["known"], bounded_actions=[operation_record.request_id],
-                next_review_condition="never", uncertainty="not executable",
+                next_review_delay_seconds=900, next_review_reason="Recheck the selected evidence", uncertainty="not executable",
             ),
             frozenset({"known"}), collection.actionable_ids(),
         )
@@ -1334,7 +1364,7 @@ def test_manager_normalizes_only_selected_action_ids_out_of_factual_evidence() -
     decision = _decision(CampaignDecision(
         decision="prepare target", motivation="source evidence supports the target",
         evidence_ids=["source:parser.c:8", action_id], bounded_actions=[action_id],
-        next_review_condition="after probe", uncertainty="probe not run",
+        next_review_delay_seconds=900, next_review_reason="Recheck after the probe", uncertainty="probe not run",
     ), frozenset({"source:parser.c:8"}), frozenset({action_id}))
 
     assert decision.evidence_ids == ["source:parser.c:8"]
@@ -1374,7 +1404,7 @@ def test_manager_evidence_normalization_fails_closed(
         _decision(CampaignDecision(
             decision="prepare target", motivation="invalid decision boundary",
             evidence_ids=evidence_ids, bounded_actions=bounded_actions,
-            next_review_condition="after probe", uncertainty="probe not run",
+            next_review_delay_seconds=900, next_review_reason="Recheck after the probe", uncertainty="probe not run",
         ), frozenset({"source:parser.c:8"}), actionable_ids)
 
 
@@ -1402,7 +1432,8 @@ def test_operation_request_ids_are_rejected_across_every_agent_evidence_boundary
     with pytest.raises(SpecialistValidationError, match="manager returned an operation-request ID as evidence"):
         _decision(CampaignDecision(
             decision="wait", motivation="malicious evidence", evidence_ids=[request_id],
-            bounded_actions=[], next_review_condition="new evidence", uncertainty="unknown",
+            bounded_actions=[], next_review_delay_seconds=900,
+            next_review_reason="Recheck when new evidence arrives", uncertainty="unknown",
         ), frozenset({request_id}), frozenset())
     with pytest.raises(SpecialistValidationError, match="operation-request IDs cannot be evidence"):
         _bounded_evidence([{"evidence_id": request_id}])

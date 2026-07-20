@@ -19,7 +19,8 @@ def run(awaitable):
 def project(commit_sha=None):
     return SimpleNamespace(id=7, repository_url="https://github.com/acme/demo.git", commit_sha=commit_sha,
                            requested_revision="HEAD", worker_count=1, token_present=False,
-                           created_at=datetime.now(timezone.utc), paused_at=None, error=None)
+                           created_at=datetime.now(timezone.utc), manager_wake_at=None,
+                           manager_wake_reason=None, error=None)
 
 
 def task():

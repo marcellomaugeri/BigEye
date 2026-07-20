@@ -1250,23 +1250,8 @@ class RepositoryCampaignRuntime:
     def progression_actions(self, project_id: int) -> tuple[ProgressionActionRecord, ...]:
         return self._progression_records.get(project_id, ())
 
-    async def pause(self, project_id: int) -> None:
-        await self._stop_observed(project_id)
-
     async def stop_campaigns(self, project, _evidence_ids) -> None:
         await self._stop_observed(project.id, project)
-
-    async def resume(self, project) -> None:
-        campaigns = await self._active_campaigns(project.id)
-        for campaign in campaigns:
-            await _await(self._containers.start_exact(project, campaign))
-
-    async def verify_resume(self, project) -> None:
-        context = self._discovery.context(project.id)
-        if context.commit_sha != project.commit_sha:
-            raise ValueError("repository commit changed before campaign resume")
-        campaigns = await self._active_campaigns(project.id)
-        await _await(self._containers.verify_exact(project, campaigns))
 
     async def enforce_worker_count(self, project, overflow: int) -> None:
         if type(overflow) is not int or overflow < 0:

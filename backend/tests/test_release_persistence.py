@@ -26,7 +26,8 @@ def project_row(**changes):
         "commit_sha": None,
         "token_present": False,
         "created_at": NOW,
-        "paused_at": None,
+        "manager_wake_at": None,
+        "manager_wake_reason": None,
         "error": None,
     } | changes
 
@@ -46,7 +47,7 @@ def test_release_models_expose_only_the_required_fields():
 
     assert tuple(Project.__dataclass_fields__) == (
         "id", "repository_url", "requested_revision", "worker_count", "commit_sha",
-        "token_present", "created_at", "paused_at", "error",
+        "token_present", "created_at", "manager_wake_at", "manager_wake_reason", "error",
     )
     assert tuple(CampaignAsset.__dataclass_fields__) == (
         "id", "project_id", "kind", "name", "content_hash", "parent_id", "created_at",
@@ -101,6 +102,8 @@ class TestProjectRepository:
 
         assert created.requested_revision == "HEAD"
         assert created.token_present is False
+        assert created.manager_wake_at is None
+        assert created.manager_wake_reason is None
         connection.transaction.assert_called_once_with()
         query = connection.fetchrow.await_args.args[0]
         assert "INSERT INTO projects (repository_url, worker_count)" in query
@@ -125,7 +128,29 @@ class TestProjectRepository:
         assert (project_id, worker_count, token) == (7, 4, "")
         assert "repository_token" not in updated.__dict__
 
-    def test_pause_resume_and_recovery_use_the_continuous_project_state(self):
+    def test_manager_review_deadline_is_scheduled_and_cleared_without_a_pause_state(self):
+        from backend.repositories.project_repository import ProjectRepository
+
+        pool = AsyncMock()
+        repository = ProjectRepository(pool)
+        wake_at = datetime(2026, 7, 19, 12, tzinfo=UTC)
+
+        run(repository.schedule_manager_review(7, wake_at, "Recheck clean coverage growth."))
+        run(repository.clear_manager_review(7))
+
+        scheduled, cleared = pool.execute.await_args_list
+        assert scheduled.args == (
+            "UPDATE projects SET manager_wake_at = $2, manager_wake_reason = $3 WHERE id = $1",
+            7,
+            wake_at,
+            "Recheck clean coverage growth.",
+        )
+        assert cleared.args == (
+            "UPDATE projects SET manager_wake_at = NULL, manager_wake_reason = NULL WHERE id = $1",
+            7,
+        )
+
+    def test_recovery_uses_the_continuous_project_state_without_a_pause_filter(self):
         from backend.repositories.project_repository import ProjectRepository
 
         pool = AsyncMock()
@@ -133,39 +158,11 @@ class TestProjectRepository:
         repository = ProjectRepository(pool)
 
         recovered = run(repository.list_unfinished())
-        run(repository.pause(7))
-        run(repository.resume(7))
 
         assert recovered == [repository._project(project_row())]
         recovery_query = pool.fetch.await_args.args[0]
-        assert "paused_at IS NULL AND error IS NULL" in recovery_query
+        assert "WHERE error IS NULL" in recovery_query
         assert "finished_at" not in recovery_query
-        assert "paused_at = CURRENT_TIMESTAMP" in pool.execute.await_args_list[0].args[0]
-        assert "paused_at = NULL" in pool.execute.await_args_list[1].args[0]
-
-    def test_settings_resume_validates_and_restarts_before_clearing_pause(self):
-        from backend.services.projects.project_settings import ProjectSettingsService
-
-        paused = project_row(paused_at=NOW)
-        resumed = project_row(paused_at=None)
-        projects = AsyncMock()
-        projects.get.side_effect = [
-            SimpleNamespace(**paused), SimpleNamespace(**resumed),
-        ]
-        registry = AsyncMock()
-        order = []
-        registry.resume.side_effect = lambda _identifier: order.append("validate-and-restart")
-        projects.resume.side_effect = lambda _identifier: order.append("clear-pause")
-        registry.settings_changed.side_effect = lambda _identifier: order.append("start-coordinator")
-        service = ProjectSettingsService(projects, registry)
-
-        result = run(service.resume(7))
-
-        assert registry.resume.await_args.args == (7,)
-        assert projects.resume.await_args.args == (7,)
-        assert registry.settings_changed.await_args.args == (7,)
-        assert order == ["validate-and-restart", "clear-pause", "start-coordinator"]
-        assert result.paused_at is None
 
     def test_get_repository_token_returns_secret_only_to_the_clone_boundary(self):
         from backend.repositories.project_repository import ProjectRepository

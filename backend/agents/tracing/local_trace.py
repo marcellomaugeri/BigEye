@@ -233,11 +233,11 @@ class LocalTrace:
                 "chunk_count": len(chunks), "encoding": "json", "data": chunk,
             })
 
-    def activity(self, decision, motivation, evidence_ids, next_review_condition) -> None:
+    def activity(self, decision, motivation, evidence_ids, next_review_reason) -> None:
         if self._event_store is not None:
             self._event_store.append_sync(self.project_id, "activity", self.sanitize({
                 "decision": decision, "motivation": motivation, "evidence_ids": evidence_ids,
-                "next_review_condition": next_review_condition,
+                "next_review_reason": next_review_reason,
             }))
 
     @staticmethod

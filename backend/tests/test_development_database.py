@@ -55,6 +55,15 @@ class DevelopmentDatabaseTests(unittest.TestCase):
         self.assertNotIn("CREATE TYPE", schema)
         self.assertNotIn("metadata", schema.lower())
 
+    def test_projects_store_manager_review_deadlines_without_a_user_pause_state(self) -> None:
+        schema = (ROOT / "backend/database/schema.sql").read_text()
+
+        project_columns = self._columns_for("projects", schema)
+
+        self.assertIn("manager_wake_at", project_columns)
+        self.assertIn("manager_wake_reason", project_columns)
+        self.assertNotIn("paused_at", project_columns)
+
     def test_tasks_reference_projects_with_a_foreign_key(self) -> None:
         schema_file = ROOT / "backend/database/schema.sql"
         self.assertTrue(schema_file.is_file())

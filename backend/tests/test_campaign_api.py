@@ -121,7 +121,7 @@ class _Checkpoints:
 
 class _Projects:
     async def get(self, project_id):
-        return SimpleNamespace(id=project_id, paused_at=None)
+        return SimpleNamespace(id=project_id)
 
 
 def _client():
@@ -150,7 +150,6 @@ def test_campaign_route_exposes_user_names_and_keeps_engine_as_metadata():
     assert response.status_code == 200
     assert response.json() == {
         "project_id": 7,
-        "project_paused": False,
         "campaigns": [{
             "id": 4, "target_asset_id": 31, "target_name": "Parser input path",
             "configuration_asset_id": 32, "configuration_name": "Encrypted mode",
@@ -198,7 +197,7 @@ def test_campaign_route_returns_an_intentional_empty_collection():
         response = client.get("/api/projects/7/campaigns")
 
     assert response.status_code == 200
-    assert response.json() == {"project_id": 7, "project_paused": False, "campaigns": [], "assets": []}
+    assert response.json() == {"project_id": 7, "campaigns": [], "assets": []}
 
 
 def test_campaign_route_returns_not_found_for_a_nonexistent_project():

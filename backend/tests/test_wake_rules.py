@@ -32,6 +32,17 @@ def test_time_slot_wakes_manager_without_stopping_campaign() -> None:
     assert trigger.evidence_ids == ("campaign:3",)
 
 
+def test_project_manager_deadline_wakes_even_without_a_campaign_deadline() -> None:
+    from backend.services.campaigns.wake_rules import WakeEvaluator
+
+    trigger = WakeEvaluator().evaluate(
+        snapshot(), snapshot(manager_wake_at=NOW), NOW,
+    )
+
+    assert trigger is not None
+    assert trigger.reason == "review window expired"
+
+
 def test_plateau_requires_three_consecutive_equal_snapshots() -> None:
     from backend.services.campaigns.wake_rules import WakeEvaluator
 

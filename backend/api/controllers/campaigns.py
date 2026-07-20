@@ -35,7 +35,6 @@ async def list_campaigns(project_id: PositiveId, request: Request):
     try:
         return CampaignListResponse(
             project_id=project_id,
-            project_paused=project.paused_at is not None,
             campaigns=[
                 CampaignResponse.from_model(campaign, assets_by_id, result.summaries[campaign.id])
                 for campaign in result.campaigns

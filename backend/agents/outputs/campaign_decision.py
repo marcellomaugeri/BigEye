@@ -11,9 +11,7 @@ class CampaignDecision(BaseModel):
     decision: str = Field(min_length=1, max_length=500)
     motivation: str = Field(min_length=1, max_length=2_000)
     evidence_ids: list[str] = Field(max_length=64)
-    bounded_actions: list[str] = Field(
-        max_length=16,
-        description="Selectable result or application-owned action IDs returned in this review.",
-    )
-    next_review_condition: str = Field(min_length=1, max_length=1_000)
+    bounded_actions: list[str] = Field(max_length=16)
+    next_review_delay_seconds: int = Field(ge=60, le=3_600)
+    next_review_reason: str = Field(min_length=1, max_length=1_000)
     uncertainty: str = Field(min_length=1, max_length=2_000)

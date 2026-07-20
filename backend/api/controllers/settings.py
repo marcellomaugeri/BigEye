@@ -2,7 +2,6 @@
 
 from fastapi import APIRouter, HTTPException, Request
 
-from backend.api.views.project import ProjectResponse
 from backend.api.views.settings import ProjectSettingsResponse, SettingsResponse, UpdateProjectSettingsRequest
 
 
@@ -36,21 +35,3 @@ async def update_project_settings(project_id: int, body: UpdateProjectSettingsRe
         detail = "project not found" if isinstance(error, KeyError) else str(error)
         raise HTTPException(status_code=status_code, detail=detail) from error
     return ProjectSettingsResponse.from_model(project)
-
-
-@router.post("/projects/{project_id}/pause", response_model=ProjectResponse)
-async def pause_project(project_id: int, request: Request):
-    try:
-        project = await project_settings(request).pause(project_id)
-    except KeyError as error:
-        raise HTTPException(status_code=404, detail="project not found") from error
-    return ProjectResponse.from_model(project)
-
-
-@router.post("/projects/{project_id}/resume", response_model=ProjectResponse)
-async def resume_project(project_id: int, request: Request):
-    try:
-        project = await project_settings(request).resume(project_id)
-    except KeyError as error:
-        raise HTTPException(status_code=404, detail="project not found") from error
-    return ProjectResponse.from_model(project)

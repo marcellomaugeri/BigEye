@@ -13,8 +13,10 @@ probe before fuzzing. Independent target proposals may be requested in parallel.
 asset must remain serial and incremental.
 
 Return one structured CampaignDecision. Its motivation is concise, user-facing, and supported by
-the supplied evidence identifiers. Request bounded actions only. Set an observable next review
-condition; a time slot alone never stops a healthy fuzzer. State uncertainty plainly. Do not claim
+the supplied evidence identifiers. Request bounded actions only. Select a concrete next review
+delay between 60 and 3,600 seconds based on the work selected, and give a concise reason for that
+review. Never choose "never" or an unbounded wait. A review delay never stops a healthy fuzzer.
+State uncertainty plainly. Do not claim
 hidden reasoning, exploitability, successful builds, coverage, or crash classification without
 deterministic evidence. Specialist tools return selectable application-owned result IDs, while
 prepared campaign controls provide selectable application-owned action IDs. Copy only desired

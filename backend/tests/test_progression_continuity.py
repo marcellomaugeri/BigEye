@@ -35,7 +35,7 @@ def test_fresh_runtime_and_coordinator_recover_the_same_partial_progression() ->
     from backend.services.campaigns.project_coordinator import ProjectCoordinator
 
     project = SimpleNamespace(
-        id=7, commit_sha="a" * 40, worker_count=2, paused_at=None, error=None,
+        id=7, commit_sha="a" * 40, worker_count=2, manager_wake_at=None, error=None,
     )
     base = SimpleNamespace(
         id=9, project_id=7, target_asset_id=31, configuration_asset_id=32,
@@ -133,7 +133,8 @@ def test_fresh_runtime_and_coordinator_recover_the_same_partial_progression() ->
             motivation="the durable action did not start",
             evidence_ids=[recovered.action_id],
             bounded_actions=[recovered.action_id],
-            next_review_condition="after the recovered worker starts",
+            next_review_delay_seconds=900,
+            next_review_reason="Recheck after the recovered worker starts",
             uncertainty="worker health is not observed yet",
         ))
 

@@ -5,10 +5,12 @@ DO $schema_contract$
 DECLARE
     expected_tables CONSTANT TEXT[] := ARRAY[
         'assets',
+        'campaign_artifact_cursors',
         'campaign_artifacts',
         'campaign_container_counters',
         'campaign_contexts',
         'campaign_crash_groups',
+        'campaign_progression_actions',
         'campaigns',
         'coverage_checkpoints',
         'coverage_evidence',
@@ -17,7 +19,7 @@ DECLARE
         'tasks'
     ];
     expected_schema_comment CONSTANT TEXT := 'bigeye-schema:release-1';
-    expected_signature CONSTANT TEXT := '6aef50e99c6ac6725bdd513b9d3e0e78';
+    expected_signature CONSTANT TEXT := 'ee18f07bb3e3b61555741da0a083b439';
     actual_tables TEXT[];
     actual_schema_comment TEXT;
     actual_signature TEXT;

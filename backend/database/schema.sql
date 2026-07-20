@@ -6,7 +6,8 @@ CREATE TABLE projects (
     repository_token TEXT,
     commit_sha TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    paused_at TIMESTAMPTZ,
+    manager_wake_at TIMESTAMPTZ,
+    manager_wake_reason TEXT,
     error TEXT
 );
 

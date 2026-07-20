@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
-
 from backend.services.campaigns.coordinator_registry import CoordinatorRegistry
 
 
@@ -31,12 +29,6 @@ class _BootstrapCoordinator:
         if notify is not None:
             notify(project_id)
 
-    async def pause(self, project_id: int) -> None:
-        await _optional_call(self._scheduler, "pause", project_id)
-
-    async def resume(self, project_id: int) -> None:
-        await _optional_call(self._scheduler, "resume", project_id)
-
 
 class ProjectBackboneService(CoordinatorRegistry):
     """Retain the public backbone name while enforcing one task per project."""
@@ -57,12 +49,3 @@ class ProjectBackboneService(CoordinatorRegistry):
 
     def schedule(self, project_id: int) -> bool:
         return self.start(project_id)
-
-
-async def _optional_call(target, method_name: str, *arguments) -> None:
-    method = getattr(target, method_name, None)
-    if method is None:
-        return
-    result = method(*arguments)
-    if inspect.isawaitable(result):
-        await result

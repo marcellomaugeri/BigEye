@@ -15,7 +15,7 @@ from starlette.testclient import TestClient
 NOW = datetime(2026, 7, 19, tzinfo=UTC)
 
 
-def project(*, revision: str = "stable", token_present: bool = True, paused_at=None):
+def project(*, revision: str = "stable", token_present: bool = True):
     from backend.models.project import Project
 
     return Project(
@@ -26,7 +26,8 @@ def project(*, revision: str = "stable", token_present: bool = True, paused_at=N
         None,
         token_present,
         NOW,
-        paused_at,
+        None,
+        None,
         None,
     )
 
@@ -67,6 +68,7 @@ def test_create_accepts_revision_and_token_but_response_redacts_token(client, se
     assert response.json()["requested_revision"] == "stable"
     assert response.json()["token_present"] is True
     assert "repository_token" not in response.json()
+    assert "paused_at" not in response.json()
     services.project_creator.create.assert_awaited_once_with(
         "https://github.com/acme/demo.git", "stable", 2, "secret-read-token"
     )
@@ -98,19 +100,11 @@ def test_project_settings_are_read_and_updated_without_returning_token(client, s
     services.project_settings.update.assert_awaited_once_with(7, 4, "")
 
 
-def test_pause_and_resume_return_the_project_state(client, services):
-    services.project_settings.pause.return_value = project(paused_at=NOW)
-    services.project_settings.resume.return_value = project(paused_at=None)
-
-    paused = client.post("/api/projects/7/pause")
-    resumed = client.post("/api/projects/7/resume")
-
-    assert paused.status_code == 200
-    assert paused.json()["paused_at"] == "2026-07-19T00:00:00Z"
-    assert resumed.status_code == 200
-    assert resumed.json()["paused_at"] is None
-    services.project_settings.pause.assert_awaited_once_with(7)
-    services.project_settings.resume.assert_awaited_once_with(7)
+def test_pause_and_resume_routes_are_not_exposed(client, services):
+    assert client.post("/api/projects/7/pause").status_code == 405
+    assert client.post("/api/projects/7/resume").status_code == 405
+    services.project_settings.pause.assert_not_called()
+    services.project_settings.resume.assert_not_called()
 
 
 def test_project_setting_missing_project_is_not_found(client, services):

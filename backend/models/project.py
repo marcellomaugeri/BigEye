@@ -13,5 +13,6 @@ class Project:
     commit_sha: str | None
     token_present: bool
     created_at: datetime
-    paused_at: datetime | None
+    manager_wake_at: datetime | None
+    manager_wake_reason: str | None
     error: str | None

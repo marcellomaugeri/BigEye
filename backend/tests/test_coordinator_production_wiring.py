@@ -118,7 +118,8 @@ def test_manager_selects_target_result_while_operation_requests_remain_audit_onl
             final_output=CampaignDecision(
                 decision="prepare parser", motivation="validated target proposal",
                 evidence_ids=["source:parser"], bounded_actions=[output["result_id"]],
-                next_review_condition="after deterministic probe", uncertainty="not probed",
+                next_review_delay_seconds=900,
+                next_review_reason="Recheck after the deterministic probe", uncertainty="not probed",
             ), raw_responses=[], new_items=[],
         )
 
@@ -282,7 +283,8 @@ def test_runtime_reconciles_persisted_state_and_builds_real_agent_context(tmp_pa
     (repository / "CMakeLists.txt").write_text("add_library(parser parser.c)\n")
     (repository / "parser.c").write_text("int parse(const char *p) { return *p; }\n")
     value = SimpleNamespace(
-        id=7, commit_sha="a" * 40, worker_count=2, paused_at=None, error=None,
+        id=7, commit_sha="a" * 40, worker_count=2, manager_wake_at=None,
+        manager_wake_reason=None, error=None,
     )
     tasks = AsyncMock()
     tasks.list_for_project.return_value = [
@@ -502,7 +504,8 @@ def test_deterministic_progression_action_starts_a_sibling_without_target_prepar
     review = collection.result(CampaignDecision(
         decision="add dictionary sibling", motivation="comparison evidence",
         evidence_ids=[action.action_id], bounded_actions=[action.action_id],
-        next_review_condition="after sibling health probe", uncertainty="coverage delta unknown",
+        next_review_delay_seconds=900,
+        next_review_reason="Recheck after the sibling health probe", uncertainty="coverage delta unknown",
     ))
     target_preparation = AsyncMock()
     executor = DecisionExecutor(target_preparation, campaign_control=runtime)
@@ -607,7 +610,8 @@ def test_retirement_is_a_known_typed_action_and_executes_only_after_selection() 
         motivation="two clean checkpoints prove a reversible subset",
         evidence_ids=[record.action_id],
         bounded_actions=[record.action_id],
-        next_review_condition="after retained campaign checkpoint",
+        next_review_delay_seconds=900,
+        next_review_reason="Recheck after the retained campaign checkpoint",
         uncertainty="future coverage may diverge",
     )
     review = collection.result(decision)
@@ -1190,7 +1194,8 @@ def test_campaign_manager_can_select_prevalidated_retirement_action(tmp_path) ->
             final_output=CampaignDecision(
                 decision="retire redundant strategy", motivation="validated subset",
                 evidence_ids=[record.action_id], bounded_actions=[record.action_id],
-                next_review_condition="after another checkpoint", uncertainty="may diverge later",
+                next_review_delay_seconds=900,
+                next_review_reason="Recheck after another checkpoint", uncertainty="may diverge later",
             ),
             raw_responses=[], new_items=[],
         )
