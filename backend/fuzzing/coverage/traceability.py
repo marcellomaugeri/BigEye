@@ -125,6 +125,19 @@ class TraceabilityService:
     async def record(self, snapshot):
         self._validate_snapshot(snapshot)
         checkout = await self._checkouts.resolve(snapshot.project_id, snapshot.commit_sha)
+        inventory_persisted = False
+        if snapshot.source_summaries:
+            for summary in snapshot.source_summaries:
+                source_path = self._safe_source_path(summary.source_path)
+                source_hash = sha256(_read_checkout_source(checkout, source_path)).hexdigest()
+                if summary.source_sha256 != source_hash:
+                    raise CoverageIntegrityError("clean source hash does not match the checkout")
+            await self._checkouts.verify(checkout)
+            persist = getattr(self._repository, "upsert_snapshot", None)
+            if persist is None:
+                raise CoverageIntegrityError("coverage inventory repository is not configured")
+            await persist(snapshot)
+            inventory_persisted = True
         lines = {(item.source_path, item.line_number): item for item in snapshot.lines}
         created = []
         for hit in snapshot.hits:
@@ -188,7 +201,7 @@ class TraceabilityService:
             if not won:
                 continue
             created.append(evidence)
-        if created and self._events is not None:
+        if (created or inventory_persisted) and self._events is not None:
             outcome = self._events.append(snapshot.project_id, "events", {"name": "coverage"})
             if inspect.isawaitable(outcome):
                 await outcome
@@ -198,10 +211,15 @@ class TraceabilityService:
         commit = await self._project_commit(project_id, allow_empty=True)
         page = await self._repository.aggregate_project(project_id, commit, limit=limit, offset=offset)
         await self._checkouts.resolve(project_id, commit)
+        files = [self._coverage_file(item) for item in page.items]
         return {
             "project_id": project_id,
             "commit_sha": commit,
-            "files": list(page.items),
+            "files": files,
+            "summary": {
+                dimension: self._sum_measurement(files, dimension)
+                for dimension in ("lines", "functions", "branches")
+            },
             "pagination": {"limit": limit, "offset": offset, "total": page.total},
         }
 
@@ -209,13 +227,27 @@ class TraceabilityService:
         self._validate_range(start_line, end_line)
         commit = await self._project_commit(project_id)
         relative = self._safe_source_path(path)
+        source_summary_method = getattr(self._repository, "source_summary", None)
+        source_summary = (
+            await source_summary_method(project_id, commit, relative)
+            if source_summary_method is not None else None
+        )
         identity = await self._repository.first_for_source(project_id, commit, relative)
-        if identity is None:
+        if source_summary is None and identity is None:
             raise KeyError("coverage not found")
-        self._require_commit((identity,), commit)
-        expected_hash = self._read_metadata(identity)["source_sha256"]
+        if identity is not None:
+            self._require_commit((identity,), commit)
+        expected_hash = (
+            source_summary["source_sha256"] if source_summary is not None
+            else self._read_metadata(identity)["source_sha256"]
+        )
         aggregate = await self._repository.aggregate_source_range(
             project_id, commit, relative, start_line, end_line,
+        )
+        branch_method = getattr(self._repository, "branch_states", None)
+        branch_states = (
+            await branch_method(project_id, commit, relative, start_line, end_line)
+            if branch_method is not None else {}
         )
         checkout = await self._checkouts.resolve(project_id, commit)
         source = _read_checkout_source(checkout, relative)
@@ -223,6 +255,7 @@ class TraceabilityService:
             raise CoverageIntegrityError("checkout source does not match the exact clean image")
         lines = source.decode("utf-8", errors="replace").splitlines()
         by_line = {item["line_number"]: item for item in aggregate}
+        branch_available = source_summary is not None and source_summary["total_branches"] is not None
         actual_end = min(end_line, len(lines))
         if actual_end < start_line:
             raise KeyError("coverage not found")
@@ -238,12 +271,47 @@ class TraceabilityService:
                     "number": number,
                     "text": lines[number - 1],
                     "covered": number in by_line,
+                    "branches": list(branch_states.get(number, ())) if branch_available else None,
                     "strategy_count": by_line.get(number, {}).get("strategy_count", 0),
                     "cpu_exposure_seconds": by_line.get(number, {}).get("cpu_exposure_seconds", 0.0),
                 }
                 for number in range(start_line, actual_end + 1)
             ],
         }
+
+    @staticmethod
+    def _measurement(covered, total):
+        if covered is None or total is None:
+            return None
+        return {
+            "covered": int(covered),
+            "total": int(total),
+            "percent": (float(covered) * 100.0 / total) if total else 0.0,
+        }
+
+    @classmethod
+    def _coverage_file(cls, item):
+        lines = cls._measurement(item.get("covered_lines"), item.get("total_lines"))
+        return {
+            **item,
+            "lines": lines,
+            "functions": cls._measurement(
+                item.get("covered_functions"), item.get("total_functions"),
+            ),
+            "branches": cls._measurement(
+                item.get("covered_branches"), item.get("total_branches"),
+            ),
+        }
+
+    @classmethod
+    def _sum_measurement(cls, files, dimension):
+        values = [item[dimension] for item in files]
+        if not values or any(value is None for value in values):
+            return None
+        return cls._measurement(
+            sum(value["covered"] for value in values),
+            sum(value["total"] for value in values),
+        )
 
     async def function_summaries(self, project_id: int, path: str, limit: int = 1_000, offset: int = 0):
         commit = await self._project_commit(project_id)
@@ -628,6 +696,28 @@ class TraceabilityService:
             or snapshot.cpu_exposure_seconds < 0
         ):
             raise CoverageIntegrityError("CPU exposure is invalid")
+        for count in (snapshot.summary.lines, snapshot.summary.functions, snapshot.summary.branches):
+            _validate_count(count)
+        source_paths = set()
+        for summary in snapshot.source_summaries:
+            path = TraceabilityService._safe_source_path(summary.source_path)
+            if path in source_paths:
+                raise CoverageIntegrityError("coverage source inventory contains duplicates")
+            source_paths.add(path)
+            _digest(summary.source_sha256, "source SHA-256")
+            for count in (summary.lines, summary.functions, summary.branches):
+                _validate_count(count)
+        branch_keys = set()
+        for branch in snapshot.branches:
+            path = TraceabilityService._safe_source_path(branch.source_path)
+            key = (path, branch.line_number, branch.branch_index)
+            if (
+                type(branch.line_number) is not int or branch.line_number <= 0
+                or type(branch.branch_index) is not int or branch.branch_index < 0
+                or type(branch.covered) is not bool or key in branch_keys
+            ):
+                raise CoverageIntegrityError("coverage branch inventory is invalid")
+            branch_keys.add(key)
 
     @staticmethod
     def _safe_source_path(path):
@@ -746,3 +836,13 @@ def _stored_replay_environment(value):
 def _digest(value, label):
     if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
         raise CoverageIntegrityError(f"{label} is invalid")
+
+
+def _validate_count(value):
+    if value is None:
+        return
+    if (
+        type(value.covered) is not int or type(value.total) is not int
+        or value.covered < 0 or value.total < 0 or value.covered > value.total
+    ):
+        raise CoverageIntegrityError("coverage count is invalid")

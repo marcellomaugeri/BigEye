@@ -1000,6 +1000,65 @@ def test_llvm_cov_regions_span_lines_skip_gaps_and_use_region_file_ids(tmp_path:
     ]
 
 
+def test_real_shaped_llvm_export_keeps_zero_count_line_function_and_branch_inventory(tmp_path: Path):
+    from backend.fuzzing.coverage.llvm_coverage import CoverageCount, LlvmCoverage
+
+    repository = tmp_path / "repository"
+    (repository / "src").mkdir(parents=True)
+    (repository / "src/a.c").write_text("int covered(void);\nint uncovered(void);\n")
+    document = {"type": "llvm.coverage.json.export", "version": "2.0.1", "data": [{
+        "files": [{
+            "filename": "/src/src/a.c",
+            "segments": [
+                [1, 1, 7, True, True, False], [2, 1, 0, True, True, False],
+                [3, 1, 0, False, False, False],
+            ],
+            "branches": [[1, 5, 1, 12, 7, 0, 0, 0, 4]],
+        }],
+        "functions": [
+            {"name": "covered", "count": 7, "filenames": ["/src/src/a.c"],
+             "regions": [[1, 1, 1, 20, 7, 0, 0, 0]]},
+            {"name": "uncovered", "count": 0, "filenames": ["/src/src/a.c"],
+             "regions": [[2, 1, 2, 22, 0, 0, 0]]},
+        ],
+    }]}
+
+    parsed = LlvmCoverage(_client(), _CoverageExecutor({}), tmp_path / "work")._parse_export(
+        json.dumps(document).encode(), _campaign(tmp_path)
+    )
+
+    assert parsed.summary.lines == CoverageCount(covered=1, total=2)
+    assert parsed.summary.functions == CoverageCount(covered=1, total=2)
+    assert parsed.summary.branches == CoverageCount(covered=1, total=2)
+    assert [(branch.source_path, branch.line_number, branch.branch_index, branch.covered)
+            for branch in parsed.branches] == [
+        ("src/a.c", 1, 0, True), ("src/a.c", 1, 1, False),
+    ]
+    assert [(line.source_path, line.line_number) for line in parsed.lines] == [("src/a.c", 1)]
+
+
+@pytest.mark.parametrize("branches", [None, "invalid", [[1, 2]]])
+def test_unavailable_or_malformed_llvm_branch_inventory_is_null(tmp_path: Path, branches):
+    from backend.fuzzing.coverage.llvm_coverage import LlvmCoverage
+
+    repository = tmp_path / "repository"
+    (repository / "src").mkdir(parents=True)
+    (repository / "src/a.c").write_text("int covered(void);\n")
+    source = {
+        "filename": "/src/src/a.c",
+        "segments": [[1, 1, 1, True, True, False], [2, 1, 0, False, False, False]],
+    }
+    if branches is not None:
+        source["branches"] = branches
+    document = {"data": [{"files": [source], "functions": []}]}
+
+    parsed = LlvmCoverage(_client(), _CoverageExecutor({}), tmp_path / "work")._parse_export(
+        json.dumps(document).encode(), _campaign(tmp_path)
+    )
+
+    assert parsed.summary.branches is None
+
+
 def test_replay_requires_exact_binary_argv_and_bounded_arguments(tmp_path: Path):
     from backend.fuzzing.coverage.llvm_coverage import LlvmCoverage
 
@@ -1240,6 +1299,7 @@ def test_project_tree_returns_truthful_empty_coverage_for_committed_project(tmp_
         "project_id": 7,
         "commit_sha": "a" * 40,
         "files": [],
+        "summary": {"lines": None, "functions": None, "branches": None},
         "pagination": {"limit": 10, "offset": 0, "total": 0},
     }
 

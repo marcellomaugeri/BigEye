@@ -155,12 +155,14 @@ def test_campaign_route_exposes_user_names_and_keeps_engine_as_metadata():
             "configuration_asset_id": 32, "configuration_name": "Encrypted mode",
             "engine": "system-engine", "started_at": "2026-07-20T09:00:00Z",
             "stopped_at": None, "last_heartbeat_at": "2026-07-20T09:00:00Z",
+            "activity": "running", "covered_line_delta_5m": None,
             "cpu_exposure_seconds": 5400.0,
             "next_review_after": "2026-07-20T09:00:00Z",
             "next_review_reason": "Coverage is still increasing in the parser.", "error": None,
             "configuration_purpose": "Exercise the encrypted parser path.",
             "retirement_reason": None,
             "reached_line_count": None, "unique_line_count": None, "overlapping_line_count": None,
+            "total_reached_lines": None,
         }],
         "assets": [
             {"id": 31, "kind": "target", "name": "Parser input path", "parent_id": None},
@@ -279,6 +281,8 @@ def test_campaign_read_service_reports_only_persisted_compatible_overlap_and_uni
         "reached_line_count": 3,
         "unique_line_count": 1,
         "overlapping_line_count": 2,
+        "covered_line_delta_5m": None,
+        "total_reached_lines": 3,
     }
     assert result.summaries[6]["unique_line_count"] == 3
     assert result.summaries[6]["overlapping_line_count"] == 0

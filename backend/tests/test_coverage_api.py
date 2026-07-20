@@ -13,14 +13,22 @@ from backend.fuzzing.coverage.llvm_coverage import CoverageIntegrityError
 class _Coverage:
     async def project_tree(self, project_id, limit=1_000, offset=0):
         return {"project_id": project_id, "commit_sha": "a" * 40, "files": [
-            {"path": "src/a.c", "covered_lines": 2, "cpu_exposure_seconds": 4.0},
-        ], "pagination": {"limit": limit, "offset": offset, "total": 1}}
+            {"path": "src/a.c", "covered_lines": 2, "total_lines": 3,
+             "lines": {"covered": 2, "total": 3, "percent": 66.66666666666667},
+             "functions": {"covered": 1, "total": 2, "percent": 50.0},
+             "branches": None, "cpu_exposure_seconds": 4.0},
+        ], "summary": {
+            "lines": {"covered": 2, "total": 3, "percent": 66.66666666666667},
+            "functions": {"covered": 1, "total": 2, "percent": 50.0},
+            "branches": None,
+        }, "pagination": {"limit": limit, "offset": offset, "total": 1}}
 
     async def source_file(self, project_id, path, start_line, end_line):
         return {
             "project_id": project_id, "commit_sha": "a" * 40, "path": path,
             "start_line": start_line, "end_line": end_line, "total_lines": 742,
             "lines": [{"number": 12, "text": "return 0;", "covered": True,
+                       "branches": [True, False],
                        "strategy_count": 1, "cpu_exposure_seconds": 2.0}],
         }
 
@@ -79,9 +87,14 @@ def test_coverage_routes_expose_tree_source_functions_and_first_hit_evidence():
 
     assert tree.status_code == 200
     assert tree.json()["files"][0]["path"] == "src/a.c"
+    assert tree.json()["summary"]["branches"] is None
+    assert tree.json()["summary"]["lines"] == {
+        "covered": 2, "total": 3, "percent": 66.66666666666667,
+    }
     assert tree.json()["pagination"] == {"limit": 1000, "offset": 0, "total": 1}
     assert source.status_code == 200
     assert source.json()["lines"][0]["covered"] is True
+    assert source.json()["lines"][0]["branches"] == [True, False]
     assert source.json()["total_lines"] == 742
     assert functions.status_code == 200
     assert functions.json()["functions"][0]["name"] == "parse"
@@ -169,6 +182,7 @@ def test_tree_route_returns_a_truthful_empty_success_when_no_coverage_exists():
         async def project_tree(self, project_id, limit=1_000, offset=0):
             return {
                 "project_id": project_id, "commit_sha": "a" * 40, "files": [],
+                "summary": {"lines": None, "functions": None, "branches": None},
                 "pagination": {"limit": limit, "offset": offset, "total": 0},
             }
 

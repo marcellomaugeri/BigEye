@@ -1,6 +1,6 @@
 """HTTP views for clean source coverage and first-hit evidence."""
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from backend.services.observability.redaction import redact_environment
 
@@ -11,9 +11,33 @@ class PaginationResponse(BaseModel):
     total: int
 
 
+class CoverageMeasurementResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    covered: int = Field(ge=0)
+    total: int = Field(ge=0)
+    percent: float = Field(ge=0, le=100)
+
+
+class CoverageSummaryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    lines: CoverageMeasurementResponse | None
+    functions: CoverageMeasurementResponse | None
+    branches: CoverageMeasurementResponse | None
+
+
 class CoverageFileResponse(BaseModel):
     path: str
     covered_lines: int
+    total_lines: int | None = None
+    covered_functions: int | None = None
+    total_functions: int | None = None
+    covered_branches: int | None = None
+    total_branches: int | None = None
+    lines: CoverageMeasurementResponse | None = None
+    functions: CoverageMeasurementResponse | None = None
+    branches: CoverageMeasurementResponse | None = None
     cpu_exposure_seconds: float
 
 
@@ -21,6 +45,7 @@ class CoverageTreeResponse(BaseModel):
     project_id: int
     commit_sha: str
     files: list[CoverageFileResponse]
+    summary: CoverageSummaryResponse
     pagination: PaginationResponse
 
 
@@ -28,6 +53,7 @@ class SourceLineResponse(BaseModel):
     number: int
     text: str
     covered: bool
+    branches: list[bool] | None = None
     strategy_count: int
     cpu_exposure_seconds: float
 

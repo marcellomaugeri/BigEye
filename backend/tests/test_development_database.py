@@ -52,8 +52,26 @@ class DevelopmentDatabaseTests(unittest.TestCase):
 
         for table in ("projects", "tasks", "assets", "campaigns", "coverage_evidence", "findings"):
             self.assertIn(f"CREATE TABLE {table}", schema)
+        for table in ("coverage_source_summaries", "coverage_branch_evidence"):
+            self.assertIn(f"CREATE TABLE {table}", schema)
         self.assertNotIn("CREATE TYPE", schema)
         self.assertNotIn("metadata", schema.lower())
+
+    def test_coverage_schema_keeps_exact_build_totals_without_persisted_activity_duplicates(self) -> None:
+        schema = (ROOT / "backend/database/schema.sql").read_text()
+
+        summaries = self._columns_for("coverage_source_summaries", schema)
+        branches = self._columns_for("coverage_branch_evidence", schema)
+        campaigns = self._columns_for("campaigns", schema)
+
+        self.assertTrue({
+            "commit_sha", "coverage_asset_id", "source_path", "source_sha256",
+            "covered_lines", "total_lines", "covered_functions", "total_functions",
+            "covered_branches", "total_branches",
+        } <= summaries)
+        self.assertTrue({"line_number", "branch_index", "covered"} <= branches)
+        self.assertNotIn("activity", campaigns)
+        self.assertNotIn("type", campaigns)
 
     def test_projects_store_manager_review_deadlines_without_a_user_pause_state(self) -> None:
         schema = (ROOT / "backend/database/schema.sql").read_text()

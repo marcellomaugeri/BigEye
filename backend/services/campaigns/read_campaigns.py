@@ -12,7 +12,7 @@ class CampaignReadResult:
 
 
 class CampaignReadService:
-    """Combine campaign context and clean checkpoints without inferring worker state."""
+    """Combine campaign context and clean checkpoints into bounded read evidence."""
 
     def __init__(self, campaigns, coverage_checkpoints):
         self._campaigns = campaigns
@@ -42,6 +42,8 @@ class CampaignReadService:
             "reached_line_count": None,
             "unique_line_count": None,
             "overlapping_line_count": None,
+            "covered_line_delta_5m": None,
+            "total_reached_lines": None,
         }
         if history is None or not history.checkpoints:
             return summary
@@ -61,5 +63,9 @@ class CampaignReadService:
             "reached_line_count": len(reached),
             "unique_line_count": len(reached - comparable_reach),
             "overlapping_line_count": len(overlapping),
+            # Checkpoints currently carry no observation timestamp. A five-minute
+            # delta is therefore honestly unavailable rather than inferred from order.
+            "covered_line_delta_5m": None,
+            "total_reached_lines": len(reached),
         })
         return summary

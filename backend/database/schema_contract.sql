@@ -12,15 +12,17 @@ DECLARE
         'campaign_crash_groups',
         'campaign_progression_actions',
         'campaigns',
+        'coverage_branch_evidence',
         'coverage_checkpoints',
         'coverage_evidence',
+        'coverage_source_summaries',
         'findings',
         'projects',
         'target_probe_attempts',
         'tasks'
     ];
     expected_schema_comment CONSTANT TEXT := 'bigeye-schema:release-1';
-    expected_signature CONSTANT TEXT := 'e081293d1471b1a6b917fa54fd61f07f';
+    expected_signature CONSTANT TEXT := 'c3d5e2de08a85200e145b9d6a126b63b';
     actual_tables TEXT[];
     actual_schema_comment TEXT;
     actual_signature TEXT;

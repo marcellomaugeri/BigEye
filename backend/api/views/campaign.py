@@ -41,6 +41,9 @@ class CampaignResponse(BaseModel):
     reached_line_count: int | None = Field(default=None, ge=0)
     unique_line_count: int | None = Field(default=None, ge=0)
     overlapping_line_count: int | None = Field(default=None, ge=0)
+    total_reached_lines: int | None = Field(default=None, ge=0)
+    covered_line_delta_5m: int | None = None
+    activity: str = Field(min_length=1, max_length=32)
 
     @classmethod
     def from_model(cls, campaign, assets_by_id, summary):
@@ -53,6 +56,12 @@ class CampaignResponse(BaseModel):
             campaign.configuration_asset_id is not None and configuration is None
         ):
             raise KeyError("campaign asset name is unavailable")
+        activity = (
+            "failed" if campaign.error is not None
+            else "stopped" if campaign.stopped_at is not None or summary.get("retirement_reason") is not None
+            else "running" if campaign.last_heartbeat_at is not None
+            else "waiting"
+        )
         return cls(
             id=campaign.id,
             target_asset_id=campaign.target_asset_id,
@@ -67,6 +76,7 @@ class CampaignResponse(BaseModel):
             next_review_after=campaign.next_review_after,
             next_review_reason=campaign.next_review_reason,
             error=campaign.error,
+            activity=activity,
             **summary,
         )
 

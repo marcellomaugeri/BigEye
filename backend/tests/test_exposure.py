@@ -248,3 +248,24 @@ def test_function_summary_uses_per_campaign_maximum_not_line_sum() -> None:
     assert "MAX(cpu_exposure_seconds)" in query
     assert "GROUP BY function_name, campaign_id" in query
     assert page.items[0]["cpu_exposure_seconds"] == 15.0
+
+
+def test_project_source_exposure_uses_campaign_maximum_then_sums_campaigns() -> None:
+    from unittest.mock import AsyncMock
+
+    from backend.repositories.coverage_repository import CoverageRepository
+
+    pool = AsyncMock()
+    pool.fetch.return_value = [{
+        "source_path": "src/a.c", "covered_lines": 2,
+        "cpu_exposure_seconds": 25.0, "covered_line_total": 2,
+        "total_lines": 3, "covered_functions": 1, "total_functions": 2,
+        "covered_branches": None, "total_branches": None, "total": 1,
+    }]
+
+    page = run(CoverageRepository(pool).aggregate_project(7, "a" * 40))
+
+    query = pool.fetch.await_args.args[0]
+    assert "MAX(cpu_exposure_seconds)" in query
+    assert "GROUP BY source_path, campaign_id" in query
+    assert page.items[0]["cpu_exposure_seconds"] == 25.0
