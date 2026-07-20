@@ -70,7 +70,9 @@ class CleanCoverageTargetResolver:
             ):
                 raise CoverageIntegrityError("first-hit replay references an unvalidated project asset")
         clean_build_configuration_asset_id = await self._clean_build_configuration(
-            request.project_id, request.configuration_asset_id,
+            request.project_id,
+            request.target_asset_id,
+            request.configuration_asset_id,
         )
         checkout = await self._checkouts.resolve(request.project_id, request.commit_sha)
         command = request.replay_command
@@ -97,13 +99,20 @@ class CleanCoverageTargetResolver:
         )
 
     async def _clean_build_configuration(
-        self, project_id: int, configuration_asset_id: int | None,
+        self,
+        project_id: int,
+        target_asset_id: int,
+        configuration_asset_id: int | None,
     ) -> int | None:
+        if configuration_asset_id is None:
+            return None
         current = configuration_asset_id
         seen: set[int] = set()
-        while current is not None and len(seen) < 32:
+        while len(seen) < 32:
             if current in seen:
-                break
+                raise CoverageIntegrityError(
+                    "first-hit replay configuration lineage is invalid"
+                )
             seen.add(current)
             asset = await self._assets.get(current)
             if (
@@ -113,12 +122,38 @@ class CleanCoverageTargetResolver:
                 raise CoverageIntegrityError(
                     "first-hit replay clean build configuration is unavailable"
                 )
-            if asset.kind != "configuration" or asset.parent_id is None:
+            if asset.kind == "script":
+                if asset.parent_id is not None:
+                    raise CoverageIntegrityError(
+                        "first-hit replay configuration lineage is invalid"
+                    )
                 return asset.id
-            current = asset.parent_id
-        if current is not None:
-            raise CoverageIntegrityError("first-hit replay configuration lineage is invalid")
-        return None
+            if asset.kind != "configuration" or asset.parent_id is None:
+                raise CoverageIntegrityError(
+                    "first-hit replay configuration lineage is invalid"
+                )
+            parent = await self._assets.get(asset.parent_id)
+            if (
+                parent is None or parent.project_id != project_id
+                or parent.validated_at is None or parent.error is not None
+            ):
+                raise CoverageIntegrityError(
+                    "first-hit replay clean build configuration is unavailable"
+                )
+            if parent.id == target_asset_id:
+                return asset.id
+            if parent.kind == "script":
+                if parent.parent_id is not None:
+                    raise CoverageIntegrityError(
+                        "first-hit replay configuration lineage is invalid"
+                    )
+                return parent.id
+            if parent.kind != "configuration":
+                raise CoverageIntegrityError(
+                    "first-hit replay configuration lineage is invalid"
+                )
+            current = parent.id
+        raise CoverageIntegrityError("first-hit replay configuration lineage is invalid")
 
 
 class DeferredLlvmCoverage:
