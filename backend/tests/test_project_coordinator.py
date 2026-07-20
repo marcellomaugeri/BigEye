@@ -453,10 +453,57 @@ def test_postgres_advisory_lock_releases_the_same_project_key() -> None:
             assert acquired is True
 
     run(scenario())
-    assert "pg_try_advisory_lock" in connection.fetchval.await_args_list[0].args[0]
-    assert "pg_advisory_unlock" in connection.fetchval.await_args_list[1].args[0]
-    assert connection.fetchval.await_args_list[0].args[1] == 7
-    assert connection.fetchval.await_args_list[1].args[1] == 7
+    acquire_call, release_call = connection.fetchval.await_args_list
+    assert "pg_try_advisory_lock($1::integer, $2::integer)" in acquire_call.args[0]
+    assert "pg_advisory_unlock($1::integer, $2::integer)" in release_call.args[0]
+    assert acquire_call.args[1:] == (0, 7)
+    assert release_call.args[1:] == acquire_call.args[1:]
+
+
+@pytest.mark.parametrize(("project_id", "expected_keys"), (
+    (1, (0, 1)),
+    (0xFFFF_FFFF, (0, -1)),
+    (0x1_0000_0000, (1, 0)),
+    (0x7FFF_FFFF_FFFF_FFFF, (0x7FFF_FFFF, -1)),
+))
+def test_postgres_advisory_lock_losslessly_splits_signed_bigint_keys(
+    project_id: int, expected_keys: tuple[int, int],
+) -> None:
+    from backend.services.campaigns.project_coordinator import PostgresProjectLock
+
+    connection = AsyncMock()
+    connection.fetchval.side_effect = [True, True]
+
+    class Acquisition:
+        async def __aenter__(self): return connection
+        async def __aexit__(self, *args): return False
+
+    async def scenario():
+        async with PostgresProjectLock(SimpleNamespace(acquire=lambda: Acquisition())).acquire(
+            project_id,
+        ):
+            pass
+
+    run(scenario())
+
+    acquire_call, release_call = connection.fetchval.await_args_list
+    assert acquire_call.args[1:] == expected_keys
+    assert release_call.args[1:] == acquire_call.args[1:]
+
+
+def test_postgres_advisory_lock_rejects_ids_outside_postgresql_bigint() -> None:
+    from backend.services.campaigns.project_coordinator import PostgresProjectLock
+
+    class Pool:
+        def acquire(self):
+            raise AssertionError("invalid project ID must not acquire a PostgreSQL connection")
+
+    async def scenario():
+        async with PostgresProjectLock(Pool()).acquire(0x8000_0000_0000_0000):
+            pass
+
+    with pytest.raises(ValueError, match="PostgreSQL BIGINT"):
+        run(scenario())
 
 
 def test_advisory_unlock_failure_does_not_replace_the_coordinator_failure() -> None:

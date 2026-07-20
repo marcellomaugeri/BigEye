@@ -45,10 +45,10 @@ class PostgresProjectLock:
 
     @asynccontextmanager
     async def acquire(self, project_id: int):
-        _project_id(project_id)
+        lock_keys = _project_lock_keys(project_id)
         async with self._pool.acquire() as connection:
             acquired = await connection.fetchval(
-                "SELECT pg_try_advisory_lock($1::bigint)", project_id,
+                "SELECT pg_try_advisory_lock($1::integer, $2::integer)", *lock_keys,
             )
             if type(acquired) is not bool:
                 raise RuntimeError("PostgreSQL returned an invalid advisory lock result")
@@ -62,7 +62,7 @@ class PostgresProjectLock:
                 if acquired:
                     try:
                         released = await connection.fetchval(
-                            "SELECT pg_advisory_unlock($1::bigint)", project_id,
+                            "SELECT pg_advisory_unlock($1::integer, $2::integer)", *lock_keys,
                         )
                         if released is not True:
                             raise RuntimeError("PostgreSQL did not release the project advisory lock")
@@ -376,6 +376,18 @@ def _action_failure_evidence(project_id: int, failures: list[object]) -> dict:
 def _project_id(value: int) -> None:
     if type(value) is not int or value <= 0:
         raise ValueError("project ID must be a positive integer")
+
+
+def _project_lock_keys(project_id: int) -> tuple[int, int]:
+    """Losslessly place a BIGINT project ID in PostgreSQL's disjoint two-key lock space."""
+    _project_id(project_id)
+    if project_id > 0x7FFF_FFFF_FFFF_FFFF:
+        raise ValueError("project ID must fit PostgreSQL BIGINT")
+    high = project_id >> 32
+    low = project_id & 0xFFFF_FFFF
+    if low > 0x7FFF_FFFF:
+        low -= 0x1_0000_0000
+    return high, low
 
 
 def _retirement_evidence(candidate: RetirementCandidate) -> dict:
