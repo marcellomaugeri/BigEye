@@ -725,7 +725,9 @@ class DeferredCampaignContainers:
                 (CleanupAssetIdentity("target", target.id, target.content_hash),),
             )
             self._unique_cleanup_identity(identities, target_identity)
-            if campaign.stopped_at is None:
+            # A stopped healthy campaign is unscheduled, not deleted. Keep its exact
+            # validated image available for later reassignment and finding replay.
+            if campaign.error is None:
                 referenced.add(invocation.image_id)
             try:
                 coverage = self._invocations.load_coverage(project.id, campaign.id)
@@ -758,7 +760,7 @@ class DeferredCampaignContainers:
                 tuple(coverage_assets),
             )
             self._unique_cleanup_identity(identities, coverage_identity)
-            if campaign.stopped_at is None:
+            if campaign.error is None:
                 referenced.add(coverage.clean_image_id)
         result = ProjectCleaner(
             client, self._workspace, clock=lambda: datetime.now(UTC),

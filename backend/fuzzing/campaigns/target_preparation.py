@@ -394,8 +394,9 @@ class TargetPreparationService:
             assets = dict(plan.existing_assets)
             for asset in assets.values():
                 self._validate_published_asset(project.id, asset)
+            creator = getattr(self._asset_store, "create_reusable", self._asset_store.create)
             for request in plan.asset_versions:
-                asset = await self._asset_store.create(
+                asset = await creator(
                     project.id,
                     request.kind,
                     request.name,

@@ -42,6 +42,91 @@ class AssetRepository:
         )
         return self._asset(row) if row else None
 
+    async def find_validated_content(
+        self, project_id: int, kind: str, name: str, content_hash: str,
+    ) -> CampaignAsset | None:
+        """Find an exact reusable version regardless of its validated parent ancestry."""
+        row = await self._pool.fetchrow(
+            """SELECT id, project_id, kind, name, content_hash, parent_id, created_at, validated_at, error
+               FROM assets
+               WHERE project_id = $1 AND kind = $2 AND name = $3 AND content_hash = $4
+                 AND validated_at IS NOT NULL AND error IS NULL
+               ORDER BY id DESC LIMIT 1""",
+            project_id, kind, name, content_hash,
+        )
+        return self._asset(row) if row else None
+
+    async def latest_validated(
+        self, project_id: int, kind: str, name: str,
+    ) -> CampaignAsset | None:
+        """Return the newest healthy version to use as a small-edit CAS parent."""
+        row = await self._pool.fetchrow(
+            """SELECT id, project_id, kind, name, content_hash, parent_id, created_at, validated_at, error
+               FROM assets
+               WHERE project_id = $1 AND kind = $2 AND name = $3
+                 AND validated_at IS NOT NULL AND error IS NULL
+               ORDER BY id DESC LIMIT 1""",
+            project_id, kind, name,
+        )
+        return self._asset(row) if row else None
+
+    async def deletion_evidence(self, project_id: int, asset_id: int) -> dict | None:
+        """Read complete absence evidence for a never-functional target candidate."""
+        if type(project_id) is not int or project_id <= 0 or type(asset_id) is not int or asset_id <= 0:
+            raise ValueError("asset lifecycle identity is invalid")
+        row = await self._pool.fetchrow(
+            """SELECT asset.id,
+                      EXISTS (
+                          SELECT 1 FROM campaigns AS campaign
+                          WHERE campaign.project_id = asset.project_id
+                            AND campaign.target_asset_id = asset.id
+                      ) AS accepted_campaign,
+                      EXISTS (
+                          SELECT 1 FROM campaigns AS campaign
+                          WHERE campaign.project_id = asset.project_id
+                            AND campaign.target_asset_id = asset.id
+                      ) AS successful_probe,
+                      EXISTS (
+                          SELECT 1 FROM campaigns AS campaign
+                          JOIN coverage_evidence AS coverage
+                            ON coverage.project_id = campaign.project_id
+                           AND coverage.campaign_id = campaign.id
+                          WHERE campaign.project_id = asset.project_id
+                            AND campaign.target_asset_id = asset.id
+                      ) AS useful_clean_coverage,
+                      ARRAY(
+                          SELECT DISTINCT finding.id::text
+                          FROM campaigns AS campaign
+                          JOIN campaign_crash_groups AS crash
+                            ON crash.campaign_id = campaign.id
+                          JOIN findings AS finding
+                            ON finding.project_id = campaign.project_id
+                           AND finding.fingerprint = crash.fingerprint
+                          WHERE campaign.project_id = asset.project_id
+                            AND campaign.target_asset_id = asset.id
+                          ORDER BY finding.id::text
+                      ) AS finding_dependencies
+               FROM assets AS asset
+               WHERE asset.id = $2 AND asset.project_id = $1""",
+            project_id, asset_id,
+        )
+        if row is None:
+            return None
+        values = dict(row)
+        return {
+            "complete": True,
+            "successful_probe": bool(values["successful_probe"]),
+            "accepted_campaign": bool(values["accepted_campaign"]),
+            "useful_clean_coverage": bool(values["useful_clean_coverage"]),
+            "finding_dependencies": tuple(values["finding_dependencies"] or ()),
+            "evidence_ids": (
+                f"asset:{project_id}:{asset_id}",
+                f"campaign-absence:{project_id}:{asset_id}",
+                f"coverage-absence:{project_id}:{asset_id}",
+                f"finding-dependency-check:{project_id}:{asset_id}",
+            ),
+        }
+
     async def mark_validated(self, asset_id: int) -> CampaignAsset:
         row = await self._pool.fetchrow(
             """UPDATE assets SET validated_at = CURRENT_TIMESTAMP, error = NULL

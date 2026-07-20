@@ -314,7 +314,15 @@ def _tool(
             tool_context.context, operation, asset_paths, assertions,
         )
         invocation = active_worker(tool_context)
-        return collection.record_operation(invocation, request).model_dump(mode="json")
+        record = collection.record_operation(
+            invocation,
+            request,
+            project_id=tool_context.context.project_id,
+            evidence_ids=tuple(sorted(exact_assignment_evidence(invocation))),
+        )
+        # The worker receives only its inert audit request identity. The distinct
+        # application-owned action ID is exposed to the manager after the attempt validates.
+        return record.model_dump(mode="json")
 
     def build(model: str):
         worker = build_fuzzing_worker(model, web_domains)
@@ -486,11 +494,15 @@ def _tool(
         )
         collection.complete_attempt(successful_invocation, accepted=True)
         accepted_review_ids.update(successful_evidence_ids)
+        operation_action_ids = [
+            collection.pipeline_action_id(request_id)
+            for request_id in output.operation_request_ids
+        ]
         return {
             "result": output.model_dump(mode="json"),
             "target_result_ids": [record.result_id for record in target_records],
             "triage_result_ids": [record.result_id for record in triage_records],
-            "operation_request_ids": list(output.operation_request_ids),
+            "operation_request_ids": operation_action_ids,
         }
 
     def worker_failure(tool_context, error: Exception):

@@ -23,6 +23,8 @@ from backend.services.stream_task_output import TaskLogReader
 from backend.services.stream_task_output import TaskLogWriter
 from backend.services.execute_project_backbone import ExecuteProjectBackbone
 from backend.services.campaigns.decision_executor import DecisionExecutor
+from backend.services.campaigns.pipeline_operations import PipelineOperationService
+from backend.services.campaigns.target_lifecycle import TargetLifecycleService
 from backend.services.campaigns.production_preparation import (
     CampaignTargetPreparation,
     DeferredTargetPreparationGraph,
@@ -50,6 +52,7 @@ from backend.fuzzing.coverage.replay_verifier import (
 )
 from backend.fuzzing.crashes.artifacts import FindingArtifactStore
 from backend.fuzzing.crashes.quarantine import CrashQuarantine
+from backend.fuzzing.crashes.reproduction_bundle import ReproductionBundleStore
 from backend.fuzzing.campaigns.production_factory import (
     DeferredRepositoryLayerBootstrap,
     ProductionTargetPreparationFactory,
@@ -78,6 +81,9 @@ class Services:
     coverage: object | None = None
     findings: object | None = None
     finding_artifacts: object | None = None
+    pipeline_operations: object | None = None
+    target_lifecycle: object | None = None
+    reproduction_bundles: object | None = None
 
     async def close(self) -> None:
         close = getattr(self.recovery, "close", None)
@@ -179,8 +185,27 @@ def build_services(pool, workspace: Path) -> Services:
         events=observability,
         execution_slots=execution_slots,
     )
+    pipeline_operations = PipelineOperationService(
+        target_preparation=campaign_preparation,
+        replay=evidence_processor,
+        coverage=coverage,
+        # CampaignTargetPreparation already owns the complete compile-to-start lease.
+        # Replay and coverage processing never acquire a heavy slot.
+        execution_slots=None,
+        discovery=discovery,
+        events=observability,
+    )
+    reproduction_bundles = ReproductionBundleStore(workspace)
+    target_lifecycle = TargetLifecycleService(
+        assets=assets,
+        campaigns=campaigns,
+        reproduction_bundles=reproduction_bundles,
+        coverage_history=coverage_history,
+    )
     decision_executor = DecisionExecutor(
-        campaign_preparation, campaign_control=campaign_runtime,
+        campaign_preparation,
+        campaign_control=campaign_runtime,
+        pipeline_operations=pipeline_operations,
     )
     advisory_lock = PostgresProjectLock(pool)
     backbone = ProjectBackboneService(
@@ -212,4 +237,7 @@ def build_services(pool, workspace: Path) -> Services:
         ), observability=observability,
         campaigns=campaigns, campaign_reader=CampaignReadService(campaigns, coverage_history),
         coverage=coverage, findings=findings, finding_artifacts=finding_artifacts,
+        pipeline_operations=pipeline_operations,
+        target_lifecycle=target_lifecycle,
+        reproduction_bundles=reproduction_bundles,
     )

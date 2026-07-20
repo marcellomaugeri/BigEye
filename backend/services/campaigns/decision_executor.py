@@ -8,6 +8,7 @@ from typing import Generic, TypeVar
 
 from backend.agents.outputs.campaign_review import (
     CampaignReviewResult,
+    PipelineOperationRecord,
     ProgressionActionRecord,
     RetirementActionRecord,
     TargetProposalRecord,
@@ -42,9 +43,10 @@ class ActionResult(Generic[ResultValue]):
 class DecisionExecutor:
     """Resolve manager-selected IDs without exposing a shell or Docker client."""
 
-    def __init__(self, target_preparation, campaign_control=None):
+    def __init__(self, target_preparation, campaign_control=None, pipeline_operations=None):
         self._target_preparation = target_preparation
         self._campaign_control = campaign_control
+        self._pipeline_operations = pipeline_operations
 
     async def execute(self, project, decision: CampaignReviewResult) -> list[ActionResult]:
         if not isinstance(decision, CampaignReviewResult):
@@ -82,6 +84,11 @@ class DecisionExecutor:
                 return ActionResult(action_id, output)
             if isinstance(record, TriageResultRecord):
                 return ActionResult(action_id, record.triage)
+            if isinstance(record, PipelineOperationRecord):
+                if self._pipeline_operations is None:
+                    raise ValueError("no pipeline operation service is configured")
+                output = await self._pipeline_operations.execute(project, record)
+                return ActionResult(action_id, output)
             if isinstance(record, RetirementActionRecord):
                 if self._campaign_control is None:
                     raise ValueError("no campaign control service is configured")
@@ -108,6 +115,8 @@ class DecisionExecutor:
             *((record.result_id, record) for record in decision.known_triage_results),
             *((record.action_id, record) for record in decision.known_retirement_actions),
             *((record.action_id, record) for record in decision.known_progression_actions),
+            *((record.action_id, record) for record in decision.known_pipeline_operations
+              if record.action_id in decision.known_action_ids),
         )
         for action_id, record in values:
             if action_id in records:
@@ -123,6 +132,7 @@ class DecisionExecutor:
             *((record.result_id, record) for record in decision.selected_triage_results),
             *((record.action_id, record) for record in decision.selected_retirement_actions),
             *((record.action_id, record) for record in decision.selected_progression_actions),
+            *((record.action_id, record) for record in decision.selected_pipeline_operations),
         )
         for action_id, record in values:
             if action_id in records:

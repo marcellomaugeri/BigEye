@@ -172,6 +172,68 @@ def pipeline(tmp_path: Path, *, replay=None, specialist=None, corrector=None, ev
     return service, repository, native
 
 
+def test_reproduction_bundle_freezes_exact_finding_dependencies_before_deletion(tmp_path: Path):
+    from backend.fuzzing.crashes.reproduction_bundle import (
+        ReproductionBundleRequest,
+        ReproductionBundleStore,
+    )
+
+    request = ReproductionBundleRequest(
+        project_id=7,
+        finding_id=11,
+        commit_sha="a" * 40,
+        image_id="sha256:" + "b" * 64,
+        command=("/opt/bigeye/parser", "/finding/input"),
+        environment=(("ASAN_OPTIONS", "abort_on_error=1"),),
+        sanitizer="address",
+        configuration="baseline",
+        minimal_testcase=b"crash",
+        target_asset_hash="c" * 64,
+        configuration_asset_hash="d" * 64,
+        coverage_asset_hash="e" * 64,
+    )
+
+    bundle = run(ReproductionBundleStore(tmp_path).freeze(request))
+
+    assert bundle.verified is True
+    assert bundle.manifest["image_id"] == request.image_id
+    assert bundle.manifest["commit_sha"] == request.commit_sha
+    assert bundle.manifest["testcase_sha256"] == __import__("hashlib").sha256(b"crash").hexdigest()
+    assert (bundle.root / "manifest.json").is_file()
+    assert (bundle.root / "testcase.input").read_bytes() == b"crash"
+
+
+def test_overlap_lifecycle_freezes_every_finding_bundle_before_authorizing_asset_deletion(
+    tmp_path: Path,
+):
+    from backend.services.campaigns.target_lifecycle import TargetLifecycleService
+
+    request = SimpleNamespace(project_id=7, finding_id=11)
+    bundles = SimpleNamespace(freeze=AsyncMock(return_value=SimpleNamespace(
+        bundle_id="bundle-11", verified=True,
+    )))
+    campaigns = SimpleNamespace(overlap_deletion_evidence=AsyncMock(return_value={
+        "complete": True, "project_id": 7, "campaign_id": 9,
+        "strategy_asset_id": 90, "retained_campaign_id": 4,
+        "retained_strategy_asset_id": 40, "comparable_clean_checkpoints": 2,
+        "fully_subsumed": True, "unique_crash_groups": (), "retained_healthy": True,
+        "finding_bundle_requests": (request,),
+        "evidence_ids": ("candidate:1", "retained:1", "candidate:2", "retained:2"),
+    }))
+    service = TargetLifecycleService(
+        assets=SimpleNamespace(), campaigns=campaigns, reproduction_bundles=bundles,
+    )
+
+    action = run(service.overlapping_deletion(7, 9))
+
+    bundles.freeze.assert_awaited_once_with(request)
+    assert action.reproduction_bundle_ids == ("bundle-11",)
+
+    bundles.freeze.return_value = SimpleNamespace(bundle_id="bundle-11", verified=False)
+    with pytest.raises(ValueError, match="verified reproduction bundle"):
+        run(service.overlapping_deletion(7, 9))
+
+
 def test_finding_publication_invalidates_findings_after_the_durable_write(tmp_path: Path):
     events = AsyncMock()
     service, repository, _ = pipeline(tmp_path, events=events)

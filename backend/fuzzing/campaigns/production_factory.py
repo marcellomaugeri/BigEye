@@ -145,9 +145,10 @@ class NormalBuildPreparation:
 class ProposalPreparationPlanner:
     """Bind model-written drafts and application scripts to one explicit preparation plan."""
 
-    def __init__(self, *, discovery, asset_store):
+    def __init__(self, *, discovery, asset_store, asset_repository=None):
         self._discovery = discovery
         self._assets = asset_store
+        self._asset_repository = asset_repository
 
     async def plan(self, project, proposal) -> PreparationPlan:
         context = self._discovery.context(project.id)
@@ -206,13 +207,13 @@ class ProposalPreparationPlanner:
             "Clean coverage uses the validated project source and the proposal coverage build command.\n",
         )
 
-        configuration = await self._assets.create(
+        configuration = await self._publish_reusable(
             project.id, "script", "target-build.sh",
-            {"target-build.sh": target_script}, None,
+            {"target-build.sh": target_script},
         )
-        coverage_configuration = await self._assets.create(
+        coverage_configuration = await self._publish_reusable(
             project.id, "script", "coverage-build.sh",
-            {"coverage-build.sh": coverage_script}, None,
+            {"coverage-build.sh": coverage_script},
         )
         requests: list[AssetVersionRequest] = []
         existing = {
@@ -220,35 +221,79 @@ class ProposalPreparationPlanner:
             "coverage_configuration": coverage_configuration,
         }
         if target_paths:
-            requests.append(AssetVersionRequest(
-                "target", "harness", "target", target_files, tuple(target_paths),
-            ))
+            exact, parent_id = await self._existing_or_parent(
+                project.id, "harness", "target", target_files,
+            )
+            if exact is not None:
+                existing["target"] = exact
+            else:
+                requests.append(AssetVersionRequest(
+                    "target", "harness", "target", target_files, tuple(target_paths),
+                    parent_id,
+                ))
         else:
-            existing["target"] = await self._assets.create(
-                project.id, "harness", "target", target_files, None,
+            existing["target"] = await self._publish_reusable(
+                project.id, "harness", "target", target_files,
             )
         if coverage_paths:
-            requests.append(AssetVersionRequest(
-                "coverage_adapter", "adapter", "coverage-adapter",
-                coverage_files, tuple(coverage_paths),
-            ))
+            exact, parent_id = await self._existing_or_parent(
+                project.id, "adapter", "coverage-adapter", coverage_files,
+            )
+            if exact is not None:
+                existing["coverage_adapter"] = exact
+            else:
+                requests.append(AssetVersionRequest(
+                    "coverage_adapter", "adapter", "coverage-adapter",
+                    coverage_files, tuple(coverage_paths), parent_id,
+                ))
         else:
-            existing["coverage_adapter"] = await self._assets.create(
+            existing["coverage_adapter"] = await self._publish_reusable(
                 project.id, "manifest", "coverage-build-manifest.txt",
-                {"coverage-build-manifest.txt": coverage_manifest}, None,
+                {"coverage-build-manifest.txt": coverage_manifest},
             )
         if patch_paths:
             patch_name = next(iter(patch_files))
-            requests.append(AssetVersionRequest(
-                "fuzz_patch", "fuzz_patch", patch_name,
-                patch_files, tuple(patch_paths),
-            ))
+            exact, parent_id = await self._existing_or_parent(
+                project.id, "fuzz_patch", patch_name, patch_files,
+            )
+            if exact is not None:
+                existing["fuzz_patch"] = exact
+            else:
+                requests.append(AssetVersionRequest(
+                    "fuzz_patch", "fuzz_patch", patch_name,
+                    patch_files, tuple(patch_paths), parent_id,
+                ))
         invocations = _probe_invocations(context, proposal)
         dependency_paths = tuple(
             intent.relative_path for intent in proposal.generated_asset_intents
             if _is_dependency_intent(intent)
         )
         return PreparationPlan(tuple(requests), invocations, existing, dependency_paths)
+
+    async def _publish_reusable(self, project_id: int, kind: str, name: str, files):
+        exact, parent_id = await self._existing_or_parent(project_id, kind, name, files)
+        if exact is not None:
+            return exact
+        creator = getattr(self._assets, "create_reusable", self._assets.create)
+        return await creator(project_id, kind, name, files, parent_id)
+
+    async def _existing_or_parent(self, project_id: int, kind: str, name: str, files):
+        """Return exact content reuse or the latest validated small-edit parent."""
+        repository = self._asset_repository
+        if repository is None:
+            return None, None
+        normalised = self._assets._normalise(project_id, kind, dict(files))
+        content_hash = self._assets._collection_hash(
+            self._assets._hash_sources(project_id, kind, normalised),
+        )
+        finder = getattr(repository, "find_validated_content", None)
+        if finder is not None:
+            exact = await finder(project_id, kind, name, content_hash)
+            if exact is not None:
+                return exact, None
+        latest = getattr(repository, "latest_validated", None)
+        parent = await latest(project_id, kind, name) if latest is not None else None
+        return None, getattr(parent, "id", None)
 
 
 class PreparedCleanCoverageCollector:
@@ -371,7 +416,9 @@ class ProductionTargetPreparationFactory:
             sink=lambda _text: None,
         )
         planner = ProposalPreparationPlanner(
-            discovery=self._discovery, asset_store=asset_store,
+            discovery=self._discovery,
+            asset_store=asset_store,
+            asset_repository=self._assets,
         )
         probe = ProbeService(
             ProbeRunner(ContainerRunner(client)),

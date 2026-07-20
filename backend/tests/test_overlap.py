@@ -1,6 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
+
+
+def run(awaitable):
+    return asyncio.run(awaitable)
 
 
 def checkpoint(identity: str, lines, functions=(("a.c", "parse"),), marginal_lines=()):
@@ -252,3 +260,84 @@ def test_retirement_candidate_must_be_reversible_and_project_bound() -> None:
             reason="clean coverage remained a subset for two consecutive checkpoints",
             reversible=False,
         )
+
+
+def test_target_lifecycle_requires_complete_never_functional_absence_evidence() -> None:
+    from backend.services.campaigns.target_lifecycle import TargetLifecycleService
+
+    assets = SimpleNamespace(deletion_evidence=AsyncMock(return_value={
+        "complete": True,
+        "successful_probe": False,
+        "accepted_campaign": False,
+        "useful_clean_coverage": False,
+        "finding_dependencies": (),
+        "evidence_ids": ("asset:90", "campaign-absence:90", "coverage-absence:90"),
+    }))
+    service = TargetLifecycleService(assets=assets, campaigns=SimpleNamespace())
+
+    action = run(service.never_functional_deletion(7, 90))
+
+    assert action is not None
+    assert action.kind == "delete-never-functional"
+    assert action.asset_ids == (90,)
+    for missing in (
+        {"complete": False}, {"successful_probe": True}, {"accepted_campaign": True},
+        {"useful_clean_coverage": True}, {"finding_dependencies": (11,)},
+    ):
+        assets.deletion_evidence.return_value = {
+            "complete": True,
+            "successful_probe": False,
+            "accepted_campaign": False,
+            "useful_clean_coverage": False,
+            "finding_dependencies": (),
+            "evidence_ids": ("complete:90",),
+        } | missing
+        assert run(service.never_functional_deletion(7, 90)) is None
+
+
+def test_healthy_unhelpful_target_is_unscheduled_and_preserved() -> None:
+    from backend.services.campaigns.target_lifecycle import TargetLifecycleService
+
+    campaigns = SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(
+        id=9, project_id=7, target_asset_id=90, stopped_at=None, error=None,
+    )))
+    service = TargetLifecycleService(assets=SimpleNamespace(), campaigns=campaigns)
+
+    action = run(service.unschedule(7, 9, "healthy but no recent marginal coverage"))
+
+    assert action.kind == "unschedule"
+    assert action.campaign_id == 9
+    assert action.asset_ids == ()
+    assert action.reversible is True
+
+
+def test_overlap_deletion_requires_two_clean_checkpoints_and_healthy_retained_strategy() -> None:
+    from backend.services.campaigns.target_lifecycle import TargetLifecycleService
+
+    campaigns = SimpleNamespace(overlap_deletion_evidence=AsyncMock(return_value={
+        "complete": True,
+        "project_id": 7,
+        "campaign_id": 9,
+        "strategy_asset_id": 90,
+        "retained_campaign_id": 4,
+        "retained_strategy_asset_id": 40,
+        "comparable_clean_checkpoints": 2,
+        "fully_subsumed": True,
+        "unique_crash_groups": (),
+        "retained_healthy": True,
+        "finding_bundle_requests": (),
+        "evidence_ids": ("candidate:1", "retained:1", "candidate:2", "retained:2"),
+    }))
+    service = TargetLifecycleService(assets=SimpleNamespace(), campaigns=campaigns)
+
+    assert run(service.overlapping_deletion(7, 9)).kind == "delete-overlapping"
+    for unsafe in (
+        {"comparable_clean_checkpoints": 1}, {"fully_subsumed": False},
+        {"unique_crash_groups": ("crash:unique",)}, {"retained_healthy": False},
+        {"complete": False},
+    ):
+        campaigns.overlap_deletion_evidence.return_value = {
+            **campaigns.overlap_deletion_evidence.return_value,
+            **unsafe,
+        }
+        assert run(service.overlapping_deletion(7, 9)) is None
