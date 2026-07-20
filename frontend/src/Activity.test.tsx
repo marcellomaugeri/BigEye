@@ -182,17 +182,20 @@ describe('Activity and Debug', () => {
 
   it('selects and marks the stream record addressed by the evidence query', async () => {
     const debugEvidence = {
-      ...modelDebug,
+      ...modelDebug, id: 10,
       payload: { ...modelDebug.payload, evidence_ids: ['replay:clean'] },
     };
     const duplicateEvidence = { ...debugEvidence, id: 19 };
-    window.history.replaceState(null, '', '/#activity?stream=debug&event=20&evidence=replay%3Aclean');
+    const older = { ...modelDebug, id: 9 };
+    window.history.replaceState(null, '', '/#activity?stream=debug&event=10&evidence=replay%3Aclean');
     const getProjectEvent = vi.fn().mockResolvedValue(debugEvidence);
     const api = apiDouble({
-      getProjectLog: vi.fn((_projectId: string, stream: 'activity' | 'debug') => Promise.resolve(
+      getProjectLog: vi.fn((_projectId: string, stream: 'activity' | 'debug', before: number) => Promise.resolve(
         stream === 'activity'
           ? { events: [activity], next_offset: 0, has_more: false }
-          : { events: [duplicateEvidence], next_offset: 0, has_more: false },
+          : before === -1
+            ? { events: [duplicateEvidence], next_offset: 19, has_more: true }
+            : { events: [debugEvidence, older], next_offset: 0, has_more: false },
       )),
       getProjectEvent,
     });
@@ -200,13 +203,16 @@ describe('Activity and Debug', () => {
 
     await waitFor(() => expect(result.current.activeTab).toBe('debug'));
     expect(result.current.focusedEvidenceId).toBe('replay:clean');
-    expect(result.current.focusedEventId).toBe(20);
-    expect(getProjectEvent).toHaveBeenCalledWith(project.id, 'debug', 20);
+    expect(result.current.focusedEventId).toBe(10);
+    expect(getProjectEvent).toHaveBeenCalledWith(project.id, 'debug', 10);
     expect(result.current.debugEvents.map((event) => event.id)).toEqual([debugEvidence.id, duplicateEvidence.id]);
+    act(() => result.current.onLoadMoreDebug());
+    await waitFor(() => expect(result.current.debugHasMore).toBe(false));
+    expect(result.current.debugEvents.map((event) => event.id)).toEqual([10, 19, 9]);
 
     render(<ActivityView model={model({
       activeTab: 'debug', debugEvents: [duplicateEvidence, debugEvidence],
-      focusedEvidenceId: 'replay:clean', focusedEventId: 20,
+      focusedEvidenceId: 'replay:clean', focusedEventId: 10,
     })} />);
     const records = screen.getAllByText('model.end').map((node) => node.closest('article'));
     expect(records[0]).not.toHaveAttribute('data-evidence-focus');

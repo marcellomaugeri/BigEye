@@ -30,6 +30,11 @@ function evidenceTargetFromLocation(): EvidenceTarget | null {
   return { evidenceId, stream, eventId };
 }
 
+function appendUniqueEvents(current: ProjectEvent[], older: ProjectEvent[]): ProjectEvent[] {
+  const retained = new Set(current.map((event) => event.id));
+  return [...current, ...older.filter((event) => !retained.has(event.id))];
+}
+
 export interface ActivityModel {
   project: Project | null;
   activityEvents: ProjectEvent[];
@@ -192,11 +197,11 @@ export function useActivity(
       if (generation.current !== currentGeneration || currentProjectId.current !== projectId) return;
       cursors.current[stream] = page.next_offset;
       if (stream === 'activity') {
-        setActivityEvents((current) => [...current, ...page.events]);
+        setActivityEvents((current) => appendUniqueEvents(current, page.events));
         setActivityHasMore(page.has_more);
         setActivityError(null);
       } else {
-        setDebugEvents((current) => [...current, ...page.events]);
+        setDebugEvents((current) => appendUniqueEvents(current, page.events));
         setDebugHasMore(page.has_more);
         setDebugError(null);
       }
