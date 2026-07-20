@@ -19,6 +19,10 @@ export interface BigEyeApi {
   getCoverageTree(projectId: string): Promise<CoverageTree>;
   getSourceFile(projectId: string, path: string, startLine?: number, endLine?: number): Promise<SourceFile>;
   getLineEvidence(projectId: string, path: string, lineNumber: number): Promise<LineEvidencePage>;
+  retainedTestcaseUrl(
+    projectId: string, path: string, lineNumber: number,
+    strategyAssetId: number, testcaseSha256: string,
+  ): string;
   listFindings(projectId: string, cursor?: string): Promise<FindingPageSummary>;
 }
 
@@ -91,6 +95,15 @@ export class ApiClient implements BigEyeApi {
     return this.request(`/api/projects/${encodeURIComponent(projectId)}/coverage/lines/${lineNumber}?${query}`);
   }
 
+  retainedTestcaseUrl(
+    projectId: string, path: string, lineNumber: number,
+    strategyAssetId: number, testcaseSha256: string,
+  ): string {
+    const query = new URLSearchParams({ path, sha256: testcaseSha256 });
+    return `${this.baseUrl}/api/projects/${encodeURIComponent(projectId)}/coverage/lines/${lineNumber}`
+      + `/testcases/${strategyAssetId}?${query}`;
+  }
+
   listFindings(projectId: string, cursor?: string): Promise<FindingPageSummary> {
     const query = cursor ? `?${new URLSearchParams({ cursor })}` : '';
     return this.request(`/api/projects/${encodeURIComponent(projectId)}/findings${query}`);
@@ -104,9 +117,7 @@ export class ApiClient implements BigEyeApi {
 }
 
 export function friendlyApiError(error: unknown, fallback: string): string {
-  if (error instanceof Error && error.message && !/request failed\s*\(\d+\)/i.test(error.message)) {
-    return error.message;
-  }
+  void error;
   return fallback;
 }
 

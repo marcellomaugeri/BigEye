@@ -53,6 +53,7 @@ function apiDouble(overrides: Partial<BigEyeApi> = {}): BigEyeApi {
     resumeProject: vi.fn().mockResolvedValue(project), listTasks: vi.fn().mockResolvedValue([]),
     getTaskLog: vi.fn(), getSettings: vi.fn(), listCampaigns: vi.fn().mockResolvedValue(campaigns),
     getCoverageTree: vi.fn().mockResolvedValue(coverage), getSourceFile: vi.fn(), getLineEvidence: vi.fn(),
+    retainedTestcaseUrl: vi.fn(),
     listFindings: vi.fn().mockResolvedValue({ items: [{ id: '1' }, { id: '2' }], next_cursor: null }),
     ...overrides
   } as BigEyeApi;
@@ -70,7 +71,8 @@ describe('Overview', () => {
     render(<OverviewView model={viewModel()} />);
 
     expect(screen.getByRole('heading', { name: 'Current focus' })).toBeVisible();
-    expect(screen.getByText('Parser input path')).toBeVisible();
+    const currentFocus = screen.getByRole('heading', { name: 'Current focus' }).closest('section')!;
+    expect(within(currentFocus).getByText('Parser input path')).toBeVisible();
     expect(screen.getByText('Coverage is still increasing in the parser.')).toBeVisible();
     expect(screen.getByText('2 replayed findings')).toBeVisible();
     expect(screen.getByText('12 covered lines')).toBeVisible();
@@ -82,6 +84,41 @@ describe('Overview', () => {
     expect(within(table).getByText('src/parser/message.c')).toBeVisible();
     await user.click(screen.getByText('Technical details'));
     expect(screen.getByText('AFL++')).toBeVisible();
+  });
+
+  it('lists only active campaign targets and configurations as active work', () => {
+    const modelCampaigns = {
+      ...campaigns,
+      campaigns: [
+        ...campaigns.campaigns,
+        { ...campaigns.campaigns[0], id: 5, target_name: 'Stopped decoder', configuration_name: 'Legacy mode', stopped_at: '2026-07-20T09:10:00Z' },
+        { ...campaigns.campaigns[0], id: 6, target_name: 'Broken socket', configuration_name: null, error: 'failed' },
+      ],
+      assets: [
+        ...campaigns.assets,
+        { id: 34, kind: 'strategy', name: 'Inactive orphan strategy', parent_id: 31 },
+      ],
+    };
+
+    render(<OverviewView model={viewModel({ campaigns: modelCampaigns })} />);
+
+    const activeWork = screen.getByRole('heading', { name: 'Active work' }).closest('section')!;
+    expect(within(activeWork).getByText('Parser input path')).toBeVisible();
+    expect(within(activeWork).getByText('Encrypted mode')).toBeVisible();
+    expect(within(activeWork).queryByText('Stopped decoder')).not.toBeInTheDocument();
+    expect(within(activeWork).queryByText('Broken socket')).not.toBeInTheDocument();
+    expect(within(activeWork).queryByText('Inactive orphan strategy')).not.toBeInTheDocument();
+  });
+
+  it('treats absent clean coverage as an empty map without reporting an outage', async () => {
+    const emptyCoverage = { ...coverage, files: [], pagination: { ...coverage.pagination, total: 0 } };
+    const api = apiDouble({ getCoverageTree: vi.fn().mockResolvedValue(emptyCoverage) });
+    const { result } = renderHook(() => useProjectOverview(api, eventStream(), project, true, vi.fn()));
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(result.current.coverage).toEqual(emptyCoverage);
+    expect(result.current.error).toBeNull();
   });
 
   it('preserves the Source route without a selected project', async () => {
@@ -102,6 +139,16 @@ describe('Overview', () => {
     expect(await screen.findByRole('heading', { name: 'Overview' })).toBeVisible();
     expect(screen.getByText('BigEye local services are temporarily unavailable.')).toBeVisible();
     expect(screen.queryByText(/500|Request failed/i)).not.toBeInTheDocument();
+  });
+
+  it('never renders arbitrary client error text', async () => {
+    window.history.replaceState(null, '', '/#overview');
+    render(<App api={apiDouble({
+      listProjects: vi.fn().mockRejectedValue(new Error('secret at /Users/private/key.txt'))
+    })} events={eventStream()} />);
+
+    expect(await screen.findByText('BigEye local services are temporarily unavailable.')).toBeVisible();
+    expect(screen.queryByText(/secret|\/Users\/private/i)).not.toBeInTheDocument();
   });
 
   it('generation-guards stale project responses', async () => {

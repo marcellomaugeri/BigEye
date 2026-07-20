@@ -423,6 +423,26 @@ def test_first_testcase_is_stable_per_strategy_and_replayed_before_insert(tmp_pa
     assert metadata["coverage_asset_id"] == 34
 
 
+def test_new_first_hit_invalidates_coverage_only_after_durable_publication(tmp_path: Path):
+    from backend.fuzzing.coverage.traceability import TraceabilityService
+
+    repository_root = tmp_path / "repository"
+    (repository_root / "src").mkdir(parents=True)
+    (repository_root / "src/a.c").write_text("x\n")
+    repository = _MemoryCoverageRepository()
+    events = AsyncMock()
+    service = TraceabilityService(
+        tmp_path, repository, lambda _request: True, _Registry(repository_root), events=events,
+    )
+
+    created = run(service.record(_snapshot(source_hash=sha256(b"x\n").hexdigest())))
+    ignored = run(service.record(_snapshot(source_hash=sha256(b"x\n").hexdigest())))
+
+    assert len(created) == 1
+    assert ignored == []
+    events.append.assert_awaited_once_with(7, "events", {"name": "coverage"})
+
+
 def test_failed_replay_never_commits_evidence(tmp_path: Path):
     from backend.fuzzing.coverage.llvm_coverage import CoverageIntegrityError
     from backend.fuzzing.coverage.traceability import TraceabilityService
@@ -826,6 +846,30 @@ def test_mixed_project_commits_fail_before_bounded_tree_query(tmp_path: Path):
         run(TraceabilityService(
             tmp_path, repository, lambda _request: True, _Registry(tmp_path)
         ).project_tree(7, limit=10, offset=0))
+
+
+def test_project_tree_returns_truthful_empty_coverage_for_committed_project(tmp_path: Path):
+    from backend.fuzzing.coverage.traceability import TraceabilityService
+
+    repository = _MemoryCoverageRepository()
+    checkout = tmp_path / "repository"
+    checkout.mkdir()
+
+    class Registry(_Registry):
+        async def commit_for_project(self, project_id):
+            assert project_id == 7
+            return "a" * 40
+
+    result = run(TraceabilityService(
+        tmp_path, repository, lambda _request: True, Registry(checkout),
+    ).project_tree(7, limit=10, offset=0))
+
+    assert result == {
+        "project_id": 7,
+        "commit_sha": "a" * 40,
+        "files": [],
+        "pagination": {"limit": 10, "offset": 0, "total": 0},
+    }
 
 
 def test_llvm_segments_reject_attacker_span_before_range_expansion(tmp_path: Path, monkeypatch):

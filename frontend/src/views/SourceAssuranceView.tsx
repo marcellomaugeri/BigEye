@@ -25,6 +25,7 @@ export function SourceAssuranceView({ model }: { model: SourceAssuranceModel }) 
         evidence={model.evidence}
         onStrategyFilter={model.onStrategyFilter}
         strategyFilter={model.strategyFilter}
+        testcaseUrl={model.testcaseUrl}
       />
     </div>
   </section>;

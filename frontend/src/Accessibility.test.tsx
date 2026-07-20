@@ -21,6 +21,7 @@ function apiDouble(): BigEyeApi {
     getCoverageTree: vi.fn().mockResolvedValue({ project_id: 1, commit_sha: '', files: [], pagination: { limit: 1000, offset: 0, total: 0 } }),
     getSourceFile: vi.fn(),
     getLineEvidence: vi.fn(),
+    retainedTestcaseUrl: vi.fn(),
     listFindings: vi.fn().mockResolvedValue({ items: [], next_cursor: null })
   };
 }
@@ -51,5 +52,10 @@ describe('Accessibility', () => {
     expect(styles).toContain('outline-offset: 3px;');
     expect(styles).not.toMatch(/focus[^}]*rgba\(/i);
     expect(styles).not.toMatch(/focus[^}]*outline:\s*0/i);
+  });
+
+  it('uses a neutral border for covered-file chips so red remains reserved for attention', () => {
+    expect(styles).toMatch(/\.coverage-area-files span\s*\{[^}]*border-left:\s*2px solid var\(--color-grey\)/s);
+    expect(styles).not.toMatch(/\.coverage-area-files span\s*\{[^}]*border-left:\s*2px solid var\(--color-red\)/s);
   });
 });

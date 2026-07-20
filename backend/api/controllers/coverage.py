@@ -1,6 +1,6 @@
 """Thin HTTP handling for source traceability queries."""
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from backend.api.views.coverage import (
     CoverageTreeResponse,
@@ -84,3 +84,25 @@ async def line_evidence(
         )
     except (ValueError, KeyError, CoverageIntegrityError) as error:
         _translate(error)
+
+
+@router.get("/projects/{project_id}/coverage/lines/{line_number}/testcases/{strategy_asset_id}")
+async def retained_testcase(
+    project_id: int,
+    line_number: int,
+    strategy_asset_id: int,
+    request: Request,
+    path: str = Query(min_length=1, max_length=4096),
+    sha256: str = Query(min_length=64, max_length=64, pattern="^[0-9a-f]{64}$"),
+):
+    try:
+        content = await _coverage(request).retained_testcase(
+            project_id, path, line_number, strategy_asset_id, sha256,
+        )
+    except (ValueError, KeyError, CoverageIntegrityError) as error:
+        _translate(error)
+    return Response(
+        content=content,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="bigeye-first-hit-{sha256}.input"'},
+    )

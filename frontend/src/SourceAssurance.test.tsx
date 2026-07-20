@@ -54,7 +54,7 @@ function model(overrides: Partial<SourceAssuranceModel> = {}): SourceAssuranceMo
     project, tree, source, campaigns, evidence: lineEvidence,
     selectedPath: 'src/parser.c', selectedLine: 42, strategyFilter: '33',
     loading: false, error: null, onSelectPath: vi.fn(), onSelectLine: vi.fn(),
-    onStrategyFilter: vi.fn(), ...overrides
+    onStrategyFilter: vi.fn(), testcaseUrl: (item) => `/retained/${item.testcase_sha256}`, ...overrides
   };
 }
 
@@ -65,6 +65,7 @@ function apiDouble(overrides: Partial<BigEyeApi> = {}): BigEyeApi {
     getTaskLog: vi.fn(), getSettings: vi.fn(), listCampaigns: vi.fn().mockResolvedValue(campaigns),
     getCoverageTree: vi.fn().mockResolvedValue(tree), getSourceFile: vi.fn().mockResolvedValue(source),
     getLineEvidence: vi.fn().mockResolvedValue(lineEvidence),
+    retainedTestcaseUrl: vi.fn().mockReturnValue('/retained/testcase'),
     listFindings: vi.fn().mockResolvedValue({ items: [], next_cursor: null }), ...overrides
   } as BigEyeApi;
 }
@@ -85,8 +86,10 @@ describe('Source assurance', () => {
     expect(within(sourceRegion).getByText('uncovered')).toBeVisible();
 
     expect(screen.getByRole('combobox', { name: 'Reaching strategy' })).toHaveValue('33');
-    expect(screen.getByRole('link', { name: 'First testcase evidence for Parser strategy' })).toBeVisible();
-    expect(screen.queryByRole('link', { name: 'First testcase evidence for Socket strategy' })).not.toBeInTheDocument();
+    const testcaseLink = screen.getByRole('link', { name: 'Download first testcase for Parser strategy' });
+    expect(testcaseLink).toHaveAttribute('href', `/retained/${'b'.repeat(64)}`);
+    expect(testcaseLink).toHaveAttribute('download');
+    expect(screen.queryByRole('link', { name: 'Download first testcase for Socket strategy' })).not.toBeInTheDocument();
     expect(screen.getByText('1.5 CPU exposure hours')).toBeVisible();
     expect(screen.getByText('b'.repeat(64))).toBeVisible();
     expect(screen.getByText('/target {input}')).toBeVisible();
@@ -111,6 +114,32 @@ describe('Source assurance', () => {
 
     expect(result.current.selectedLine).toBe(42);
     expect(result.current.evidence?.evidence[0].testcase_sha256).toBe('f'.repeat(64));
+  });
+
+  it('selects the first covered line and never requests evidence for an uncovered line', async () => {
+    const getLineEvidence = vi.fn().mockResolvedValue(lineEvidence);
+    const api = apiDouble({ getLineEvidence });
+    const { result } = renderHook(() => useSourceAssurance(api, events, project, true));
+
+    await waitFor(() => expect(result.current.source?.path).toBe('src/parser.c'));
+    await waitFor(() => expect(result.current.selectedLine).toBe(41));
+    expect(getLineEvidence).toHaveBeenCalledWith('7', 'src/parser.c', 41);
+
+    act(() => result.current.onSelectLine(43));
+    await waitFor(() => expect(result.current.selectedLine).toBe(43));
+    expect(result.current.evidence).toBeNull();
+    expect(getLineEvidence).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats absent clean coverage as a truthful empty state rather than an outage', async () => {
+    const emptyTree = { ...tree, files: [], pagination: { ...tree.pagination, total: 0 } };
+    const api = apiDouble({ getCoverageTree: vi.fn().mockResolvedValue(emptyTree) });
+    const { result } = renderHook(() => useSourceAssurance(api, events, project, true));
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(result.current.tree).toEqual(emptyTree);
+    expect(result.current.error).toBeNull();
   });
 
   it('exposes an accessible source list equivalent', () => {

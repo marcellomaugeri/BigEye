@@ -13,7 +13,9 @@ export function OverviewView({ model }: { model: ProjectOverviewModel }) {
   const findingLabel = model.findingCount === 0
     ? 'No replayed findings yet'
     : `${model.findingsHaveMore ? 'At least ' : ''}${model.findingCount} replayed ${model.findingCount === 1 ? 'finding' : 'findings'}`;
-  const strategies = model.campaigns?.assets.filter((asset) => asset.kind === 'strategy') ?? [];
+  const activeCampaigns = model.campaigns?.campaigns.filter((campaign) => (
+    campaign.stopped_at === null && campaign.error === null
+  )) ?? [];
 
   return <div className="overview-view">
     <header className="view-title">
@@ -51,10 +53,13 @@ export function OverviewView({ model }: { model: ProjectOverviewModel }) {
         </section>
         <section>
           <p className="eyebrow">Active work</p>
-          <h2>Strategies</h2>
-          {strategies.length === 0
-            ? <p>No strategy has started yet.</p>
-            : <ul>{strategies.map((strategy) => <li key={strategy.id}><strong>{strategy.name}</strong></li>)}</ul>}
+          <h2>Active work</h2>
+          {activeCampaigns.length === 0
+            ? <p>No assurance work is active yet.</p>
+            : <ul>{activeCampaigns.map((campaign) => <li key={campaign.id}>
+              <strong>{campaign.target_name}</strong>
+              {campaign.configuration_name && <span>{campaign.configuration_name}</span>}
+            </li>)}</ul>}
         </section>
       </aside>
     </div>

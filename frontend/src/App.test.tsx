@@ -32,6 +32,7 @@ function apiDouble(): BigEyeApi {
     getCoverageTree: vi.fn().mockResolvedValue({ project_id: 1, commit_sha: '', files: [], pagination: { limit: 1000, offset: 0, total: 0 } }),
     getSourceFile: vi.fn(),
     getLineEvidence: vi.fn(),
+    retainedTestcaseUrl: vi.fn(),
     listFindings: vi.fn().mockResolvedValue({ items: [], next_cursor: null })
   };
 }

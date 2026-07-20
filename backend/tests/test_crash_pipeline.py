@@ -7,6 +7,7 @@ import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -151,7 +152,7 @@ class Specialist:
         )
 
 
-def pipeline(tmp_path: Path, *, replay=None, specialist=None, corrector=None):
+def pipeline(tmp_path: Path, *, replay=None, specialist=None, corrector=None, events=None):
     repository = Findings()
     native = NativeMinimiser()
     service = CrashPipeline(
@@ -161,8 +162,19 @@ def pipeline(tmp_path: Path, *, replay=None, specialist=None, corrector=None):
         findings=repository,
         specialist=specialist or Specialist(),
         correction=corrector,
+        events=events,
     )
     return service, repository, native
+
+
+def test_finding_publication_invalidates_findings_after_the_durable_write(tmp_path: Path):
+    events = AsyncMock()
+    service, repository, _ = pipeline(tmp_path, events=events)
+
+    finding = run(service.process(observation()))
+
+    assert repository.rows[(7, finding.fingerprint)] == finding
+    events.append.assert_awaited_once_with(7, "events", {"name": "findings"})
 
 
 def artifact_evidence(fingerprint: str) -> CrashTriageEvidence:

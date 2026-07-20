@@ -42,6 +42,7 @@ function apiDouble(overrides: Record<string, unknown> = {}) {
     getCoverageTree: vi.fn().mockResolvedValue({ project_id: 7, commit_sha: activeProject.commit_sha, files: [], pagination: { limit: 1000, offset: 0, total: 0 } }),
     getSourceFile: vi.fn(),
     getLineEvidence: vi.fn(),
+    retainedTestcaseUrl: vi.fn(),
     listFindings: vi.fn().mockResolvedValue({ items: [], next_cursor: null }),
     ...overrides
   } as BigEyeApi & Record<string, ReturnType<typeof vi.fn>>;

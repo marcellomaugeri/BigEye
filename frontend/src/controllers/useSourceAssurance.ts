@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { CampaignList } from '../models/campaign';
-import type { CoverageTree, LineEvidencePage, SourceFile } from '../models/coverage';
+import type { CoverageTree, LineEvidence, LineEvidencePage, SourceFile } from '../models/coverage';
 import type { Project } from '../models/project';
 import { friendlyApiError, type BigEyeApi } from '../services/apiClient';
 import type { ProjectEventStream, ProjectInvalidation } from '../services/eventStream';
@@ -21,6 +21,7 @@ export interface SourceAssuranceModel {
   onSelectPath: (path: string) => void;
   onSelectLine: (line: number) => void;
   onStrategyFilter: (strategyId: string) => void;
+  testcaseUrl: (evidence: LineEvidence) => string;
 }
 
 export function useSourceAssurance(
@@ -60,7 +61,7 @@ export function useSourceAssurance(
         currentProjectId.current !== projectId || selectedPathRef.current !== path
       ) return;
       setSource(value);
-      const firstLine = value.lines[0]?.number ?? null;
+      const firstLine = value.lines.find((line) => line.covered)?.number ?? null;
       selectedLineRef.current = firstLine;
       setSelectedLine(firstLine);
     } catch (requestError) {
@@ -121,7 +122,14 @@ export function useSourceAssurance(
           selectedPathRef.current = nextPath;
           setSelectedPath(nextPath);
         }
-        if (nextPath) void loadSource(projectId, nextPath);
+        if (nextPath) {
+          void loadSource(projectId, nextPath);
+        } else {
+          selectedLineRef.current = null;
+          setSelectedLine(null);
+          setSource(null);
+          setEvidence(null);
+        }
       } catch (requestError) {
         if (isCurrent()) reportError(requestError);
       }
@@ -161,8 +169,14 @@ export function useSourceAssurance(
     if (!enabled || !project || !selectedPath || selectedLine === null) return;
     selectedPathRef.current = selectedPath;
     selectedLineRef.current = selectedLine;
+    const selectedSourceLine = source?.lines.find((line) => line.number === selectedLine);
+    if (!selectedSourceLine?.covered) {
+      evidenceGeneration.current += 1;
+      setEvidence(null);
+      return;
+    }
     void loadEvidence(project.id, selectedPath, selectedLine);
-  }, [enabled, loadEvidence, project, selectedLine, selectedPath]);
+  }, [enabled, loadEvidence, project, selectedLine, selectedPath, source]);
 
   const onSelectPath = useCallback((path: string) => {
     if (!project || path === selectedPathRef.current) return;
@@ -183,5 +197,12 @@ export function useSourceAssurance(
     project, tree, source, campaigns, evidence, selectedPath, selectedLine,
     strategyFilter, loading, error, onSelectPath, onSelectLine,
     onStrategyFilter: setStrategyFilter,
+    testcaseUrl: (item) => (
+      project && selectedPath && selectedLine !== null
+        ? api.retainedTestcaseUrl(
+          project.id, selectedPath, selectedLine, item.strategy_asset_id, item.testcase_sha256,
+        )
+        : '#'
+    ),
   };
 }

@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
+from backend.fuzzing.coverage.llvm_coverage import CoverageIntegrityError
+
 
 class _Coverage:
     async def project_tree(self, project_id, limit=1_000, offset=0):
@@ -39,6 +41,12 @@ class _Coverage:
             "pagination": {"limit": limit, "offset": offset, "total": 1},
         }
 
+    async def retained_testcase(self, project_id, path, line_number, strategy_asset_id, testcase_sha256):
+        assert (project_id, path, line_number, strategy_asset_id, testcase_sha256) == (
+            7, "src/a.c", 12, 33, "b" * 64,
+        )
+        return b"retained-testcase"
+
 
 def _client(coverage=None):
     from backend.api.app import create_app
@@ -63,6 +71,10 @@ def test_coverage_routes_expose_tree_source_functions_and_first_hit_evidence():
         source = client.get("/api/projects/7/coverage/source", params={"path": "src/a.c", "start_line": 12, "end_line": 20})
         functions = client.get("/api/projects/7/coverage/functions", params={"path": "src/a.c"})
         evidence = client.get("/api/projects/7/coverage/lines/12", params={"path": "src/a.c"})
+        testcase = client.get(
+            "/api/projects/7/coverage/lines/12/testcases/33",
+            params={"path": "src/a.c", "sha256": "b" * 64},
+        )
 
     assert tree.status_code == 200
     assert tree.json()["files"][0]["path"] == "src/a.c"
@@ -75,6 +87,25 @@ def test_coverage_routes_expose_tree_source_functions_and_first_hit_evidence():
     assert evidence.status_code == 200
     assert evidence.json()["evidence"][0]["strategy_asset_id"] == 33
     assert evidence.json()["pagination"]["total"] == 1
+    assert testcase.status_code == 200
+    assert testcase.content == b"retained-testcase"
+    assert testcase.headers["content-type"] == "application/octet-stream"
+    assert testcase.headers["content-disposition"].startswith("attachment;")
+
+
+def test_retained_testcase_route_rejects_untrusted_identity_without_leaking_paths():
+    class RejectingCoverage(_Coverage):
+        async def retained_testcase(self, *_args):
+            raise CoverageIntegrityError("/Users/private/secret was replaced")
+
+    with _client(RejectingCoverage()) as client:
+        response = client.get(
+            "/api/projects/7/coverage/lines/12/testcases/33",
+            params={"path": "src/a.c", "sha256": "b" * 64},
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid source path or range"}
 
 
 def test_source_route_enforces_bounded_ranges_before_service_call():
@@ -85,6 +116,22 @@ def test_source_route_enforces_bounded_ranges_before_service_call():
         })
 
     assert invalid.status_code == 422
+
+
+def test_tree_route_returns_a_truthful_empty_success_when_no_coverage_exists():
+    class EmptyCoverage(_Coverage):
+        async def project_tree(self, project_id, limit=1_000, offset=0):
+            return {
+                "project_id": project_id, "commit_sha": "a" * 40, "files": [],
+                "pagination": {"limit": limit, "offset": offset, "total": 0},
+            }
+
+    with _client(EmptyCoverage()) as client:
+        response = client.get("/api/projects/7/coverage/tree")
+
+    assert response.status_code == 200
+    assert response.json()["files"] == []
+    assert response.json()["pagination"]["total"] == 0
 
 
 def test_source_route_maps_containment_failure_without_leaking_host_path():

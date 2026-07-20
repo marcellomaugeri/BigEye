@@ -52,7 +52,7 @@ class CrashPipeline:
     """Run deterministic evidence collection before the only finding database write."""
 
     def __init__(self, *, quarantine: CrashQuarantine, replayer, minimiser: CrashMinimiser,
-                 findings, specialist, correction=None, replay_attempts: int = 3):
+                 findings, specialist, correction=None, replay_attempts: int = 3, events=None):
         self.quarantine = quarantine
         self.artifacts = FindingArtifactStore(quarantine)
         self._replayer = replayer
@@ -61,6 +61,7 @@ class CrashPipeline:
         self._findings = findings
         self._specialist = specialist
         self._correction = correction
+        self._events = events
 
     async def process(self, observation: CrashObservation) -> Finding | None:
         quarantined = self.quarantine.persist(observation)
@@ -86,7 +87,7 @@ class CrashPipeline:
         async with self.artifacts.coordinate(
             fingerprint, quarantined, minimum.input_bytes, evidence, published_triage,
         ) as selected:
-            return await self._findings.create_or_increment(
+            finding = await self._findings.create_or_increment(
                 project_id=observation.project_id,
                 fingerprint=fingerprint,
                 classification=selected.classification,
@@ -94,6 +95,9 @@ class CrashPipeline:
                 reproducible=selected.reproducible,
                 candidate_selected=selected.candidate_selected,
             )
+        if self._events is not None:
+            await self._events.append(observation.project_id, "events", {"name": "findings"})
+        return finding
 
     async def _correction_experiment(
         self, observation: CrashObservation, fingerprint: str,

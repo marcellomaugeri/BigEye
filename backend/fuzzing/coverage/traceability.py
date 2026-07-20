@@ -32,6 +32,14 @@ class ProjectCheckoutRegistry:
         self._workspace = Path(os.path.abspath(workspace))
         self._projects = projects
 
+    async def commit_for_project(self, project_id: int) -> str:
+        _positive(project_id, "project ID")
+        project = await self._projects.get(project_id)
+        if project is None or project.commit_sha is None:
+            raise KeyError("project commit not found")
+        _commit(project.commit_sha)
+        return project.commit_sha
+
     async def resolve(self, project_id: int, commit_sha: str) -> TrustedCheckout:
         _positive(project_id, "project ID")
         _commit(commit_sha)
@@ -104,11 +112,12 @@ class _RetainedHit:
 
 
 class TraceabilityService:
-    def __init__(self, workspace: Path, repository, replay_verifier, checkout_registry):
+    def __init__(self, workspace: Path, repository, replay_verifier, checkout_registry, events=None):
         self._workspace = Path(os.path.abspath(workspace))
         self._repository = repository
         self._replay_verifier = replay_verifier
         self._checkouts = checkout_registry
+        self._events = events
 
     async def record(self, snapshot):
         self._validate_snapshot(snapshot)
@@ -176,13 +185,15 @@ class TraceabilityService:
             if not won:
                 continue
             created.append(evidence)
+        if created and self._events is not None:
+            outcome = self._events.append(snapshot.project_id, "events", {"name": "coverage"})
+            if inspect.isawaitable(outcome):
+                await outcome
         return created
 
     async def project_tree(self, project_id: int, limit: int = 1_000, offset: int = 0):
-        commit = await self._project_commit(project_id)
+        commit = await self._project_commit(project_id, allow_empty=True)
         page = await self._repository.aggregate_project(project_id, commit, limit=limit, offset=offset)
-        if page.total == 0:
-            raise KeyError("coverage not found")
         await self._checkouts.resolve(project_id, commit)
         return {
             "project_id": project_id,
@@ -276,10 +287,38 @@ class TraceabilityService:
             "pagination": {"limit": limit, "offset": offset, "total": page.total},
         }
 
-    async def _project_commit(self, project_id):
+    async def retained_testcase(
+        self, project_id: int, path: str, line_number: int,
+        strategy_asset_id: int, testcase_sha256: str,
+    ) -> bytes:
+        _positive(line_number, "line number")
+        _positive(strategy_asset_id, "strategy asset ID")
+        _digest(testcase_sha256, "testcase SHA-256")
+        commit = await self._project_commit(project_id)
+        relative = self._safe_source_path(path)
+        page = await self._repository.page_for_line(
+            project_id, commit, relative, line_number, limit=500, offset=0,
+        )
+        if page.total > 500:
+            raise CoverageIntegrityError("line evidence exceeds the retained testcase read bound")
+        self._require_commit(page.items, commit)
+        evidence = next((
+            item for item in page.items
+            if item.asset_id == strategy_asset_id
+            and item.first_testcase_sha256 == testcase_sha256
+        ), None)
+        if evidence is None:
+            raise KeyError("coverage testcase not found")
+        await self._checkouts.resolve(project_id, commit)
+        _, testcase = self._read_artifact(evidence)
+        return testcase
+
+    async def _project_commit(self, project_id, *, allow_empty=False):
         _positive(project_id, "project ID")
         commits = await self._repository.list_commits(project_id)
         if not commits:
+            if allow_empty:
+                return await self._checkouts.commit_for_project(project_id)
             raise KeyError("coverage not found")
         if len(commits) != 1:
             raise CoverageIntegrityError("project coverage spans multiple commits")
@@ -438,6 +477,10 @@ class TraceabilityService:
         os.fsync(parent)
 
     def _read_metadata(self, evidence):
+        document, _ = self._read_artifact(evidence)
+        return document
+
+    def _read_artifact(self, evidence):
         parent, _, logical = self._open_logical_parent(
             evidence.project_id, evidence.commit_sha, evidence.asset_id,
             evidence.source_path, evidence.line_number,
@@ -502,7 +545,7 @@ class TraceabilityService:
             or sum(len(argument) for argument in document["replay_command"]) > 16 * 1024
         ):
             raise CoverageIntegrityError("first-hit metadata is invalid")
-        return document
+        return document, testcase
 
     @staticmethod
     def _metadata(snapshot, hit, source_hash, logical):
