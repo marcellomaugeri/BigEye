@@ -272,7 +272,7 @@ class TargetPreparationService:
         self._activity = activity
         self._sink = sink or (lambda _text: None)
         self._locks = _LockPool()
-        self._validated: dict[tuple[int, str], PreparedTarget] = {}
+        self._validated: dict[str, PreparedTarget] = {}
 
     async def prepare(self, project, proposal: TargetProposal | TargetProposalRecord) -> PreparedTarget:
         self._validate_project(project)
@@ -283,16 +283,27 @@ class TargetPreparationService:
         if not isinstance(project_manifest, LayerManifest) or project_manifest.kind != "project":
             raise DeterministicPreparationError("normal build did not produce a validated project layer")
 
+        identity_key = self._target_identity_lock_key(project.id, candidate)
+        async with self._locks.acquire(identity_key):
+            return await self._prepare_with_repair(
+                project, project_manifest, candidate, initial_model,
+            )
+
+    async def _prepare_with_repair(
+        self,
+        project,
+        project_manifest: LayerManifest,
+        candidate: TargetProposal,
+        initial_model: str,
+    ) -> PreparedTarget:
         attempts: list[str] = []
         while True:
             model = initial_model if not attempts else _TERRA
             attempts.append(model)
             try:
-                identity_key = self._target_identity_lock_key(project.id, candidate)
-                async with self._locks.acquire(identity_key):
-                    prepared = await self._prepare_once(
-                        project, project_manifest, candidate, tuple(attempts),
-                    )
+                prepared = await self._prepare_once(
+                    project, project_manifest, candidate, tuple(attempts),
+                )
             except DeterministicPreparationError as error:
                 retained = self._validated.get(self._target_key(project, candidate))
                 await self._record_activity(
@@ -555,34 +566,40 @@ class TargetPreparationService:
             raise DeterministicPreparationError("prepared image is not an exact linux/amd64 image ID")
         return image_id
 
-    @staticmethod
-    def _proposal_identity(proposal: TargetProposal) -> tuple[str, str, str]:
-        return proposal.target_name, proposal.instance_type, proposal.configuration
+    @classmethod
+    def _proposal_identity(cls, proposal: TargetProposal) -> tuple[str, str, str]:
+        return tuple(
+            cls._normalize_identity_field(value)
+            for value in (proposal.instance_type, proposal.target_name, proposal.configuration)
+        )
 
     @classmethod
-    def _target_key(cls, project, proposal: TargetProposal) -> tuple[int, str]:
-        return project.id, cls._target_identity_digest(proposal)
+    def _target_key(cls, project, proposal: TargetProposal) -> str:
+        return cls._target_identity_digest(project.id, proposal)
 
     @classmethod
-    def _target_identity_lock_key(cls, project_id: int, proposal: TargetProposal) -> tuple[str, int, str]:
-        return "target", project_id, cls._target_identity_digest(proposal)
+    def _target_identity_lock_key(cls, project_id: int, proposal: TargetProposal) -> tuple[str, str]:
+        return "target", cls._target_identity_digest(project_id, proposal)
 
-    @staticmethod
-    def _target_identity_digest(proposal: TargetProposal) -> str:
+    @classmethod
+    def _target_identity_digest(cls, project_id: int, proposal: TargetProposal) -> str:
         fields = (
+            str(project_id),
             proposal.instance_type,
             proposal.target_name,
-            proposal.byte_path,
             proposal.configuration,
-            proposal.build_command,
-            proposal.run_command,
         )
         digest = sha256()
         for value in fields:
-            normalized = unicodedata.normalize("NFKC", value).strip()
-            if not normalized:
-                raise ValueError("target identity fields must not be blank")
+            normalized = cls._normalize_identity_field(value)
             encoded = normalized.encode("utf-8")
             digest.update(len(encoded).to_bytes(8, "big"))
             digest.update(encoded)
         return digest.hexdigest()
+
+    @staticmethod
+    def _normalize_identity_field(value: str) -> str:
+        normalized = unicodedata.normalize("NFKC", value).strip()
+        if not normalized:
+            raise ValueError("target identity fields must not be blank")
+        return normalized

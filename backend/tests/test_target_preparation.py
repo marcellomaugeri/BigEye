@@ -550,6 +550,43 @@ def test_second_deterministic_failure_retains_last_validated_target() -> None:
     assert captured.value.retained_target.target_manifest.tag == first.target_manifest.tag
 
 
+@pytest.mark.parametrize("change", [
+    {"byte_path": "bytes -> repaired_parse_message"},
+    {"build_command": "cmake --build build --target parser_fuzz_repaired"},
+    {"run_command": "/opt/bigeye/parser_fuzz_repaired"},
+])
+def test_mutable_repair_fields_retain_the_last_accepted_target(change) -> None:
+    service = preparation()
+    accepted = run(service.prepare(project(), proposal()))
+    service._probe = _Probe(probe_evidence(input_evidence(project_lines=0)))
+    changed = proposal().model_copy(update=change)
+
+    with pytest.raises(TargetPreparationFailed) as captured:
+        run(service.prepare(project(), changed))
+
+    assert captured.value.retained_target is accepted
+
+
+def test_repair_identity_digest_uses_only_project_type_name_and_configuration() -> None:
+    base = proposal()
+    mutable_change = base.model_copy(update={
+        "byte_path": "bytes -> another function",
+        "build_command": "ninja -C another-build parser_fuzz",
+        "run_command": "/opt/bigeye/another-parser-fuzz",
+    })
+    different_configuration = base.model_copy(update={"configuration": "feature-enabled"})
+
+    assert TargetPreparationService._target_identity_digest(7, base) == (
+        TargetPreparationService._target_identity_digest(7, mutable_change)
+    )
+    assert TargetPreparationService._target_identity_digest(7, base) != (
+        TargetPreparationService._target_identity_digest(8, base)
+    )
+    assert TargetPreparationService._target_identity_digest(7, base) != (
+        TargetPreparationService._target_identity_digest(7, different_configuration)
+    )
+
+
 def test_crashing_probe_is_not_repaired_and_returns_both_executions_for_triage() -> None:
     crash = probe_evidence(input_evidence(immediate_crash=True, replayed_immediate_crash=True))
     repairer = _Repairer()
@@ -590,6 +627,70 @@ def test_only_typed_compilation_failure_gets_one_terra_repair() -> None:
 
     assert prepared.agent_attempts == ("gpt-5.6-luna", "gpt-5.6-terra")
     assert len(repairer.calls) == 1
+
+
+def test_concurrent_initial_and_terra_repair_share_one_identity_lock() -> None:
+    class Activity:
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+            self.guard = threading.Lock()
+
+        def enter(self):
+            with self.guard:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+
+        def leave(self):
+            with self.guard:
+                self.active -= 1
+
+    activity = Activity()
+
+    class FirstCompilationFails(_TargetLayers):
+        def __init__(self):
+            super().__init__()
+            self.count = 0
+            self.guard = threading.Lock()
+
+        def prepare(self, *arguments, cancellation_signal=None):
+            activity.enter()
+            try:
+                time.sleep(0.02)
+                with self.guard:
+                    self.count += 1
+                    call = self.count
+            finally:
+                activity.leave()
+            if call == 1:
+                raise ImageCompilationFailed("generated target did not compile")
+            return _manifest("target", f"bigeye-target:{call}")
+
+    class SlowRepair:
+        async def repair(self, selected_project, selected_proposal, failure, model):
+            activity.enter()
+            try:
+                await asyncio.sleep(0.04)
+            finally:
+                activity.leave()
+            return TargetRepair(
+                selected_proposal.model_copy(update={"uncertainty": "repaired"}),
+                "gpt-5.6-terra",
+            )
+
+    service = preparation(target_layers=FirstCompilationFails(), repairer=SlowRepair())
+
+    async def scenario():
+        return await asyncio.gather(
+            service.prepare(project(), proposal()),
+            service.prepare(project(), proposal()),
+        )
+
+    first, second = run(scenario())
+
+    assert activity.max_active == 1
+    assert first.agent_attempts == ("gpt-5.6-luna", "gpt-5.6-terra")
+    assert second.agent_attempts == ("gpt-5.6-luna",)
 
 
 def test_daemon_build_failure_is_fatal_and_never_sent_to_repair() -> None:
