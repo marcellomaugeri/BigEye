@@ -28,6 +28,7 @@ class CoverageIntegrityError(ValueError):
 
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _FORBIDDEN_REPLAY_ENVIRONMENT = frozenset({"PATH", "PYTHONPATH"})
+_MAX_FAILURE_STDERR_BYTES = 32 * 1_024
 
 
 @dataclass(frozen=True)
@@ -157,8 +158,12 @@ class DockerCoverageExecutor:
             if attached is not None:
                 send_exact_stdin(attached, stdin_bytes, self._timeout)
             result = container.wait(timeout=self._timeout)
-            if int(result["StatusCode"]) != 0:
-                raise CoverageIntegrityError("clean coverage command failed")
+            exit_code = int(result["StatusCode"])
+            if exit_code != 0:
+                stderr, truncated, unavailable = _bounded_failure_stderr(container)
+                raise CoverageIntegrityError(
+                    _coverage_failure_diagnostic(exit_code, stderr, truncated, unavailable)
+                )
             output = bytearray()
             for chunk in container.logs(stdout=True, stderr=False, stream=True, follow=False):
                 encoded = chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8", errors="replace")
@@ -176,6 +181,50 @@ class DockerCoverageExecutor:
                 container.remove(force=True)
             except Exception:
                 pass
+
+
+def _bounded_failure_stderr(container) -> tuple[bytes, bool, bool]:
+    output = bytearray()
+    truncated = False
+    try:
+        for chunk in container.logs(stdout=False, stderr=True, stream=True, follow=False):
+            encoded = (
+                chunk if isinstance(chunk, bytes)
+                else str(chunk).encode("utf-8", errors="replace")
+            )
+            remaining = _MAX_FAILURE_STDERR_BYTES - len(output)
+            if len(encoded) > remaining:
+                output.extend(encoded[:remaining])
+                truncated = True
+                break
+            output.extend(encoded)
+    except Exception:
+        return bytes(output), truncated, True
+    return bytes(output), truncated, False
+
+
+def _coverage_failure_diagnostic(
+    exit_code: int, stderr: bytes, truncated: bool, unavailable: bool,
+) -> str:
+    text = stderr.decode("utf-8", errors="replace")
+    labels = []
+    for marker, label in (
+        ("AddressSanitizer", "AddressSanitizer"),
+        ("UndefinedBehaviorSanitizer", "UndefinedBehaviorSanitizer"),
+        ("LeakSanitizer", "LeakSanitizer"),
+        ("MemorySanitizer", "MemorySanitizer"),
+        ("ThreadSanitizer", "ThreadSanitizer"),
+        ("runtime error:", "undefined-behaviour runtime error"),
+        ("Failed spawning a tracer thread", "sanitizer tracer thread unavailable"),
+    ):
+        if marker in text:
+            labels.append(label)
+    if truncated:
+        labels.append("stderr truncated")
+    if unavailable:
+        labels.append("stderr unavailable")
+    detail = "; ".join(labels) if labels else "stderr withheld"
+    return f"clean coverage command failed (exit {exit_code}; {detail})"
 
 
 class LlvmCoverage:

@@ -40,6 +40,7 @@ from backend.fuzzing.docker.container_runner import ContainerRunner
 from backend.fuzzing.docker.client import DockerClient
 from backend.fuzzing.docker.image_builder import ImageBuilder
 from backend.fuzzing.docker.image_inspector import ImageInspector
+from backend.fuzzing.sanitizer_environment import BASELINE_SANITIZER_ENVIRONMENT
 from backend.fuzzing.layers.coverage_layer import CoverageLayerService
 from backend.fuzzing.layers.project_layer import ProjectLayerService
 from backend.fuzzing.layers.repository_layer import RepositoryLayerService
@@ -351,6 +352,7 @@ class _CleanCampaign:
     cpu_exposure_seconds: float
     repository_root: Path
     source_root: str = "/src"
+    replay_environment: tuple[tuple[str, str], ...] = BASELINE_SANITIZER_ENVIRONMENT
 
 
 class ProductionTargetPreparationFactory:

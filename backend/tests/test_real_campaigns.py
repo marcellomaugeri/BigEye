@@ -303,6 +303,56 @@ class _NoopCrashMinimiser:
         return input_bytes
 
 
+def test_real_linux_amd64_probe_uses_the_application_sanitizer_runtime(tmp_path: Path) -> None:
+    from backend.fuzzing.campaigns.probe import ProbeInvocation, ProbeRunner
+    from backend.fuzzing.docker.container_runner import ContainerRunner
+    from backend.fuzzing.docker.image_builder import ImageBuilder
+    from backend.fuzzing.docker.image_inspector import ImageInspector
+    from backend.fuzzing.toolchain.builder import ToolchainBuilder
+
+    client = _docker_client()
+    image_id = None
+    try:
+        toolchain = ToolchainBuilder(
+            Path("backend/fuzzing/images/Dockerfile"),
+            ImageBuilder(client),
+            ImageInspector(client),
+        )
+        toolchain_info = toolchain.ensure(lambda _text: None)
+        image_id = _fixture_image(
+            client, tmp_path, "system_project", toolchain.tag(), toolchain_info.image_id,
+        )
+        invocation = ProbeInvocation(
+            "plain seed",
+            "seed",
+            (
+                "/opt/bigeye/bigeye_system_fixture",
+                "--mode",
+                "plain",
+                "--file",
+                "/fixture/seeds/plain.txt",
+            ),
+            b"plain-seed\n",
+        )
+
+        observation = asyncio.run(ProbeRunner(ContainerRunner(client)).run(
+            image_id, invocation, 10.0, lambda _text: None,
+        ))
+
+        inspected = client.api.inspect_image(image_id)
+        assert (inspected["Os"], inspected["Architecture"]) == ("linux", "amd64")
+        assert observation.exit_code == 0
+        assert observation.immediate_crash is False
+        assert "LeakSanitizer" not in observation.sanitizer_output
+    finally:
+        if image_id is not None:
+            try:
+                client.images.remove(image_id, force=True)
+            except Exception:
+                pass
+        client.close()
+
+
 class _RealHarnessCorrection:
     def __init__(
         self, replay, corrected_image_id, base_manifest_hash, corrected_manifest_hash,

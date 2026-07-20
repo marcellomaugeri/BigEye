@@ -13,13 +13,11 @@ from backend.fuzzing.docker.client import DockerClient
 from backend.fuzzing.engines.afl.command import AflCommand
 from backend.fuzzing.engines.contracts import EngineSpec
 from backend.fuzzing.engines.libfuzzer.command import LibFuzzerCommand
+from backend.fuzzing.sanitizer_environment import BASELINE_SANITIZER_ENVIRONMENT
 
 
 _INITIAL_REVIEW_DELAY = timedelta(minutes=5)
-_SANITIZER_ENVIRONMENT = {
-    "ASAN_OPTIONS": "abort_on_error=1:symbolize=0",
-    "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1",
-}
+_SANITIZER_ENVIRONMENT = dict(BASELINE_SANITIZER_ENVIRONMENT)
 _SHELL_OPERATOR_TOKENS = frozenset({";", "|", "||", "&&", ">", ">>", "<", "<<", "2>", "2>>"})
 
 

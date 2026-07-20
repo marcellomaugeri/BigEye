@@ -8,6 +8,7 @@ from pathlib import PurePosixPath
 from typing import Protocol
 
 from backend.fuzzing.docker.container_runner import ContainerTimedOut
+from backend.fuzzing.sanitizer_environment import BASELINE_SANITIZER_ENVIRONMENT
 
 
 _INPUT_ROLES = frozenset({"empty", "minimum", "seed"})
@@ -162,10 +163,12 @@ class ProbeRunner:
                 result = await self._bounded_runner.run(
                     image_id, command, timeout, sink,
                     stdin_bytes=invocation.testcase_bytes,
+                    environment=dict(BASELINE_SANITIZER_ENVIRONMENT),
                 )
             else:
                 result = await self._bounded_runner.run(
                     image_id, list(invocation.command), timeout, sink,
+                    environment=dict(BASELINE_SANITIZER_ENVIRONMENT),
                 )
         except ContainerTimedOut:
             return ProbeProcessObservation(None, False, True, False, "")

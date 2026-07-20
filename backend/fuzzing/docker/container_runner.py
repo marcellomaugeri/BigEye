@@ -1,6 +1,8 @@
 """Run short, tightly bounded verification containers through the SDK."""
 
 import asyncio
+from collections.abc import Mapping
+import re
 import threading
 from dataclasses import dataclass
 
@@ -23,6 +25,10 @@ class ContainerCancelled(RuntimeError):
 
 
 MAX_OUTPUT_BYTES = 1_048_576
+_ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+_MAX_ENVIRONMENT_ENTRIES = 16
+_MAX_ENVIRONMENT_VALUE_BYTES = 4_096
+_MAX_ENVIRONMENT_BYTES = 16 * 1_024
 
 
 @dataclass(frozen=True)
@@ -38,6 +44,7 @@ class ContainerRunner:
     async def run(
         self, image: str, command: list[str], timeout: float, sink, *,
         stdin_bytes: bytes | None = None,
+        environment: Mapping[str, str] | None = None,
     ) -> ContainerResult:
         if timeout <= 0:
             raise ValueError("timeout must be positive")
@@ -45,9 +52,11 @@ class ContainerRunner:
             not isinstance(stdin_bytes, bytes) or len(stdin_bytes) > MAX_STDIN_BYTES
         ):
             raise ValueError("container stdin exceeds its byte bound")
+        bounded_environment = _bounded_environment(environment)
         holder: dict[str, object] = {"cancel_requested": False, "cleanup_started": False, "lock": threading.Lock()}
         worker = asyncio.create_task(asyncio.to_thread(
             self._run_blocking, holder, image, command, timeout, sink, stdin_bytes,
+            bounded_environment,
         ))
         worker.add_done_callback(self._observe_worker)
         try:
@@ -63,7 +72,7 @@ class ContainerRunner:
 
     def _run_blocking(
         self, holder, image: str, command: list[str], timeout: float, sink,
-        stdin_bytes: bytes | None,
+        stdin_bytes: bytes | None, environment: dict[str, str],
     ) -> ContainerResult:
         options = {
             "platform": PLATFORM, "network_disabled": True, "read_only": True,
@@ -73,6 +82,8 @@ class ContainerRunner:
         }
         if stdin_bytes is not None:
             options.update({"stdin_open": True, "tty": False})
+        if environment:
+            options["environment"] = environment
         container = self._client.containers.create(image, command, **options)
         with holder["lock"]:
             holder["container"] = container
@@ -157,3 +168,25 @@ class ContainerRunner:
             container.remove(force=True)
         except Exception:
             pass
+
+
+def _bounded_environment(environment: Mapping[str, str] | None) -> dict[str, str]:
+    if environment is None:
+        return {}
+    if not isinstance(environment, Mapping) or len(environment) > _MAX_ENVIRONMENT_ENTRIES:
+        raise ValueError("container environment exceeds its entry bound")
+    result: dict[str, str] = {}
+    total = 0
+    for name, value in environment.items():
+        if not isinstance(name, str) or not _ENVIRONMENT_NAME.fullmatch(name):
+            raise ValueError("container environment name is invalid")
+        if (
+            not isinstance(value, str) or "\x00" in value
+            or len(value.encode("utf-8")) > _MAX_ENVIRONMENT_VALUE_BYTES
+        ):
+            raise ValueError("container environment value is invalid or unbounded")
+        total += len(name.encode("utf-8")) + len(value.encode("utf-8"))
+        if total > _MAX_ENVIRONMENT_BYTES:
+            raise ValueError("container environment exceeds its byte bound")
+        result[name] = value
+    return result

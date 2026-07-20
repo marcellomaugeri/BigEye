@@ -230,6 +230,12 @@ def test_system_campaign_uses_file_mode_only_for_an_explicit_input_placeholder()
 
     assert file_invocation.command[-1] == "@@"
     assert "@@" not in stdin_invocation.command
+    assert file_invocation.environment["ASAN_OPTIONS"] == (
+        "abort_on_error=1:symbolize=0:detect_leaks=0"
+    )
+    assert stdin_invocation.environment["UBSAN_OPTIONS"] == (
+        "halt_on_error=1:print_stacktrace=1"
+    )
 
 
 def test_campaign_run_command_rejects_noncontained_or_shell_argv() -> None:

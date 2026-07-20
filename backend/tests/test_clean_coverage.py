@@ -359,6 +359,54 @@ def test_docker_executor_is_isolated_and_returns_stdout_only(tmp_path: Path):
         )
 
 
+def test_docker_executor_reports_only_bounded_classified_stderr_on_failure(tmp_path: Path):
+    from backend.fuzzing.coverage.llvm_coverage import (
+        CoverageIntegrityError,
+        DockerCoverageExecutor,
+    )
+
+    class Container:
+        def __init__(self):
+            self.removed = False
+
+        def start(self): pass
+        def wait(self, timeout): return {"StatusCode": 1}
+
+        def logs(self, **kwargs):
+            assert kwargs == {
+                "stdout": False, "stderr": True, "stream": True, "follow": False,
+            }
+            yield (
+                b"ERROR: LeakSanitizer: fatal\n"
+                b"Failed spawning a tracer thread (errno 22)\n"
+                b"OPENAI_API_KEY=must-not-be-reported\n"
+                + b"x" * 100_000
+            )
+            raise AssertionError("stderr collection must stop at its byte bound")
+
+        def remove(self, force):
+            self.removed = force
+
+    container = Container()
+    client = SimpleNamespace(
+        containers=SimpleNamespace(create=lambda *_args, **_kwargs: container),
+    )
+
+    with pytest.raises(CoverageIntegrityError) as failure:
+        DockerCoverageExecutor(client, timeout_seconds=30).run(
+            CLEAN_IMAGE_ID, ("/opt/bigeye/build/target", "/coverage/input"), {}, tmp_path,
+        )
+
+    diagnostic = str(failure.value)
+    assert "exit 1" in diagnostic
+    assert "LeakSanitizer" in diagnostic
+    assert "tracer thread" in diagnostic
+    assert "OPENAI_API_KEY" not in diagnostic
+    assert "must-not-be-reported" not in diagnostic
+    assert len(diagnostic) < 300
+    assert container.removed is True
+
+
 def test_docker_coverage_executor_feeds_exact_stdin_without_mounting_input(tmp_path: Path):
     import socket
 

@@ -192,7 +192,7 @@ class _ProbeRunner:
         self.outputs = list(outputs)
         self.calls = []
 
-    async def run(self, image, command, timeout, sink):
+    async def run(self, image, command, timeout, sink, **_options):
         self.calls.append((image, tuple(command), timeout))
         value = self.outputs.pop(0)
         if isinstance(value, BaseException):
@@ -252,8 +252,11 @@ def test_probe_runs_empty_minimum_and_real_seed_twice_and_records_exact_evidence
 
 def test_probe_runner_strips_internal_stdin_marker_and_feeds_exact_testcase_bytes() -> None:
     class BoundedRunner:
-        async def run(self, image, command, timeout, sink, *, stdin_bytes=None):
+        async def run(
+            self, image, command, timeout, sink, *, stdin_bytes=None, environment=None,
+        ):
             self.call = (image, command, timeout, stdin_bytes)
+            self.environment = environment
             return ContainerResult(0, "")
 
     bounded = BoundedRunner()
@@ -353,6 +356,7 @@ def test_clean_probe_coverage_replays_same_stdin_bytes_without_an_argv_path(
 
     def replay(_self, campaign, inputs):
         captured["command"] = campaign.replay_command
+        captured["environment"] = campaign.replay_environment
         captured["bytes"] = inputs[0].read_bytes()
         return SimpleNamespace(lines=())
 
@@ -385,6 +389,10 @@ def test_clean_probe_coverage_replays_same_stdin_bytes_without_an_argv_path(
 
     assert captured == {
         "command": ("/opt/bigeye/stdin-parser", "--plain", "{stdin}"),
+        "environment": (
+            ("ASAN_OPTIONS", "abort_on_error=1:symbolize=0:detect_leaks=0"),
+            ("UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1"),
+        ),
         "bytes": b"\x00exact-clean\xff",
     }
     assert evidence.provenance.testcase_sha256 == invocation.testcase_sha256
