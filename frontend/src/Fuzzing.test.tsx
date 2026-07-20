@@ -35,7 +35,7 @@ function model(overrides: Partial<FuzzingModel> = {}): FuzzingModel {
       id: 4, target: 'Encrypted parser path', configuration: 'Framed input',
       purpose: 'Exercise encrypted parser input.', engine: 'AFL++', activity: 'running',
       coverageDelta5m: null, totalReach: 19, cpuExposureSeconds: 5_400,
-      lastEvidenceAt: '2026-07-20T09:59:30Z', state: 'Healthy',
+      lastEvidenceAt: '2026-07-20T09:59:30Z', state: 'Running',
     }], loading: false, error: null, ...overrides,
   };
 }
@@ -51,11 +51,11 @@ describe('Fuzzing workspace', () => {
     const table = screen.getByRole('table', { name: 'Autonomous fuzzing campaigns' });
     expect(within(table).getByText('Encrypted parser path')).toBeVisible();
     expect(within(table).getByText('Exercise encrypted parser input.')).toBeVisible();
-    expect(within(table).getByText('Running')).toBeVisible();
     expect(within(table).getByText('Unavailable')).toBeVisible();
     expect(within(table).getByText('19 lines')).toBeVisible();
     expect(within(table).getByText('1.5 CPU h')).toBeVisible();
-    expect(within(table).getByText('Healthy')).toBeVisible();
+    expect(within(table).getAllByText('Running')).toHaveLength(2);
+    expect(within(table).queryByText('Healthy')).not.toBeInTheDocument();
     expect(within(table).getByText('AFL++')).toHaveClass('technical-metadata');
   });
 
@@ -73,6 +73,7 @@ describe('Fuzzing workspace', () => {
     const api = apiDouble();
     const { result } = renderHook(() => useFuzzing(api, events, project, true));
     await waitFor(() => expect(result.current.rows).toHaveLength(1));
+    expect(result.current.rows[0].state).toBe('Running');
 
     for (const name of ['campaigns', 'coverage', 'activity'] as const) {
       act(() => invalidate(name));

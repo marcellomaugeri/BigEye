@@ -117,7 +117,7 @@ dd { margin: 0; }
 .fuzzing-table { min-width: 64rem; }
 .fuzzing-table tbody th { display: grid; gap: .2rem; min-width: 16rem; }
 .fuzzing-table tbody th span, .technical-metadata { color: var(--color-grey); font-size: .72rem; font-weight: 500; }
-.campaign-state[data-state="Healthy"] { color: var(--color-success); font-weight: 800; }
+.campaign-state[data-state="Running"] { color: var(--color-success); font-weight: 800; }
 .campaign-state[data-state="Needs attention"] { color: var(--color-red); font-weight: 800; }
 .overview-aside { border-left: 1px solid var(--color-grey); padding-left: clamp(1rem, 3vw, 2rem); }
 .overview-aside section { border-top: 1px solid var(--color-black); padding: 1.25rem 0 2.5rem; }

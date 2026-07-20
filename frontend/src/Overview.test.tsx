@@ -133,6 +133,42 @@ describe('Overview', () => {
     }
   });
 
+  it('prefers a running campaign over waiting and inactive campaign evidence', () => {
+    const retired = {
+      ...campaigns.campaigns[0], id: 5, target_name: 'Retired decoder',
+      activity: 'stopped' as const, stopped_at: '2026-07-20T09:00:00Z',
+      retirement_reason: 'Fully overlapped.',
+    };
+    const waiting = {
+      ...campaigns.campaigns[0], id: 6, target_name: 'Waiting parser',
+      activity: 'waiting' as const, last_heartbeat_at: null,
+    };
+    const running = {
+      ...campaigns.campaigns[0], id: 7, target_name: 'Running parser',
+      activity: 'running' as const,
+    };
+    render(<OverviewView model={viewModel({
+      campaigns: { ...campaigns, campaigns: [retired, waiting, running] },
+    })} />);
+
+    const currentFocus = screen.getByRole('heading', { name: 'Current focus' }).closest('section')!;
+    expect(within(currentFocus).getByText('Running parser')).toBeVisible();
+    expect(within(currentFocus).queryByText('Waiting parser')).not.toBeInTheDocument();
+    expect(within(currentFocus).queryByText('Retired decoder')).not.toBeInTheDocument();
+  });
+
+  it('uses a safe current-focus fallback when every campaign is inactive', () => {
+    const inactive = campaigns.campaigns.map((campaign) => ({
+      ...campaign, activity: 'stopped' as const, stopped_at: '2026-07-20T09:00:00Z',
+      retirement_reason: 'Fully overlapped.', target_name: 'Retired decoder',
+    }));
+    render(<OverviewView model={viewModel({ campaigns: { ...campaigns, campaigns: inactive } })} />);
+
+    const currentFocus = screen.getByRole('heading', { name: 'Current focus' }).closest('section')!;
+    expect(within(currentFocus).getByText('No active fuzzing focus is available.')).toBeVisible();
+    expect(within(currentFocus).queryByText('Retired decoder')).not.toBeInTheDocument();
+  });
+
   it('treats absent clean coverage as an empty map without reporting an outage', async () => {
     const emptyCoverage = { ...coverage, files: [], pagination: { ...coverage.pagination, total: 0 } };
     const api = apiDouble({ getCoverageTree: vi.fn().mockResolvedValue(emptyCoverage) });

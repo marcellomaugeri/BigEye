@@ -46,15 +46,29 @@ export function useFindingReproduction(
       setRun(started);
       const url = api.findingReproductionEventsUrl(projectId, findingId, started.run_id);
       if (!events.subscribeReproduction) throw new Error('reproduction stream is unavailable');
-      unsubscribe.current = events.subscribeReproduction(url, (event) => {
-        if (generation.current !== currentGeneration) return;
+      let terminalReceived = false;
+      const closeStream = () => {
+        const close = unsubscribe.current;
+        unsubscribe.current = null;
+        close?.();
+      };
+      const close = events.subscribeReproduction(url, (event) => {
+        if (generation.current !== currentGeneration || terminalReceived) return;
         if (event.type === 'output') setOutput((current) => [...current, event.data]);
-        else setRun(event.data);
+        else {
+          setRun(event.data);
+          if (['completed', 'failed', 'timed_out', 'interrupted'].includes(event.data.phase)) {
+            terminalReceived = true;
+            closeStream();
+          }
+        }
       }, () => {
-        if (generation.current === currentGeneration) {
+        if (generation.current === currentGeneration && !terminalReceived) {
           setError('Live reproduction output is temporarily unavailable.');
         }
       });
+      if (terminalReceived) close();
+      else unsubscribe.current = close;
     } catch (requestError) {
       if (generation.current === currentGeneration) {
         setError(friendlyApiError(requestError, 'Finding reproduction is temporarily unavailable.'));

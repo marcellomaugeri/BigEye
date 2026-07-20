@@ -8,8 +8,12 @@ export function OverviewView({ model }: { model: ProjectOverviewModel }) {
     return <EmptyState title="Overview">Select or create a project to inspect its assurance work.</EmptyState>;
   }
 
-  const focus = model.campaigns?.campaigns.find((campaign) => campaign.stopped_at === null && campaign.error === null)
-    ?? model.campaigns?.campaigns.at(-1) ?? null;
+  const focusCandidates = model.campaigns?.campaigns.filter((campaign) => (
+    campaign.stopped_at === null && campaign.error === null && campaign.retirement_reason === null
+    && (campaign.activity === 'running' || campaign.activity === 'waiting')
+  )) ?? [];
+  const focus = focusCandidates.find((campaign) => campaign.activity === 'running')
+    ?? focusCandidates.find((campaign) => campaign.activity === 'waiting') ?? null;
   const findingLabel = model.findingCount === 0
     ? 'No replayed findings yet'
     : `${model.findingsHaveMore ? 'At least ' : ''}${model.findingCount} replayed ${model.findingCount === 1 ? 'finding' : 'findings'}`;
@@ -21,7 +25,10 @@ export function OverviewView({ model }: { model: ProjectOverviewModel }) {
     if (campaign.last_heartbeat_at) return `Last observed ${new Date(campaign.last_heartbeat_at).toLocaleString()}`;
     return 'Configured';
   };
-  const activeJobs = campaignEvidence.filter((campaign) => campaign.activity === 'running').length;
+  const activeJobs = campaignEvidence.filter((campaign) => (
+    campaign.activity === 'running' && campaign.stopped_at === null
+    && campaign.error === null && campaign.retirement_reason === null
+  )).length;
 
   return <div className="overview-view">
     <header className="view-title"><div><p className="eyebrow">Assurance overview</p><h2>Overview</h2></div></header>
@@ -42,7 +49,7 @@ export function OverviewView({ model }: { model: ProjectOverviewModel }) {
               <summary>Technical details</summary>
               <dl><div><dt>Underlying fuzzer</dt><dd>{focus.engine}</dd></div></dl>
             </details>
-          </> : <p>No assurance campaign has been configured yet.</p>}
+          </> : <p>No active fuzzing focus is available.</p>}
         </section>
         <CoverageMap files={model.coverage?.files ?? []} summary={model.coverage?.summary ?? null} />
       </div>

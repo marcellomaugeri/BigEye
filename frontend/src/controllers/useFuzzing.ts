@@ -9,7 +9,7 @@ function campaignState(campaign: Campaign): string {
   if (campaign.error !== null) return 'Needs attention';
   if (campaign.retirement_reason !== null) return 'Retired';
   if (campaign.activity === 'stopped') return 'Stopped';
-  if (campaign.activity === 'running') return 'Healthy';
+  if (campaign.activity === 'running') return 'Running';
   return 'Waiting';
 }
 

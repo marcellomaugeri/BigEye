@@ -51,6 +51,44 @@ describe('finding reproduction', () => {
     expect(result.current.output).toEqual([{ stream: 'stdout', text: 'reproduced\n' }]);
   });
 
+  it('closes a terminal stream once and ignores duplicate terminal events and later errors', async () => {
+    let emit!: (event: ReproductionStreamEvent) => void;
+    let reportError!: (message: string) => void;
+    const close = vi.fn();
+    const events: ProjectEventStream = {
+      subscribe: vi.fn().mockReturnValue(() => undefined),
+      subscribeReproduction: vi.fn((_url, onEvent, onError) => {
+        emit = onEvent;
+        reportError = onError!;
+        return close;
+      }),
+    };
+    const api = {
+      startFindingReproduction: vi.fn().mockResolvedValue(run),
+      findingReproductionEventsUrl: vi.fn().mockReturnValue('/events'),
+    } as unknown as BigEyeApi;
+    const { result } = renderHook(() => useFindingReproduction(api, events, '7', '9'));
+    await act(async () => { await result.current.start(); });
+
+    const completed = {
+      ...run, phase: 'completed' as const, completed_at: '2026-07-20T10:00:01Z',
+      exit_code: 1, terminal_reason: 'exited',
+    };
+    act(() => emit({ type: 'reproduction', data: completed }));
+
+    expect(close).toHaveBeenCalledOnce();
+    expect(events.subscribeReproduction).toHaveBeenCalledOnce();
+    expect(result.current.run).toEqual(completed);
+
+    act(() => emit({ type: 'reproduction', data: { ...completed, phase: 'failed' } }));
+    act(() => reportError('connection closed'));
+
+    expect(close).toHaveBeenCalledOnce();
+    expect(events.subscribeReproduction).toHaveBeenCalledOnce();
+    expect(result.current.run).toEqual(completed);
+    expect(result.current.error).toBeNull();
+  });
+
   it('does not capture keyboard input', async () => {
     const user = userEvent.setup();
     render(<ReproductionTerminal run={run} output={[]} />);
