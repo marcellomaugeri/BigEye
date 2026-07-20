@@ -23,7 +23,7 @@ DECLARE
         'tasks'
     ];
     expected_schema_comment CONSTANT TEXT := 'bigeye-schema:release-1';
-    expected_signature CONSTANT TEXT := 'd7d38f7962801654cbb30f9f11428eea';
+    expected_signature CONSTANT TEXT := '0ff04d92b0d60a41ea4e451484989f5c';
     actual_tables TEXT[];
     actual_schema_comment TEXT;
     actual_signature TEXT;

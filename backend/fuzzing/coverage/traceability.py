@@ -725,7 +725,7 @@ class TraceabilityService:
             path = TraceabilityService._safe_source_path(branch.source_path)
             key = (
                 path, branch.line_number, branch.start_column,
-                branch.end_line, branch.end_column, branch.branch_index,
+                branch.end_line, branch.end_column, branch.branch_index, branch.outcome_index,
             )
             if (
                 type(branch.line_number) is not int or branch.line_number <= 0
@@ -733,6 +733,7 @@ class TraceabilityService:
                 or type(branch.end_line) is not int or branch.end_line < branch.line_number
                 or type(branch.end_column) is not int or branch.end_column <= 0
                 or type(branch.branch_index) is not int or branch.branch_index < 0
+                or type(branch.outcome_index) is not int or branch.outcome_index not in {0, 1}
                 or type(branch.covered) is not bool or key in branch_keys
             ):
                 raise CoverageIntegrityError("coverage branch inventory is invalid")

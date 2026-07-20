@@ -284,3 +284,29 @@ def test_project_function_union_uses_exact_function_inventory_not_line_names() -
     query = pool.fetch.await_args.args[0]
     assert "coverage_function_evidence" in query
     assert "COUNT(DISTINCT function_name)" not in query
+
+
+def test_project_branch_union_keeps_both_outcomes_and_reports_seven_of_eight() -> None:
+    from unittest.mock import AsyncMock
+
+    from backend.repositories.coverage_repository import CoverageRepository
+
+    pool = AsyncMock()
+    pool.fetch.return_value = [{
+        "source_path": "src/a.c", "covered_lines": 1,
+        "cpu_exposure_seconds": 1.0, "total_lines": 1,
+        "covered_functions": 1, "total_functions": 1,
+        "covered_branches": 7, "total_branches": 8, "total": 1,
+        "project_covered_lines": 1, "project_total_lines": 1,
+        "project_covered_functions": 1, "project_total_functions": 1,
+        "project_covered_branches": 7, "project_total_branches": 8,
+        "project_lines_available": True, "project_functions_available": True,
+        "project_branches_available": True,
+    }]
+
+    page = run(CoverageRepository(pool).aggregate_project(7, "a" * 40))
+
+    query = pool.fetch.await_args.args[0]
+    assert "outcome_index" in query
+    assert page.items[0]["covered_branches"] == 7
+    assert page.summary["branches"] == {"covered": 7, "total": 8, "percent": 87.5}

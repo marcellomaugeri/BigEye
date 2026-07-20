@@ -204,15 +204,16 @@ class CoverageRepository:
                         """INSERT INTO coverage_branch_evidence
                                   (project_id, commit_sha, coverage_asset_id, source_path,
                                    line_number, start_column, end_line, end_column,
-                                   branch_index, covered)
-                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                                   branch_index, outcome_index, covered)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                            ON CONFLICT (project_id, coverage_asset_id, source_path,
                                         line_number, start_column, end_line, end_column,
-                                        branch_index) DO UPDATE SET
+                                        branch_index, outcome_index) DO UPDATE SET
                                covered = coverage_branch_evidence.covered OR EXCLUDED.covered""",
                         snapshot.project_id, snapshot.commit_sha, snapshot.coverage_asset_id,
                         branch.source_path, branch.line_number, branch.start_column,
-                        branch.end_line, branch.end_column, branch.branch_index, branch.covered,
+                        branch.end_line, branch.end_column, branch.branch_index,
+                        branch.outcome_index, branch.covered,
                     )
 
     async def apply_exposure_observation(
@@ -403,11 +404,11 @@ class CoverageRepository:
                           COUNT(*) FILTER (WHERE covered IS TRUE) AS covered_branches
                    FROM (
                        SELECT source_path, line_number, start_column, end_line, end_column,
-                              branch_index, BOOL_OR(covered) AS covered
+                              branch_index, outcome_index, BOOL_OR(covered) AS covered
                        FROM coverage_branch_evidence
                        WHERE project_id = $1 AND commit_sha = $2
                        GROUP BY source_path, line_number, start_column, end_line,
-                                end_column, branch_index
+                                end_column, branch_index, outcome_index
                    ) AS exact_branches GROUP BY source_path
                ), inventories AS (
                    SELECT source_path,
@@ -599,11 +600,12 @@ class CoverageRepository:
         start_line: int, end_line: int,
     ) -> dict[int, tuple[bool, ...]]:
         rows = await self._pool.fetch(
-            """SELECT line_number, branch_index, BOOL_OR(covered) AS covered
+            """SELECT line_number, branch_index, outcome_index, BOOL_OR(covered) AS covered
                FROM coverage_branch_evidence
                WHERE project_id = $1 AND commit_sha = $2 AND source_path = $3
                  AND line_number BETWEEN $4 AND $5
-               GROUP BY line_number, branch_index ORDER BY line_number, branch_index""",
+               GROUP BY line_number, branch_index, outcome_index
+               ORDER BY line_number, branch_index, outcome_index""",
             project_id, commit_sha, source_path, start_line, end_line,
         )
         grouped: dict[int, list[bool]] = {}

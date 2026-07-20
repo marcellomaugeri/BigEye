@@ -1037,9 +1037,11 @@ def test_real_shaped_llvm_export_keeps_zero_count_line_function_and_branch_inven
     assert parsed.summary.lines == CoverageCount(covered=1, total=2)
     assert parsed.summary.functions == CoverageCount(covered=1, total=2)
     assert parsed.summary.branches == CoverageCount(covered=1, total=2)
-    assert [(branch.source_path, branch.line_number, branch.branch_index, branch.covered)
+    assert [(branch.source_path, branch.line_number, branch.branch_index,
+             branch.outcome_index, branch.covered)
             for branch in parsed.branches] == [
-        ("src/a.c", 1, 0, True),
+        ("src/a.c", 1, 0, 0, True),
+        ("src/a.c", 1, 0, 1, False),
     ]
     assert [(line.source_path, line.line_number) for line in parsed.lines] == [("src/a.c", 1)]
 
@@ -1147,6 +1149,58 @@ def test_real_llvm_export_line_and_branch_counts_match_llvm_report_when_availabl
         covered=int(total[10]) - int(total[11]), total=int(total[10]),
     )
     assert len(parsed.lines) == parsed.summary.lines.covered
+
+
+def test_live_llvm_seven_of_eight_branch_outcomes_remain_distinct(tmp_path: Path):
+    from backend.fuzzing.coverage.llvm_coverage import CoverageCount, LlvmCoverage
+
+    if shutil.which("xcrun") is None:
+        pytest.skip("Apple LLVM tools are unavailable")
+    source = tmp_path / "branches.c"
+    binary = tmp_path / "branches"
+    profile = tmp_path / "branches.profdata"
+    source.write_text(
+        "int main(int argc, char **argv) {\n"
+        "  int x = argv[1][0] - '0';\n"
+        "  int y = 0;\n"
+        "  if (x > 0) y++;\n"
+        "  if (x > 1) y++;\n"
+        "  if (x > 2) y++;\n"
+        "  if (x > 3) y++;\n"
+        "  return 0;\n"
+        "}\n"
+    )
+    subprocess.run([
+        "xcrun", "clang", "-fprofile-instr-generate", "-fcoverage-mapping",
+        str(source), "-o", str(binary),
+    ], check=True, capture_output=True)
+    raw_profiles = []
+    for index, argument in enumerate(("0", "3")):
+        raw = tmp_path / f"branches-{index}.profraw"
+        subprocess.run(
+            [str(binary), argument], check=True, capture_output=True,
+            env={**os.environ, "LLVM_PROFILE_FILE": str(raw)},
+        )
+        raw_profiles.append(str(raw))
+    subprocess.run([
+        "xcrun", "llvm-profdata", "merge", "-sparse", *raw_profiles,
+        "-o", str(profile),
+    ], check=True, capture_output=True)
+    exported = subprocess.run([
+        "xcrun", "llvm-cov", "export", str(binary), f"-instr-profile={profile}",
+    ], check=True, capture_output=True).stdout
+
+    parsed = LlvmCoverage(_client(), _CoverageExecutor({}), tmp_path / "work")._parse_export(
+        exported, _campaign(
+            tmp_path, repository_root=tmp_path, source_root=str(tmp_path),
+            binary_path=str(binary), replay_command=(str(binary), "{input}"),
+        ),
+    )
+
+    assert parsed.summary.branches == CoverageCount(covered=7, total=8)
+    assert len(parsed.branches) == 8
+    assert sum(branch.covered for branch in parsed.branches) == 7
+    assert {branch.outcome_index for branch in parsed.branches} == {0, 1}
 
 
 def test_project_summary_is_not_recomputed_from_the_paginated_file_page(tmp_path: Path):

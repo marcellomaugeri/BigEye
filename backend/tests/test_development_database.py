@@ -69,7 +69,7 @@ class DevelopmentDatabaseTests(unittest.TestCase):
             "covered_lines", "total_lines", "covered_functions", "total_functions",
             "covered_branches", "total_branches",
         } <= summaries)
-        self.assertTrue({"line_number", "branch_index", "covered"} <= branches)
+        self.assertTrue({"line_number", "branch_index", "outcome_index", "covered"} <= branches)
         self.assertNotIn("activity", campaigns)
         self.assertNotIn("type", campaigns)
 

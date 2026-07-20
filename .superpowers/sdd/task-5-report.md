@@ -18,14 +18,15 @@
 
 - Started a disposable `postgres:18.4-bookworm` container on `linux/amd64` with an in-memory PostgreSQL 18 data root.
 - Applied `backend/database/schema.sql` with `ON_ERROR_STOP=1`.
-- Computed corrected catalog signature `d7d38f7962801654cbb30f9f11428eea` from PostgreSQL's real relation, column, constraint, and index catalog.
+- Computed final catalog signature `0ff04d92b0d60a41ea4e451484989f5c` from PostgreSQL's real relation, column, constraint, and index catalog.
 - Applied `backend/database/schema_contract.sql` successfully (`DO`).
 - Removed the disposable container after verification.
 
 ## Verification
 
 - Reviewer correction: a live Apple LLVM 21 compile/profile/export/report test verifies parser line and branch totals against `llvm-cov report`; exact function identities are unioned from their own inventory; project summaries are computed before file pagination; and cross-asset source conflicts are locked and rejected before insert.
-- `backend/.venv/bin/python -m pytest backend/tests/test_clean_coverage.py backend/tests/test_coverage_api.py backend/tests/test_exposure.py backend/tests/test_campaign_api.py backend/tests/test_development_database.py -q`: `140 passed, 1 warning in 2.81s`.
+- Final branch-outcome correction: both true and false LLVM outcomes persist under the same real coordinate plus stable coordinate ordinal and outcome index. A live LLVM 21 fixture and repository aggregate both prove `7/8` remains `7/8`.
+- `backend/.venv/bin/python -m pytest backend/tests/test_clean_coverage.py backend/tests/test_coverage_api.py backend/tests/test_exposure.py backend/tests/test_campaign_api.py backend/tests/test_development_database.py -q`: `142 passed, 1 warning in 2.83s`.
 - Target production modules compile with `python -m py_compile`.
 - `git diff --check`: passed.
 - No broad backend suite or heavy-job scheduling test was run or changed.

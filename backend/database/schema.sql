@@ -167,10 +167,11 @@ CREATE TABLE coverage_branch_evidence (
     end_line INTEGER NOT NULL,
     end_column INTEGER NOT NULL,
     branch_index INTEGER NOT NULL,
+    outcome_index INTEGER NOT NULL,
     covered BOOLEAN NOT NULL,
     PRIMARY KEY (
         project_id, coverage_asset_id, source_path, line_number,
-        start_column, end_line, end_column, branch_index
+        start_column, end_line, end_column, branch_index, outcome_index
     ),
     FOREIGN KEY (project_id) REFERENCES projects (id),
     FOREIGN KEY (coverage_asset_id) REFERENCES assets (id),
@@ -178,7 +179,8 @@ CREATE TABLE coverage_branch_evidence (
     CHECK (start_column > 0),
     CHECK (end_line >= line_number),
     CHECK (end_column > 0),
-    CHECK (branch_index >= 0)
+    CHECK (branch_index >= 0),
+    CHECK (outcome_index IN (0, 1))
 );
 
 CREATE TABLE coverage_function_evidence (

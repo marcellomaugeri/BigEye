@@ -65,6 +65,7 @@ class CoverageBranch:
     end_line: int
     end_column: int
     branch_index: int
+    outcome_index: int
     covered: bool
 
 
@@ -633,7 +634,7 @@ class LlvmCoverage:
         function_regions: dict[str, list[tuple[int, int, str]]] = {}
         function_inventory: set[tuple[str, str, int, int, bool]] = set()
         line_inventory: dict[tuple[str, int], bool] = {}
-        branches: dict[tuple[str, int, int, int, int, int], bool] = {}
+        branches: dict[tuple[str, int, int, int, int, int, int], bool] = {}
         source_counts: dict[str, dict[str, CoverageCount | None]] = {}
         sources_with_summary: set[str] = set()
         branches_available = False
@@ -676,9 +677,11 @@ class LlvmCoverage:
                         branches_malformed = True
                     else:
                         branches_available = True
-                        for line, start_column, end_line, end_column, branch_index, covered in parsed_branches:
+                        for (line, start_column, end_line, end_column,
+                             branch_index, outcome_index, covered) in parsed_branches:
                             key = (
-                                relative, line, start_column, end_line, end_column, branch_index,
+                                relative, line, start_column, end_line, end_column,
+                                branch_index, outcome_index,
                             )
                             branches[key] = branches.get(key, False) or covered
         result = []
@@ -692,8 +695,12 @@ class LlvmCoverage:
             for path, name, line, column, covered in sorted(function_inventory)
         )
         branch_records = tuple(
-            CoverageBranch(path, line, start_column, end_line, end_column, branch_index, covered)
-            for (path, line, start_column, end_line, end_column, branch_index), covered
+            CoverageBranch(
+                path, line, start_column, end_line, end_column,
+                branch_index, outcome_index, covered,
+            )
+            for (path, line, start_column, end_line, end_column,
+                 branch_index, outcome_index), covered
             in sorted(branches.items())
         ) if branches_available and not branches_malformed else ()
         paths = sorted(set(source_counts) | {path for path, _line in line_inventory} | {
@@ -844,9 +851,9 @@ class LlvmCoverage:
             coordinate = (start_line, start_column, end_line, end_column)
             branch_index = coordinate_ordinals.get(coordinate, 0)
             coordinate_ordinals[coordinate] = branch_index + 1
-            result.append((
-                start_line, start_column, end_line, end_column, branch_index,
-                true_count > 0 or false_count > 0,
+            result.extend((
+                (start_line, start_column, end_line, end_column, branch_index, 0, true_count > 0),
+                (start_line, start_column, end_line, end_column, branch_index, 1, false_count > 0),
             ))
         return tuple(result)
 
