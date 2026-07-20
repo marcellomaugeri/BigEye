@@ -1,4 +1,6 @@
-"""SQL access for campaign assets only."""
+"""SQL access for campaign assets and exact target validation attempts."""
+
+from hashlib import sha256
 
 from backend.models.asset import CampaignAsset
 
@@ -51,6 +53,12 @@ class AssetRepository:
                FROM assets
                WHERE project_id = $1 AND kind = $2 AND name = $3 AND content_hash = $4
                  AND validated_at IS NOT NULL AND error IS NULL
+                 AND (kind <> 'harness' OR EXISTS (
+                     SELECT 1 FROM target_probe_attempts AS attempt
+                     WHERE attempt.project_id = assets.project_id
+                       AND attempt.target_asset_id = assets.id
+                       AND attempt.successful IS TRUE
+                 ))
                ORDER BY id DESC LIMIT 1""",
             project_id, kind, name, content_hash,
         )
@@ -65,6 +73,12 @@ class AssetRepository:
                FROM assets
                WHERE project_id = $1 AND kind = $2 AND name = $3
                  AND validated_at IS NOT NULL AND error IS NULL
+                 AND (kind <> 'harness' OR EXISTS (
+                     SELECT 1 FROM target_probe_attempts AS attempt
+                     WHERE attempt.project_id = assets.project_id
+                       AND attempt.target_asset_id = assets.id
+                       AND attempt.successful IS TRUE
+                 ))
                ORDER BY id DESC LIMIT 1""",
             project_id, kind, name,
         )
@@ -75,17 +89,16 @@ class AssetRepository:
         if type(project_id) is not int or project_id <= 0 or type(asset_id) is not int or asset_id <= 0:
             raise ValueError("asset lifecycle identity is invalid")
         row = await self._pool.fetchrow(
-            """SELECT asset.id,
+            """SELECT asset.id, asset.kind, asset.content_hash,
+                      COUNT(attempt.id) AS probe_attempts,
+                      COUNT(attempt.id) FILTER (WHERE attempt.successful IS FALSE) AS failed_probe_attempts,
+                      COALESCE(MAX(attempt.id), 0) AS attempt_revision,
                       EXISTS (
                           SELECT 1 FROM campaigns AS campaign
                           WHERE campaign.project_id = asset.project_id
                             AND campaign.target_asset_id = asset.id
                       ) AS accepted_campaign,
-                      EXISTS (
-                          SELECT 1 FROM campaigns AS campaign
-                          WHERE campaign.project_id = asset.project_id
-                            AND campaign.target_asset_id = asset.id
-                      ) AS successful_probe,
+                      COALESCE(BOOL_OR(attempt.successful), FALSE) AS successful_probe,
                       EXISTS (
                           SELECT 1 FROM campaigns AS campaign
                           JOIN coverage_evidence AS coverage
@@ -107,7 +120,11 @@ class AssetRepository:
                           ORDER BY finding.id::text
                       ) AS finding_dependencies
                FROM assets AS asset
-               WHERE asset.id = $2 AND asset.project_id = $1""",
+               LEFT JOIN target_probe_attempts AS attempt
+                 ON attempt.project_id = asset.project_id
+                AND attempt.target_asset_id = asset.id
+               WHERE asset.id = $2 AND asset.project_id = $1
+               GROUP BY asset.id, asset.kind, asset.content_hash""",
             project_id, asset_id,
         )
         if row is None:
@@ -115,6 +132,11 @@ class AssetRepository:
         values = dict(row)
         return {
             "complete": True,
+            "asset_kind": values["kind"],
+            "asset_content_hash": values["content_hash"],
+            "probe_attempts": int(values["probe_attempts"]),
+            "failed_probe_attempts": int(values["failed_probe_attempts"]),
+            "attempt_revision": int(values["attempt_revision"]),
             "successful_probe": bool(values["successful_probe"]),
             "accepted_campaign": bool(values["accepted_campaign"]),
             "useful_clean_coverage": bool(values["useful_clean_coverage"]),
@@ -126,6 +148,108 @@ class AssetRepository:
                 f"finding-dependency-check:{project_id}:{asset_id}",
             ),
         }
+
+    async def record_probe_attempt(
+        self, *, project_id: int, target_asset_id: int, proposal_result_id: str,
+        operation: str, successful: bool, outcome: str,
+    ) -> str:
+        if (
+            type(project_id) is not int or project_id <= 0
+            or type(target_asset_id) is not int or target_asset_id <= 0
+            or not isinstance(proposal_result_id, str) or not proposal_result_id
+            or operation not in {"build", "probe"}
+            or type(successful) is not bool
+            or not isinstance(outcome, str) or not outcome.strip() or len(outcome) > 2_000
+        ):
+            raise ValueError("target probe attempt is invalid")
+        digest = sha256(
+            f"{project_id}\0{target_asset_id}\0{proposal_result_id}\0{operation}\0"
+            f"{int(successful)}\0{outcome.strip()}".encode("utf-8")
+        ).hexdigest()
+        evidence_id = f"target-attempt:{project_id}:{digest}"
+        value = await self._pool.fetchval(
+            """INSERT INTO target_probe_attempts
+                      (project_id, target_asset_id, proposal_result_id, operation,
+                       successful, evidence_id, outcome)
+               SELECT $1, asset.id, $3, $4, $5, $6, $7
+                 FROM assets AS asset
+                WHERE asset.id = $2 AND asset.project_id = $1 AND asset.kind = 'harness'
+               ON CONFLICT (evidence_id) DO UPDATE SET evidence_id = EXCLUDED.evidence_id
+               RETURNING evidence_id""",
+            project_id, target_asset_id, proposal_result_id, operation,
+            successful, evidence_id, outcome.strip(),
+        )
+        if value != evidence_id:
+            raise ValueError("target probe attempt does not reference an exact harness asset")
+        return evidence_id
+
+    async def delete_authorized(
+        self, *, project_id: int, asset_id: int, content_hash: str, attempt_revision: int,
+    ) -> bool:
+        """Delete only the exact unreferenced failed target revision authorised by lifecycle CAS."""
+        deleted = await self._pool.fetchval(
+            """DELETE FROM assets AS asset
+               WHERE asset.id = $2 AND asset.project_id = $1 AND asset.kind = 'harness'
+                 AND asset.content_hash = $3
+                 AND NOT EXISTS (SELECT 1 FROM campaigns WHERE target_asset_id = asset.id)
+                 AND NOT EXISTS (
+                     SELECT 1 FROM target_probe_attempts
+                      WHERE target_asset_id = asset.id AND successful IS TRUE
+                 )
+                 AND (SELECT COALESCE(MAX(id), 0) FROM target_probe_attempts
+                       WHERE target_asset_id = asset.id) = $4
+                 AND EXISTS (
+                     SELECT 1 FROM target_probe_attempts
+                      WHERE target_asset_id = asset.id AND successful IS FALSE
+                 )
+               RETURNING asset.id""",
+            project_id, asset_id, content_hash, attempt_revision,
+        )
+        return deleted == asset_id
+
+    async def delete_overlap_authorized(
+        self, *, project_id: int, asset_id: int, content_hash: str, revision: int,
+    ) -> bool:
+        """Detach one stopped strategy configuration and delete its exact unused version."""
+        if revision != asset_id:
+            return False
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                asset = await connection.fetchrow(
+                    """SELECT id, kind, content_hash FROM assets
+                       WHERE id = $2 AND project_id = $1 FOR UPDATE""",
+                    project_id, asset_id,
+                )
+                if asset is None or asset["content_hash"] != content_hash or asset["kind"] == "harness":
+                    return False
+                active = await connection.fetchval(
+                    """SELECT EXISTS (
+                           SELECT 1 FROM campaigns
+                            WHERE project_id = $1 AND configuration_asset_id = $2
+                              AND stopped_at IS NULL
+                       )""",
+                    project_id, asset_id,
+                )
+                if active:
+                    return False
+                await connection.execute(
+                    """UPDATE campaigns SET configuration_asset_id = NULL
+                       WHERE project_id = $1 AND configuration_asset_id = $2
+                         AND stopped_at IS NOT NULL""",
+                    project_id, asset_id,
+                )
+                deleted = await connection.fetchval(
+                    """DELETE FROM assets
+                       WHERE id = $2 AND project_id = $1 AND content_hash = $3
+                         AND NOT EXISTS (
+                             SELECT 1 FROM campaigns
+                              WHERE target_asset_id = assets.id
+                                 OR configuration_asset_id = assets.id
+                         )
+                       RETURNING id""",
+                    project_id, asset_id, content_hash,
+                )
+                return deleted == asset_id
 
     async def mark_validated(self, asset_id: int) -> CampaignAsset:
         row = await self._pool.fetchrow(

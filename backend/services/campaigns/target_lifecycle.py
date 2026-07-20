@@ -22,6 +22,7 @@ class TargetLifecycleAction(BaseModel):
     campaign_id: int | None = Field(default=None, ge=1)
     retained_campaign_id: int | None = Field(default=None, ge=1)
     asset_ids: tuple[int, ...] = Field(default=(), max_length=64)
+    asset_revisions: tuple[tuple[int, str, str, int], ...] = Field(default=(), max_length=64)
     evidence_ids: tuple[str, ...] = Field(min_length=1, max_length=64)
     reproduction_bundle_ids: tuple[str, ...] = Field(default=(), max_length=64)
     reason: str = Field(min_length=1, max_length=1_000)
@@ -35,6 +36,14 @@ class TargetLifecycleAction(BaseModel):
             type(value) is not int or value <= 0 for value in self.asset_ids
         ):
             raise ValueError("target lifecycle asset identities are invalid")
+        if tuple(value[0] for value in self.asset_revisions) != self.asset_ids or any(
+            len(value) != 4 or not isinstance(value[1], str) or not value[1] or len(value[1]) > 100
+            or not isinstance(value[2], str) or len(value[2]) != 64
+            or any(character not in "0123456789abcdef" for character in value[2])
+            or type(value[3]) is not int or value[3] < 0
+            for value in self.asset_revisions
+        ):
+            raise ValueError("target lifecycle asset revisions are invalid")
         if len(self.evidence_ids) != len(set(self.evidence_ids)) or any(
             not isinstance(value, str) or not value.strip() or len(value) > 2_000
             for value in self.evidence_ids
@@ -46,7 +55,7 @@ class TargetLifecycleAction(BaseModel):
         ):
             raise ValueError("target lifecycle reproduction bundle identities are invalid")
         if self.kind == "unschedule":
-            if self.campaign_id is None or self.asset_ids or self.reversible is not True:
+            if self.campaign_id is None or self.asset_ids or self.asset_revisions or self.reversible is not True:
                 raise ValueError("target unscheduling must be reversible and preserve assets")
         elif self.reversible is not False or not self.asset_ids:
             raise ValueError("target deletion action is invalid")
@@ -58,11 +67,14 @@ class TargetLifecycleService:
 
     def __init__(
         self, *, assets, campaigns, reproduction_bundles=None, coverage_history=None,
+        journal=None, events=None,
     ):
         self._assets = assets
         self._campaigns = campaigns
         self._bundles = reproduction_bundles
         self._coverage_history = coverage_history
+        self._journal = journal
+        self._events = events
 
     async def never_functional_deletion(
         self, project_id: int, target_asset_id: int,
@@ -77,6 +89,12 @@ class TargetLifecycleService:
         values = self._mapping(evidence)
         if not (
             values.get("complete") is True
+            and values.get("asset_kind") == "harness"
+            and type(values.get("probe_attempts")) is int
+            and values["probe_attempts"] >= 1
+            and values.get("failed_probe_attempts") == values["probe_attempts"]
+            and type(values.get("attempt_revision")) is int
+            and values["attempt_revision"] >= 1
             and values.get("successful_probe") is False
             and values.get("accepted_campaign") is False
             and values.get("useful_clean_coverage") is False
@@ -88,10 +106,33 @@ class TargetLifecycleService:
             "delete-never-functional",
             project_id,
             asset_ids=(target_asset_id,),
+            asset_revisions=((
+                target_asset_id, "harness", values["asset_content_hash"],
+                values["attempt_revision"],
+            ),),
             evidence_ids=evidence_ids,
             reason="complete deterministic evidence shows that the target never functioned",
             reversible=False,
         )
+
+    async def prepared_actions(self, project_id: int) -> tuple[TargetLifecycleAction, ...]:
+        """Return bounded application-owned deletion candidates for manager review."""
+        assets, campaigns = await asyncio.gather(
+            self._call(self._assets.list_for_project, project_id),
+            self._call(self._campaigns.list_for_project, project_id),
+        )
+        values = []
+        for asset in assets[:1_000]:
+            if getattr(asset, "kind", None) == "harness":
+                action = await self.never_functional_deletion(project_id, asset.id)
+                if action is not None:
+                    values.append(action)
+        for campaign in campaigns[:256]:
+            action = await self.overlapping_deletion(project_id, campaign.id)
+            if action is not None:
+                values.append(action)
+        unique = {action.action_id: action for action in values}
+        return tuple(unique[key] for key in sorted(unique))
 
     async def overlapping_deletion(
         self, project_id: int, campaign_id: int,
@@ -126,12 +167,19 @@ class TargetLifecycleService:
         bundle_ids = await self._freeze_dependencies(
             project_id, tuple(values.get("finding_bundle_requests", ())),
         )
+        asset = await self._call(self._assets.get, values["strategy_asset_id"])
+        if (
+            asset is None or getattr(asset, "project_id", None) != project_id
+            or getattr(asset, "validated_at", None) is None or getattr(asset, "error", None) is not None
+        ):
+            return None
         return self._action(
             "delete-overlapping",
             project_id,
             campaign_id=campaign_id,
             retained_campaign_id=values["retained_campaign_id"],
             asset_ids=(values["strategy_asset_id"],),
+            asset_revisions=((asset.id, asset.kind, asset.content_hash, asset.id),),
             evidence_ids=self._evidence_ids(values),
             reproduction_bundle_ids=bundle_ids,
             reason="clean reach was fully subsumed at two comparable checkpoints",
@@ -231,6 +279,86 @@ class TargetLifecycleService:
             raise ValueError("finding dependencies did not produce unique reproduction bundles")
         return tuple(bundle_ids)
 
+    async def execute(self, project, action: TargetLifecycleAction) -> dict:
+        """Revalidate exact evidence, then unschedule/freeze/delete in that order."""
+        if not isinstance(action, TargetLifecycleAction) or action.project_id != project.id:
+            raise ValueError("target lifecycle action does not belong to the selected project")
+        payload = action.model_dump(mode="json")
+        started = False
+        try:
+            if self._journal is not None:
+                prior = self._journal.begin(project.id, action.action_id, payload)
+                if prior is not None:
+                    if prior.state == "completed" and prior.result is not None:
+                        return prior.result
+                    raise RuntimeError("target lifecycle action has a durable failed result")
+                started = True
+            if action.kind == "unschedule":
+                current = await self.unschedule(project.id, action.campaign_id, action.reason)
+                if current != action:
+                    raise ValueError("target lifecycle evidence changed before unscheduling")
+                stopped = await self._call(
+                    self._campaigns.stop_for_worker_limit,
+                    project.id, action.campaign_id, action.reason,
+                )
+                if stopped is not True:
+                    raise ValueError("target lifecycle campaign changed before unscheduling")
+            elif action.kind == "delete-never-functional":
+                current = await self.never_functional_deletion(project.id, action.asset_ids[0])
+                if current != action:
+                    raise ValueError("never-functional evidence changed before deletion")
+                asset_id, _kind, content_hash, attempt_revision = action.asset_revisions[0]
+                deleted = await self._call(
+                    self._assets.delete_authorized,
+                    project_id=project.id, asset_id=asset_id,
+                    content_hash=content_hash, attempt_revision=attempt_revision,
+                )
+                if deleted is not True:
+                    raise ValueError("never-functional deletion CAS failed")
+            else:
+                current = await self.overlapping_deletion(project.id, action.campaign_id)
+                if current != action:
+                    raise ValueError("overlap evidence changed before deletion")
+                stopped = await self._call(
+                    self._campaigns.stop_for_worker_limit,
+                    project.id, action.campaign_id, action.reason,
+                )
+                if stopped is not True:
+                    raise ValueError("overlap campaign changed before unscheduling")
+                if self._bundles is not None:
+                    for bundle_id in action.reproduction_bundle_ids:
+                        if await self._call(self._bundles.verify, project.id, bundle_id) is not True:
+                            raise ValueError("reproduction bundle pin changed before deletion")
+                for asset_id, _kind, content_hash, revision in action.asset_revisions:
+                    deleted = await self._call(
+                        self._assets.delete_overlap_authorized,
+                        project_id=project.id, asset_id=asset_id,
+                        content_hash=content_hash, revision=revision,
+                    )
+                    if deleted is not True:
+                        raise ValueError("overlap asset deletion CAS failed")
+            result = {"action_id": action.action_id, "status": "completed", "kind": action.kind}
+            if self._journal is not None:
+                self._journal.complete(project.id, action.action_id, payload, result)
+            await self._event(project.id, action, "completed", None)
+            return result
+        except BaseException as error:
+            await self._event(project.id, action, "failed", error)
+            if self._journal is not None and started:
+                self._journal.fail(project.id, action.action_id, payload, {
+                    "error_type": type(error).__name__, "error": str(error)[:2_000],
+                })
+            raise
+
+    async def _event(self, project_id, action, status, error):
+        if self._events is not None:
+            await self._call(self._events.append, project_id, "debug", {
+                "event": "target.lifecycle", "action_id": action.action_id,
+                "kind": action.kind, "status": status,
+                "error_type": type(error).__name__ if error is not None else None,
+                "trusted_instructions": False,
+            })
+
     @classmethod
     def _action(cls, kind: str, project_id: int, **values) -> TargetLifecycleAction:
         identity = {
@@ -278,6 +406,6 @@ class TargetLifecycleService:
             raise ValueError(f"{label} must be positive")
 
     @staticmethod
-    async def _call(method, *arguments):
-        value = method(*arguments)
+    async def _call(method, *arguments, **keywords):
+        value = method(*arguments, **keywords)
         return await value if inspect.isawaitable(value) else value

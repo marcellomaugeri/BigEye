@@ -23,7 +23,12 @@ from backend.services.stream_task_output import TaskLogReader
 from backend.services.stream_task_output import TaskLogWriter
 from backend.services.execute_project_backbone import ExecuteProjectBackbone
 from backend.services.campaigns.decision_executor import DecisionExecutor
-from backend.services.campaigns.pipeline_operations import PipelineOperationService
+from backend.services.campaigns.pipeline_operations import (
+    CampaignArtifactPipelineAdapter,
+    PipelineOperationService,
+    TargetProposalPipelineAdapter,
+)
+from backend.services.campaigns.action_journal import ActionJournal
 from backend.services.campaigns.target_lifecycle import TargetLifecycleService
 from backend.services.campaigns.production_preparation import (
     CampaignTargetPreparation,
@@ -52,7 +57,10 @@ from backend.fuzzing.coverage.replay_verifier import (
 )
 from backend.fuzzing.crashes.artifacts import FindingArtifactStore
 from backend.fuzzing.crashes.quarantine import CrashQuarantine
-from backend.fuzzing.crashes.reproduction_bundle import ReproductionBundleStore
+from backend.fuzzing.crashes.reproduction_bundle import (
+    ProductionReproductionBundleResolver,
+    ReproductionBundleStore,
+)
 from backend.fuzzing.campaigns.production_factory import (
     DeferredRepositoryLayerBootstrap,
     ProductionTargetPreparationFactory,
@@ -120,9 +128,19 @@ def build_services(pool, workspace: Path) -> Services:
     )
     discovery = ProjectDiscovery(workspace)
     invocation_store = CampaignInvocationStore(workspace)
+    finding_artifacts = FindingArtifactStore(CrashQuarantine(workspace))
+    reproduction_bundles = ReproductionBundleStore(
+        workspace,
+        ProductionReproductionBundleResolver(
+            projects=projects, findings=findings, finding_artifacts=finding_artifacts,
+            assets=assets, campaigns=campaigns, invocations=invocation_store,
+            docker=DockerClient(),
+        ),
+    )
     execution_slots = ProjectExecutionSlots()
     campaign_containers = DeferredCampaignContainers(
         workspace, invocation_store=invocation_store, execution_slots=execution_slots,
+        image_pins=reproduction_bundles,
     )
     checkout_registry = ProjectCheckoutRegistry(workspace, projects)
     replay_verifier = FirstHitReplayVerifier(
@@ -184,28 +202,38 @@ def build_services(pool, workspace: Path) -> Services:
         containers=campaign_containers,
         events=observability,
         execution_slots=execution_slots,
+        attempts=assets,
     )
     pipeline_operations = PipelineOperationService(
-        target_preparation=campaign_preparation,
-        replay=evidence_processor,
-        coverage=coverage,
-        # CampaignTargetPreparation already owns the complete compile-to-start lease.
-        # Replay and coverage processing never acquire a heavy slot.
-        execution_slots=None,
+        build=TargetProposalPipelineAdapter(campaign_preparation, "build"),
+        probe=TargetProposalPipelineAdapter(campaign_preparation, "probe"),
+        replay=CampaignArtifactPipelineAdapter(
+            operation="replay", campaigns=campaigns, assets=assets,
+            invocations=invocation_store, progress=campaign_runtime,
+            processor=evidence_processor,
+        ),
+        coverage=CampaignArtifactPipelineAdapter(
+            operation="coverage", campaigns=campaigns, assets=assets,
+            invocations=invocation_store, progress=campaign_runtime,
+            processor=evidence_processor,
+        ),
         discovery=discovery,
         events=observability,
+        journal=ActionJournal(workspace),
     )
-    reproduction_bundles = ReproductionBundleStore(workspace)
     target_lifecycle = TargetLifecycleService(
         assets=assets,
         campaigns=campaigns,
         reproduction_bundles=reproduction_bundles,
         coverage_history=coverage_history,
+        journal=ActionJournal(workspace),
+        events=observability,
     )
     decision_executor = DecisionExecutor(
         campaign_preparation,
         campaign_control=campaign_runtime,
         pipeline_operations=pipeline_operations,
+        target_lifecycle=target_lifecycle,
     )
     advisory_lock = PostgresProjectLock(pool)
     backbone = ProjectBackboneService(
@@ -222,9 +250,9 @@ def build_services(pool, workspace: Path) -> Services:
             advisory_lock=advisory_lock,
             events=observability,
             execution_slots=execution_slots,
+            target_lifecycle=target_lifecycle,
         ),
     )
-    finding_artifacts = FindingArtifactStore(CrashQuarantine(workspace))
     return Services(
         project_creator=CreateProjectService(
             projects, backbone, InitialTaskService(repository_analysis=False),

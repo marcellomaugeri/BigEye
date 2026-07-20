@@ -14,6 +14,7 @@ from backend.fuzzing.engines.afl.command import AflCommand
 from backend.fuzzing.engines.contracts import EngineSpec
 from backend.fuzzing.engines.libfuzzer.command import LibFuzzerCommand
 from backend.fuzzing.sanitizer_environment import BASELINE_SANITIZER_ENVIRONMENT
+from backend.fuzzing.campaigns.target_preparation import TargetPreparationFailed
 
 
 _INITIAL_REVIEW_DELAY = timedelta(minutes=5)
@@ -55,6 +56,7 @@ class CampaignTargetPreparation:
         events=None,
         clock=None,
         execution_slots=None,
+        attempts=None,
     ):
         self._preparation = preparation
         self._campaigns = campaigns
@@ -63,20 +65,66 @@ class CampaignTargetPreparation:
         self._events = events
         self._clock = clock or (lambda: datetime.now(UTC))
         self._execution_slots = execution_slots
+        self._attempts = attempts
 
     async def prepare(self, project, record: TargetProposalRecord):
         if not isinstance(record, TargetProposalRecord):
             raise TypeError("campaign preparation requires a validated target proposal record")
-        if self._execution_slots is None:
-            prepared = await self._preparation.prepare(project, record)
-            return await self._publish_and_start(project, record, prepared)
-        async with self._execution_slots.compilation(
-            project, f"prepare-target:{record.result_id}",
-        ) as lease:
-            prepared = await self._preparation.prepare(project, record)
-            campaign = await self._publish_and_start(project, record, prepared)
-            await lease.promote(campaign.id)
-            return campaign
+        try:
+            if self._execution_slots is None:
+                prepared = await self._preparation.prepare(project, record)
+                campaign = await self._publish_and_start(project, record, prepared)
+            else:
+                async with self._execution_slots.compilation(
+                    project, f"prepare-target:{record.result_id}",
+                ) as lease:
+                    prepared = await self._preparation.prepare(project, record)
+                    campaign = await self._publish_and_start(project, record, prepared)
+                    await lease.promote(campaign.id)
+        except TargetPreparationFailed as error:
+            await self._record_failed_attempt(project, record, error)
+            raise
+        await self._record_attempt(
+            project.id, campaign.target_asset_id, record.result_id, True,
+            "build and deterministic probe succeeded",
+        )
+        return campaign
+
+    async def _record_failed_attempt(self, project, record, error) -> None:
+        target_asset_id = getattr(error, "target_asset_id", None)
+        evidence_id = None
+        if type(target_asset_id) is int and target_asset_id > 0:
+            evidence_id = await self._record_attempt(
+                project.id, target_asset_id, record.result_id, False,
+                str(error)[:2_000] or type(error).__name__,
+            )
+        if self._events is not None:
+            await self._events.append(project.id, "debug", {
+                "event": "target.preparation_failed",
+                "proposal_result_id": record.result_id,
+                "target_asset_id": target_asset_id,
+                "evidence_id": evidence_id,
+                "error_type": type(error).__name__,
+                "error": (str(error) or type(error).__name__)[:2_000],
+                "trusted_instructions": False,
+            })
+            await self._events.append(project.id, "events", {
+                "name": "campaigns", "evidence_id": evidence_id,
+            })
+
+    async def _record_attempt(
+        self, project_id, target_asset_id, proposal_result_id, successful, outcome,
+    ):
+        if self._attempts is None:
+            return None
+        return await self._attempts.record_probe_attempt(
+            project_id=project_id,
+            target_asset_id=target_asset_id,
+            proposal_result_id=proposal_result_id,
+            operation="probe",
+            successful=successful,
+            outcome=outcome,
+        )
 
     async def _publish_and_start(self, project, record: TargetProposalRecord, prepared):
         target_asset_id, configuration_asset_id, _coverage_asset_id = self._identity(

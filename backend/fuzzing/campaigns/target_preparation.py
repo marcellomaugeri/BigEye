@@ -40,6 +40,8 @@ _TERRA = "gpt-5.6-terra"
 class DeterministicPreparationError(ValueError):
     """A proposal, generated asset, layer, or probe failed reproducible validation."""
 
+    target_asset_id: int | None = None
+
 
 class ProbeRejected(DeterministicPreparationError):
     """A complete supervised probe was rejected while retaining its evidence."""
@@ -60,11 +62,13 @@ class TargetPreparationFailed(DeterministicPreparationError):
         agent_attempts: tuple[str, ...],
         retained_target: "PreparedTarget | None",
         probe_evidence: ProbeEvidence | None = None,
+        target_asset_id: int | None = None,
     ):
         super().__init__(message)
         self.agent_attempts = agent_attempts
         self.retained_target = retained_target
         self.probe_evidence = probe_evidence
+        self.target_asset_id = target_asset_id
 
 
 @dataclass(frozen=True)
@@ -357,6 +361,7 @@ class TargetPreparationService:
                 raise TargetPreparationFailed(
                     str(error), agent_attempts=tuple(attempts), retained_target=retained,
                     probe_evidence=getattr(error, "evidence", None),
+                    target_asset_id=getattr(error, "target_asset_id", None),
                 ) from error
             self._validated[self._target_key(project, candidate)] = prepared
             await self._record_activity(
@@ -375,6 +380,7 @@ class TargetPreparationService:
         proposal: TargetProposal,
         attempts: tuple[str, ...],
     ) -> PreparedTarget:
+        target_asset_id = None
         try:
             plan = self._planner.plan(project, proposal)
             if inspect.isawaitable(plan):
@@ -394,6 +400,7 @@ class TargetPreparationService:
             assets = dict(plan.existing_assets)
             for asset in assets.values():
                 self._validate_published_asset(project.id, asset)
+            target_asset_id = getattr(assets.get("target"), "id", None)
             creator = getattr(self._asset_store, "create_reusable", self._asset_store.create)
             for request in plan.asset_versions:
                 asset = await creator(
@@ -405,6 +412,8 @@ class TargetPreparationService:
                 )
                 self._validate_published_asset(project.id, asset)
                 assets[request.role] = asset
+                if request.role == "target":
+                    target_asset_id = asset.id
             asset_lock_keys = tuple(
                 ("asset", project.id, asset.id) for asset in assets.values()
             )
@@ -466,7 +475,9 @@ class TargetPreparationService:
                     attempts,
                     built.replay_environment,
                 )
-        except DeterministicPreparationError:
+        except DeterministicPreparationError as error:
+            if target_asset_id is not None:
+                error.target_asset_id = target_asset_id
             raise
         except ValueError as error:
             raise DeterministicPreparationError(str(error)) from error

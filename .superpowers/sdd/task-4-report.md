@@ -102,3 +102,32 @@ deterministic execution.
 - No user-facing lifecycle controls were added.
 - Live Docker/agent acceptance is outside Task 4 and remains covered by the later controlled-loop and
   one-hour acceptance tasks; Task 4 verification used the focused and complete backend suites.
+
+## Review correction
+
+The rejected first pass exposed four boundary errors: operation requests were dispatched through
+generic dependencies instead of typed production adapters, action identity omitted immutable input
+state, preparation could repair while retaining the compilation lease, and lifecycle/bundle checks
+were not connected to the manager/executor path. The correction now:
+
+- binds build/probe to the exact accepted `TargetProposalRecord` and replay/coverage to an immutable
+  campaign/artifact snapshot, with draft hashes and the project commit included in the action ID;
+- executes all four operations through explicit production adapters and performs draft CAS before
+  the first side effect;
+- persists selected/completed/failed action state in a project-scoped atomic journal, so a restart
+  cannot repeat a selected side effect and a failed selection wakes the manager with durable evidence;
+- persists build/probe outcomes and releases the compilation slot before publishing failure and
+  waking the manager; production preparation no longer invokes an internal repair agent;
+- derives lifecycle actions from persisted evidence, executes them only through manager selection,
+  and applies revision/content CAS immediately before deletion;
+- verifies authoritative bundle dependencies and pins verified Docker images through cleanup;
+- scopes target ancestry by stable logical target identity and successful probe lineage only; and
+- records hashing/CAS/build failures in bounded debug output instead of losing the failure boundary.
+
+Correction RED was `4 failed, 8 passed` in `test_pipeline_operations.py`. Focused correction GREEN
+was `149 passed in 2.88s` across pipeline operations, overlap, crash pipeline, target preparation,
+recovery cleanup, and development database tests. Additional compatibility verification passed
+`113` baseline sanitizer tests; the manager/coordinator/agent group reached `194 passed` with one
+stale count assertion, which was corrected. The full backend suite was deliberately deferred at the
+integration owner's request to prioritise the demo handoff; it must be run once after all concurrent
+task branches are integrated.

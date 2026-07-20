@@ -1037,8 +1037,7 @@ def test_missing_dependency_command_is_an_explicit_noop_not_fake_compilation(tmp
     assert "cmake" not in text and "make" not in text
 
 
-def test_production_factory_wires_one_bounded_terra_asset_repair(tmp_path) -> None:
-    from backend.agents.target_repair import TargetRepairAgent
+def test_production_factory_defers_target_repair_until_after_compilation_lease(tmp_path) -> None:
     from backend.fuzzing.campaigns.production_factory import ProductionTargetPreparationFactory
 
     dockerfile = tmp_path / "Dockerfile"
@@ -1055,7 +1054,7 @@ def test_production_factory_wires_one_bounded_terra_asset_repair(tmp_path) -> No
     }
     service = factory(client)
 
-    assert isinstance(service._repairer, TargetRepairAgent)
+    assert service._service._repairer is None
 
 
 def test_production_onboarding_uses_repository_layer_not_standalone_analysis(tmp_path) -> None:

@@ -1244,6 +1244,56 @@ def _record(result_id: str = "target_known") -> TargetProposalRecord:
     )
 
 
+def test_failed_production_preparation_releases_compilation_before_persisting_manager_wake() -> None:
+    from contextlib import asynccontextmanager
+    from pathlib import Path
+    from backend.services.campaigns.production_preparation import CampaignTargetPreparation
+
+    state = {"leased": False, "attempted": False, "evented": False}
+
+    class Slots:
+        @asynccontextmanager
+        async def compilation(self, _project, _identity):
+            state["leased"] = True
+            try:
+                yield SimpleNamespace(promote=lambda _campaign_id: None)
+            finally:
+                state["leased"] = False
+
+    class Preparation:
+        async def prepare(self, _project, _record):
+            error = TargetPreparationFailed(
+                "probe rejected", agent_attempts=("gpt-5.6-luna",),
+                retained_target=None, target_asset_id=91,
+            )
+            raise error
+
+    class Attempts:
+        async def record_probe_attempt(self, **_values):
+            assert state["leased"] is False
+            state["attempted"] = True
+            return "target-attempt:7:failed"
+
+    class Events:
+        async def append(self, *_values):
+            assert state["leased"] is False
+            state["evented"] = True
+
+    subject = CampaignTargetPreparation(
+        preparation=Preparation(), campaigns=SimpleNamespace(),
+        invocation_store=SimpleNamespace(), containers=SimpleNamespace(),
+        events=Events(), execution_slots=Slots(), attempts=Attempts(),
+    )
+
+    with pytest.raises(TargetPreparationFailed):
+        run(subject.prepare(project(), _record()))
+
+    assert state == {"leased": False, "attempted": True, "evented": True}
+    source = Path("backend/fuzzing/campaigns/production_factory.py").read_text()
+    assert "TargetRepairAgent" not in source
+    assert "repairer=None" in source
+
+
 def _review(*, selected=("target_known",), decision_actions=("target_known",)) -> CampaignReviewResult:
     record = _record()
     return CampaignReviewResult(

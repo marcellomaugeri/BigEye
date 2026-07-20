@@ -712,7 +712,7 @@ def test_luna_specialist_retries_once_with_terra_only_after_validation_failure(
 
     assert calls == [("gpt-5.6-luna", 14), ("gpt-5.6-terra", 14)]
     assert set(output) == {
-        "result", "target_result_ids", "triage_result_ids", "operation_request_ids",
+        "result", "target_result_ids", "triage_result_ids", "pipeline_action_ids",
     }
     assert output["result"]["target_proposals"] == [
         _target_proposal("known").model_dump(mode="json")
@@ -831,8 +831,8 @@ def test_retry_quarantines_luna_requests_and_returns_only_terra_invocation_ids(
         operation = next(item for item in starting_agent.tools if item.name == "request_contained_operation")
         outer_id = context.tool_call_id if isinstance(context, ToolContext) else "call-retry"
         arguments = (
-            '{"operation":"probe","asset_paths":[],"assertions":["'
-            + starting_agent.model + '"]}'
+            '{"operation":"probe","asset_paths":[],"assertions":'
+            '["seed reaches parser code"]}'
         )
         operation_output = await operation.on_invoke_tool(ToolContext(
             context.context if isinstance(context, ToolContext) else context,
@@ -857,7 +857,7 @@ def test_retry_quarantines_luna_requests_and_returns_only_terra_invocation_ids(
     assert output["result"]["target_proposals"][0]["target_name"] == "validated-terra-target"
     assert "failed-luna-target" not in str(output)
     assert set(output) == {
-        "result", "target_result_ids", "triage_result_ids", "operation_request_ids",
+        "result", "target_result_ids", "triage_result_ids", "pipeline_action_ids",
     }
     review = collection.result(CampaignDecision(
         decision="select retry", motivation="Terra corrected evidence", evidence_ids=["known"],
@@ -1251,7 +1251,7 @@ def test_parallel_agent_tool_results_and_requests_never_cross_invocations(
                     repair_intent="preserve testcase and report the source location",
                 )
                 self.final_output = _worker_result(
-                    triage=[triage], operation_request_ids=[operation_request_id],
+                    triage=[triage], operation_request_ids=[],
                 )
             else:
                 self.final_output = _worker_result(
@@ -1271,13 +1271,15 @@ def test_parallel_agent_tool_results_and_requests_never_cross_invocations(
 
     async def runner(starting_agent=None, context=None, hooks=None, **kwargs):
         await hooks.on_agent_start(context, starting_agent)
+        if context.tool_call_id == "call-triage":
+            return Result(context, None)
         operation = next(item for item in starting_agent.tools if item.name == "request_contained_operation")
         inner = ToolContext(
             context.context, tool_name=operation.name,
             tool_call_id="inner-" + context.tool_call_id,
             tool_arguments=(
-                '{"operation":"probe","asset_paths":[],"assertions":["probe '
-                + context.tool_call_id + '"]}'
+                '{"operation":"probe","asset_paths":[],"assertions":'
+                '["seed reaches parser code"]}'
             ), run_config=RunConfig(), agent=starting_agent, tool_input=context.tool_input,
         )
         operation_output = await operation.on_invoke_tool(inner, inner.tool_arguments)
@@ -1322,9 +1324,9 @@ def test_parallel_agent_tool_results_and_requests_never_cross_invocations(
     assert {record.tool_call_id for record in review.known_target_proposals} == {"call-a", "call-b"}
     assert {record.tool_call_id for record in review.known_triage_results} == {"call-triage"}
     assert {record.tool_call_id for record in review.known_operation_requests} == {
-        "call-a", "call-b", "call-triage",
+        "call-a", "call-b",
     }
-    assert len({record.request_id for record in review.known_operation_requests}) == 3
+    assert len({record.request_id for record in review.known_operation_requests}) == 2
     assert {record.actionable for record in review.known_operation_requests} == {False}
     assert {record.result_id for record in review.selected_target_proposals} == {
         first["target_result_ids"][0]

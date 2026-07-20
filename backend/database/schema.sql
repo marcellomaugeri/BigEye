@@ -68,6 +68,21 @@ CREATE TABLE campaign_progression_actions (
     FOREIGN KEY (campaign_id) REFERENCES campaigns (id)
 );
 
+CREATE TABLE target_probe_attempts (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    project_id BIGINT NOT NULL,
+    target_asset_id BIGINT NOT NULL,
+    proposal_result_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    successful BOOLEAN NOT NULL,
+    evidence_id TEXT NOT NULL UNIQUE,
+    outcome TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (project_id) REFERENCES projects (id),
+    FOREIGN KEY (target_asset_id) REFERENCES assets (id),
+    CHECK (operation IN ('build', 'probe'))
+);
+
 CREATE TABLE campaign_container_counters (
     campaign_id BIGINT NOT NULL,
     container_id TEXT NOT NULL,
@@ -165,6 +180,7 @@ CREATE TABLE campaign_crash_groups (
 CREATE INDEX tasks_project_created_at_idx ON tasks (project_id, created_at, id);
 CREATE INDEX assets_project_created_at_idx ON assets (project_id, created_at, id);
 CREATE INDEX campaigns_project_started_at_idx ON campaigns (project_id, started_at, id);
+CREATE INDEX target_probe_attempts_project_target_idx ON target_probe_attempts (project_id, target_asset_id, id);
 CREATE INDEX coverage_evidence_project_source_line_idx ON coverage_evidence (project_id, source_path, line_number);
 CREATE INDEX coverage_checkpoints_project_campaign_idx ON coverage_checkpoints (project_id, campaign_id, id);
 CREATE INDEX findings_project_created_at_idx ON findings (project_id, created_at, id);

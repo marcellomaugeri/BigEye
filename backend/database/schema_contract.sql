@@ -16,10 +16,11 @@ DECLARE
         'coverage_evidence',
         'findings',
         'projects',
+        'target_probe_attempts',
         'tasks'
     ];
     expected_schema_comment CONSTANT TEXT := 'bigeye-schema:release-1';
-    expected_signature CONSTANT TEXT := 'ee18f07bb3e3b61555741da0a083b439';
+    expected_signature CONSTANT TEXT := 'e081293d1471b1a6b917fa54fd61f07f';
     actual_tables TEXT[];
     actual_schema_comment TEXT;
     actual_signature TEXT;

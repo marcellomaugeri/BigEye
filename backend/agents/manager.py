@@ -23,6 +23,7 @@ from backend.agents.tools.agent_dispatch import (
 )
 from backend.agents.tracing.hooks import AgentTraceHooks
 from backend.agents.tracing.local_trace import LocalTrace
+from backend.services.campaigns.target_lifecycle import TargetLifecycleAction
 
 
 MAX_MANAGER_EVIDENCE_ITEMS = 64
@@ -127,7 +128,9 @@ class CampaignManager:
         evidence,
         reason: str,
         *,
-        prepared_actions: tuple[RetirementActionRecord | ProgressionActionRecord, ...] = (),
+        prepared_actions: tuple[
+            RetirementActionRecord | ProgressionActionRecord | TargetLifecycleAction, ...
+        ] = (),
     ) -> CampaignReviewResult:
         if not isinstance(reason, str) or not reason.strip() or len(reason) > MAX_MANAGER_REASON_CHARS:
             raise ValueError("campaign review reason is invalid")
@@ -143,7 +146,9 @@ class CampaignManager:
             not isinstance(prepared_actions, tuple)
             or len(prepared_actions) > MAX_MANAGER_EVIDENCE_ITEMS
             or any(
-                not isinstance(record, (RetirementActionRecord, ProgressionActionRecord))
+                not isinstance(record, (
+                    RetirementActionRecord, ProgressionActionRecord, TargetLifecycleAction,
+                ))
                 or record.project_id != context.project_id
                 or record.action_id not in evidence_ids
                 for record in prepared_actions
@@ -154,8 +159,10 @@ class CampaignManager:
             _reject_operation_request_evidence_ids(record.evidence_ids)
             if isinstance(record, RetirementActionRecord):
                 collection.record_retirement(record)
-            else:
+            elif isinstance(record, ProgressionActionRecord):
                 collection.record_progression(record)
+            else:
+                collection.record_lifecycle(record)
         tools = dispatch_tools(
             context, evidence_ids=evidence_ids, hooks=hooks, trace=trace,
             evidence_registry=evidence_registry, evidence_records=evidence_records,

@@ -314,6 +314,22 @@ class CampaignRepository:
             raise OverflowError("campaign read limit exceeded")
         return [self._campaign(row) for row in rows]
 
+    async def for_finding(self, project_id: int, fingerprint: str) -> list[Campaign]:
+        rows = await self._pool.fetch(
+            """SELECT campaign.id, campaign.project_id, campaign.target_asset_id,
+                      campaign.configuration_asset_id, campaign.engine, campaign.started_at,
+                      campaign.stopped_at, campaign.last_heartbeat_at, campaign.cpu_seconds,
+                      campaign.next_review_after, campaign.next_review_reason, campaign.error
+                 FROM campaigns AS campaign
+                 JOIN campaign_crash_groups AS crash ON crash.campaign_id = campaign.id
+                WHERE campaign.project_id = $1 AND crash.fingerprint = $2
+                ORDER BY campaign.id LIMIT $3""",
+            project_id, fingerprint, self._MAX_PROJECT_CAMPAIGNS + 1,
+        )
+        if len(rows) > self._MAX_PROJECT_CAMPAIGNS:
+            raise OverflowError("finding campaign read limit exceeded")
+        return [self._campaign(row) for row in rows]
+
     async def list_with_assets_for_project(
         self, project_id: int,
     ) -> tuple[list[Campaign], list[CampaignAsset]]:

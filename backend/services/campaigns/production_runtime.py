@@ -625,6 +625,7 @@ class DeferredCampaignContainers:
         service_factory=FuzzContainerService,
         monitor=None,
         execution_slots=None,
+        image_pins=None,
     ):
         self._workspace = Path(workspace)
         self._docker_client = docker_client or DockerClient()
@@ -632,6 +633,7 @@ class DeferredCampaignContainers:
         self._service_factory = service_factory
         self._monitor = monitor or DockerCampaignMonitor(workspace)
         self._execution_slots = execution_slots
+        self._image_pins = image_pins
 
     async def reconcile(
         self, project, campaigns, assets=(), artifact_cursors=None,
@@ -684,9 +686,12 @@ class DeferredCampaignContainers:
                             "evidence_id": current.evidence_id,
                             "project_id": project.id,
                             "campaign_id": campaign.id,
+                            "target_asset_id": campaign.target_asset_id,
+                            "configuration_asset_id": campaign.configuration_asset_id,
                             "cpu_seconds": current.cpu_seconds,
                             "queue_files": current.queue_files,
                             "crash_files": current.crash_files,
+                            "artifacts": [asdict(item) for item in current.artifacts],
                             "provenance": "docker_campaign_monitor",
                             "trusted_instructions": False,
                         })
@@ -694,17 +699,20 @@ class DeferredCampaignContainers:
                     unhealthy_ids.append(campaign.id)
                     state = f"invalid:{type(error).__name__}"
                 evidence.append(self._evidence(project, campaign, state))
-            evidence.extend(self._cleanup_lifecycle(client, project, campaigns, assets))
+            evidence.extend(await self._cleanup_lifecycle(client, project, campaigns, assets))
         finally:
             self._close(client)
         return ContainerObservation(
             tuple(active_ids), tuple(unhealthy_ids), tuple(evidence), tuple(progress),
         )
 
-    def _cleanup_lifecycle(self, client, project, campaigns, assets) -> list[dict]:
+    async def _cleanup_lifecycle(self, client, project, campaigns, assets) -> list[dict]:
         assets_by_id = {asset.id: asset for asset in assets}
         identities: dict[str, CleanupImageIdentity] = {}
-        referenced = set()
+        referenced = set(
+            await _await(self._image_pins.pinned_image_ids(project.id))
+            if self._image_pins is not None else ()
+        )
         for campaign in campaigns:
             if campaign.error is not None and campaign.stopped_at is None:
                 continue
@@ -1327,6 +1335,16 @@ class RepositoryCampaignRuntime:
 
     async def review_evidence(self, project, _snapshot, _trigger) -> list[dict]:
         return [dict(item) for item in self._review_evidence.get(project.id, ())]
+
+    def pipeline_progress(self, project_id: int, campaign_id: int) -> CampaignProgressObservation:
+        """Resolve the exact current monitor page selected for replay/coverage CAS."""
+        observation = self._observations.get(project_id)
+        if observation is None:
+            raise ValueError("pipeline campaign observation is unavailable")
+        matches = tuple(item for item in observation.progress if item.campaign_id == campaign_id)
+        if len(matches) != 1:
+            raise ValueError("pipeline campaign observation is no longer exact")
+        return matches[0]
 
     def progression_actions(self, project_id: int) -> tuple[ProgressionActionRecord, ...]:
         return self._progression_records.get(project_id, ())

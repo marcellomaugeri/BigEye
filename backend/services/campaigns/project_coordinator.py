@@ -91,6 +91,7 @@ class ProjectCoordinator:
         wake_evaluator: WakeEvaluator | None = None,
         clock=None,
         execution_slots=None,
+        target_lifecycle=None,
     ):
         self.projects = projects
         self._bootstrap = bootstrap
@@ -103,6 +104,7 @@ class ProjectCoordinator:
         self._wake_evaluator = wake_evaluator or WakeEvaluator()
         self._clock = clock or (lambda: datetime.now(UTC))
         self._execution_slots = execution_slots
+        self._target_lifecycle = target_lifecycle
         self._previous: dict[int, CampaignSnapshot] = {}
         self._pending_reviews: dict[int, _PendingReview] = {}
         self._signals: dict[int, asyncio.Event] = {}
@@ -165,7 +167,22 @@ class ProjectCoordinator:
                     progression_actions = tuple(
                         await _await(progression_provider(self._runtime, project_id))
                     )
-                prepared_actions = (*retirement_actions, *progression_actions)
+                lifecycle_actions = ()
+                if self._target_lifecycle is not None:
+                    lifecycle_actions = tuple(await _await(
+                        self._target_lifecycle.prepared_actions(project_id)
+                    ))
+                prepared_actions = (*retirement_actions, *progression_actions, *lifecycle_actions)
+                retirement_evidence = (*retirement_evidence, *(
+                    {
+                        "evidence_id": action.action_id,
+                        "kind": "target_lifecycle_action",
+                        "action_kind": action.kind,
+                        "supporting_evidence_ids": list(action.evidence_ids),
+                        "trusted_instructions": False,
+                    }
+                    for action in lifecycle_actions
+                ))
                 if retirement_evidence:
                     snapshot = replace(
                         snapshot,

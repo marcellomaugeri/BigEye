@@ -15,6 +15,7 @@ from backend.agents.outputs.campaign_decision import CampaignDecision
 from backend.agents.outputs.target_proposal import TargetProposal
 from backend.agents.outputs.triage_result import TriageResult
 from backend.fuzzing.campaigns.coverage_contract import valid_replay_environment
+from backend.services.campaigns.target_lifecycle import TargetLifecycleAction
 
 
 @dataclass(frozen=True)
@@ -97,11 +98,15 @@ class PipelineOperationRecord(BaseModel):
 
     action_id: str = Field(min_length=1, max_length=100)
     project_id: int = Field(ge=1)
+    project_commit_sha: str = Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
     operation: str = Field(min_length=1, max_length=100)
     asset_paths: tuple[str, ...] = Field(max_length=16)
+    draft_sha256s: tuple[tuple[str, str], ...] = Field(max_length=16)
     assertions: tuple[str, ...] = Field(min_length=1, max_length=16)
     worker_tool_call_id: str = Field(min_length=1, max_length=500)
     evidence_ids: tuple[str, ...] = Field(max_length=64)
+    target_proposal: TargetProposalRecord | None = None
+    campaign_snapshot: "PipelineCampaignSnapshot | None" = None
 
     @model_validator(mode="after")
     def validate_bounded_action(self):
@@ -117,6 +122,12 @@ class PipelineOperationRecord(BaseModel):
                 part in {"", ".", ".."} or part.casefold() == ".git" for part in path.parts
             ):
                 raise ValueError("pipeline operation asset path is invalid")
+        if tuple(path for path, _digest in self.draft_sha256s) != self.asset_paths or any(
+            not isinstance(digest, str) or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            for _path, digest in self.draft_sha256s
+        ):
+            raise ValueError("pipeline operation draft snapshots are invalid")
         if len(self.assertions) != len(set(self.assertions)) or any(
             not isinstance(value, str) or not value.strip() or len(value) > 500
             for value in self.assertions
@@ -127,17 +138,82 @@ class PipelineOperationRecord(BaseModel):
             for value in self.evidence_ids
         ):
             raise ValueError("pipeline operation evidence identifiers are invalid")
+        if self.operation in {"build", "probe"}:
+            if self.target_proposal is None or self.campaign_snapshot is not None:
+                raise ValueError("build and probe actions require one exact target proposal")
+            if self.target_proposal.tool_call_id != self.worker_tool_call_id:
+                raise ValueError("pipeline target proposal crossed its worker call boundary")
+        elif self.target_proposal is not None or self.campaign_snapshot is None:
+            raise ValueError("replay and coverage actions require one exact campaign snapshot")
+        if self.campaign_snapshot is not None and self.campaign_snapshot.operation != self.operation:
+            raise ValueError("pipeline campaign snapshot operation changed")
         expected = _record_id("pipeline", {
             "project_id": self.project_id,
+            "project_commit_sha": self.project_commit_sha,
             "operation": self.operation,
             "asset_paths": self.asset_paths,
+            "draft_sha256s": self.draft_sha256s,
             "assertions": self.assertions,
             "worker_tool_call_id": self.worker_tool_call_id,
             "evidence_ids": self.evidence_ids,
+            "target_proposal": (
+                self.target_proposal.model_dump(mode="json")
+                if self.target_proposal is not None else None
+            ),
+            "campaign_snapshot": (
+                self.campaign_snapshot.model_dump(mode="json")
+                if self.campaign_snapshot is not None else None
+            ),
         })
         if self.action_id != expected:
             raise ValueError("pipeline operation action identity is invalid")
         return self
+
+
+class PipelineArtifactSnapshot(BaseModel):
+    """One exact monitored input selected for replay or clean coverage."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: str
+    relative_path: str = Field(min_length=1, max_length=1_000)
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    size_bytes: int = Field(ge=0, le=16 * 1024 * 1024)
+
+    @model_validator(mode="after")
+    def validate_artifact(self):
+        if self.kind not in {"crash", "corpus"}:
+            raise ValueError("pipeline artifact kind is invalid")
+        path = PurePosixPath(self.relative_path)
+        if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+            raise ValueError("pipeline artifact path is invalid")
+        return self
+
+
+class PipelineCampaignSnapshot(BaseModel):
+    """Persisted campaign and monitor identity required by replay/coverage adapters."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    operation: str
+    campaign_id: int = Field(ge=1)
+    target_asset_id: int = Field(ge=1)
+    configuration_asset_id: int | None = Field(default=None, ge=1)
+    progress_evidence_id: str = Field(min_length=1, max_length=256)
+    artifacts: tuple[PipelineArtifactSnapshot, ...] = Field(min_length=1, max_length=1_024)
+
+    @model_validator(mode="after")
+    def validate_campaign_snapshot(self):
+        expected_kind = {"replay": "crash", "coverage": "corpus"}.get(self.operation)
+        if expected_kind is None or any(value.kind != expected_kind for value in self.artifacts):
+            raise ValueError("pipeline campaign snapshot does not match its operation")
+        identities = tuple((item.relative_path, item.content_sha256) for item in self.artifacts)
+        if len(identities) != len(set(identities)):
+            raise ValueError("pipeline campaign snapshot artifacts are not unique")
+        return self
+
+
+PipelineOperationRecord.model_rebuild()
 
 
 class RetirementActionRecord(BaseModel):
@@ -257,6 +333,8 @@ class CampaignReviewResult(BaseModel):
     selected_progression_actions: tuple[ProgressionActionRecord, ...] = ()
     known_pipeline_operations: tuple[PipelineOperationRecord, ...] = ()
     selected_pipeline_operations: tuple[PipelineOperationRecord, ...] = ()
+    known_lifecycle_actions: tuple[TargetLifecycleAction, ...] = ()
+    selected_lifecycle_actions: tuple[TargetLifecycleAction, ...] = ()
 
     @property
     def target_proposals(self) -> tuple[TargetProposalRecord, ...]:
@@ -295,11 +373,12 @@ class CampaignReviewCollection:
         self._pipeline_by_request: dict[str, str] = {}
         self._retirements: dict[str, RetirementActionRecord] = {}
         self._progressions: dict[str, ProgressionActionRecord] = {}
+        self._lifecycles: dict[str, TargetLifecycleAction] = {}
         self._pending_operations: dict[
             tuple[str, str, int, str], dict[str, ContainedOperationRequestRecord]
         ] = {}
         self._pending_pipeline_operations: dict[
-            tuple[str, str, int, str], dict[str, PipelineOperationRecord]
+            tuple[str, str, int, str], dict[str, dict]
         ] = {}
         self._quarantined_operations: dict[str, ContainedOperationRequestRecord] = {}
 
@@ -339,6 +418,9 @@ class CampaignReviewCollection:
         request: dict,
         *,
         project_id: int | None = None,
+        project_commit_sha: str | None = None,
+        draft_sha256s: tuple[tuple[str, str], ...] = (),
+        campaign_snapshot: PipelineCampaignSnapshot | None = None,
         evidence_ids: tuple[str, ...] = (),
     ) -> ContainedOperationRequestRecord:
         request = dict(request)
@@ -352,25 +434,30 @@ class CampaignReviewCollection:
             request_id=_record_id("operation", payload), **invocation.__dict__, **request,
             actionable=False,
         )
-        pipeline = None
+        pipeline_values = None
         if project_id is not None:
-            values = {
+            if project_commit_sha is None:
+                # Compatibility path for audit-only unit callers. Production promotion
+                # always supplies an exact commit and immutable draft identities.
+                pipeline_values = None
+            else:
+                pipeline_values = {
                 "project_id": project_id,
+                "project_commit_sha": project_commit_sha,
                 "operation": record.operation,
                 "asset_paths": record.asset_paths,
+                "draft_sha256s": draft_sha256s,
                 "assertions": record.assertions,
                 "worker_tool_call_id": invocation.tool_call_id,
                 "evidence_ids": evidence_ids,
+                "campaign_snapshot": campaign_snapshot,
             }
-            pipeline = PipelineOperationRecord(
-                action_id=_record_id("pipeline", values), **values,
-            )
         with self._lock:
             pending = self._pending_operations.setdefault(invocation.key, {})
             pending.setdefault(record.request_id, record)
-            if pipeline is not None:
+            if pipeline_values is not None:
                 pipeline_pending = self._pending_pipeline_operations.setdefault(invocation.key, {})
-                pipeline_pending.setdefault(record.request_id, pipeline)
+                pipeline_pending.setdefault(record.request_id, pipeline_values)
             return pending[record.request_id]
 
     def pending_operation_ids(self, invocation: WorkerInvocation) -> frozenset[str]:
@@ -386,8 +473,9 @@ class CampaignReviewCollection:
             for request_id, record in pending.items():
                 if accepted:
                     self._operations.setdefault(request_id, record)
-                    pipeline = pending_pipeline.get(request_id)
-                    if pipeline is not None:
+                    values = pending_pipeline.get(request_id)
+                    if values is not None:
+                        pipeline = self._promote_pipeline(invocation, record, values)
                         existing_action = self._pipeline_operations.setdefault(
                             pipeline.action_id, pipeline,
                         )
@@ -397,6 +485,37 @@ class CampaignReviewCollection:
                 else:
                     self._quarantined_operations.setdefault(request_id, record)
 
+    def _promote_pipeline(self, invocation, request, values) -> PipelineOperationRecord:
+        target = None
+        campaign = values.pop("campaign_snapshot")
+        if request.operation in {"build", "probe"}:
+            candidates = tuple(
+                record for record in self._targets.values()
+                if (
+                    record.worker_assignment, record.tool_call_id, record.attempt, record.model
+                ) == invocation.key
+                and set(request.asset_paths).issubset({
+                    intent.relative_path for intent in record.proposal.generated_asset_intents
+                })
+                and set(request.assertions).issubset(set(record.proposal.probe_assertions))
+            )
+            if len(candidates) != 1:
+                raise ValueError("pipeline operation must bind one exact target proposal")
+            target = candidates[0]
+        elif campaign is None:
+            raise ValueError("pipeline operation must bind one exact campaign snapshot")
+        canonical = {
+            **values,
+            "target_proposal": target.model_dump(mode="json") if target is not None else None,
+            "campaign_snapshot": campaign.model_dump(mode="json") if campaign is not None else None,
+        }
+        return PipelineOperationRecord(
+            action_id=_record_id("pipeline", canonical),
+            **values,
+            target_proposal=target,
+            campaign_snapshot=campaign,
+        )
+
     def pipeline_action_id(self, request_id: str) -> str:
         """Resolve an accepted worker request to its separate selectable action identity."""
         with self._lock:
@@ -405,11 +524,18 @@ class CampaignReviewCollection:
             except KeyError as error:
                 raise ValueError("operation request has no accepted pipeline action") from error
 
+    def pipeline_operation(self, request_id: str) -> PipelineOperationRecord:
+        """Resolve an accepted audit request to its immutable application action."""
+        action_id = self.pipeline_action_id(request_id)
+        with self._lock:
+            return self._pipeline_operations[action_id]
+
     def actionable_ids(self) -> frozenset[str]:
         with self._lock:
             return frozenset((
                 *self._targets, *self._triage, *self._retirements, *self._progressions,
                 *self._pipeline_operations,
+                *self._lifecycles,
             ))
 
     def record_retirement(self, record: RetirementActionRecord) -> RetirementActionRecord:
@@ -434,12 +560,22 @@ class CampaignReviewCollection:
                 raise ValueError("progression action identifier is not unique")
             return self._progressions[record.action_id]
 
+    def record_lifecycle(self, record: TargetLifecycleAction) -> TargetLifecycleAction:
+        if not isinstance(record, TargetLifecycleAction):
+            raise TypeError("lifecycle action must be application-validated")
+        with self._lock:
+            self._lifecycles.setdefault(record.action_id, record)
+            if self._lifecycles[record.action_id] != record:
+                raise ValueError("lifecycle action identifier is not unique")
+            return self._lifecycles[record.action_id]
+
     def result(self, decision: CampaignDecision) -> CampaignReviewResult:
         with self._lock:
             selected_ids = tuple(decision.bounded_actions)
             selectable_ids = frozenset((
                 *self._targets, *self._triage, *self._retirements, *self._progressions,
                 *self._pipeline_operations,
+                *self._lifecycles,
             ))
             if len(selected_ids) != len(set(selected_ids)):
                 raise ValueError("campaign decision contains duplicate action IDs")
@@ -455,6 +591,7 @@ class CampaignReviewCollection:
                 *self._triage,
                 *self._retirements,
                 *self._progressions,
+                *self._lifecycles,
                 *(value for value in selected_ids if value in self._pipeline_operations),
             ))
             target_values = tuple(self._targets[key] for key in sorted(self._targets))
@@ -465,6 +602,7 @@ class CampaignReviewCollection:
             pipeline_values = tuple(
                 self._pipeline_operations[key] for key in sorted(self._pipeline_operations)
             )
+            lifecycle_values = tuple(self._lifecycles[key] for key in sorted(self._lifecycles))
             return CampaignReviewResult(
                 decision=decision,
                 known_action_ids=tuple(sorted(known_ids)), selected_action_ids=selected_ids,
@@ -492,5 +630,9 @@ class CampaignReviewCollection:
                 known_pipeline_operations=pipeline_values,
                 selected_pipeline_operations=tuple(
                     record for record in pipeline_values if record.action_id in selected_ids
+                ),
+                known_lifecycle_actions=lifecycle_values,
+                selected_lifecycle_actions=tuple(
+                    record for record in lifecycle_values if record.action_id in selected_ids
                 ),
             )

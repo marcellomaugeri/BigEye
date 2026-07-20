@@ -193,7 +193,9 @@ def test_reproduction_bundle_freezes_exact_finding_dependencies_before_deletion(
         coverage_asset_hash="e" * 64,
     )
 
-    bundle = run(ReproductionBundleStore(tmp_path).freeze(request))
+    resolver = SimpleNamespace(verify=AsyncMock(return_value=True))
+    store = ReproductionBundleStore(tmp_path, resolver)
+    bundle = run(store.freeze(request))
 
     assert bundle.verified is True
     assert bundle.manifest["image_id"] == request.image_id
@@ -201,6 +203,8 @@ def test_reproduction_bundle_freezes_exact_finding_dependencies_before_deletion(
     assert bundle.manifest["testcase_sha256"] == __import__("hashlib").sha256(b"crash").hexdigest()
     assert (bundle.root / "manifest.json").is_file()
     assert (bundle.root / "testcase.input").read_bytes() == b"crash"
+    assert run(store.verify(7, bundle.bundle_id)) is True
+    assert run(store.pinned_image_ids(7)) == (request.image_id,)
 
 
 def test_overlap_lifecycle_freezes_every_finding_bundle_before_authorizing_asset_deletion(
@@ -220,8 +224,12 @@ def test_overlap_lifecycle_freezes_every_finding_bundle_before_authorizing_asset
         "finding_bundle_requests": (request,),
         "evidence_ids": ("candidate:1", "retained:1", "candidate:2", "retained:2"),
     }))
+    assets = SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(
+        id=90, project_id=7, kind="configuration", content_hash="a" * 64,
+        validated_at=object(), error=None,
+    )))
     service = TargetLifecycleService(
-        assets=SimpleNamespace(), campaigns=campaigns, reproduction_bundles=bundles,
+        assets=assets, campaigns=campaigns, reproduction_bundles=bundles,
     )
 
     action = run(service.overlapping_deletion(7, 9))

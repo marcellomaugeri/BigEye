@@ -16,7 +16,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from backend.agents.context import AgentContext
 from backend.agents.fuzzing_worker import build_fuzzing_worker
-from backend.agents.outputs.campaign_review import CampaignReviewCollection, WorkerInvocation
+from backend.agents.outputs.campaign_review import (
+    CampaignReviewCollection,
+    PipelineArtifactSnapshot,
+    PipelineCampaignSnapshot,
+    WorkerInvocation,
+)
 from backend.agents.outputs.fuzzing_worker_result import FuzzingWorkerResult
 from backend.agents.outputs.target_proposal import TargetProposal
 from backend.agents.outputs.triage_result import TriageResult
@@ -25,7 +30,7 @@ from backend.agents.tools.contained_operations import (
     contained_operation_error,
     contained_operation_request,
 )
-from backend.agents.tools.generated_assets import _relative_path
+from backend.agents.tools.generated_assets import _relative_path, read_asset_file
 from backend.agents.tools.evidence_retrieval import (
     EvidenceLimit,
     EvidenceQuestion,
@@ -278,6 +283,33 @@ def _tool(
         with assignment_lock:
             assignment_evidence.pop(invocation.key, None)
 
+    def campaign_snapshot(
+        operation: str, assigned_ids: frozenset[str],
+    ) -> PipelineCampaignSnapshot | None:
+        if operation not in {"replay", "coverage"}:
+            return None
+        expected_kind = "crash" if operation == "replay" else "corpus"
+        candidates = []
+        for evidence_id in assigned_ids:
+            value = evidence_records.get(evidence_id, {})
+            artifacts = tuple(
+                PipelineArtifactSnapshot.model_validate(item)
+                for item in value.get("artifacts", ())
+                if isinstance(item, dict) and item.get("kind") == expected_kind
+            )
+            if artifacts:
+                candidates.append(PipelineCampaignSnapshot(
+                    operation=operation,
+                    campaign_id=value.get("campaign_id"),
+                    target_asset_id=value.get("target_asset_id"),
+                    configuration_asset_id=value.get("configuration_asset_id"),
+                    progress_evidence_id=evidence_id,
+                    artifacts=artifacts,
+                ))
+        if len(candidates) != 1:
+            raise ValueError("replay or coverage request requires one exact campaign artifact page")
+        return candidates[0]
+
     def active_worker(tool_context: RunContextWrapper[AgentContext]) -> WorkerInvocation:
         invocation = _CURRENT_WORKER_INVOCATION.get()
         tool_input = getattr(tool_context, "tool_input", None)
@@ -314,11 +346,19 @@ def _tool(
             tool_context.context, operation, asset_paths, assertions,
         )
         invocation = active_worker(tool_context)
+        assigned = exact_assignment_evidence(invocation)
+        draft_sha256s = tuple(
+            (path, str(read_asset_file(tool_context.context, path)["sha256"]))
+            for path in request["asset_paths"]
+        )
         record = collection.record_operation(
             invocation,
             request,
             project_id=tool_context.context.project_id,
-            evidence_ids=tuple(sorted(exact_assignment_evidence(invocation))),
+            project_commit_sha=tool_context.context.commit_sha,
+            draft_sha256s=draft_sha256s,
+            campaign_snapshot=campaign_snapshot(operation, assigned),
+            evidence_ids=tuple(sorted(assigned)),
         )
         # The worker receives only its inert audit request identity. The distinct
         # application-owned action ID is exposed to the manager after the attempt validates.
@@ -499,10 +539,10 @@ def _tool(
             for request_id in output.operation_request_ids
         ]
         return {
-            "result": output.model_dump(mode="json"),
+            "result": output.model_dump(mode="json", exclude={"operation_request_ids"}),
             "target_result_ids": [record.result_id for record in target_records],
             "triage_result_ids": [record.result_id for record in triage_records],
-            "operation_request_ids": operation_action_ids,
+            "pipeline_action_ids": operation_action_ids,
         }
 
     def worker_failure(tool_context, error: Exception):

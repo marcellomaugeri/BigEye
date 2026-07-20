@@ -14,6 +14,7 @@ from backend.agents.outputs.campaign_review import (
     TargetProposalRecord,
     TriageResultRecord,
 )
+from backend.services.campaigns.target_lifecycle import TargetLifecycleAction
 
 
 ResultValue = TypeVar("ResultValue")
@@ -43,10 +44,14 @@ class ActionResult(Generic[ResultValue]):
 class DecisionExecutor:
     """Resolve manager-selected IDs without exposing a shell or Docker client."""
 
-    def __init__(self, target_preparation, campaign_control=None, pipeline_operations=None):
+    def __init__(
+        self, target_preparation, campaign_control=None, pipeline_operations=None,
+        target_lifecycle=None,
+    ):
         self._target_preparation = target_preparation
         self._campaign_control = campaign_control
         self._pipeline_operations = pipeline_operations
+        self._target_lifecycle = target_lifecycle
 
     async def execute(self, project, decision: CampaignReviewResult) -> list[ActionResult]:
         if not isinstance(decision, CampaignReviewResult):
@@ -99,6 +104,11 @@ class DecisionExecutor:
                     raise ValueError("no campaign control service is configured")
                 output = await self._campaign_control.progress(project, record)
                 return ActionResult(action_id, output)
+            if isinstance(record, TargetLifecycleAction):
+                if self._target_lifecycle is None:
+                    raise ValueError("no target lifecycle service is configured")
+                output = await self._target_lifecycle.execute(project, record)
+                return ActionResult(action_id, output)
             raise TypeError("manager-selected action record type is unsupported")
         except Exception as error:
             return ActionResult(
@@ -117,6 +127,7 @@ class DecisionExecutor:
             *((record.action_id, record) for record in decision.known_progression_actions),
             *((record.action_id, record) for record in decision.known_pipeline_operations
               if record.action_id in decision.known_action_ids),
+            *((record.action_id, record) for record in decision.known_lifecycle_actions),
         )
         for action_id, record in values:
             if action_id in records:
@@ -133,6 +144,7 @@ class DecisionExecutor:
             *((record.action_id, record) for record in decision.selected_retirement_actions),
             *((record.action_id, record) for record in decision.selected_progression_actions),
             *((record.action_id, record) for record in decision.selected_pipeline_operations),
+            *((record.action_id, record) for record in decision.selected_lifecycle_actions),
         )
         for action_id, record in values:
             if action_id in records:

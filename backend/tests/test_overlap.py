@@ -267,6 +267,8 @@ def test_target_lifecycle_requires_complete_never_functional_absence_evidence() 
 
     assets = SimpleNamespace(deletion_evidence=AsyncMock(return_value={
         "complete": True,
+        "asset_kind": "harness", "asset_content_hash": "a" * 64,
+        "probe_attempts": 2, "failed_probe_attempts": 2, "attempt_revision": 12,
         "successful_probe": False,
         "accepted_campaign": False,
         "useful_clean_coverage": False,
@@ -283,9 +285,13 @@ def test_target_lifecycle_requires_complete_never_functional_absence_evidence() 
     for missing in (
         {"complete": False}, {"successful_probe": True}, {"accepted_campaign": True},
         {"useful_clean_coverage": True}, {"finding_dependencies": (11,)},
+        {"probe_attempts": 0, "failed_probe_attempts": 0},
+        {"asset_kind": "configuration"},
     ):
         assets.deletion_evidence.return_value = {
             "complete": True,
+            "asset_kind": "harness", "asset_content_hash": "a" * 64,
+            "probe_attempts": 2, "failed_probe_attempts": 2, "attempt_revision": 12,
             "successful_probe": False,
             "accepted_campaign": False,
             "useful_clean_coverage": False,
@@ -301,7 +307,11 @@ def test_healthy_unhelpful_target_is_unscheduled_and_preserved() -> None:
     campaigns = SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(
         id=9, project_id=7, target_asset_id=90, stopped_at=None, error=None,
     )))
-    service = TargetLifecycleService(assets=SimpleNamespace(), campaigns=campaigns)
+    assets = SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(
+        id=90, project_id=7, kind="configuration", content_hash="a" * 64,
+        validated_at=object(), error=None,
+    )))
+    service = TargetLifecycleService(assets=assets, campaigns=campaigns)
 
     action = run(service.unschedule(7, 9, "healthy but no recent marginal coverage"))
 
@@ -328,7 +338,11 @@ def test_overlap_deletion_requires_two_clean_checkpoints_and_healthy_retained_st
         "finding_bundle_requests": (),
         "evidence_ids": ("candidate:1", "retained:1", "candidate:2", "retained:2"),
     }))
-    service = TargetLifecycleService(assets=SimpleNamespace(), campaigns=campaigns)
+    assets = SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(
+        id=90, project_id=7, kind="configuration", content_hash="a" * 64,
+        validated_at=object(), error=None,
+    )))
+    service = TargetLifecycleService(assets=assets, campaigns=campaigns)
 
     assert run(service.overlapping_deletion(7, 9)).kind == "delete-overlapping"
     for unsafe in (

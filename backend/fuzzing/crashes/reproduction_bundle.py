@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import inspect
 from types import MappingProxyType
 from uuid import uuid4
 
@@ -81,17 +82,25 @@ class ReproductionBundle:
 class ReproductionBundleStore:
     """Write and verify exact immutable bundle data below one workspace root."""
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, resolver=None):
         root = Path(os.path.abspath(os.fspath(workspace)))
         if root.is_symlink():
             raise ValueError("reproduction bundle workspace must not be a symlink")
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._workspace = root.resolve(strict=True)
+        self._resolver = resolver
 
     async def freeze(self, request: ReproductionBundleRequest) -> ReproductionBundle:
         """Atomically freeze and verify one immutable finding reproduction bundle."""
         if not isinstance(request, ReproductionBundleRequest):
             raise TypeError("reproduction bundle freeze requires a validated request")
+        if self._resolver is None:
+            raise ValueError("reproduction bundle authoritative resolver is unavailable")
+        verified = self._resolver.verify(request)
+        if inspect.isawaitable(verified):
+            verified = await verified
+        if verified is not True:
+            raise ValueError("reproduction bundle dependencies do not match authoritative stores")
         testcase_hash = sha256(request.minimal_testcase).hexdigest()
         identity = {
             "project_id": request.project_id,
@@ -144,6 +153,56 @@ class ReproductionBundleStore:
                 self._remove_staging(staging)
             raise
         return self._verified_bundle(request, destination, manifest)
+
+    async def verify(self, project_id: int, bundle_id: str) -> bool:
+        if type(project_id) is not int or project_id <= 0 or _DIGEST.fullmatch(bundle_id) is None:
+            return False
+        root = self._workspace / "projects" / str(project_id) / "findings"
+        if root.is_symlink() or not root.is_dir():
+            return False
+        for finding in root.iterdir():
+            candidate = finding / "bundle" / bundle_id
+            if not candidate.is_dir() or candidate.is_symlink():
+                continue
+            try:
+                manifest = json.loads((candidate / "manifest.json").read_text(encoding="utf-8"))
+                testcase = (candidate / "testcase.input").read_bytes()
+                request = ReproductionBundleRequest(
+                    project_id=manifest["project_id"], finding_id=manifest["finding_id"],
+                    commit_sha=manifest["commit_sha"], image_id=manifest["image_id"],
+                    command=tuple(manifest["command"]),
+                    environment=tuple(tuple(item) for item in manifest["environment"]),
+                    sanitizer=manifest["sanitizer"], configuration=manifest["configuration"],
+                    minimal_testcase=testcase,
+                    target_asset_hash=manifest["target_asset_hash"],
+                    configuration_asset_hash=manifest["configuration_asset_hash"],
+                    coverage_asset_hash=manifest["coverage_asset_hash"],
+                )
+                bundle = self._verified_bundle(request, candidate, manifest)
+                verified = self._resolver.verify(request)
+                if inspect.isawaitable(verified):
+                    verified = await verified
+                return bundle.verified and verified is True
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                return False
+        return False
+
+    async def pinned_image_ids(self, project_id: int) -> tuple[str, ...]:
+        if type(project_id) is not int or project_id <= 0:
+            raise ValueError("reproduction bundle project ID is invalid")
+        root = self._workspace / "projects" / str(project_id) / "findings"
+        if not root.is_dir() or root.is_symlink():
+            return ()
+        values = set()
+        for manifest_path in root.glob("*/bundle/*/manifest.json"):
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                bundle_id = manifest.get("bundle_id")
+                if await self.verify(project_id, bundle_id):
+                    values.add(manifest["image_id"])
+            except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+                continue
+        return tuple(sorted(values))
 
     def _bundle_parent(self, project_id: int, finding_id: int) -> Path:
         current = self._workspace
@@ -207,3 +266,60 @@ class ReproductionBundleStore:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+
+
+class ProductionReproductionBundleResolver:
+    """Resolve bundle dependencies against projects, findings, assets, contracts, and Docker."""
+
+    def __init__(self, *, projects, findings, finding_artifacts, assets, campaigns, invocations, docker):
+        self._projects = projects
+        self._findings = findings
+        self._finding_artifacts = finding_artifacts
+        self._assets = assets
+        self._campaigns = campaigns
+        self._invocations = invocations
+        self._docker = docker
+
+    async def verify(self, request: ReproductionBundleRequest) -> bool:
+        project = await self._projects.get(request.project_id)
+        finding = await self._findings.get(request.finding_id)
+        if (
+            project is None or project.commit_sha != request.commit_sha
+            or finding is None or finding.project_id != request.project_id
+            or self._finding_artifacts.read_reproducer(finding) != request.minimal_testcase
+        ):
+            return False
+        assets = await self._assets.list_for_project(request.project_id)
+        hashes = {asset.content_hash for asset in assets if asset.validated_at is not None and asset.error is None}
+        if not {
+            request.target_asset_hash,
+            request.configuration_asset_hash,
+            request.coverage_asset_hash,
+        }.issubset(hashes):
+            return False
+        campaigns = await self._campaigns.for_finding(request.project_id, finding.fingerprint)
+        contract_matches = False
+        for campaign in campaigns:
+            invocation = self._invocations.load(request.project_id, campaign.id)
+            commands = {tuple(invocation.command)}
+            images = {invocation.image_id}
+            try:
+                coverage = self._invocations.load_coverage(request.project_id, campaign.id)
+            except (FileNotFoundError, ValueError):
+                coverage = None
+            if coverage is not None:
+                commands.add(tuple(coverage.replay_command))
+                images.add(coverage.clean_image_id)
+            if request.command in commands and request.image_id in images:
+                contract_matches = True
+                break
+        if not contract_matches:
+            return False
+        client = self._docker.connect()
+        try:
+            image = client.images.get(request.image_id)
+            return getattr(image, "id", None) == request.image_id
+        finally:
+            close = getattr(client, "close", None)
+            if close is not None:
+                close()

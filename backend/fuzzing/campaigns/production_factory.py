@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
 from dataclasses import dataclass
 from hashlib import sha256
 import os
@@ -46,11 +47,11 @@ from backend.fuzzing.layers.project_layer import ProjectLayerService
 from backend.fuzzing.layers.repository_layer import RepositoryLayerService
 from backend.fuzzing.layers.target_layer import TargetLayerService
 from backend.fuzzing.toolchain.builder import ToolchainBuilder
-from backend.agents.target_repair import TargetRepairAgent
 
 
 _MAX_SEED_BYTES = 16 * 1024 * 1024
 _SHELL_OPERATOR_TOKENS = frozenset({";", "|", "||", "&&", ">", ">>", "<", "<<", "2>", "2>>"})
+_BUILD_LOG_PROJECT: ContextVar[int | None] = ContextVar("build_log_project", default=None)
 
 
 class DeferredRepositoryLayerBootstrap:
@@ -152,6 +153,7 @@ class ProposalPreparationPlanner:
 
     async def plan(self, project, proposal) -> PreparationPlan:
         context = self._discovery.context(project.id)
+        logical_target = _logical_target_identity(proposal)
         target_files: dict[str, Path | tuple[Path, str]] = {}
         coverage_files: dict[str, Path | tuple[Path, str]] = {}
         patch_files: dict[str, Path] = {}
@@ -208,11 +210,11 @@ class ProposalPreparationPlanner:
         )
 
         configuration = await self._publish_reusable(
-            project.id, "script", "target-build.sh",
+            project.id, "script", f"target-build:{logical_target}.sh",
             {"target-build.sh": target_script},
         )
         coverage_configuration = await self._publish_reusable(
-            project.id, "script", "coverage-build.sh",
+            project.id, "script", f"coverage-build:{logical_target}.sh",
             {"coverage-build.sh": coverage_script},
         )
         requests: list[AssetVersionRequest] = []
@@ -222,13 +224,13 @@ class ProposalPreparationPlanner:
         }
         if target_paths:
             exact, parent_id = await self._existing_or_parent(
-                project.id, "harness", "target", target_files,
+                project.id, "harness", f"target:{logical_target}", target_files,
             )
             if exact is not None:
                 existing["target"] = exact
             else:
                 requests.append(AssetVersionRequest(
-                    "target", "harness", "target", target_files, tuple(target_paths),
+                    "target", "harness", f"target:{logical_target}", target_files, tuple(target_paths),
                     parent_id,
                 ))
         else:
@@ -237,13 +239,13 @@ class ProposalPreparationPlanner:
             )
         if coverage_paths:
             exact, parent_id = await self._existing_or_parent(
-                project.id, "adapter", "coverage-adapter", coverage_files,
+                project.id, "adapter", f"coverage-adapter:{logical_target}", coverage_files,
             )
             if exact is not None:
                 existing["coverage_adapter"] = exact
             else:
                 requests.append(AssetVersionRequest(
-                    "coverage_adapter", "adapter", "coverage-adapter",
+                    "coverage_adapter", "adapter", f"coverage-adapter:{logical_target}",
                     coverage_files, tuple(coverage_paths), parent_id,
                 ))
         else:
@@ -407,13 +409,23 @@ class ProductionTargetPreparationFactory:
         inspector = ImageInspector(client)
         builder = ImageBuilder(client)
         asset_store = AssetStore(self._workspace, self._assets)
+        def debug_sink(value):
+            project_id = _BUILD_LOG_PROJECT.get()
+            append = getattr(self._events, "append_sync", None)
+            if project_id is not None and append is not None:
+                append(project_id, "debug", {
+                    "event": "target.build_output",
+                    "text": str(value)[:16_384],
+                    "trusted_instructions": False,
+                })
+
         normal = NormalBuildPreparation(
             discovery=self._discovery,
             asset_store=asset_store,
             repository_layers=RepositoryLayerService(self._workspace, builder, inspector),
             project_layers=ProjectLayerService(self._workspace, builder, inspector),
             toolchain_tag=ToolchainBuilder(self._dockerfile, builder, inspector).tag(),
-            sink=lambda _text: None,
+            sink=debug_sink,
         )
         planner = ProposalPreparationPlanner(
             discovery=self._discovery,
@@ -425,7 +437,7 @@ class ProductionTargetPreparationFactory:
             PreparedCleanCoverageCollector(client, self._workspace, self._discovery),
             timeout_seconds=10.0,
         )
-        return TargetPreparationService(
+        service = TargetPreparationService(
             normal_build=normal,
             planner=planner,
             asset_store=asset_store,
@@ -433,9 +445,25 @@ class ProductionTargetPreparationFactory:
             coverage_layers=CoverageLayerService(self._workspace, builder, inspector),
             image_inspector=inspector,
             probe=probe,
-            repairer=TargetRepairAgent(self._discovery, self._events),
+            repairer=None,
             activity=self._events,
+            sink=debug_sink,
         )
+        return _ProjectBoundPreparation(service)
+
+
+class _ProjectBoundPreparation:
+    """Bind synchronous build log callbacks to one exact project preparation."""
+
+    def __init__(self, service):
+        self._service = service
+
+    async def prepare(self, project, proposal):
+        token = _BUILD_LOG_PROJECT.set(project.id)
+        try:
+            return await self._service.prepare(project, proposal)
+        finally:
+            _BUILD_LOG_PROJECT.reset(token)
 
 
 def _application_file(context, relative_path: str, content: str) -> tuple[Path, str]:
@@ -456,6 +484,23 @@ def _application_file(context, relative_path: str, content: str) -> tuple[Path, 
         if existing["content"] != content:
             raise ValueError("application-owned generated preparation source changed")
     return context.generated_assets_root / relative_path, digest
+
+
+def _logical_target_identity(proposal) -> str:
+    # TargetProposal supplies all three fields. The planner also has small direct
+    # unit callers, so use the executable path as the stable logical name when
+    # those callers intentionally omit display metadata.
+    values = (
+        proposal.instance_type,
+        getattr(proposal, "target_name", proposal.run_command),
+        getattr(proposal, "configuration", "default"),
+    )
+    digest = sha256()
+    for value in values:
+        encoded = value.strip().encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()[:24]
 
 
 def _application_preparation_file(context, name: str, content: str) -> tuple[Path, str]:
