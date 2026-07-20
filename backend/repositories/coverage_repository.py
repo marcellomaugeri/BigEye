@@ -22,6 +22,7 @@ _PAGE_COLUMNS = ", ".join(f"page.{name}" for name in _COLUMN_NAMES)
 class CoveragePage:
     items: tuple
     total: int
+    summary: dict | None = None
 
 
 class CoverageClaim:
@@ -107,6 +108,7 @@ class CoverageRepository:
     async def upsert_snapshot(self, snapshot) -> None:
         """Union one immutable exact-build inventory in a single transaction."""
         summaries = tuple(snapshot.source_summaries)
+        functions = tuple(snapshot.functions)
         branches = tuple(snapshot.branches)
         if not summaries:
             return
@@ -129,27 +131,39 @@ class CoverageRepository:
                     or int(identity["asset_project_id"]) != snapshot.project_id
                 ):
                     raise ValueError("coverage snapshot is not bound to the exact project build")
+                for source_path in sorted(summary.source_path for summary in summaries):
+                    lock_key = int.from_bytes(
+                        sha256(
+                            f"{snapshot.project_id}\0{snapshot.commit_sha}\0{source_path}".encode()
+                        ).digest()[:8],
+                        "big", signed=True,
+                    )
+                    await connection.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
                 existing = await connection.fetch(
                     """SELECT source_path, commit_sha, source_sha256,
                               total_lines, total_functions, total_branches
                        FROM coverage_source_summaries
-                       WHERE project_id = $1 AND coverage_asset_id = $2
+                       WHERE project_id = $1 AND commit_sha = $2
+                         AND source_path = ANY($3::text[])
                        FOR UPDATE""",
-                    snapshot.project_id, snapshot.coverage_asset_id,
+                    snapshot.project_id, snapshot.commit_sha,
+                    [summary.source_path for summary in summaries],
                 )
-                by_path = {str(row["source_path"]): row for row in existing}
+                by_path: dict[str, list] = {}
+                for row in existing:
+                    by_path.setdefault(str(row["source_path"]), []).append(row)
                 for summary in summaries:
-                    prior = by_path.get(summary.source_path)
+                    prior_rows = by_path.get(summary.source_path, ())
                     totals = (
                         _count_total(summary.lines), _count_total(summary.functions),
                         _count_total(summary.branches),
                     )
-                    if prior is not None and (
-                        prior["commit_sha"] != snapshot.commit_sha
-                        or prior["source_sha256"] != summary.source_sha256
+                    if any(
+                        prior["source_sha256"] != summary.source_sha256
                         or tuple(prior[name] for name in (
                             "total_lines", "total_functions", "total_branches",
                         )) != totals
+                        for prior in prior_rows
                     ):
                         raise ValueError("coverage source denominator conflicts with its exact build")
                     await connection.execute(
@@ -172,17 +186,33 @@ class CoverageRepository:
                         _count_covered(summary.functions), totals[1],
                         _count_covered(summary.branches), totals[2],
                     )
+                for function in functions:
+                    await connection.execute(
+                        """INSERT INTO coverage_function_evidence
+                                  (project_id, commit_sha, coverage_asset_id, source_path,
+                                   function_name, start_line, start_column, covered)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                           ON CONFLICT (project_id, coverage_asset_id, source_path,
+                                        function_name, start_line, start_column) DO UPDATE SET
+                               covered = coverage_function_evidence.covered OR EXCLUDED.covered""",
+                        snapshot.project_id, snapshot.commit_sha, snapshot.coverage_asset_id,
+                        function.source_path, function.function_name,
+                        function.start_line, function.start_column, function.covered,
+                    )
                 for branch in branches:
                     await connection.execute(
                         """INSERT INTO coverage_branch_evidence
                                   (project_id, commit_sha, coverage_asset_id, source_path,
-                                   line_number, branch_index, covered)
-                           VALUES ($1, $2, $3, $4, $5, $6, $7)
+                                   line_number, start_column, end_line, end_column,
+                                   branch_index, covered)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                            ON CONFLICT (project_id, coverage_asset_id, source_path,
-                                        line_number, branch_index) DO UPDATE SET
+                                        line_number, start_column, end_line, end_column,
+                                        branch_index) DO UPDATE SET
                                covered = coverage_branch_evidence.covered OR EXCLUDED.covered""",
                         snapshot.project_id, snapshot.commit_sha, snapshot.coverage_asset_id,
-                        branch.source_path, branch.line_number, branch.branch_index, branch.covered,
+                        branch.source_path, branch.line_number, branch.start_column,
+                        branch.end_line, branch.end_column, branch.branch_index, branch.covered,
                     )
 
     async def apply_exposure_observation(
@@ -360,17 +390,24 @@ class CoverageRepository:
                    FROM coverage_evidence
                    WHERE project_id = $1 AND commit_sha = $2 GROUP BY source_path
                ), function_union AS (
-                   SELECT source_path, COUNT(DISTINCT function_name) AS covered_functions
-                   FROM coverage_evidence
-                   WHERE project_id = $1 AND commit_sha = $2 AND function_name IS NOT NULL
-                   GROUP BY source_path
+                   SELECT source_path, COUNT(*) FILTER (WHERE covered IS TRUE) AS covered_functions
+                   FROM (
+                       SELECT source_path, function_name, start_line, start_column,
+                              BOOL_OR(covered) AS covered
+                       FROM coverage_function_evidence
+                       WHERE project_id = $1 AND commit_sha = $2
+                       GROUP BY source_path, function_name, start_line, start_column
+                   ) AS exact_functions GROUP BY source_path
                ), branch_union AS (
                    SELECT source_path,
                           COUNT(*) FILTER (WHERE covered IS TRUE) AS covered_branches
                    FROM (
-                       SELECT DISTINCT source_path, line_number, branch_index, covered
+                       SELECT source_path, line_number, start_column, end_line, end_column,
+                              branch_index, BOOL_OR(covered) AS covered
                        FROM coverage_branch_evidence
                        WHERE project_id = $1 AND commit_sha = $2
+                       GROUP BY source_path, line_number, start_column, end_line,
+                                end_column, branch_index
                    ) AS exact_branches GROUP BY source_path
                ), inventories AS (
                    SELECT source_path,
@@ -405,10 +442,21 @@ class CoverageRepository:
                ), page AS (
                    SELECT *
                    FROM grouped ORDER BY source_path LIMIT $3 OFFSET $4
+               ), overall AS (
+                   SELECT SUM(covered_lines) AS project_covered_lines,
+                          SUM(total_lines) AS project_total_lines,
+                          SUM(covered_functions) AS project_covered_functions,
+                          SUM(total_functions) AS project_total_functions,
+                          SUM(covered_branches) AS project_covered_branches,
+                          SUM(total_branches) AS project_total_branches,
+                          BOOL_AND(total_lines IS NOT NULL) AS project_lines_available,
+                          BOOL_AND(total_functions IS NOT NULL) AS project_functions_available,
+                          BOOL_AND(total_branches IS NOT NULL) AS project_branches_available
+                   FROM grouped
                )
-               SELECT page.*, total.total
+               SELECT page.*, total.total, overall.*
                FROM (SELECT COUNT(*) AS total FROM grouped) AS total
-               LEFT JOIN page ON TRUE ORDER BY page.source_path""",
+               CROSS JOIN overall LEFT JOIN page ON TRUE ORDER BY page.source_path""",
             project_id, commit_sha, limit, offset,
         )
         total = int(rows[0]["total"]) if rows else 0
@@ -437,7 +485,10 @@ class CoverageRepository:
                 "total_branches": total_branches,
                 "cpu_exposure_seconds": float(row["cpu_exposure_seconds"]),
             })
-        return CoveragePage(tuple(items), total)
+        summary = _project_summary(rows[0]) if rows else {
+            "lines": None, "functions": None, "branches": None,
+        }
+        return CoveragePage(tuple(items), total, summary)
 
     async def source_summary(self, project_id: int, commit_sha: str, source_path: str):
         rows = await self._pool.fetch(
@@ -471,7 +522,12 @@ class CoverageRepository:
     ) -> CoveragePage:
         self._validate_page(limit, offset)
         rows = await self._pool.fetch(
-            """WITH per_campaign AS (
+            """WITH identities AS (
+                   SELECT function_name, start_line, start_column, BOOL_OR(covered) AS covered
+                   FROM coverage_function_evidence
+                   WHERE project_id = $1 AND commit_sha = $2 AND source_path = $3
+                   GROUP BY function_name, start_line, start_column
+               ), per_campaign AS (
                    SELECT function_name, campaign_id, MAX(cpu_exposure_seconds) AS cpu_exposure_seconds
                    FROM coverage_evidence
                    WHERE project_id = $1 AND commit_sha = $2 AND source_path = $3
@@ -483,25 +539,34 @@ class CoverageRepository:
                    WHERE project_id = $1 AND commit_sha = $2 AND source_path = $3
                      AND function_name IS NOT NULL
                    GROUP BY function_name
-               ), grouped AS (
-                   SELECT per_campaign.function_name, line_counts.covered_lines,
-                          SUM(per_campaign.cpu_exposure_seconds) AS cpu_exposure_seconds
-                   FROM per_campaign
-                   JOIN line_counts USING (function_name)
-                   GROUP BY per_campaign.function_name, line_counts.covered_lines
+               ), exposure AS (
+                   SELECT function_name, SUM(cpu_exposure_seconds) AS cpu_exposure_seconds
+                   FROM per_campaign GROUP BY function_name
                ), page AS (
-                   SELECT function_name, covered_lines, cpu_exposure_seconds
-                   FROM grouped ORDER BY function_name LIMIT $4 OFFSET $5
+                   SELECT identities.function_name, identities.start_line,
+                          identities.start_column, identities.covered,
+                          COALESCE(line_counts.covered_lines, 0) AS covered_lines,
+                          COALESCE(exposure.cpu_exposure_seconds, 0) AS cpu_exposure_seconds
+                   FROM identities
+                   LEFT JOIN line_counts USING (function_name)
+                   LEFT JOIN exposure USING (function_name)
+                   ORDER BY function_name, start_line, start_column LIMIT $4 OFFSET $5
                )
-               SELECT page.function_name, page.covered_lines, page.cpu_exposure_seconds, total.total
-               FROM (SELECT COUNT(*) AS total FROM grouped) AS total
-               LEFT JOIN page ON TRUE ORDER BY page.function_name""",
+               SELECT page.*, total.total
+               FROM (SELECT COUNT(*) AS total FROM identities) AS total
+               LEFT JOIN page ON TRUE ORDER BY page.function_name, page.start_line, page.start_column""",
             project_id, commit_sha, source_path, limit, offset,
         )
         total = int(rows[0]["total"]) if rows else 0
         return CoveragePage(tuple({
             "name": str(row["function_name"]),
             "path": source_path,
+            "start_line": _optional_int(_row_value(row, "start_line")),
+            "start_column": _optional_int(_row_value(row, "start_column")),
+            "covered": (
+                bool(_row_value(row, "covered"))
+                if _row_value(row, "covered") is not None else None
+            ),
             "covered_lines": int(row["covered_lines"]),
             "cpu_exposure_seconds": float(row["cpu_exposure_seconds"]),
         } for row in rows if row["function_name"] is not None), total)
@@ -629,3 +694,24 @@ def _row_value(row, name, default=None):
 
 def _optional_int(value):
     return None if value is None else int(value)
+
+
+def _project_summary(row):
+    return {
+        name: _measurement(
+            _row_value(row, f"project_covered_{name}"),
+            _row_value(row, f"project_total_{name}"),
+        ) if _row_value(row, f"project_{name}_available", False) else None
+        for name in ("lines", "functions", "branches")
+    }
+
+
+def _measurement(covered, total):
+    if covered is None or total is None:
+        return None
+    covered, total = int(covered), int(total)
+    return {
+        "covered": covered,
+        "total": total,
+        "percent": (covered * 100.0 / total) if total else 0.0,
+    }

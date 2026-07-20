@@ -163,13 +163,41 @@ CREATE TABLE coverage_branch_evidence (
     coverage_asset_id BIGINT NOT NULL,
     source_path TEXT NOT NULL,
     line_number INTEGER NOT NULL,
+    start_column INTEGER NOT NULL,
+    end_line INTEGER NOT NULL,
+    end_column INTEGER NOT NULL,
     branch_index INTEGER NOT NULL,
     covered BOOLEAN NOT NULL,
-    PRIMARY KEY (project_id, coverage_asset_id, source_path, line_number, branch_index),
+    PRIMARY KEY (
+        project_id, coverage_asset_id, source_path, line_number,
+        start_column, end_line, end_column, branch_index
+    ),
     FOREIGN KEY (project_id) REFERENCES projects (id),
     FOREIGN KEY (coverage_asset_id) REFERENCES assets (id),
     CHECK (line_number > 0),
+    CHECK (start_column > 0),
+    CHECK (end_line >= line_number),
+    CHECK (end_column > 0),
     CHECK (branch_index >= 0)
+);
+
+CREATE TABLE coverage_function_evidence (
+    project_id BIGINT NOT NULL,
+    commit_sha TEXT NOT NULL,
+    coverage_asset_id BIGINT NOT NULL,
+    source_path TEXT NOT NULL,
+    function_name TEXT NOT NULL,
+    start_line INTEGER NOT NULL,
+    start_column INTEGER NOT NULL,
+    covered BOOLEAN NOT NULL,
+    PRIMARY KEY (
+        project_id, coverage_asset_id, source_path,
+        function_name, start_line, start_column
+    ),
+    FOREIGN KEY (project_id) REFERENCES projects (id),
+    FOREIGN KEY (coverage_asset_id) REFERENCES assets (id),
+    CHECK (start_line > 0),
+    CHECK (start_column > 0)
 );
 
 CREATE TABLE coverage_checkpoints (
@@ -222,6 +250,7 @@ CREATE INDEX target_probe_attempts_project_target_idx ON target_probe_attempts (
 CREATE INDEX coverage_evidence_project_source_line_idx ON coverage_evidence (project_id, source_path, line_number);
 CREATE INDEX coverage_source_summaries_project_source_idx ON coverage_source_summaries (project_id, source_path);
 CREATE INDEX coverage_branch_evidence_project_source_line_idx ON coverage_branch_evidence (project_id, source_path, line_number);
+CREATE INDEX coverage_function_evidence_project_source_idx ON coverage_function_evidence (project_id, source_path);
 CREATE INDEX coverage_checkpoints_project_campaign_idx ON coverage_checkpoints (project_id, campaign_id, id);
 CREATE INDEX findings_project_created_at_idx ON findings (project_id, created_at, id);
 

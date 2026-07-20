@@ -18,13 +18,14 @@
 
 - Started a disposable `postgres:18.4-bookworm` container on `linux/amd64` with an in-memory PostgreSQL 18 data root.
 - Applied `backend/database/schema.sql` with `ON_ERROR_STOP=1`.
-- Computed catalog signature `c3d5e2de08a85200e145b9d6a126b63b` from PostgreSQL's real relation, column, constraint, and index catalog.
+- Computed corrected catalog signature `d7d38f7962801654cbb30f9f11428eea` from PostgreSQL's real relation, column, constraint, and index catalog.
 - Applied `backend/database/schema_contract.sql` successfully (`DO`).
 - Removed the disposable container after verification.
 
 ## Verification
 
-- `backend/.venv/bin/python -m pytest backend/tests/test_clean_coverage.py backend/tests/test_coverage_api.py backend/tests/test_exposure.py backend/tests/test_campaign_api.py backend/tests/test_development_database.py -q`: `135 passed, 1 warning in 1.57s`.
+- Reviewer correction: a live Apple LLVM 21 compile/profile/export/report test verifies parser line and branch totals against `llvm-cov report`; exact function identities are unioned from their own inventory; project summaries are computed before file pagination; and cross-asset source conflicts are locked and rejected before insert.
+- `backend/.venv/bin/python -m pytest backend/tests/test_clean_coverage.py backend/tests/test_coverage_api.py backend/tests/test_exposure.py backend/tests/test_campaign_api.py backend/tests/test_development_database.py -q`: `140 passed, 1 warning in 2.81s`.
 - Target production modules compile with `python -m py_compile`.
 - `git diff --check`: passed.
 - No broad backend suite or heavy-job scheduling test was run or changed.

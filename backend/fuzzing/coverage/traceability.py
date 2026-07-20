@@ -216,7 +216,7 @@ class TraceabilityService:
             "project_id": project_id,
             "commit_sha": commit,
             "files": files,
-            "summary": {
+            "summary": getattr(page, "summary", None) or {
                 dimension: self._sum_measurement(files, dimension)
                 for dimension in ("lines", "functions", "branches")
             },
@@ -708,11 +708,30 @@ class TraceabilityService:
             for count in (summary.lines, summary.functions, summary.branches):
                 _validate_count(count)
         branch_keys = set()
+        function_keys = set()
+        for function in snapshot.functions:
+            path = TraceabilityService._safe_source_path(function.source_path)
+            key = (path, function.function_name, function.start_line, function.start_column)
+            if (
+                not isinstance(function.function_name, str) or not function.function_name
+                or len(function.function_name) > 4_096
+                or type(function.start_line) is not int or function.start_line <= 0
+                or type(function.start_column) is not int or function.start_column <= 0
+                or type(function.covered) is not bool or key in function_keys
+            ):
+                raise CoverageIntegrityError("coverage function inventory is invalid")
+            function_keys.add(key)
         for branch in snapshot.branches:
             path = TraceabilityService._safe_source_path(branch.source_path)
-            key = (path, branch.line_number, branch.branch_index)
+            key = (
+                path, branch.line_number, branch.start_column,
+                branch.end_line, branch.end_column, branch.branch_index,
+            )
             if (
                 type(branch.line_number) is not int or branch.line_number <= 0
+                or type(branch.start_column) is not int or branch.start_column <= 0
+                or type(branch.end_line) is not int or branch.end_line < branch.line_number
+                or type(branch.end_column) is not int or branch.end_column <= 0
                 or type(branch.branch_index) is not int or branch.branch_index < 0
                 or type(branch.covered) is not bool or key in branch_keys
             ):

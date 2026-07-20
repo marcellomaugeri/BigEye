@@ -61,7 +61,19 @@ class CoverageCount:
 class CoverageBranch:
     source_path: str
     line_number: int
+    start_column: int
+    end_line: int
+    end_column: int
     branch_index: int
+    covered: bool
+
+
+@dataclass(frozen=True)
+class CoverageFunction:
+    source_path: str
+    function_name: str
+    start_line: int
+    start_column: int
     covered: bool
 
 
@@ -84,6 +96,7 @@ class CoverageSourceSummary:
 @dataclass(frozen=True)
 class ParsedCoverage:
     lines: tuple[CoverageLine, ...]
+    functions: tuple[CoverageFunction, ...]
     branches: tuple[CoverageBranch, ...]
     summary: CoverageSummary
     source_summaries: tuple[CoverageSourceSummary, ...]
@@ -116,6 +129,7 @@ class CoverageSnapshot:
     lines: tuple[CoverageLine, ...]
     hits: tuple[CoverageHit, ...]
     replay_environment: tuple[tuple[str, str], ...]
+    functions: tuple[CoverageFunction, ...] = ()
     branches: tuple[CoverageBranch, ...] = ()
     summary: CoverageSummary = CoverageSummary(None, None, None)
     source_summaries: tuple[CoverageSourceSummary, ...] = ()
@@ -353,7 +367,7 @@ class LlvmCoverage:
                 self._copy_regular(profile_dir / profdata, destination)
                 merged_profiles.append(f"/coverage/profiles/{profdata}")
 
-            merged = ParsedCoverage((), (), CoverageSummary(None, None, None), ())
+            merged = ParsedCoverage((), (), (), CoverageSummary(None, None, None), ())
             if merged_profiles:
                 self._require_profile_directory(aggregate, {Path(name).name for name in merged_profiles})
                 aggregate_manifest = self._profile_manifest(
@@ -409,6 +423,7 @@ class LlvmCoverage:
                 lines=merged.lines,
                 hits=tuple(first_hits[key] for key in sorted(first_hits) if key in merged_keys),
                 replay_environment=campaign.replay_environment,
+                functions=merged.functions,
                 branches=merged.branches,
                 summary=merged.summary,
                 source_summaries=merged.source_summaries,
@@ -422,6 +437,7 @@ class LlvmCoverage:
         manifest = self._profile_manifest(profile_directory, tuple(sorted(allowed)))
         source_paths = {
             *(line.source_path for line in parsed.lines),
+            *(function.source_path for function in parsed.functions),
             *(branch.source_path for branch in parsed.branches),
             *(summary.source_path for summary in parsed.source_summaries),
         }
@@ -439,6 +455,7 @@ class LlvmCoverage:
                 CoverageLine(line.source_path, line.line_number, line.function_name, hashes[line.source_path])
                 for line in parsed.lines
             ),
+            parsed.functions,
             parsed.branches,
             parsed.summary,
             tuple(
@@ -614,9 +631,11 @@ class LlvmCoverage:
         if not isinstance(document, dict) or not isinstance(document.get("data"), list):
             raise CoverageIntegrityError("llvm-cov returned an invalid document")
         function_regions: dict[str, list[tuple[int, int, str]]] = {}
-        function_inventory: set[tuple[str, str, int, bool]] = set()
+        function_inventory: set[tuple[str, str, int, int, bool]] = set()
         line_inventory: dict[tuple[str, int], bool] = {}
-        branches: dict[tuple[str, int, int], bool] = {}
+        branches: dict[tuple[str, int, int, int, int, int], bool] = {}
+        source_counts: dict[str, dict[str, CoverageCount | None]] = {}
+        sources_with_summary: set[str] = set()
         branches_available = False
         branches_malformed = False
         functions_available = False
@@ -639,6 +658,10 @@ class LlvmCoverage:
                 relative = self._source_path(source.get("filename"), campaign)
                 if relative is None:
                     continue
+                exact_counts = self._file_summary(source.get("summary"))
+                source_counts[relative] = exact_counts
+                if isinstance(source.get("summary"), dict):
+                    sources_with_summary.add(relative)
                 segments = source.get("segments")
                 segment_states = self._segment_line_states(segments) if isinstance(segments, list) else ()
                 lines_available = lines_available or isinstance(segments, list)
@@ -653,8 +676,10 @@ class LlvmCoverage:
                         branches_malformed = True
                     else:
                         branches_available = True
-                        for line, branch_index, covered in parsed_branches:
-                            key = (relative, line, branch_index)
+                        for line, start_column, end_line, end_column, branch_index, covered in parsed_branches:
+                            key = (
+                                relative, line, start_column, end_line, end_column, branch_index,
+                            )
                             branches[key] = branches.get(key, False) or covered
         result = []
         for (path, line), covered in sorted(line_inventory.items()):
@@ -662,45 +687,45 @@ class LlvmCoverage:
                 continue
             names = [name for start, end, name in function_regions.get(path, ()) if start <= line <= end]
             result.append(CoverageLine(path, line, min(names) if names else None))
+        function_records = tuple(
+            CoverageFunction(path, name, line, column, covered)
+            for path, name, line, column, covered in sorted(function_inventory)
+        )
         branch_records = tuple(
-            CoverageBranch(path, line, branch_index, covered)
-            for (path, line, branch_index), covered in sorted(branches.items())
+            CoverageBranch(path, line, start_column, end_line, end_column, branch_index, covered)
+            for (path, line, start_column, end_line, end_column, branch_index), covered
+            in sorted(branches.items())
         ) if branches_available and not branches_malformed else ()
-        branch_count = (
-            CoverageCount(sum(branch.covered for branch in branch_records), len(branch_records))
-            if branches_available and not branches_malformed else None
-        )
-        line_count = (
-            CoverageCount(sum(line_inventory.values()), len(line_inventory))
-            if lines_available else None
-        )
-        function_count = (
-            CoverageCount(sum(covered for *_identity, covered in function_inventory), len(function_inventory))
-            if functions_available else None
-        )
-        paths = sorted({path for path, _line in line_inventory} | {
-            path for path, _name, _start, _covered in function_inventory
-        } | {path for path, _line, _index in branches})
+        paths = sorted(set(source_counts) | {path for path, _line in line_inventory} | {
+            path for path, _name, _start, _column, _covered in function_inventory
+        } | {path for path, *_identity in branches})
         source_summaries = []
         for path in paths:
             source_lines = [covered for (candidate, _line), covered in line_inventory.items() if candidate == path]
             source_functions = [
-                covered for candidate, _name, _start, covered in function_inventory if candidate == path
+                covered for candidate, _name, _start, _column, covered in function_inventory if candidate == path
             ]
             source_branches = [
-                covered for (candidate, _line, _index), covered in branches.items() if candidate == path
+                covered for (candidate, *_identity), covered in branches.items() if candidate == path
             ]
+            exact = source_counts.get(path, {})
             source_summaries.append(CoverageSourceSummary(
                 path, None,
-                CoverageCount(sum(source_lines), len(source_lines)) if lines_available else None,
-                CoverageCount(sum(source_functions), len(source_functions)) if functions_available else None,
-                (
-                    CoverageCount(sum(source_branches), len(source_branches))
-                    if branches_available and not branches_malformed else None
+                exact.get("lines") if path in sources_with_summary else (
+                    CoverageCount(sum(source_lines), len(source_lines)) if lines_available else None
                 ),
+                exact.get("functions") if path in sources_with_summary else (
+                    CoverageCount(sum(source_functions), len(source_functions)) if functions_available else None
+                ),
+                None if branches_malformed else exact.get("branches"),
             ))
+        line_count = _sum_source_counts(source_summaries, "lines")
+        function_count = _sum_source_counts(source_summaries, "functions")
+        branch_count = (
+            _sum_source_counts(source_summaries, "branches") if not branches_malformed else None
+        )
         return ParsedCoverage(
-            tuple(result), branch_records,
+            tuple(result), function_records, branch_records,
             CoverageSummary(line_count, function_count, branch_count),
             tuple(source_summaries),
         )
@@ -721,12 +746,12 @@ class LlvmCoverage:
         for index, segment in enumerate(segments):
             if not isinstance(segment, list) or len(segment) < 6:
                 raise CoverageIntegrityError("llvm-cov segment is invalid")
-            line, column, count, has_count, _entry, gap = segment[:6]
+            line, column, count, has_count, entry, gap = segment[:6]
             if (
                 type(line) is not int or type(column) is not int
                 or not 1 <= line <= maximum_lines or not 1 <= column <= maximum_lines
                 or isinstance(count, bool) or not isinstance(count, (int, float)) or not math.isfinite(count)
-                or type(has_count) is not bool or type(gap) is not bool
+                or type(has_count) is not bool or type(entry) is not bool or type(gap) is not bool
             ):
                 raise CoverageIntegrityError("llvm-cov segment coordinates are invalid")
             if has_count is not True or gap is True:
@@ -744,11 +769,12 @@ class LlvmCoverage:
                 ):
                     raise CoverageIntegrityError("llvm-cov next segment coordinates are invalid")
                 end = next_line if next_column > 1 else next_line - 1
-            if end >= line:
-                span = end - line + 1
+            start = line if entry else line + 1
+            if end >= start:
+                span = end - start + 1
                 if span > maximum_lines - expanded:
                     raise CoverageIntegrityError("llvm-cov covered span exceeds its limit")
-                spans.append((line, end, count > 0))
+                spans.append((start, end, count > 0))
                 expanded += span
         result: dict[int, bool] = {}
         for line, end, covered in spans:
@@ -774,9 +800,12 @@ class LlvmCoverage:
         for region in regions:
             if not isinstance(region, list) or len(region) < 6:
                 continue
-            start, end, count, file_id = region[0], region[2], region[4], region[5]
+            start, start_column, end, count, file_id = (
+                region[0], region[1], region[2], region[4], region[5]
+            )
             if (
-                type(start) is not int or type(end) is not int or start < 1 or end < start
+                type(start) is not int or type(start_column) is not int
+                or type(end) is not int or start < 1 or start_column < 1 or end < start
                 or isinstance(count, bool) or not isinstance(count, (int, float)) or not math.isfinite(count)
                 or type(file_id) is not int or not 0 <= file_id < len(filenames)
             ):
@@ -784,7 +813,7 @@ class LlvmCoverage:
             relative = self._source_path(filenames[file_id], campaign)
             if relative is not None:
                 covered = (function_count if function_count is not None else count) > 0
-                identities.append((relative, function["name"], start, covered))
+                identities.append((relative, function["name"], start, start_column, covered))
                 if covered:
                     collected.setdefault(relative, []).append((start, end, function["name"]))
         if identities:
@@ -795,7 +824,8 @@ class LlvmCoverage:
         if not isinstance(values, list) or len(values) > 2_000_000:
             return None
         result = []
-        for record_index, branch in enumerate(values):
+        coordinate_ordinals: dict[tuple[int, int, int, int], int] = {}
+        for branch in values:
             if not isinstance(branch, list) or len(branch) < 9:
                 return None
             start_line, start_column, end_line, end_column, true_count, false_count = branch[:6]
@@ -811,11 +841,31 @@ class LlvmCoverage:
                 or true_count < 0 or false_count < 0
             ):
                 return None
-            result.extend((
-                (start_line, record_index * 2, true_count > 0),
-                (start_line, record_index * 2 + 1, false_count > 0),
+            coordinate = (start_line, start_column, end_line, end_column)
+            branch_index = coordinate_ordinals.get(coordinate, 0)
+            coordinate_ordinals[coordinate] = branch_index + 1
+            result.append((
+                start_line, start_column, end_line, end_column, branch_index,
+                true_count > 0 or false_count > 0,
             ))
         return tuple(result)
+
+    @staticmethod
+    def _file_summary(value):
+        result = {"lines": None, "functions": None, "branches": None}
+        if not isinstance(value, dict):
+            return result
+        for name in result:
+            measurement = value.get(name)
+            if not isinstance(measurement, dict):
+                continue
+            covered, total = measurement.get("covered"), measurement.get("count")
+            if (
+                type(covered) is int and type(total) is int
+                and 0 <= covered <= total <= 2_000_000
+            ):
+                result[name] = CoverageCount(covered, total)
+        return result
 
     @staticmethod
     def _source_path(filename, campaign):
@@ -858,6 +908,16 @@ def _valid_coverage_environment(environment) -> bool:
             and len(value) <= 4_096
             for key, value in environment.items()
         )
+    )
+
+
+def _sum_source_counts(summaries, name):
+    values = [getattr(summary, name) for summary in summaries]
+    if not values or any(value is None for value in values):
+        return None
+    return CoverageCount(
+        sum(value.covered for value in values),
+        sum(value.total for value in values),
     )
 
 

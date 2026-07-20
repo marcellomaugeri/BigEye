@@ -71,6 +71,9 @@ class SourceFileResponse(BaseModel):
 class FunctionCoverageResponse(BaseModel):
     name: str
     path: str
+    start_line: int | None = None
+    start_column: int | None = None
+    covered: bool | None = None
     covered_lines: int
     cpu_exposure_seconds: float
 

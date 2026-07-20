@@ -28,7 +28,7 @@ class _Coverage:
             "project_id": project_id, "commit_sha": "a" * 40, "path": path,
             "start_line": start_line, "end_line": end_line, "total_lines": 742,
             "lines": [{"number": 12, "text": "return 0;", "covered": True,
-                       "branches": [True, False],
+                       "branches": [True],
                        "strategy_count": 1, "cpu_exposure_seconds": 2.0}],
         }
 
@@ -94,7 +94,7 @@ def test_coverage_routes_expose_tree_source_functions_and_first_hit_evidence():
     assert tree.json()["pagination"] == {"limit": 1000, "offset": 0, "total": 1}
     assert source.status_code == 200
     assert source.json()["lines"][0]["covered"] is True
-    assert source.json()["lines"][0]["branches"] == [True, False]
+    assert source.json()["lines"][0]["branches"] == [True]
     assert source.json()["total_lines"] == 742
     assert functions.status_code == 200
     assert functions.json()["functions"][0]["name"] == "parse"

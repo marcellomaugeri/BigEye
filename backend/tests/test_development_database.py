@@ -52,7 +52,7 @@ class DevelopmentDatabaseTests(unittest.TestCase):
 
         for table in ("projects", "tasks", "assets", "campaigns", "coverage_evidence", "findings"):
             self.assertIn(f"CREATE TABLE {table}", schema)
-        for table in ("coverage_source_summaries", "coverage_branch_evidence"):
+        for table in ("coverage_source_summaries", "coverage_branch_evidence", "coverage_function_evidence"):
             self.assertIn(f"CREATE TABLE {table}", schema)
         self.assertNotIn("CREATE TYPE", schema)
         self.assertNotIn("metadata", schema.lower())

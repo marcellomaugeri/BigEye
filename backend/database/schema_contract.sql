@@ -15,6 +15,7 @@ DECLARE
         'coverage_branch_evidence',
         'coverage_checkpoints',
         'coverage_evidence',
+        'coverage_function_evidence',
         'coverage_source_summaries',
         'findings',
         'projects',
@@ -22,7 +23,7 @@ DECLARE
         'tasks'
     ];
     expected_schema_comment CONSTANT TEXT := 'bigeye-schema:release-1';
-    expected_signature CONSTANT TEXT := 'c3d5e2de08a85200e145b9d6a126b63b';
+    expected_signature CONSTANT TEXT := 'd7d38f7962801654cbb30f9f11428eea';
     actual_tables TEXT[];
     actual_schema_comment TEXT;
     actual_signature TEXT;

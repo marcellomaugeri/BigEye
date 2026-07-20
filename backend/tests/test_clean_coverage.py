@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import stat
+import subprocess
 from contextlib import asynccontextmanager
 from hashlib import sha256
 from pathlib import Path
@@ -1014,6 +1016,11 @@ def test_real_shaped_llvm_export_keeps_zero_count_line_function_and_branch_inven
                 [3, 1, 0, False, False, False],
             ],
             "branches": [[1, 5, 1, 12, 7, 0, 0, 0, 4]],
+            "summary": {
+                "lines": {"count": 2, "covered": 1},
+                "functions": {"count": 2, "covered": 1},
+                "branches": {"count": 2, "covered": 1},
+            },
         }],
         "functions": [
             {"name": "covered", "count": 7, "filenames": ["/src/src/a.c"],
@@ -1032,7 +1039,7 @@ def test_real_shaped_llvm_export_keeps_zero_count_line_function_and_branch_inven
     assert parsed.summary.branches == CoverageCount(covered=1, total=2)
     assert [(branch.source_path, branch.line_number, branch.branch_index, branch.covered)
             for branch in parsed.branches] == [
-        ("src/a.c", 1, 0, True), ("src/a.c", 1, 1, False),
+        ("src/a.c", 1, 0, True),
     ]
     assert [(line.source_path, line.line_number) for line in parsed.lines] == [("src/a.c", 1)]
 
@@ -1057,6 +1064,121 @@ def test_unavailable_or_malformed_llvm_branch_inventory_is_null(tmp_path: Path, 
     )
 
     assert parsed.summary.branches is None
+
+
+def test_non_entry_boundary_segment_does_not_cover_its_own_start_line(tmp_path: Path):
+    from backend.fuzzing.coverage.llvm_coverage import CoverageCount, LlvmCoverage
+
+    repository = tmp_path / "repository"
+    (repository / "src").mkdir(parents=True)
+    (repository / "src/a.c").write_text("\n" * 17)
+    document = {"data": [{
+        "files": [{
+            "filename": "/src/src/a.c",
+            "segments": [
+                [1, 1, 1, True, True, False],
+                [11, 1, 0, True, True, False],
+                [14, 8, 1, True, False, False],
+                [15, 1, 0, False, False, False],
+            ],
+            "branches": [],
+            "summary": {
+                "lines": {"count": 17, "covered": 10},
+                "functions": {"count": 0, "covered": 0},
+                "branches": {"count": 0, "covered": 0},
+            },
+        }],
+        "functions": [],
+    }]}
+
+    parsed = LlvmCoverage(_client(), _CoverageExecutor({}), tmp_path / "work")._parse_export(
+        json.dumps(document).encode(), _campaign(tmp_path)
+    )
+
+    assert parsed.summary.lines == CoverageCount(covered=10, total=17)
+    assert ("src/a.c", 14) not in {(line.source_path, line.line_number) for line in parsed.lines}
+
+
+def test_real_llvm_export_line_and_branch_counts_match_llvm_report_when_available(tmp_path: Path):
+    from backend.fuzzing.coverage.llvm_coverage import CoverageCount, LlvmCoverage
+
+    if shutil.which("xcrun") is None:
+        pytest.skip("Apple LLVM tools are unavailable")
+    source = tmp_path / "real.c"
+    binary = tmp_path / "real"
+    raw = tmp_path / "real.profraw"
+    profile = tmp_path / "real.profdata"
+    source.write_text(
+        "int classify(int x) {\n"
+        "  if (x > 2) { return 10; }\n"
+        "  if (x == 2) { return 20; }\n"
+        "  return 30;\n"
+        "}\n"
+        "int main(void) { return classify(4) == 10 ? 0 : 1; }\n"
+    )
+    subprocess.run([
+        "xcrun", "clang", "-fprofile-instr-generate", "-fcoverage-mapping",
+        str(source), "-o", str(binary),
+    ], check=True, capture_output=True)
+    subprocess.run(
+        [str(binary)], check=True, capture_output=True,
+        env={**os.environ, "LLVM_PROFILE_FILE": str(raw)},
+    )
+    subprocess.run([
+        "xcrun", "llvm-profdata", "merge", "-sparse", str(raw), "-o", str(profile),
+    ], check=True, capture_output=True)
+    exported = subprocess.run([
+        "xcrun", "llvm-cov", "export", str(binary), f"-instr-profile={profile}",
+    ], check=True, capture_output=True).stdout
+    report = subprocess.run([
+        "xcrun", "llvm-cov", "report", str(binary), f"-instr-profile={profile}",
+    ], check=True, capture_output=True, text=True).stdout
+
+    parsed = LlvmCoverage(_client(), _CoverageExecutor({}), tmp_path / "work")._parse_export(
+        exported, _campaign(
+            tmp_path, repository_root=tmp_path, source_root=str(tmp_path),
+            binary_path=str(binary), replay_command=(str(binary), "{input}"),
+        ),
+    )
+    total = next(line for line in report.splitlines() if line.startswith("TOTAL")).split()
+
+    assert parsed.summary.lines == CoverageCount(covered=int(total[7]) - int(total[8]), total=int(total[7]))
+    assert parsed.summary.branches == CoverageCount(
+        covered=int(total[10]) - int(total[11]), total=int(total[10]),
+    )
+    assert len(parsed.lines) == parsed.summary.lines.covered
+
+
+def test_project_summary_is_not_recomputed_from_the_paginated_file_page(tmp_path: Path):
+    from backend.fuzzing.coverage.traceability import TraceabilityService
+    from backend.repositories.coverage_repository import CoveragePage
+
+    checkout = tmp_path / "repository"
+    checkout.mkdir()
+
+    class Repository(_MemoryCoverageRepository):
+        async def list_commits(self, _project_id):
+            return ["a" * 40]
+
+        async def aggregate_project(self, *_args, **_kwargs):
+            return CoveragePage(({
+                "path": "src/page.c", "covered_lines": 1, "total_lines": 2,
+                "covered_functions": 1, "total_functions": 1,
+                "covered_branches": 0, "total_branches": 2,
+                "cpu_exposure_seconds": 1.0,
+            },), 2, {
+                "lines": {"covered": 11, "total": 22, "percent": 50.0},
+                "functions": {"covered": 3, "total": 4, "percent": 75.0},
+                "branches": {"covered": 2, "total": 8, "percent": 25.0},
+            })
+
+    result = run(TraceabilityService(
+        tmp_path, Repository(), lambda _request: True, _Registry(checkout),
+    ).project_tree(7, limit=1, offset=0))
+
+    assert len(result["files"]) == 1
+    assert result["pagination"]["total"] == 2
+    assert result["summary"]["lines"] == {"covered": 11, "total": 22, "percent": 50.0}
 
 
 def test_replay_requires_exact_binary_argv_and_bounded_arguments(tmp_path: Path):
@@ -1086,6 +1208,42 @@ class _Acquire:
 
     async def __aexit__(self, *_args):
         return False
+
+
+def test_snapshot_upsert_rejects_cross_asset_source_denominator_conflict_before_insert():
+    from unittest.mock import MagicMock
+
+    from backend.fuzzing.coverage.llvm_coverage import CoverageCount, CoverageSourceSummary
+    from backend.repositories.coverage_repository import CoverageRepository
+
+    source_hash = "e" * 64
+    snapshot = _snapshot(source_hash=source_hash)
+    snapshot = snapshot.__class__(**{
+        **{name: getattr(snapshot, name) for name in snapshot.__dataclass_fields__},
+        "source_summaries": (CoverageSourceSummary(
+            "src/a.c", source_hash,
+            CoverageCount(1, 2), CoverageCount(1, 2), CoverageCount(1, 2),
+        ),),
+    })
+    connection = AsyncMock()
+    connection.transaction = MagicMock(return_value=_Transaction())
+    connection.fetchrow.return_value = {
+        "commit_sha": "a" * 40, "asset_project_id": 7,
+    }
+    connection.fetch.return_value = [{
+        "source_path": "src/a.c", "commit_sha": "a" * 40,
+        "source_sha256": source_hash, "total_lines": 3,
+        "total_functions": 2, "total_branches": 2,
+    }]
+
+    with pytest.raises(ValueError, match="denominator conflicts"):
+        run(CoverageRepository(
+            SimpleNamespace(acquire=lambda: _Acquire(connection))
+        ).upsert_snapshot(snapshot))
+
+    assert any("ANY($3::text[])" in call.args[0] for call in connection.fetch.await_args_list)
+    assert not any("INSERT INTO coverage_source_summaries" in call.args[0]
+                   for call in connection.execute.await_args_list)
 
 
 def test_repository_claim_holds_transaction_advisory_lock_and_inserts_first_winner():
