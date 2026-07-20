@@ -417,10 +417,15 @@ class CampaignRepository:
             """WITH updated AS (
                    UPDATE campaigns SET
                        next_review_reason = CASE
-                           WHEN next_review_after IS NULL OR $2 < next_review_after THEN $3
+                           WHEN next_review_after IS NULL OR $2 < next_review_after
+                                OR next_review_after <= CURRENT_TIMESTAMP THEN $3
                            ELSE next_review_reason
                        END,
-                       next_review_after = LEAST(COALESCE(next_review_after, $2), $2)
+                       next_review_after = CASE
+                           WHEN next_review_after IS NULL
+                                OR next_review_after <= CURRENT_TIMESTAMP THEN $2
+                           ELSE LEAST(next_review_after, $2)
+                       END
                    WHERE project_id = $1 AND stopped_at IS NULL
                    RETURNING id
                ) SELECT COUNT(*) FROM updated""",

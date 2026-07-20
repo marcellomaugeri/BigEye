@@ -1170,6 +1170,7 @@ class RepositoryCampaignRuntime:
                     if (
                         candidate.id in contexts
                         and candidate.target_asset_id == campaign.target_asset_id
+                        and candidate.error is None
                     )
                 },
             )
