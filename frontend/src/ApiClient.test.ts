@@ -28,4 +28,26 @@ describe('ApiClient source assurance boundaries', () => {
   it('uses only the caller-owned fallback for unknown errors', () => {
     expect(friendlyApiError(new Error('secret at /Users/private/key.txt'), 'Safe fallback.')).toBe('Safe fallback.');
   });
+
+  it('uses the project-scoped finding and event-log contracts', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json({ items: [], next_cursor: null }))
+      .mockResolvedValueOnce(Response.json({ id: '9' }))
+      .mockResolvedValueOnce(Response.json({ events: [], next_offset: -1 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const api = new ApiClient('http://127.0.0.1:8000');
+
+    await api.listFindings('project/7', 'cursor value');
+    await api.getFinding('project/7', 'finding/9');
+    await api.getProjectLog('project/7', 'debug', 12, 50);
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      'http://127.0.0.1:8000/api/projects/project%2F7/findings?cursor=cursor+value',
+      'http://127.0.0.1:8000/api/projects/project%2F7/findings/finding%2F9',
+      'http://127.0.0.1:8000/api/projects/project%2F7/logs/debug?after=12&limit=50',
+    ]);
+    expect(api.findingReproducerUrl('project/7', 'finding/9')).toBe(
+      'http://127.0.0.1:8000/api/projects/project%2F7/findings/finding%2F9/reproducer',
+    );
+  });
 });

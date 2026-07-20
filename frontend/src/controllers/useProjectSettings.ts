@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { MAX_WORKER_COUNT, type Project } from '../models/project';
-import type { ProjectSettings } from '../models/settings';
+import type { ProjectSettings, Settings } from '../models/settings';
 import { friendlyApiError, type BigEyeApi } from '../services/apiClient';
 
 export function useProjectSettings(api: BigEyeApi, project: Project | null, enabled: boolean, onProjectChange: (project: Project) => void) {
   const [settings, setSettings] = useState<ProjectSettings | null>(null);
+  const [localServices, setLocalServices] = useState<Settings | null>(null);
   const [workerCount, setWorkerCount] = useState('');
   const [repositoryToken, setRepositoryToken] = useState('');
   const [loading, setLoading] = useState(false);
@@ -19,13 +20,29 @@ export function useProjectSettings(api: BigEyeApi, project: Project | null, enab
     setLoading(true);
     setError(null);
     try {
-      const value = await api.getProjectSettings(projectId);
+      const [projectResult, servicesResult] = await Promise.allSettled([
+        api.getProjectSettings(projectId), api.getSettings(),
+      ]);
       if (generation !== requestGeneration.current) return;
-      setSettings(value);
-      setWorkerCount(String(value.worker_count));
-      setRepositoryToken('');
+      if (projectResult.status === 'fulfilled') {
+        setSettings(projectResult.value);
+        setWorkerCount(String(projectResult.value.worker_count));
+        setRepositoryToken('');
+      } else {
+        setError(friendlyApiError(projectResult.reason, 'Could not load project settings.'));
+      }
+      if (servicesResult.status === 'fulfilled') {
+        setLocalServices(servicesResult.value);
+      } else {
+        setLocalServices(null);
+        setError((current) => current ?? friendlyApiError(
+          servicesResult.reason, 'Could not load local service checks.',
+        ));
+      }
     } catch (requestError) {
-      if (generation === requestGeneration.current) setError(friendlyApiError(requestError, 'Could not load project settings.'));
+      if (generation === requestGeneration.current) {
+        setError(friendlyApiError(requestError, 'Could not load project settings.'));
+      }
     } finally {
       if (generation === requestGeneration.current) setLoading(false);
     }
@@ -80,5 +97,8 @@ export function useProjectSettings(api: BigEyeApi, project: Project | null, enab
     }
   }, [api, onProjectChange, project]);
 
-  return { settings, workerCount, repositoryToken, loading, saving, error, setWorkerCount, setRepositoryToken, save, setPaused };
+  return {
+    settings, localServices, workerCount, repositoryToken, loading, saving, error,
+    setWorkerCount, setRepositoryToken, save, setPaused,
+  };
 }

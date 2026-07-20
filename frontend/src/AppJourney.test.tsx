@@ -1,7 +1,8 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, renderHook, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { App } from './App';
+import { useProjectSettings } from './controllers/useProjectSettings';
 import type { BigEyeApi } from './services/apiClient';
 
 const activeProject = {
@@ -37,13 +38,14 @@ function apiDouble(overrides: Record<string, unknown> = {}) {
     resumeProject: vi.fn().mockResolvedValue(activeProject),
     listTasks: vi.fn().mockResolvedValue([]),
     getTaskLog: vi.fn(),
-    getSettings: vi.fn(),
+    getSettings: vi.fn().mockResolvedValue({ database: true, docker: false, openai_api_key_present: true, toolchain: true }),
     listCampaigns: vi.fn().mockResolvedValue({ project_id: 7, campaigns: [], assets: [] }),
     getCoverageTree: vi.fn().mockResolvedValue({ project_id: 7, commit_sha: activeProject.commit_sha, files: [], pagination: { limit: 1000, offset: 0, total: 0 } }),
     getSourceFile: vi.fn(),
     getLineEvidence: vi.fn(),
     retainedTestcaseUrl: vi.fn(),
     listFindings: vi.fn().mockResolvedValue({ items: [], next_cursor: null }),
+    getFinding: vi.fn(), findingReproducerUrl: vi.fn(), getProjectLog: vi.fn(),
     ...overrides
   } as BigEyeApi & Record<string, ReturnType<typeof vi.fn>>;
 }
@@ -65,6 +67,8 @@ describe('App journey', () => {
     render(<App api={apiDouble()} />);
 
     expect(await screen.findByRole('navigation', { name: 'Main navigation' })).toBeVisible();
+    expect(screen.getByText('Continuous assurance')).toBeVisible();
+    expect(screen.queryByText('Repository intelligence')).not.toBeInTheDocument();
     for (const label of ['AFL++', 'libFuzzer', 'Luna', 'Terra', 'Docker']) {
       expect(screen.queryByRole('link', { name: label })).not.toBeInTheDocument();
     }
@@ -107,6 +111,27 @@ describe('App journey', () => {
     expect(api.updateProjectSettings).toHaveBeenCalledWith(activeProject.id, { worker_count: 4 });
   });
 
+  it('loads host health with project settings and presents compact local service checks', async () => {
+    const api = apiDouble();
+    const { result } = renderHook(() => useProjectSettings(api, activeProject, true, vi.fn()));
+
+    await waitFor(() => expect(result.current.localServices?.database).toBe(true));
+    expect(api.getProjectSettings).toHaveBeenCalledWith('7');
+    expect(api.getSettings).toHaveBeenCalledTimes(1);
+
+    const user = userEvent.setup();
+    render(<App api={api} />);
+    await user.click(screen.getByRole('link', { name: 'Settings' }));
+    const services = await screen.findByRole('heading', { name: 'Local services' });
+    const section = services.closest('section')!;
+    expect(within(section).getByText('Database')).toBeVisible();
+    expect(within(section).getByText('Docker')).toBeVisible();
+    expect(within(section).getByText('OpenAI access')).toBeVisible();
+    expect(within(section).getByText('Toolchain')).toBeVisible();
+    expect(within(section).getByText('Needs attention')).toBeVisible();
+    expect(within(section).queryByText(/sk-|api key/i)).not.toBeInTheDocument();
+  });
+
   it('pauses and resumes the selected project through the API', async () => {
     const api = apiDouble();
     const user = userEvent.setup();
@@ -122,12 +147,13 @@ describe('App journey', () => {
     expect(api.resumeProject).toHaveBeenCalledWith(activeProject.id);
   });
 
-  it('uses truthful unavailable states for future data views', async () => {
+  it('uses a truthful empty state for replayed findings', async () => {
     const user = userEvent.setup();
     render(<App api={apiDouble()} />);
 
     await user.click(screen.getByRole('link', { name: 'Findings' }));
-    expect(await screen.findByText('Findings are unavailable until crash processing produces evidence.')).toBeInTheDocument();
+    expect(await screen.findByText('No replayed findings yet.')).toBeInTheDocument();
+    expect(screen.queryByText(/not implemented/i)).not.toBeInTheDocument();
   });
 
   it('retains the selected project when a stale refresh finishes after a newer selection', async () => {

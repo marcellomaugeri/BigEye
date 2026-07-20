@@ -1,8 +1,10 @@
 import type { CreateProjectRequest, Project } from '../models/project';
 import type { ProjectSettings, Settings, UpdateProjectSettingsRequest } from '../models/settings';
 import type { Task, TaskLog } from '../models/task';
-import type { CampaignList, FindingPageSummary } from '../models/campaign';
+import type { CampaignList } from '../models/campaign';
 import type { CoverageTree, LineEvidencePage, SourceFile } from '../models/coverage';
+import type { ProjectEventPage } from '../models/event';
+import type { FindingDetail, FindingPage } from '../models/finding';
 
 export interface BigEyeApi {
   createProject(request: CreateProjectRequest): Promise<Project>;
@@ -23,7 +25,12 @@ export interface BigEyeApi {
     projectId: string, path: string, lineNumber: number,
     strategyAssetId: number, testcaseSha256: string,
   ): string;
-  listFindings(projectId: string, cursor?: string): Promise<FindingPageSummary>;
+  listFindings(projectId: string, cursor?: string): Promise<FindingPage>;
+  getFinding(projectId: string, findingId: string): Promise<FindingDetail>;
+  findingReproducerUrl(projectId: string, findingId: string): string;
+  getProjectLog(
+    projectId: string, stream: 'activity' | 'debug', after?: number, limit?: number,
+  ): Promise<ProjectEventPage>;
 }
 
 export class ApiClient implements BigEyeApi {
@@ -104,9 +111,29 @@ export class ApiClient implements BigEyeApi {
       + `/testcases/${strategyAssetId}?${query}`;
   }
 
-  listFindings(projectId: string, cursor?: string): Promise<FindingPageSummary> {
+  listFindings(projectId: string, cursor?: string): Promise<FindingPage> {
     const query = cursor ? `?${new URLSearchParams({ cursor })}` : '';
     return this.request(`/api/projects/${encodeURIComponent(projectId)}/findings${query}`);
+  }
+
+  getFinding(projectId: string, findingId: string): Promise<FindingDetail> {
+    return this.request(
+      `/api/projects/${encodeURIComponent(projectId)}/findings/${encodeURIComponent(findingId)}`,
+    );
+  }
+
+  findingReproducerUrl(projectId: string, findingId: string): string {
+    return `${this.baseUrl}/api/projects/${encodeURIComponent(projectId)}`
+      + `/findings/${encodeURIComponent(findingId)}/reproducer`;
+  }
+
+  getProjectLog(
+    projectId: string, stream: 'activity' | 'debug', after = -1, limit = 100,
+  ): Promise<ProjectEventPage> {
+    const query = new URLSearchParams({ after: String(after), limit: String(limit) });
+    return this.request(
+      `/api/projects/${encodeURIComponent(projectId)}/logs/${stream}?${query}`,
+    );
   }
 
   private async request<T>(path: string, init?: RequestInit): Promise<T> {

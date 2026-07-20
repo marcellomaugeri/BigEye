@@ -3,7 +3,7 @@ import { EmptyState } from '../components/design-system/EmptyState';
 import { TextField } from '../components/design-system/Field';
 import { StatusText } from '../components/design-system/StatusText';
 import type { Project } from '../models/project';
-import type { ProjectSettings } from '../models/settings';
+import type { ProjectSettings, Settings } from '../models/settings';
 
 interface SettingsViewProps {
   project: Project | null;
@@ -11,6 +11,7 @@ interface SettingsViewProps {
   saving: boolean;
   error: string | null;
   settings: ProjectSettings | null;
+  localServices: Settings | null;
   workerCount: string;
   repositoryToken: string;
   onWorkerCountChange: (value: string) => void;
@@ -19,7 +20,14 @@ interface SettingsViewProps {
   onPauseToggle: (paused: boolean) => void;
 }
 
-export function SettingsView({ project, loading, saving, error, settings, workerCount, repositoryToken, onWorkerCountChange, onRepositoryTokenChange, onSave, onPauseToggle }: SettingsViewProps) {
+const serviceRows: Array<{ key: keyof Settings; label: string; ready: string }> = [
+  { key: 'database', label: 'Database', ready: 'Ready' },
+  { key: 'docker', label: 'Docker', ready: 'Ready' },
+  { key: 'openai_api_key_present', label: 'OpenAI access', ready: 'Configured' },
+  { key: 'toolchain', label: 'Toolchain', ready: 'Ready' },
+];
+
+export function SettingsView({ project, loading, saving, error, settings, localServices, workerCount, repositoryToken, onWorkerCountChange, onRepositoryTokenChange, onSave, onPauseToggle }: SettingsViewProps) {
   if (!project) return <EmptyState title="Settings">Select a project to review its settings.</EmptyState>;
   return (
     <section aria-labelledby="settings-heading" className="panel">
@@ -36,6 +44,16 @@ export function SettingsView({ project, loading, saving, error, settings, worker
         <Button disabled={saving} type="submit">Save settings</Button>
         <Button disabled={saving} onClick={() => onPauseToggle(!project.paused_at)} type="button" variant="secondary">{project.paused_at ? 'Resume project' : 'Pause project'}</Button>
       </form>}
+      {localServices && <section aria-labelledby="local-services-heading" className="local-services">
+        <p className="eyebrow">This laptop</p>
+        <h3 id="local-services-heading">Local services</h3>
+        <ul>{serviceRows.map((service) => {
+          const available = localServices[service.key];
+          return <li className={available ? 'service-ready' : 'service-attention'} key={service.key}>
+            <span>{service.label}</span><strong>{available ? service.ready : 'Needs attention'}</strong>
+          </li>;
+        })}</ul>
+      </section>}
     </section>
   );
 }

@@ -22,7 +22,8 @@ function apiDouble(): BigEyeApi {
     getSourceFile: vi.fn(),
     getLineEvidence: vi.fn(),
     retainedTestcaseUrl: vi.fn(),
-    listFindings: vi.fn().mockResolvedValue({ items: [], next_cursor: null })
+    listFindings: vi.fn().mockResolvedValue({ items: [], next_cursor: null }),
+    getFinding: vi.fn(), findingReproducerUrl: vi.fn(), getProjectLog: vi.fn(),
   };
 }
 
