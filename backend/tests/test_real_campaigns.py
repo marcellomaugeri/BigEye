@@ -489,6 +489,7 @@ def test_real_system_and_component_campaigns_run_concurrently_and_clean_up(tmp_p
             ),
             target_asset_id=91001,
             configuration_asset_id=None,
+            clean_build_configuration_asset_id=None,
             strategy_asset_id=91001,
             coverage_asset_id=91003,
             cpu_exposure_seconds=max(

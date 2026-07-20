@@ -275,9 +275,17 @@ class CampaignInvocationStore:
         content = self._read_config(project_id, campaign_id, "coverage.json")
         try:
             document = json.loads(content)
+            if not isinstance(document, dict) or not isinstance(document.get("replay_command"), list):
+                raise TypeError("coverage contract must be a JSON object with a command list")
+            environment = document.get("replay_environment", [])
+            if not isinstance(environment, list) or any(
+                not isinstance(item, list) or len(item) != 2
+                for item in environment
+            ):
+                raise TypeError("replay environment must be a list of two-item lists")
             document["replay_command"] = tuple(document["replay_command"])
             document["replay_environment"] = tuple(
-                tuple(item) for item in document.get("replay_environment", ())
+                tuple(item) for item in environment
             )
             contract = CampaignCoverageContract(**document)
         except (KeyError, UnicodeDecodeError, json.JSONDecodeError, TypeError) as error:
@@ -323,6 +331,7 @@ class CampaignInvocationStore:
             clean_parent_image_id=parent_image_id,
             target_asset_id=target_asset_id,
             configuration_asset_id=configuration_asset_id,
+            clean_build_configuration_asset_id=configuration_asset_id,
             coverage_asset_id=coverage_asset_id,
             binary_path=replay_command[0],
             replay_command=replay_command,
@@ -419,6 +428,7 @@ class CampaignInvocationStore:
         configuration_files: dict[str, bytes] | None = None,
         coverage_arguments: tuple[str, ...] = (),
         coverage_environment: tuple[tuple[str, str], ...] = (),
+        configuration_asset_id: int | None = None,
     ) -> None:
         """Clone durable corpus/coverage while changing only a bounded runtime configuration."""
         if base_campaign_id == campaign_id:
@@ -440,6 +450,7 @@ class CampaignInvocationStore:
             raise ValueError("campaign variant invocation exceeds its size limit")
         coverage = self._variant_coverage(
             project_id, base_campaign_id, coverage_arguments, coverage_environment,
+            configuration_asset_id,
         )
         copied_config = {}
         for name in ("sanitizer-intent.json", "tokens.dict"):
@@ -516,6 +527,7 @@ class CampaignInvocationStore:
         campaign_id: int,
         arguments: tuple[str, ...],
         environment: tuple[tuple[str, str], ...],
+        configuration_asset_id: int | None,
     ) -> bytes:
         base = self.load_coverage(project_id, campaign_id)
         if (
@@ -527,10 +539,19 @@ class CampaignInvocationStore:
         command = [*base.replay_command, *arguments]
         merged_environment = dict(base.replay_environment)
         merged_environment.update(dict(environment))
+        if configuration_asset_id is not None and (
+            type(configuration_asset_id) is not int or configuration_asset_id <= 0
+        ):
+            raise ValueError("campaign coverage variant configuration asset is invalid")
         contract = replace(
             base,
             replay_command=tuple(command),
             replay_environment=tuple(sorted(merged_environment.items())),
+            configuration_asset_id=(
+                configuration_asset_id
+                if configuration_asset_id is not None
+                else base.configuration_asset_id
+            ),
         )
         encoded = json.dumps(
             asdict(contract), ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -600,7 +621,10 @@ class DeferredCampaignContainers:
     async def reconcile(
         self, project, campaigns, assets=(), artifact_cursors=None,
     ) -> ContainerObservation:
-        active = tuple(campaign for campaign in campaigns if campaign.stopped_at is None)
+        active = tuple(
+            campaign for campaign in campaigns
+            if campaign.stopped_at is None and campaign.error is None
+        )
         if not active:
             return ContainerObservation()
         client = self._docker_client.connect()
@@ -660,6 +684,8 @@ class DeferredCampaignContainers:
         identities: dict[str, CleanupImageIdentity] = {}
         referenced = set()
         for campaign in campaigns:
+            if campaign.error is not None and campaign.stopped_at is None:
+                continue
             invocation = self._invocations.load(project.id, campaign.id)
             target = assets_by_id.get(campaign.target_asset_id)
             if (
@@ -684,9 +710,15 @@ class DeferredCampaignContainers:
             except FileNotFoundError:
                 continue
             coverage_assets = []
+            strategy = assets_by_id.get(coverage.configuration_asset_id)
+            if (
+                strategy is None or strategy.project_id != project.id
+                or strategy.validated_at is None or strategy.error is not None
+            ):
+                raise ValueError("campaign cleanup strategy asset identity is unavailable")
             for role, asset_id in (
                 ("target", coverage.target_asset_id),
-                ("configuration", coverage.configuration_asset_id),
+                ("configuration", coverage.clean_build_configuration_asset_id),
                 ("coverage", coverage.coverage_asset_id),
             ):
                 asset = assets_by_id.get(asset_id)
@@ -929,6 +961,7 @@ class RepositoryCampaignRuntime:
         evidence_processor=None,
         artifact_state=None,
         progression=None,
+        progression_assets=None,
     ):
         if (
             isinstance(monitor_interval_seconds, bool)
@@ -955,6 +988,7 @@ class RepositoryCampaignRuntime:
         self._evidence_processor = evidence_processor
         self._artifact_state = artifact_state
         self._progression = progression or ProductionProgression()
+        self._progression_assets = progression_assets
         if evidence_processor is not None and invocations is None:
             raise ValueError("campaign evidence processing requires the invocation store")
         self._observations: dict[int, ContainerObservation] = {}
@@ -1248,6 +1282,8 @@ class RepositoryCampaignRuntime:
             raise ValueError("progression action belongs to another project")
         if self._invocations is None:
             raise ValueError("campaign invocation store is unavailable")
+        if self._progression_assets is None:
+            raise ValueError("progression asset publisher is unavailable")
         base = await self._campaigns.get(record.base_campaign_id)
         if (
             base is None
@@ -1256,16 +1292,22 @@ class RepositoryCampaignRuntime:
             or base.stopped_at is not None
         ):
             raise ValueError("progression base campaign identity changed")
+        existing = await self._campaigns.get_progression(record.action_id)
         observed = self._observations.get(project.id, ContainerObservation())
-        if len(observed.active_campaign_ids) >= project.worker_count:
+        if existing is None and len(observed.active_campaign_ids) >= project.worker_count:
             raise ValueError("progression requires one free project worker slot")
         invocation = _progression_invocation(
             self._invocations.load(project.id, base.id), record,
         )
-        campaign = await self._campaigns.create(
+        configuration_asset = await _await(self._progression_assets.publish(
+            self._discovery.context(project.id), base, record,
+        ))
+        campaign = await self._campaigns.create_progression(
+            action_id=record.action_id,
             project_id=project.id,
+            base_campaign_id=base.id,
             target_asset_id=base.target_asset_id,
-            configuration_asset_id=base.configuration_asset_id,
+            configuration_asset_id=configuration_asset.id,
             engine=base.engine,
             next_review_after=self._now() + timedelta(minutes=5),
             next_review_reason="initial campaign supervision",
@@ -1284,8 +1326,14 @@ class RepositoryCampaignRuntime:
                 coverage_environment=(
                     record.environment if record.action_name == "try configuration" else ()
                 ),
+                configuration_asset_id=configuration_asset.id,
             )
             await _await(self._containers.start_exact(project, campaign))
+            cleared = await _await(self._campaigns.clear_progression_error(
+                record.action_id, campaign.id,
+            ))
+            if cleared is not True:
+                raise RuntimeError("progression campaign error identity changed before recovery")
         except BaseException as error:
             message = (
                 "campaign progression was cancelled"
@@ -1293,9 +1341,13 @@ class RepositoryCampaignRuntime:
                 else (str(error) or type(error).__name__)
             )
             try:
-                await self._campaigns.record_error(campaign.id, message[:2_000])
-            except BaseException as cleanup_error:
-                error.add_note(f"progression cleanup also failed: {cleanup_error}")
+                recorded = await _await(self._campaigns.record_progression_error(
+                    record.action_id, campaign.id, message[:2_000],
+                ))
+                if recorded is not True:
+                    raise RuntimeError("progression campaign identity changed before error persistence")
+            except BaseException as persistence_error:
+                error.add_note(f"progression error persistence also failed: {persistence_error}")
             raise
         if self._events is not None:
             await self._events.append(project.id, "events", {"name": "campaigns"})
@@ -1403,7 +1455,7 @@ class RepositoryCampaignRuntime:
     async def _active_campaigns(self, project_id: int):
         return [
             campaign for campaign in await self._campaigns.list_for_project(project_id)
-            if campaign.stopped_at is None
+            if campaign.stopped_at is None and campaign.error is None
         ]
 
     async def _stop_observed(self, project_id: int, project=None) -> None:

@@ -59,6 +59,14 @@ CREATE TABLE campaign_contexts (
     FOREIGN KEY (campaign_id) REFERENCES campaigns (id)
 );
 
+CREATE TABLE campaign_progression_actions (
+    action_id TEXT PRIMARY KEY,
+    base_campaign_id BIGINT NOT NULL,
+    campaign_id BIGINT NOT NULL UNIQUE,
+    FOREIGN KEY (base_campaign_id) REFERENCES campaigns (id),
+    FOREIGN KEY (campaign_id) REFERENCES campaigns (id)
+);
+
 CREATE TABLE campaign_container_counters (
     campaign_id BIGINT NOT NULL,
     container_id TEXT NOT NULL,

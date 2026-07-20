@@ -22,6 +22,7 @@ class CampaignCoverageContract:
     clean_parent_image_id: str
     target_asset_id: int
     configuration_asset_id: int | None
+    clean_build_configuration_asset_id: int | None
     coverage_asset_id: int
     binary_path: str
     replay_command: tuple[str, ...]
@@ -37,6 +38,13 @@ class CampaignCoverageContract:
             or type(self.target_asset_id) is not int or self.target_asset_id <= 0
             or self.configuration_asset_id is not None
             and (type(self.configuration_asset_id) is not int or self.configuration_asset_id <= 0)
+            or self.clean_build_configuration_asset_id is not None
+            and (
+                type(self.clean_build_configuration_asset_id) is not int
+                or self.clean_build_configuration_asset_id <= 0
+            )
+            or (self.configuration_asset_id is None)
+            != (self.clean_build_configuration_asset_id is None)
             or type(self.coverage_asset_id) is not int or self.coverage_asset_id <= 0
             or not isinstance(self.binary_path, str) or not self.binary_path.startswith("/opt/bigeye/")
             or not isinstance(self.replay_command, tuple)

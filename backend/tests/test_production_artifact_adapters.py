@@ -414,7 +414,8 @@ def test_configuration_variant_updates_fuzzer_and_clean_replay_without_rebuildin
         project_id=7, commit_sha=COMMIT,
         clean_image_id="sha256:" + "c" * 64,
         clean_content_hash="d" * 64, clean_parent_image_id=IMAGE_ID,
-        target_asset_id=31, configuration_asset_id=32, coverage_asset_id=34,
+        target_asset_id=31, configuration_asset_id=32,
+        clean_build_configuration_asset_id=32, coverage_asset_id=34,
         binary_path="/opt/bigeye/parser",
         replay_command=("/opt/bigeye/parser", "--file", "{input}"),
     )
@@ -445,6 +446,31 @@ def test_configuration_variant_updates_fuzzer_and_clean_replay_without_rebuildin
     )
     assert coverage.replay_environment == (("BIGEYE_MODE", "encrypted"),)
     assert not (tmp_path / "projects/7/assets").exists()
+
+
+def test_clean_coverage_loader_rejects_string_pairs_in_replay_environment(tmp_path: Path) -> None:
+    import json
+    from dataclasses import asdict
+
+    from backend.fuzzing.campaigns.coverage_contract import CampaignCoverageContract
+    from backend.services.campaigns.production_runtime import CampaignInvocationStore
+
+    campaign_root = _workspace(tmp_path)
+    contract = CampaignCoverageContract(
+        project_id=7, commit_sha=COMMIT,
+        clean_image_id="sha256:" + "c" * 64,
+        clean_content_hash="d" * 64, clean_parent_image_id=IMAGE_ID,
+        target_asset_id=31, configuration_asset_id=32,
+        clean_build_configuration_asset_id=32, coverage_asset_id=34,
+        binary_path="/opt/bigeye/parser",
+        replay_command=("/opt/bigeye/parser", "{input}"),
+    )
+    document = asdict(contract)
+    document["replay_environment"] = ["AB"]
+    (campaign_root / "config/coverage.json").write_text(json.dumps(document))
+
+    with pytest.raises(ValueError, match="contract file is invalid"):
+        CampaignInvocationStore(tmp_path).load_coverage(7, 9)
 
 
 def test_artifact_state_is_keyed_by_project_and_campaign_without_a_read_cap() -> None:

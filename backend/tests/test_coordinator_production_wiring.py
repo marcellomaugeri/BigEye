@@ -355,7 +355,7 @@ def test_deterministic_progression_action_starts_a_sibling_without_target_prepar
         engine="afl", stopped_at=None, error=None,
     )
     sibling = SimpleNamespace(
-        id=12, project_id=7, target_asset_id=31, configuration_asset_id=32,
+        id=12, project_id=7, target_asset_id=31, configuration_asset_id=41,
         engine="afl", stopped_at=None, error=None,
     )
     invocation = ContainerInvocation(
@@ -370,8 +370,14 @@ def test_deterministic_progression_action_starts_a_sibling_without_target_prepar
         timeout_ms=1_000, memory_limit_mb=1_024,
     )
     campaigns = AsyncMock()
-    campaigns.create.return_value = sibling
+    campaigns.create_progression.return_value = sibling
     campaigns.get.return_value = base
+    campaigns.get_progression.return_value = None
+    campaigns.clear_progression_error.return_value = True
+    progression_assets = AsyncMock()
+    progression_assets.publish.return_value = SimpleNamespace(
+        id=41, project_id=7, parent_id=32, validated_at=NOW, error=None,
+    )
     clone_variant = AsyncMock()
     invocations = SimpleNamespace(
         load=lambda *_args: invocation,
@@ -380,7 +386,9 @@ def test_deterministic_progression_action_starts_a_sibling_without_target_prepar
     containers = AsyncMock()
     runtime = RepositoryCampaignRuntime(
         tasks=AsyncMock(), assets=AsyncMock(), campaigns=campaigns,
-        discovery=AsyncMock(), containers=containers, invocations=invocations,
+        discovery=SimpleNamespace(context=lambda _project_id: SimpleNamespace(project_id=7)),
+        containers=containers, invocations=invocations,
+        progression_assets=progression_assets,
     )
     runtime._persisted_campaigns[7] = (base,)
     action = ProgressionActionRecord(
@@ -404,9 +412,9 @@ def test_deterministic_progression_action_starts_a_sibling_without_target_prepar
 
     assert results[0].succeeded is True
     target_preparation.prepare.assert_not_awaited()
-    campaigns.create.assert_awaited_once()
-    assert campaigns.create.await_args.kwargs["target_asset_id"] == 31
-    assert campaigns.create.await_args.kwargs["configuration_asset_id"] == 32
+    campaigns.create_progression.assert_awaited_once()
+    assert campaigns.create_progression.await_args.kwargs["target_asset_id"] == 31
+    assert campaigns.create_progression.await_args.kwargs["configuration_asset_id"] == 41
     clone_variant.assert_awaited_once()
     clone = clone_variant.await_args
     assert clone.args[:3] == (7, 9, 12)
@@ -427,7 +435,7 @@ def test_configuration_progression_never_splits_an_input_option_from_its_placeho
         engine="afl", stopped_at=None, error=None,
     )
     sibling = SimpleNamespace(
-        id=12, project_id=7, target_asset_id=31, configuration_asset_id=32,
+        id=12, project_id=7, target_asset_id=31, configuration_asset_id=41,
         engine="afl", stopped_at=None, error=None,
     )
     invocation = ContainerInvocation(
@@ -443,14 +451,22 @@ def test_configuration_progression_never_splits_an_input_option_from_its_placeho
     )
     campaigns = AsyncMock()
     campaigns.get.return_value = base
-    campaigns.create.return_value = sibling
+    campaigns.create_progression.return_value = sibling
+    campaigns.get_progression.return_value = None
+    campaigns.clear_progression_error.return_value = True
+    progression_assets = AsyncMock()
+    progression_assets.publish.return_value = SimpleNamespace(
+        id=41, project_id=7, parent_id=32, validated_at=NOW, error=None,
+    )
     clone_variant = AsyncMock()
     invocations = SimpleNamespace(
         load=lambda *_args: invocation, clone_variant=clone_variant,
     )
     runtime = RepositoryCampaignRuntime(
         tasks=AsyncMock(), assets=AsyncMock(), campaigns=campaigns,
-        discovery=AsyncMock(), containers=AsyncMock(), invocations=invocations,
+        discovery=SimpleNamespace(context=lambda _project_id: SimpleNamespace(project_id=7)),
+        containers=AsyncMock(), invocations=invocations,
+        progression_assets=progression_assets,
     )
     action = ProgressionActionRecord(
         action_id="campaign-progression:7:9:abcd1234abcd1234",
@@ -466,6 +482,7 @@ def test_configuration_progression_never_splits_an_input_option_from_its_placeho
         "/opt/bigeye/parser", "--file", "@@", "--encrypt",
     ]
     assert clone_variant.await_args.kwargs["coverage_arguments"] == ("--encrypt",)
+    assert clone_variant.await_args.kwargs["configuration_asset_id"] == 41
 
 
 def test_retirement_is_a_known_typed_action_and_executes_only_after_selection() -> None:
@@ -644,9 +661,9 @@ def test_worker_limit_stops_and_durably_retires_lowest_investment_campaigns() ->
 
     project = SimpleNamespace(id=7, commit_sha="a" * 40, worker_count=1)
     values = [
-        SimpleNamespace(id=9, project_id=7, stopped_at=None, cpu_seconds=100.0),
-        SimpleNamespace(id=10, project_id=7, stopped_at=None, cpu_seconds=2.0),
-        SimpleNamespace(id=11, project_id=7, stopped_at=None, cpu_seconds=2.0),
+        SimpleNamespace(id=9, project_id=7, stopped_at=None, cpu_seconds=100.0, error=None),
+        SimpleNamespace(id=10, project_id=7, stopped_at=None, cpu_seconds=2.0, error=None),
+        SimpleNamespace(id=11, project_id=7, stopped_at=None, cpu_seconds=2.0, error=None),
     ]
     campaigns = AsyncMock()
     campaigns.list_for_project.return_value = values

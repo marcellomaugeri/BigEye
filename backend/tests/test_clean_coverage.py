@@ -66,6 +66,7 @@ def _campaign(tmp_path: Path, **changes):
         "replay_command": ("/src/build/clean-target", "{input}"),
         "target_asset_id": 31,
         "configuration_asset_id": 32,
+        "clean_build_configuration_asset_id": 32,
         "strategy_asset_id": 33,
         "coverage_asset_id": 34,
         "cpu_exposure_seconds": 8.5,
@@ -1274,7 +1275,8 @@ def test_production_first_hit_record_replays_through_bounded_docker_executor(tmp
     )
     campaigns = SimpleNamespace(get=AsyncMock(return_value=campaign))
     assets = SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(
-        project_id=7, validated_at=object(), error=None,
+        id=32, project_id=7, kind="script", parent_id=None,
+        validated_at=object(), error=None,
     )))
     verifier = FirstHitReplayVerifier(
         CleanCoverageTargetResolver(registry, campaigns, assets),

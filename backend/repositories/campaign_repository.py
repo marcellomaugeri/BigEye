@@ -23,6 +23,23 @@ class CampaignRepository:
         )
         return self._campaign(row) if row else None
 
+    async def get_progression(self, action_id: str) -> Campaign | None:
+        if (
+            not isinstance(action_id, str) or not action_id.strip() or len(action_id) > 200
+            or "\x00" in action_id
+        ):
+            raise ValueError("campaign progression action ID is invalid")
+        row = await self._pool.fetchrow(
+            """SELECT c.id, c.project_id, c.target_asset_id, c.configuration_asset_id,
+                      c.engine, c.started_at, c.stopped_at, c.last_heartbeat_at,
+                      c.cpu_seconds, c.next_review_after, c.next_review_reason, c.error
+               FROM campaign_progression_actions AS action
+               JOIN campaigns AS c ON c.id = action.campaign_id
+               WHERE action.action_id = $1""",
+            action_id,
+        )
+        return self._campaign(row) if row else None
+
     async def create(
         self,
         *,
@@ -66,6 +83,136 @@ class CampaignRepository:
         if row is None:
             raise RuntimeError("campaign creation did not return a row")
         return self._campaign(row)
+
+    async def create_progression(
+        self,
+        *,
+        action_id: str,
+        project_id: int,
+        base_campaign_id: int,
+        target_asset_id: int,
+        configuration_asset_id: int,
+        engine: str,
+        next_review_after,
+        next_review_reason: str,
+        configuration_purpose: str,
+    ) -> Campaign:
+        """Atomically bind one durable action ID to exactly one sibling campaign."""
+        if (
+            not isinstance(action_id, str) or not action_id.strip() or len(action_id) > 200
+            or type(project_id) is not int or project_id <= 0
+            or type(base_campaign_id) is not int or base_campaign_id <= 0
+            or type(target_asset_id) is not int or target_asset_id <= 0
+            or type(configuration_asset_id) is not int or configuration_asset_id <= 0
+            or not isinstance(engine, str) or not engine.strip() or len(engine) > 100
+            or getattr(next_review_after, "tzinfo", None) is None
+            or not isinstance(next_review_reason, str) or not next_review_reason.strip()
+            or len(next_review_reason) > 1_000
+            or not isinstance(configuration_purpose, str)
+            or not configuration_purpose.strip() or len(configuration_purpose) > 2_000
+            or "\x00" in action_id or "\x00" in configuration_purpose
+        ):
+            raise ValueError("campaign progression persistence is invalid")
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    action_id,
+                )
+                existing = await connection.fetchrow(
+                    """SELECT c.id, c.project_id, c.target_asset_id, c.configuration_asset_id,
+                              c.engine, c.started_at, c.stopped_at, c.last_heartbeat_at,
+                              c.cpu_seconds, c.next_review_after, c.next_review_reason, c.error,
+                              action.base_campaign_id AS action_base_campaign_id
+                       FROM campaign_progression_actions AS action
+                       JOIN campaigns AS c ON c.id = action.campaign_id
+                       WHERE action.action_id = $1""",
+                    action_id,
+                )
+                if existing is not None:
+                    if (
+                        existing["action_base_campaign_id"] != base_campaign_id
+                        or existing["project_id"] != project_id
+                        or existing["target_asset_id"] != target_asset_id
+                        or existing["configuration_asset_id"] != configuration_asset_id
+                        or existing["engine"] != engine.strip()
+                    ):
+                        raise ValueError("progression action is bound to a different campaign identity")
+                    return self._campaign_fields(existing)
+                row = await connection.fetchrow(
+                    """WITH created AS (
+                           INSERT INTO campaigns
+                               (project_id, target_asset_id, configuration_asset_id, engine,
+                                next_review_after, next_review_reason)
+                           VALUES ($2, $4, $5, $6, $7, $8)
+                           RETURNING id, project_id, target_asset_id, configuration_asset_id,
+                                     engine, started_at, stopped_at, last_heartbeat_at,
+                                     cpu_seconds, next_review_after, next_review_reason, error
+                       ), context AS (
+                           INSERT INTO campaign_contexts (campaign_id, configuration_purpose)
+                           SELECT id, $9 FROM created RETURNING campaign_id
+                       ), action AS (
+                           INSERT INTO campaign_progression_actions
+                               (action_id, base_campaign_id, campaign_id)
+                           SELECT $1, $3, id FROM created RETURNING campaign_id
+                       )
+                       SELECT created.* FROM created
+                       JOIN context ON context.campaign_id = created.id
+                       JOIN action ON action.campaign_id = created.id""",
+                    action_id,
+                    project_id,
+                    base_campaign_id,
+                    target_asset_id,
+                    configuration_asset_id,
+                    engine.strip(),
+                    next_review_after,
+                    next_review_reason.strip(),
+                    configuration_purpose.strip(),
+                )
+                if row is None:
+                    raise RuntimeError("campaign progression creation did not return a row")
+                return self._campaign(row)
+
+    async def record_progression_error(
+        self, action_id: str, campaign_id: int, error: str,
+    ) -> bool:
+        if (
+            not isinstance(action_id, str) or not action_id.strip() or len(action_id) > 200
+            or type(campaign_id) is not int or campaign_id <= 0
+            or not isinstance(error, str) or not error.strip() or len(error) > 2_000
+            or "\x00" in action_id or "\x00" in error
+        ):
+            raise ValueError("campaign progression error is invalid")
+        value = await self._pool.fetchval(
+            """UPDATE campaigns AS campaign SET error = $3
+               FROM campaign_progression_actions AS action
+               WHERE action.action_id = $1
+                 AND action.campaign_id = $2
+                 AND campaign.id = action.campaign_id
+                 AND campaign.stopped_at IS NULL
+               RETURNING campaign.id""",
+            action_id, campaign_id, error.strip(),
+        )
+        return value == campaign_id
+
+    async def clear_progression_error(self, action_id: str, campaign_id: int) -> bool:
+        if (
+            not isinstance(action_id, str) or not action_id.strip() or len(action_id) > 200
+            or type(campaign_id) is not int or campaign_id <= 0
+            or "\x00" in action_id
+        ):
+            raise ValueError("campaign progression identity is invalid")
+        value = await self._pool.fetchval(
+            """UPDATE campaigns AS campaign SET error = NULL
+               FROM campaign_progression_actions AS action
+               WHERE action.action_id = $1
+                 AND action.campaign_id = $2
+                 AND campaign.id = action.campaign_id
+                 AND campaign.stopped_at IS NULL
+               RETURNING campaign.id""",
+            action_id, campaign_id,
+        )
+        return value == campaign_id
 
     async def record_error(self, campaign_id: int, error: str) -> None:
         await self._pool.execute(
@@ -268,7 +415,12 @@ class CampaignRepository:
             raise ValueError("campaign review schedule is invalid")
         value = await self._pool.fetchval(
             """WITH updated AS (
-                   UPDATE campaigns SET next_review_after = $2, next_review_reason = $3
+                   UPDATE campaigns SET
+                       next_review_reason = CASE
+                           WHEN next_review_after IS NULL OR $2 < next_review_after THEN $3
+                           ELSE next_review_reason
+                       END,
+                       next_review_after = LEAST(COALESCE(next_review_after, $2), $2)
                    WHERE project_id = $1 AND stopped_at IS NULL
                    RETURNING id
                ) SELECT COUNT(*) FROM updated""",
@@ -279,3 +431,12 @@ class CampaignRepository:
     @staticmethod
     def _campaign(row) -> Campaign:
         return Campaign(**dict(row))
+
+    @staticmethod
+    def _campaign_fields(row) -> Campaign:
+        names = (
+            "id", "project_id", "target_asset_id", "configuration_asset_id", "engine",
+            "started_at", "stopped_at", "last_heartbeat_at", "cpu_seconds",
+            "next_review_after", "next_review_reason", "error",
+        )
+        return Campaign(**{name: row[name] for name in names})

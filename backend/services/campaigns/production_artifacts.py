@@ -46,6 +46,7 @@ class CampaignCoverageTargetResolver:
         for asset_id in {
             contract.target_asset_id,
             contract.configuration_asset_id,
+            contract.clean_build_configuration_asset_id,
             contract.coverage_asset_id,
         } - {None}:
             asset = await self._assets.get(asset_id)
@@ -68,6 +69,7 @@ class CampaignCoverageTargetResolver:
             replay_command=contract.replay_command,
             target_asset_id=contract.target_asset_id,
             configuration_asset_id=contract.configuration_asset_id,
+            clean_build_configuration_asset_id=contract.clean_build_configuration_asset_id,
             strategy_asset_id=contract.configuration_asset_id or contract.target_asset_id,
             coverage_asset_id=contract.coverage_asset_id,
             cpu_exposure_seconds=0.0,
@@ -390,6 +392,7 @@ def _coverage_contract(target) -> str:
         getattr(target, "commit_sha", ""), getattr(target, "clean_image_id", ""),
         str(getattr(target, "target_asset_id", "")),
         str(getattr(target, "configuration_asset_id", "")),
+        str(getattr(target, "clean_build_configuration_asset_id", "")),
         str(getattr(target, "coverage_asset_id", "")),
         "\0".join(getattr(target, "replay_command", ())),
         "\0".join(

@@ -3,10 +3,35 @@
 from __future__ import annotations
 
 import asyncio
+import math
+
+
+class PermanentCoordinatorFailure(RuntimeError):
+    """An explicitly diagnosed bootstrap or durable project-state corruption."""
 
 
 class CoordinatorRegistry:
-    def __init__(self, projects, coordinator_factory):
+    def __init__(
+        self,
+        projects,
+        coordinator_factory,
+        *,
+        restart_base_delay_seconds: float = 1.0,
+        restart_max_delay_seconds: float = 60.0,
+        sleep=asyncio.sleep,
+    ):
+        if (
+            isinstance(restart_base_delay_seconds, bool)
+            or not isinstance(restart_base_delay_seconds, (int, float))
+            or not math.isfinite(restart_base_delay_seconds)
+            or restart_base_delay_seconds <= 0
+            or isinstance(restart_max_delay_seconds, bool)
+            or not isinstance(restart_max_delay_seconds, (int, float))
+            or not math.isfinite(restart_max_delay_seconds)
+            or restart_max_delay_seconds < restart_base_delay_seconds
+            or not callable(sleep)
+        ):
+            raise ValueError("coordinator restart backoff is invalid")
         self._projects = projects
         self._coordinator_factory = coordinator_factory
         self._tasks: dict[int, asyncio.Task] = {}
@@ -14,6 +39,9 @@ class CoordinatorRegistry:
         self._closed = False
         self._restart_attempts: dict[int, int] = {}
         self._failure_tasks: set[asyncio.Task] = set()
+        self._restart_base_delay_seconds = float(restart_base_delay_seconds)
+        self._restart_max_delay_seconds = float(restart_max_delay_seconds)
+        self._sleep = sleep
 
     @property
     def tasks(self) -> dict[int, asyncio.Task]:
@@ -69,6 +97,8 @@ class CoordinatorRegistry:
             await asyncio.gather(*tasks, return_exceptions=True)
         failures = tuple(self._failure_tasks)
         if failures:
+            for failure in failures:
+                failure.cancel()
             await asyncio.gather(*failures, return_exceptions=True)
         self._tasks.clear()
         self._coordinators.clear()
@@ -88,17 +118,31 @@ class CoordinatorRegistry:
         failure.add_done_callback(self._failure_tasks.discard)
 
     async def _recover_failure(self, project_id: int, error: Exception) -> None:
-        if self._closed:
-            return
-        project = await self._projects.get(project_id)
-        attempts = self._restart_attempts.get(project_id, 0)
-        if (
-            project is not None and project.error is None and project.paused_at is None
-            and attempts < 1
-        ):
+        current_error = error
+        while not self._closed:
+            if isinstance(current_error, PermanentCoordinatorFailure):
+                finish = getattr(self._projects, "finish", None)
+                if finish is not None:
+                    await finish(
+                        project_id, f"coordinator failed ({type(current_error).__name__})",
+                    )
+                return
+            attempts = self._restart_attempts.get(project_id, 0)
+            delay = min(
+                self._restart_base_delay_seconds * (2 ** min(attempts, 62)),
+                self._restart_max_delay_seconds,
+            )
             self._restart_attempts[project_id] = attempts + 1
-            self.start(project_id)
+            await self._sleep(delay)
+            if self._closed:
+                return
+            try:
+                project = await self._projects.get(project_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as dependency_error:
+                current_error = dependency_error
+                continue
+            if project is not None and project.error is None and project.paused_at is None:
+                self.start(project_id)
             return
-        finish = getattr(self._projects, "finish", None)
-        if finish is not None:
-            await finish(project_id, f"coordinator failed ({type(error).__name__})")

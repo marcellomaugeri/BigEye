@@ -307,7 +307,10 @@ class LlvmCoverage:
             "bigeye.content-hash": campaign.clean_content_hash,
             "bigeye.parent-image": campaign.clean_parent_image_id,
             "bigeye.target-asset-id": str(campaign.target_asset_id),
-            "bigeye.configuration-asset-id": "" if campaign.configuration_asset_id is None else str(campaign.configuration_asset_id),
+            "bigeye.configuration-asset-id": (
+                "" if campaign.clean_build_configuration_asset_id is None
+                else str(campaign.clean_build_configuration_asset_id)
+            ),
             "bigeye.coverage-asset-id": str(campaign.coverage_asset_id),
         }
         if data.get("Os") != "linux" or data.get("Architecture") != "amd64":
@@ -330,6 +333,13 @@ class LlvmCoverage:
             type(campaign.configuration_asset_id) is not int or campaign.configuration_asset_id <= 0
         ):
             raise ValueError("configuration asset ID must be a positive integer")
+        clean_configuration = getattr(campaign, "clean_build_configuration_asset_id", None)
+        if (
+            clean_configuration is not None
+            and (type(clean_configuration) is not int or clean_configuration <= 0)
+            or (campaign.configuration_asset_id is None) != (clean_configuration is None)
+        ):
+            raise ValueError("clean build configuration asset ID is invalid")
         _require_hex(campaign.commit_sha, {40, 64}, "coverage commit")
         _require_hex(campaign.clean_content_hash, {64}, "coverage content hash")
         _require_image_id(campaign.clean_image_id, "clean image ID")

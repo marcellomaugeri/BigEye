@@ -7,6 +7,11 @@ from hashlib import sha256
 import json
 import re
 
+from backend.agents.tools.generated_assets import (
+    GeneratedAssetError,
+    read_asset_file,
+    write_asset_file,
+)
 from backend.fuzzing.campaigns.configuration import (
     ConfigurationEvidence,
     ConfigurationHypothesis,
@@ -27,6 +32,57 @@ _COMPARISON = re.compile(r"\b(?:strcmp|strncmp|memcmp|strcasecmp|strncasecmp)\s*
 _LITERAL = re.compile(r"(?:\"[^\"\n]{1,128}\"|'[^'\n]{1,128}')")
 _CONCURRENCY = re.compile(r"\b(?:pthread_|std::thread|std::mutex|mutex_|atomic_)\b", re.IGNORECASE)
 _JSON = re.compile(r"\b(?:json|rapidjson|nlohmann|yyjson|cjson)[A-Za-z0-9_:.-]*\b", re.IGNORECASE)
+
+
+class ProgressionAssetPublisher:
+    """Publish one immutable configuration identity for deterministic campaign mechanics."""
+
+    def __init__(self, asset_store):
+        self._asset_store = asset_store
+
+    async def publish(self, context, base_campaign, record):
+        if (
+            getattr(context, "project_id", None) != record.project_id
+            or getattr(base_campaign, "project_id", None) != record.project_id
+            or getattr(base_campaign, "id", None) != record.base_campaign_id
+            or getattr(base_campaign, "target_asset_id", None) != record.target_asset_id
+        ):
+            raise ValueError("progression asset identity does not match its base campaign")
+        document = json.dumps({
+            "action": record.action_name,
+            "arguments": list(record.arguments),
+            "environment": [list(item) for item in record.environment],
+            "detail": record.detail,
+            "dictionary_content": record.dictionary_content,
+        }, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n"
+        digest = sha256(document.encode("utf-8")).hexdigest()
+        relative_path = f"application/progressions/{digest}.json"
+        try:
+            write_asset_file(context, relative_path, document, None)
+        except GeneratedAssetError:
+            existing = read_asset_file(context, relative_path)
+            if existing["content"] != document:
+                raise ValueError("progression manifest identity changed during publication")
+        parent_id = (
+            base_campaign.configuration_asset_id
+            if base_campaign.configuration_asset_id is not None
+            else base_campaign.target_asset_id
+        )
+        asset = await self._asset_store.create_reusable(
+            record.project_id,
+            "configuration",
+            f"progression-{digest}.json",
+            {"variant.json": context.generated_assets_root / relative_path},
+            parent_id,
+        )
+        if (
+            getattr(asset, "project_id", None) != record.project_id
+            or getattr(asset, "parent_id", None) != parent_id
+            or getattr(asset, "validated_at", None) is None
+            or getattr(asset, "error", None) is not None
+        ):
+            raise ValueError("progression configuration asset was not validated")
+        return asset
 
 
 @dataclass(frozen=True)

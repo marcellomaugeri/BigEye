@@ -601,15 +601,56 @@ def test_registry_keeps_concurrent_projects_independent_when_one_fails() -> None
     run(scenario())
 
 
-def test_registry_restarts_one_crashed_coordinator_then_persists_the_second_failure() -> None:
+def test_registry_retries_transient_coordinator_failures_with_bounded_exponential_backoff() -> None:
     from backend.services.campaigns.coordinator_registry import CoordinatorRegistry
 
     attempts = []
+    delays = []
 
     class Failing:
         async def run(self, identifier):
             attempts.append(identifier)
             raise RuntimeError("coordinator crashed")
+        def notify(self, _identifier): pass
+
+    async def sleep(delay):
+        delays.append(delay)
+        await asyncio.sleep(0)
+
+    projects = AsyncMock()
+    projects.get.return_value = project(identifier=7)
+    registry = CoordinatorRegistry(
+        projects,
+        lambda _identifier: Failing(),
+        restart_base_delay_seconds=1,
+        restart_max_delay_seconds=4,
+        sleep=sleep,
+    )
+
+    async def scenario():
+        registry.start(7)
+        for _ in range(100):
+            await asyncio.sleep(0)
+            if len(attempts) >= 5:
+                break
+        await registry.close()
+
+    run(scenario())
+
+    assert len(attempts) >= 5
+    assert delays[:4] == [1, 2, 4, 4]
+    projects.finish.assert_not_awaited()
+
+
+def test_registry_terminalises_only_an_explicit_permanent_project_failure() -> None:
+    from backend.services.campaigns.coordinator_registry import (
+        CoordinatorRegistry,
+        PermanentCoordinatorFailure,
+    )
+
+    class Failing:
+        async def run(self, _identifier):
+            raise PermanentCoordinatorFailure("bootstrap project state is corrupt")
         def notify(self, _identifier): pass
 
     projects = AsyncMock()
@@ -626,10 +667,9 @@ def test_registry_restarts_one_crashed_coordinator_then_persists_the_second_fail
 
     run(scenario())
 
-    assert attempts == [7, 7]
-    projects.finish.assert_awaited_once()
-    assert projects.finish.await_args.args[0] == 7
-    assert "RuntimeError" in projects.finish.await_args.args[1]
+    projects.finish.assert_awaited_once_with(
+        7, "coordinator failed (PermanentCoordinatorFailure)",
+    )
 
 
 def test_backbone_compatibility_service_uses_registry_lifecycle_for_legacy_bootstrap() -> None:

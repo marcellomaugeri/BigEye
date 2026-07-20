@@ -285,6 +285,7 @@ class PreparedCleanCoverageCollector:
             project_id=prepared.project_id,
             target_asset_id=target_id,
             configuration_asset_id=configuration_id,
+            clean_build_configuration_asset_id=configuration_id,
             strategy_asset_id=configuration_id,
             coverage_asset_id=coverage_id,
             commit_sha=prepared.commit_sha,
@@ -333,6 +334,7 @@ class _CleanCampaign:
     project_id: int
     target_asset_id: int
     configuration_asset_id: int | None
+    clean_build_configuration_asset_id: int | None
     strategy_asset_id: int
     coverage_asset_id: int
     commit_sha: str

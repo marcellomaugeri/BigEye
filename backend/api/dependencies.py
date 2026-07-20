@@ -56,6 +56,8 @@ from backend.fuzzing.campaigns.production_factory import (
 from backend.services.initial_tasks import InitialTaskService
 from backend.fuzzing.coverage.exposure import ExposureAccountant
 from backend.fuzzing.docker.client import DockerClient
+from backend.fuzzing.assets.store import AssetStore
+from backend.services.campaigns.production_progression import ProgressionAssetPublisher
 
 
 @dataclass
@@ -154,6 +156,7 @@ def build_services(pool, workspace: Path) -> Services:
         campaign_contexts=campaigns,
         evidence_processor=evidence_processor,
         artifact_state=campaign_artifacts,
+        progression_assets=ProgressionAssetPublisher(AssetStore(workspace, assets)),
     )
     campaign_manager = CampaignWorkflow(observability)
     preparation_graph = DeferredTargetPreparationGraph(
