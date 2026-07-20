@@ -27,18 +27,24 @@ and UI paths. Test-defined target commands do not satisfy this acceptance criter
 
 ## 2. Product contract
 
-The user selects a repository, an exact revision, and a project worker count. The default worker
-count is four. It is the number of concurrent fuzzing jobs available to that project, not a quota
-for a particular engine or target type.
+The user selects a repository, an exact revision, and a project execution-slot count. The default
+count is four. These slots limit concurrent CPU-heavy Docker compilation and fuzzing jobs, not
+OpenAI API workers and not a particular engine or target type.
 
 BigEye then operates continuously without routine user decisions. It prioritises code, assigns
 fuzzing-engineer workers, creates and repairs targets, builds incremental Docker layers, validates
 seeds, schedules campaigns, improves and minimises corpora, tries configurations, measures clean
 coverage, removes redundant work, triages crashes, and schedules its own next review.
 
-The manager may allocate all four jobs to system targets, all four to component targets, or any
-mixture. The allocation must be justified by current evidence rather than a hard-coded engine
-split. Fuzzer processes are ordinary deterministic jobs, not agents.
+The manager may allocate all four execution slots to system targets, all four to component targets,
+all four to compilation, or any mixture of compiling and fuzzing work. The allocation must be
+justified by current evidence rather than a hard-coded engine split. Fuzzer and compiler processes
+are ordinary deterministic jobs, not agents.
+
+Agent runs do not consume project execution slots. Independent target analysis, crash triage,
+corpus reasoning, coverage interpretation, and draft preparation may run concurrently whenever the
+OpenAI API and independent asset boundaries allow it. If one of those tasks later requests a
+CPU-heavy compilation or fuzzing operation, that deterministic operation waits for a project slot.
 
 The application is continuous while its host backend is running. Every unfinished project must
 always have at least one of the following:
@@ -53,9 +59,9 @@ There is no silent idle state.
 
 ### 3.1 Manager
 
-One GPT-5.6 Terra manager owns each project's durable objective and its complete worker budget. It
-receives bounded project, build, campaign, coverage, corpus, crash, and resource evidence. It does
-not receive an unrestricted repository dump, host shell, or Docker client.
+One GPT-5.6 Terra manager owns each project's durable objective and its complete execution-slot
+budget. It receives bounded project, build, campaign, coverage, corpus, crash, and resource
+evidence. It does not receive an unrestricted repository dump, host shell, or Docker client.
 
 The manager may invoke the same general fuzzing-worker tool several times in one review. Independent
 assignments may run concurrently through `Agent.as_tool()` and parallel tool calls. Only the manager
@@ -281,8 +287,8 @@ The existing professional shell remains. The completion adds or changes these pr
 - **Activity:** concise manager and worker decisions.
 - **Debug logs:** complete sanitized model, tool, deterministic operation, retry, timeout, and token
   usage records. The UI shows reasoning summaries returned by the API, never hidden chain-of-thought.
-- **Settings:** immutable revision, configurable project worker count, project read-only Git token,
-  and actual local health. Pause and resume controls are removed.
+- **Settings:** immutable revision, configurable project execution-slot count, project read-only
+  Git token, and actual local health. Pause and resume controls are removed.
 
 The footer continues to show one plain-language manager state. When no review is due and all slots
 are healthy it may say, for example, `Fuzzing at full speed`. It must be derived from real state.
@@ -337,8 +343,8 @@ The real demonstration project is the [official libaom repository at tag
 Dockerfile, harness, corpus, workflow, code, or generated artefact.
 
 After agent-led preparation, fuzzing runs for one continuous wall-clock hour with the project's
-worker count set to four. The observation window begins only after the first validated fuzzer is
-active. During the run BigEye must:
+execution-slot count set to four. The observation window begins only after the first validated
+fuzzer is active. During the run BigEye must:
 
 - create targets and configurations through real worker-agent tool calls;
 - execute both a system-level AFL++ campaign and a component-level libFuzzer campaign;
