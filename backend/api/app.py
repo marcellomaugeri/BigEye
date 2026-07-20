@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from backend.api.controllers import campaigns, coverage, events, findings, projects, settings, tasks
+from backend.api.controllers import campaigns, coverage, events, findings, projects, reproductions, settings, tasks
 from backend.api.dependencies import build_services
 from backend.database.connection import create_pool
 
@@ -62,6 +62,7 @@ def create_app(
     app.include_router(campaigns.router, prefix="/api")
     app.include_router(coverage.router, prefix="/api")
     app.include_router(findings.router, prefix="/api")
+    app.include_router(reproductions.router, prefix="/api")
     build = _verified_frontend_build(frontend_dist or _PROJECT_ROOT / "frontend" / "dist")
     if build is not None:
         index, assets = build

@@ -293,6 +293,49 @@ class TestDockerClient:
 
 
 class TestContainerRunner:
+    def test_reproduction_streams_demuxed_output_with_only_read_only_testcase(self, tmp_path: Path) -> None:
+        from backend.fuzzing.docker.container_runner import ContainerRunner
+
+        testcase = tmp_path / "minimal.input"
+        testcase.write_bytes(b"crash")
+        created, output, removed = [], [], []
+
+        class Container:
+            id = "reproduction-1"
+            def start(self): pass
+            def attach(self, **kwargs):
+                assert kwargs == {
+                    "stream": True, "logs": True, "stdout": True,
+                    "stderr": True, "demux": True,
+                }
+                return iter(((b"stdout\xff\n", None), (None, b"asan\x1b[31m\n")))
+            def wait(self, timeout): return {"StatusCode": 1}
+            def remove(self, force=False): removed.append((self.id, force))
+
+        class Containers:
+            def create(self, image, command, **kwargs):
+                created.append((image, command, kwargs))
+                return Container()
+
+        result = run(ContainerRunner(SimpleNamespace(containers=Containers())).run_reproduction(
+            "sha256:" + "a" * 64, ["/opt/bigeye/reproduce", "/finding/input"], 12,
+            lambda stream, text: output.append((stream, text)), testcase,
+            environment={"ASAN_OPTIONS": "abort_on_error=1"},
+        ))
+
+        assert result.exit_code == 1
+        assert output == [("stdout", "stdout\ufffd\n"), ("stderr", "asan\n")]
+        assert removed == [("reproduction-1", True)]
+        assert created[0][2] == {
+            "platform": "linux/amd64", "network_disabled": True, "read_only": True,
+            "cap_drop": ["ALL"], "security_opt": ["no-new-privileges"], "pids_limit": 64,
+            "mem_limit": "512m", "nano_cpus": 1_000_000_000,
+            "tmpfs": {"/tmp": "rw,nosuid,nodev,exec,size=64m,mode=1777"},
+            "detach": True, "user": "65534:65534",
+            "volumes": {str(testcase.resolve()): {"bind": "/finding/input", "mode": "ro"}},
+            "environment": {"ASAN_OPTIONS": "abort_on_error=1"},
+        }
+
     def test_runner_forces_bounded_non_privileged_container_and_removes_it(self) -> None:
         from backend.fuzzing.docker.container_runner import ContainerRunner
 

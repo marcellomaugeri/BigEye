@@ -29,6 +29,7 @@ from backend.models.finding import Finding
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _POINTER_MAX_BYTES = 2_048
 _EVIDENCE_MAX_BYTES = 512 * 1024
+_ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _CLASSIFICATION_ORDER = {
     "true vulnerability": 0,
     "improper contract usage": 1,
@@ -36,6 +37,16 @@ _CLASSIFICATION_ORDER = {
     "flaky or environmental": 3,
     "unresolved": 4,
 }
+
+
+def sanitise_terminal_output(value: bytes | str) -> str:
+    """Return bounded-log-safe UTF-8 text without terminal control sequences."""
+    text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
+    text = _ANSI_ESCAPE.sub("", text)
+    return "".join(
+        character if character in "\n\r\t" or ord(character) >= 0x20 else "\ufffd"
+        for character in text
+    )
 
 
 class FindingRecoveryRequired(RuntimeError):

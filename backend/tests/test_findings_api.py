@@ -52,6 +52,27 @@ class FindingArtifacts:
         return b"crash"
 
 
+class Reproductions:
+    async def start(self, project_id, finding_id):
+        from backend.services.findings.reproduction_registry import ReproductionRun
+        from backend.services.findings.reproduce_finding import FindingNotFound
+
+        if (project_id, finding_id) != (7, 5):
+            raise FindingNotFound("finding not found")
+        return ReproductionRun(
+            "c" * 32, 7, 5, "starting", NOW, None,
+            "sha256:" + "d" * 64,
+            ("/opt/bigeye/reproduce", "/finding/input"),
+        )
+
+    async def stream(self, project_id, finding_id, run_id):
+        if (project_id, finding_id, run_id) != (7, 5, "c" * 32):
+            raise LookupError("not found")
+        yield {"event": "reproduction", "data": {"phase": "starting"}}
+        yield {"event": "output", "data": {"stream": "stderr", "text": "asan\n"}}
+        yield {"event": "reproduction", "data": {"phase": "completed", "exit_code": 1}}
+
+
 def client(rows=None, artifacts=None, observability=None):
     from backend.api.app import create_app
 
@@ -60,6 +81,7 @@ def client(rows=None, artifacts=None, observability=None):
         findings=rows or FindingRows(),
         finding_artifacts=artifacts or FindingArtifacts(),
         observability=observability or SimpleNamespace(locate_evidence=AsyncMock(return_value={})),
+        reproductions=Reproductions(),
         close=lambda: None,
     )
     app = create_app(services=services)
@@ -131,6 +153,25 @@ def test_reproducer_download_has_fixed_safe_headers_and_no_host_path():
     assert response.headers["content-type"] == "application/octet-stream"
     assert response.headers["content-disposition"] == 'attachment; filename="bigeye-finding-5.bin"'
     assert "x-sendfile" not in response.headers
+
+
+def test_exact_reproduction_is_accepted_and_streamed_only_as_sse():
+    with client() as api:
+        started = api.post("/api/projects/7/findings/5/reproductions")
+        wrong_project = api.post("/api/projects/8/findings/5/reproductions")
+        stream = api.get(
+            "/api/projects/7/findings/5/reproductions/" + "c" * 32 + "/events",
+        )
+        websocket_like = api.get(
+            "/api/projects/7/findings/5/reproductions/" + "c" * 32 + "/stdin",
+        )
+
+    assert started.status_code == 202
+    assert started.json()["command"] == ["/opt/bigeye/reproduce", "/finding/input"]
+    assert wrong_project.status_code == 404
+    assert stream.headers["content-type"].startswith("text/event-stream")
+    assert "event: output\ndata: {\"stream\":\"stderr\",\"text\":\"asan\\n\"}" in stream.text
+    assert websocket_like.status_code == 404
 
 
 def test_missing_or_unpublished_finding_is_not_found():
@@ -271,6 +312,7 @@ def test_production_services_wire_committed_finding_routes(tmp_path):
     assert response.json() == {"items": [], "next_cursor": None}
     assert isinstance(services.findings, FindingRepository)
     assert isinstance(services.finding_artifacts, FindingArtifactStore)
+    assert services.reproductions is not None
     assert pool.fetch_calls[0][1] == (7, 51, None, None, None)
 
 

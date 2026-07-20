@@ -13,6 +13,23 @@ CONFIGURATION_HASH = "d" * 64
 NOW = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
 
 
+def test_services_shutdown_closes_reproductions_before_general_recovery() -> None:
+    from backend.api.dependencies import Services
+
+    calls = []
+
+    class Closable:
+        def __init__(self, name): self.name = name
+        async def close(self): calls.append(self.name)
+
+    services = Services(
+        project_creator=None, projects=None, tasks=None, logs=None, events=None,
+        settings=None, recovery=Closable("recovery"), reproductions=Closable("reproductions"),
+    )
+    __import__("asyncio").run(services.close())
+    assert calls == ["reproductions", "recovery"]
+
+
 class RecoveryControl:
     def __init__(self):
         self.calls = []

@@ -47,6 +47,8 @@ from backend.services.campaigns.production_evidence_factory import (
 )
 from backend.services.campaigns.project_coordinator import PostgresProjectLock, ProjectCoordinator
 from backend.services.campaigns.read_campaigns import CampaignReadService
+from backend.services.findings.reproduce_finding import FindingReproductionService
+from backend.services.findings.reproduction_registry import ReproductionRegistry
 from backend.agents.workflow import CampaignWorkflow, RepositoryAnalysisWorkflow
 from backend.fuzzing.toolchain.deferred import DeferredToolchain
 from backend.fuzzing.coverage.traceability import ProjectCheckoutRegistry, TraceabilityService
@@ -92,8 +94,11 @@ class Services:
     pipeline_operations: object | None = None
     target_lifecycle: object | None = None
     reproduction_bundles: object | None = None
+    reproductions: object | None = None
 
     async def close(self) -> None:
+        if self.reproductions is not None:
+            await self.reproductions.close()
         close = getattr(self.recovery, "close", None)
         if close is not None:
             await close()
@@ -135,6 +140,12 @@ def build_services(pool, workspace: Path) -> Services:
             projects=projects, findings=findings, finding_artifacts=finding_artifacts,
             assets=assets, campaigns=campaigns, invocations=invocation_store,
             docker=DockerClient(),
+        ),
+    )
+    reproductions = ReproductionRegistry(
+        workspace,
+        FindingReproductionService(
+            workspace, findings, reproduction_bundles, DockerClient(),
         ),
     )
     execution_slots = ProjectExecutionSlots()
@@ -268,4 +279,5 @@ def build_services(pool, workspace: Path) -> Services:
         pipeline_operations=pipeline_operations,
         target_lifecycle=target_lifecycle,
         reproduction_bundles=reproduction_bundles,
+        reproductions=reproductions,
     )

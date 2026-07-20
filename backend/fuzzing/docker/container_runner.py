@@ -14,6 +14,7 @@ from backend.fuzzing.docker.stdin import (
     close_attached_stdin,
     send_exact_stdin,
 )
+from backend.fuzzing.crashes.artifacts import sanitise_terminal_output
 
 
 class ContainerTimedOut(RuntimeError):
@@ -73,6 +74,96 @@ class ContainerRunner:
             self._request_cancellation(holder)
             await self._cleanup_holder(holder, stop=True)
             raise
+
+    async def run_reproduction(
+        self, image: str, command: list[str], timeout: float, sink,
+        testcase_path, *, environment: Mapping[str, str] | None = None,
+    ) -> ContainerResult:
+        """Stream one read-only testcase without exposing stdin or a shell."""
+        from pathlib import Path
+
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        testcase = Path(testcase_path)
+        if testcase.is_symlink() or not testcase.is_file():
+            raise ValueError("reproduction testcase is unavailable or unsafe")
+        testcase = testcase.resolve(strict=True)
+        bounded_environment = _bounded_environment(environment)
+        holder: dict[str, object] = {
+            "cancel_requested": False, "cleanup_started": False,
+            "lock": threading.Lock(),
+        }
+        worker = asyncio.create_task(asyncio.to_thread(
+            self._run_reproduction_blocking, holder, image, command, timeout,
+            sink, testcase, bounded_environment,
+        ))
+        worker.add_done_callback(self._observe_worker)
+        try:
+            return await asyncio.wait_for(worker, timeout=timeout)
+        except asyncio.TimeoutError as error:
+            self._request_cancellation(holder)
+            await self._cleanup_holder(holder, stop=True)
+            raise ContainerTimedOut(f"container exceeded {timeout} seconds") from error
+        except BaseException:
+            self._request_cancellation(holder)
+            await self._cleanup_holder(holder, stop=True)
+            raise
+
+    def _run_reproduction_blocking(
+        self, holder, image: str, command: list[str], timeout: float, sink,
+        testcase, environment: dict[str, str],
+    ) -> ContainerResult:
+        options = {
+            "platform": PLATFORM, "network_disabled": True, "read_only": True,
+            "cap_drop": ["ALL"], "security_opt": ["no-new-privileges"],
+            "pids_limit": 64, "mem_limit": "512m", "nano_cpus": 1_000_000_000,
+            "tmpfs": {"/tmp": "rw,nosuid,nodev,exec,size=64m,mode=1777"},
+            "detach": True, "user": "65534:65534",
+            "volumes": {str(testcase): {"bind": "/finding/input", "mode": "ro"}},
+        }
+        if environment:
+            options["environment"] = environment
+        container = self._client.containers.create(image, command, **options)
+        with holder["lock"]:
+            holder["container"] = container
+            cancelled = holder["cancel_requested"]
+        failed = True
+        chunks: list[str] = []
+        output_size = 0
+        try:
+            if cancelled:
+                raise ContainerCancelled(f"container {container.id} was cancelled before start")
+            container.start()
+            output = container.attach(
+                stream=True, logs=True, stdout=True, stderr=True, demux=True,
+            )
+            with holder["lock"]:
+                holder["output"] = output
+                cancelled = holder["cancel_requested"] or holder["cleanup_started"]
+            if cancelled:
+                close = getattr(output, "close", None)
+                if close is not None:
+                    close()
+                raise ContainerCancelled(f"container {container.id} was cancelled during output attachment")
+            for item in output:
+                stdout, stderr = item if isinstance(item, tuple) else (item, None)
+                for stream, chunk in (("stdout", stdout), ("stderr", stderr)):
+                    if chunk is None:
+                        continue
+                    raw_size = len(chunk) if isinstance(chunk, bytes) else len(str(chunk).encode("utf-8"))
+                    output_size += raw_size
+                    if output_size > MAX_OUTPUT_BYTES:
+                        message = f"container output exceeded {MAX_OUTPUT_BYTES} bytes\n"
+                        sink("stderr", message)
+                        raise ContainerOutputExceeded(message.rstrip())
+                    text = sanitise_terminal_output(chunk)
+                    chunks.append(text)
+                    sink(stream, text)
+            waited = container.wait(timeout=timeout)
+            failed = False
+            return ContainerResult(int(waited["StatusCode"]), "".join(chunks))
+        finally:
+            self._cleanup_holder_blocking(holder, stop=failed)
 
     def _run_blocking(
         self, holder, image: str, command: list[str], timeout: float, sink,
@@ -152,6 +243,11 @@ class ContainerRunner:
             attached = holder.get("attached")
         if attached is not None:
             close_attached_stdin(attached)
+        output = holder.get("output")
+        if output is not None:
+            close = getattr(output, "close", None)
+            if close is not None:
+                close()
         self._cleanup(container, stop)
 
     @staticmethod
