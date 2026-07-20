@@ -19,7 +19,7 @@ class _Coverage:
     async def source_file(self, project_id, path, start_line, end_line):
         return {
             "project_id": project_id, "commit_sha": "a" * 40, "path": path,
-            "start_line": start_line, "end_line": end_line,
+            "start_line": start_line, "end_line": end_line, "total_lines": 742,
             "lines": [{"number": 12, "text": "return 0;", "covered": True,
                        "strategy_count": 1, "cpu_exposure_seconds": 2.0}],
         }
@@ -81,6 +81,7 @@ def test_coverage_routes_expose_tree_source_functions_and_first_hit_evidence():
     assert tree.json()["pagination"] == {"limit": 1000, "offset": 0, "total": 1}
     assert source.status_code == 200
     assert source.json()["lines"][0]["covered"] is True
+    assert source.json()["total_lines"] == 742
     assert functions.status_code == 200
     assert functions.json()["functions"][0]["name"] == "parse"
     assert functions.json()["pagination"]["total"] == 1
@@ -116,6 +117,17 @@ def test_source_route_enforces_bounded_ranges_before_service_call():
         })
 
     assert invalid.status_code == 422
+
+
+def test_source_route_pages_to_a_deep_link_beyond_line_five_hundred():
+    with _client() as client:
+        response = client.get("/api/projects/7/coverage/source", params={
+            "path": "src/a.c", "start_line": 501, "end_line": 1_000,
+        })
+
+    assert response.status_code == 200
+    assert response.json()["start_line"] == 501
+    assert response.json()["total_lines"] == 742
 
 
 def test_tree_route_returns_a_truthful_empty_success_when_no_coverage_exists():

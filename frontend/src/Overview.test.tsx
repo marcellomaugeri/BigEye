@@ -16,13 +16,16 @@ const project: Project = {
 
 const campaigns = {
   project_id: 7,
+  project_paused: false,
   campaigns: [{
     id: 4, target_asset_id: 31, target_name: 'Parser input path',
     configuration_asset_id: 32, configuration_name: 'Encrypted mode', engine: 'AFL++',
     started_at: '2026-07-20T08:00:00Z', stopped_at: null,
     last_heartbeat_at: '2026-07-20T09:00:00Z', cpu_exposure_seconds: 5400,
     next_review_after: '2026-07-20T10:00:00Z',
-    next_review_reason: 'Coverage is still increasing in the parser.', error: null
+    next_review_reason: 'Coverage is still increasing in the parser.', error: null,
+    configuration_purpose: 'Exercise encrypted parser input.', retirement_reason: null,
+    reached_line_count: 16, unique_line_count: 12, overlapping_line_count: 4,
   }],
   assets: [{ id: 33, kind: 'strategy', name: 'Parser strategy', parent_id: 31 }]
 };
@@ -75,6 +78,8 @@ describe('Overview', () => {
     const currentFocus = screen.getByRole('heading', { name: 'Current focus' }).closest('section')!;
     expect(within(currentFocus).getByText('Parser input path')).toBeVisible();
     expect(screen.getByText('Coverage is still increasing in the parser.')).toBeVisible();
+    expect(within(currentFocus).getByText(/Last observed/)).toBeVisible();
+    expect(screen.queryByText(/running/i)).not.toBeInTheDocument();
     expect(screen.getByText('2 replayed findings')).toBeVisible();
     expect(screen.getByText('12 covered lines')).toBeVisible();
     expect(screen.getByText('1.5 CPU exposure hours')).toBeVisible();
@@ -87,12 +92,12 @@ describe('Overview', () => {
     expect(screen.getByText('AFL++')).toBeVisible();
   });
 
-  it('lists only active campaign targets and configurations as active work', () => {
+  it('shows persisted campaign evidence and retirement rationale without inferring running state', () => {
     const modelCampaigns = {
       ...campaigns,
       campaigns: [
         ...campaigns.campaigns,
-        { ...campaigns.campaigns[0], id: 5, target_name: 'Stopped decoder', configuration_name: 'Legacy mode', stopped_at: '2026-07-20T09:10:00Z' },
+        { ...campaigns.campaigns[0], id: 5, target_name: 'Stopped decoder', configuration_name: 'Legacy mode', stopped_at: '2026-07-20T09:10:00Z', retirement_reason: 'Its clean reach remained a subset.' },
         { ...campaigns.campaigns[0], id: 6, target_name: 'Broken socket', configuration_name: null, error: 'failed' },
       ],
       assets: [
@@ -103,12 +108,26 @@ describe('Overview', () => {
 
     render(<OverviewView model={viewModel({ campaigns: modelCampaigns })} />);
 
-    const activeWork = screen.getByRole('heading', { name: 'Active work' }).closest('section')!;
-    expect(within(activeWork).getByText('Parser input path')).toBeVisible();
-    expect(within(activeWork).getByText('Encrypted mode')).toBeVisible();
-    expect(within(activeWork).queryByText('Stopped decoder')).not.toBeInTheDocument();
-    expect(within(activeWork).queryByText('Broken socket')).not.toBeInTheDocument();
-    expect(within(activeWork).queryByText('Inactive orphan strategy')).not.toBeInTheDocument();
+    const evidence = screen.getByRole('heading', { name: 'Campaign evidence' }).closest('section')!;
+    const parserEvidence = within(evidence).getByText('Parser input path').closest('li')!;
+    expect(within(parserEvidence).getByText('Encrypted mode')).toBeVisible();
+    expect(within(parserEvidence).getByText('12 unique lines')).toBeVisible();
+    expect(within(parserEvidence).getByText('4 overlapping lines')).toBeVisible();
+    expect(within(evidence).getByText('Stopped decoder')).toBeVisible();
+    expect(within(evidence).getByText('Its clean reach remained a subset.')).toBeVisible();
+    expect(within(evidence).getByText('Broken socket')).toBeVisible();
+    expect(within(evidence).queryByText('Inactive orphan strategy')).not.toBeInTheDocument();
+    expect(within(evidence).queryByText(/running/i)).not.toBeInTheDocument();
+  });
+
+  it('uses the server-backed project pause fact instead of labelling configured campaigns as running', () => {
+    render(<OverviewView model={viewModel({
+      project: { ...project, paused_at: '2026-07-20T09:30:00Z' },
+      campaigns: { ...campaigns, project_paused: true },
+    })} />);
+
+    expect(screen.getAllByText('Paused').length).toBeGreaterThan(0);
+    expect(screen.queryByText(/running/i)).not.toBeInTheDocument();
   });
 
   it('treats absent clean coverage as an empty map without reporting an outage', async () => {
@@ -123,7 +142,7 @@ describe('Overview', () => {
   });
 
   it('preserves the Source route without a selected project', async () => {
-    window.history.replaceState(null, '', '/#source');
+    window.history.replaceState(null, '', '/#source?path=src%2Fparser.c&line=742');
     render(<App api={apiDouble({ listProjects: vi.fn().mockResolvedValue([]) })} events={eventStream()} />);
 
     expect(await screen.findByRole('heading', { name: 'Source assurance' })).toBeVisible();

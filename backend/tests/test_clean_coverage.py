@@ -506,7 +506,22 @@ def test_record_rejects_source_hash_not_bound_to_checkout(tmp_path: Path):
     assert repository.create_count == 0
 
 
-@pytest.mark.parametrize("source_path", ["build/a.c", "generated/a.c", "harness/a.c", "fuzz-target/a.c"])
+@pytest.mark.parametrize("source_path", [
+    "build/a.c",
+    "generated/a.c",
+    "harness/a.c",
+    "fuzz-target/a.c",
+    "src/.GiT/config.c",
+    "src/.BigEye/generated.c",
+    "src/Generated/a.c",
+    "src/BUILD/a.c",
+    "src/Harnesses/a.c",
+    "src/FuZz/a.c",
+    "src/fuzzer/a.c",
+    "src/FUZZERS/a.c",
+    "src/Fuzz_Target/a.c",
+    "src/cmake-build-debug/a.c",
+])
 def test_traceability_independently_rejects_non_project_source_trees(tmp_path: Path, source_path: str):
     from backend.fuzzing.coverage.llvm_coverage import CoverageIntegrityError
     from backend.fuzzing.coverage.traceability import TraceabilityService
@@ -522,6 +537,31 @@ def test_traceability_independently_rejects_non_project_source_trees(tmp_path: P
             tmp_path, repository, lambda _request: True, _Registry(repository_root)
         ).record(_snapshot(source_path=source_path)))
     assert repository.create_count == 0
+
+
+@pytest.mark.parametrize("source_path", [
+    "src/.GiT/config.c",
+    "src/.BigEye/generated.c",
+    "src/Generated/a.c",
+    "src/BUILD/a.c",
+    "src/Harnesses/a.c",
+    "src/FuZz/a.c",
+    "src/fuzzer/a.c",
+    "src/FUZZERS/a.c",
+    "src/Fuzz-Target/a.c",
+    "src/cmake-build-debug/a.c",
+])
+def test_clean_export_rejects_forbidden_segments_at_any_depth_case_insensitively(
+    tmp_path: Path, source_path: str,
+):
+    from backend.fuzzing.coverage.llvm_coverage import LlvmCoverage
+
+    repository = tmp_path / "repository"
+    source = repository / source_path
+    source.parent.mkdir(parents=True)
+    source.write_text("int hidden(void) { return 0; }\n")
+
+    assert LlvmCoverage._source_path(f"/src/{source_path}", _campaign(tmp_path)) is None
 
 
 def test_source_query_rejects_checkout_bytes_that_differ_from_clean_image(tmp_path: Path):

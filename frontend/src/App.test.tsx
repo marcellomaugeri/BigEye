@@ -28,7 +28,7 @@ function apiDouble(): BigEyeApi {
     listTasks: vi.fn().mockResolvedValue([]),
     getTaskLog: vi.fn(),
     getSettings: vi.fn(),
-    listCampaigns: vi.fn().mockResolvedValue({ project_id: 1, campaigns: [], assets: [] }),
+    listCampaigns: vi.fn().mockResolvedValue({ project_id: 1, project_paused: false, campaigns: [], assets: [] }),
     getCoverageTree: vi.fn().mockResolvedValue({ project_id: 1, commit_sha: '', files: [], pagination: { limit: 1000, offset: 0, total: 0 } }),
     getSourceFile: vi.fn(),
     getLineEvidence: vi.fn(),

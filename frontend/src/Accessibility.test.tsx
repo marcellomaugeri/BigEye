@@ -17,7 +17,7 @@ function apiDouble(): BigEyeApi {
     listTasks: vi.fn().mockResolvedValue([]),
     getTaskLog: vi.fn(),
     getSettings: vi.fn(),
-    listCampaigns: vi.fn().mockResolvedValue({ project_id: 1, campaigns: [], assets: [] }),
+    listCampaigns: vi.fn().mockResolvedValue({ project_id: 1, project_paused: false, campaigns: [], assets: [] }),
     getCoverageTree: vi.fn().mockResolvedValue({ project_id: 1, commit_sha: '', files: [], pagination: { limit: 1000, offset: 0, total: 0 } }),
     getSourceFile: vi.fn(),
     getLineEvidence: vi.fn(),
@@ -58,5 +58,11 @@ describe('Accessibility', () => {
   it('uses a neutral border for covered-file chips so red remains reserved for attention', () => {
     expect(styles).toMatch(/\.coverage-area-files span\s*\{[^}]*border-left:\s*2px solid var\(--color-grey\)/s);
     expect(styles).not.toMatch(/\.coverage-area-files span\s*\{[^}]*border-left:\s*2px solid var\(--color-red\)/s);
+  });
+
+  it('uses readable muted text and keeps technical summaries visibly focusable', () => {
+    expect(styles).toContain('--color-grey: #5f5f5f;');
+    expect(styles).toMatch(/summary\s*\{[^}]*color:\s*var\(--color-black\)/s);
+    expect(styles).toMatch(/summary:(?:hover|focus-visible)[^}]*color:\s*var\(--color-red\)/s);
   });
 });

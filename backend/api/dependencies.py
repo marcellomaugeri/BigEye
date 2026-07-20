@@ -33,6 +33,7 @@ from backend.services.campaigns.production_runtime import (
     RepositoryCampaignRuntime,
 )
 from backend.services.campaigns.project_coordinator import PostgresProjectLock, ProjectCoordinator
+from backend.services.campaigns.read_campaigns import CampaignReadService
 from backend.agents.workflow import CampaignWorkflow, RepositoryAnalysisWorkflow
 from backend.fuzzing.toolchain.deferred import DeferredToolchain
 from backend.fuzzing.coverage.traceability import ProjectCheckoutRegistry, TraceabilityService
@@ -64,6 +65,7 @@ class Services:
     project_settings: object | None = None
     observability: object | None = None
     campaigns: object | None = None
+    campaign_reader: object | None = None
     coverage: object | None = None
     findings: object | None = None
     finding_artifacts: object | None = None
@@ -176,5 +178,6 @@ def build_services(pool, workspace: Path) -> Services:
         settings=SettingsService(pool, toolchain.docker_available, toolchain.toolchain_available),
         recovery=backbone, analysis=AnalysisReader(workspace),
         project_settings=ProjectSettingsService(projects, backbone), observability=observability,
-        campaigns=campaigns, coverage=coverage, findings=findings, finding_artifacts=finding_artifacts,
+        campaigns=campaigns, campaign_reader=CampaignReadService(campaigns, coverage_history),
+        coverage=coverage, findings=findings, finding_artifacts=finding_artifacts,
     )

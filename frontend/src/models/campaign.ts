@@ -19,10 +19,16 @@ export interface Campaign {
   next_review_after: string | null;
   next_review_reason: string | null;
   error: string | null;
+  configuration_purpose: string | null;
+  retirement_reason: string | null;
+  reached_line_count: number | null;
+  unique_line_count: number | null;
+  overlapping_line_count: number | null;
 }
 
 export interface CampaignList {
   project_id: number;
+  project_paused: boolean;
   campaigns: Campaign[];
   assets: CampaignAsset[];
 }

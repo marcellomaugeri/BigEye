@@ -36,9 +36,14 @@ class CampaignResponse(BaseModel):
     next_review_after: datetime | None
     next_review_reason: str | None = Field(default=None, max_length=2_000)
     error: str | None = Field(default=None, max_length=2_000)
+    configuration_purpose: str | None = Field(default=None, max_length=2_000)
+    retirement_reason: str | None = Field(default=None, max_length=1_024)
+    reached_line_count: int | None = Field(default=None, ge=0)
+    unique_line_count: int | None = Field(default=None, ge=0)
+    overlapping_line_count: int | None = Field(default=None, ge=0)
 
     @classmethod
-    def from_model(cls, campaign, assets_by_id):
+    def from_model(cls, campaign, assets_by_id, summary):
         target = assets_by_id.get(campaign.target_asset_id)
         configuration = (
             assets_by_id.get(campaign.configuration_asset_id)
@@ -62,6 +67,7 @@ class CampaignResponse(BaseModel):
             next_review_after=campaign.next_review_after,
             next_review_reason=campaign.next_review_reason,
             error=campaign.error,
+            **summary,
         )
 
 
@@ -69,5 +75,6 @@ class CampaignListResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     project_id: int = Field(gt=0)
+    project_paused: bool
     campaigns: list[CampaignResponse]
     assets: list[CampaignAssetResponse]

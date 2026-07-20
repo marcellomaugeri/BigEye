@@ -43,7 +43,7 @@ export function LineEvidence({ campaigns, evidence, strategyFilter, onStrategyFi
                 <dl>
                   <div><dt>CPU exposure</dt><dd>{formatCpuExposure(item.cpu_exposure_seconds)}</dd></div>
                   <div><dt>Testcase SHA-256</dt><dd><code>{item.testcase_sha256}</code></dd></div>
-                  <div><dt>Replay command</dt><dd><code>{item.replay_command.join(' ')}</code></dd></div>
+                  <div><dt>Replay arguments</dt><dd><code>{JSON.stringify(item.replay_command)}</code></dd></div>
                 </dl>
                 <details>
                   <summary>Technical details</summary>

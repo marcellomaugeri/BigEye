@@ -31,6 +31,7 @@ export interface SourceFile {
   path: string;
   start_line: number;
   end_line: number;
+  total_lines: number;
   lines: SourceLine[];
 }
 

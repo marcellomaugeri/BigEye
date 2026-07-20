@@ -172,10 +172,21 @@ class CampaignRepository:
     ) -> tuple[list[Campaign], list[CampaignAsset]]:
         """Read campaign state and its project-owned names without adding persistence state."""
         campaigns = await self.list_for_project(project_id)
+        referenced_ids = sorted({
+            asset_id
+            for campaign in campaigns
+            for asset_id in (campaign.target_asset_id, campaign.configuration_asset_id)
+            if asset_id is not None
+        })
+        if not referenced_ids:
+            return campaigns, []
         rows = await self._pool.fetch(
             """SELECT id, project_id, kind, name, content_hash, parent_id, created_at, validated_at, error
-               FROM assets WHERE project_id = $1 ORDER BY created_at, id LIMIT $2""",
-            project_id,
+               FROM assets
+               WHERE project_id = $1
+                 AND (id = ANY($2::bigint[]) OR parent_id = ANY($2::bigint[]))
+               ORDER BY created_at, id LIMIT $3""",
+            project_id, referenced_ids,
             self._MAX_PROJECT_ASSETS + 1,
         )
         if len(rows) > self._MAX_PROJECT_ASSETS:

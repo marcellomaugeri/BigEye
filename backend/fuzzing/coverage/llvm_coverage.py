@@ -14,6 +14,8 @@ from pathlib import Path, PurePosixPath
 from tempfile import mkdtemp
 from typing import Protocol
 
+from backend.fuzzing.coverage.source_paths import is_forbidden_source_path
+
 
 class CoverageIntegrityError(ValueError):
     """Raised when coverage cannot be bound to clean, immutable project source."""
@@ -524,12 +526,7 @@ class LlvmCoverage:
                 return None
         if not path.parts or any(part in {"", ".", ".."} for part in path.parts):
             return None
-        lowered = tuple(part.lower() for part in path.parts)
-        if (
-            path.suffix.lower() == ".patch"
-            or lowered[0] in {".git", ".bigeye", "build", "generated", "harness", "fuzz-target", "fuzz_target"}
-            or any(part.startswith("cmake-build") for part in lowered)
-        ):
+        if is_forbidden_source_path(path):
             return None
         try:
             _read_regular(Path(os.path.abspath(campaign.repository_root)).joinpath(*path.parts), 2 * 1024 * 1024)

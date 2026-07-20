@@ -13,6 +13,7 @@ from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
 from backend.fuzzing.coverage.llvm_coverage import CoverageIntegrityError
+from backend.fuzzing.coverage.source_paths import is_forbidden_source_path
 from backend.services.projects.clone_repository import GitCommandFailed, run_command
 
 
@@ -229,6 +230,7 @@ class TraceabilityService:
             "path": relative,
             "start_line": start_line,
             "end_line": actual_end,
+            "total_lines": len(lines),
             "lines": [
                 {
                     "number": number,
@@ -618,14 +620,9 @@ class TraceabilityService:
         if not isinstance(path, str) or not path:
             raise ValueError("source path is required")
         value = PurePosixPath(path)
-        if value.is_absolute() or not value.parts or any(part in {"", ".", "..", ".git"} for part in value.parts):
+        if value.is_absolute() or not value.parts or any(part in {"", ".", ".."} for part in value.parts):
             raise ValueError("source path must be repository-relative")
-        first = value.parts[0].lower()
-        if (
-            value.suffix.lower() == ".patch"
-            or first in {"build", "generated", "harness", "fuzz-target", "fuzz_target", ".bigeye"}
-            or first.startswith("cmake-build")
-        ):
+        if is_forbidden_source_path(value):
             raise ValueError("generated and fuzz-only paths are not project source")
         return value.as_posix()
 

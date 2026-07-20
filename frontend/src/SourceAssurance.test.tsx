@@ -1,6 +1,6 @@
 import { act, render, renderHook, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { useSourceAssurance, type SourceAssuranceModel } from './controllers/useSourceAssurance';
 import type { Project } from './models/project';
 import type { BigEyeApi } from './services/apiClient';
@@ -14,11 +14,13 @@ const project: Project = {
 };
 
 const campaigns = {
-  project_id: 7, campaigns: [{
+  project_id: 7, project_paused: false, campaigns: [{
     id: 4, target_asset_id: 31, target_name: 'Parser input path', configuration_asset_id: null,
     configuration_name: null, engine: 'component engine', started_at: '2026-07-20T08:00:00Z',
     stopped_at: null, last_heartbeat_at: null, cpu_exposure_seconds: 5400,
-    next_review_after: null, next_review_reason: 'Review after coverage plateaus.', error: null
+    next_review_after: null, next_review_reason: 'Review after coverage plateaus.', error: null,
+    configuration_purpose: 'Exercise parser input.', retirement_reason: null,
+    reached_line_count: 2, unique_line_count: 2, overlapping_line_count: 0,
   }],
   assets: [
     { id: 33, kind: 'strategy', name: 'Parser strategy', parent_id: 31 },
@@ -34,6 +36,7 @@ const tree = {
 
 const source = {
   project_id: 7, commit_sha: 'a'.repeat(40), path: 'src/parser.c', start_line: 41, end_line: 43,
+  total_lines: 742,
   lines: [
     { number: 41, text: 'int parse(const char *data) {', covered: true, strategy_count: 1, cpu_exposure_seconds: 1200 },
     { number: 42, text: '  return decode(data);', covered: true, strategy_count: 2, cpu_exposure_seconds: 5400 },
@@ -43,7 +46,7 @@ const source = {
 
 const lineEvidence = {
   evidence: [
-    { campaign_id: 4, strategy_asset_id: 33, testcase_sha256: 'b'.repeat(64), replay_command: ['/target', '{input}'], target_asset_id: 31, configuration_asset_id: null, clean_image_id: `sha256:${'c'.repeat(64)}`, cpu_exposure_seconds: 5400 },
+    { campaign_id: 4, strategy_asset_id: 33, testcase_sha256: 'b'.repeat(64), replay_command: ['/target', '--label=two words', '{input}'], target_asset_id: 31, configuration_asset_id: null, clean_image_id: `sha256:${'c'.repeat(64)}`, cpu_exposure_seconds: 5400 },
     { campaign_id: 4, strategy_asset_id: 34, testcase_sha256: 'd'.repeat(64), replay_command: ['/socket-target', '{input}'], target_asset_id: 31, configuration_asset_id: null, clean_image_id: `sha256:${'e'.repeat(64)}`, cpu_exposure_seconds: 1800 }
   ],
   pagination: { limit: 500, offset: 0, total: 2 }
@@ -54,6 +57,7 @@ function model(overrides: Partial<SourceAssuranceModel> = {}): SourceAssuranceMo
     project, tree, source, campaigns, evidence: lineEvidence,
     selectedPath: 'src/parser.c', selectedLine: 42, strategyFilter: '33',
     loading: false, error: null, onSelectPath: vi.fn(), onSelectLine: vi.fn(),
+    onPreviousSourcePage: vi.fn(), onNextSourcePage: vi.fn(),
     onStrategyFilter: vi.fn(), testcaseUrl: (item) => `/retained/${item.testcase_sha256}`, ...overrides
   };
 }
@@ -74,6 +78,8 @@ function apiDouble(overrides: Partial<BigEyeApi> = {}): BigEyeApi {
 const events: ProjectEventStream = { subscribe: vi.fn().mockReturnValue(() => undefined) };
 
 describe('Source assurance', () => {
+  afterEach(() => { window.history.replaceState(null, '', '/'); });
+
   it('shows selectable source lines, strategy-filtered first testcase evidence and CPU exposure', async () => {
     const user = userEvent.setup();
     const onSelectLine = vi.fn();
@@ -93,7 +99,7 @@ describe('Source assurance', () => {
     expect(screen.queryByRole('link', { name: 'Download first testcase for Socket strategy' })).not.toBeInTheDocument();
     expect(screen.getByText('1.5 CPU exposure hours')).toBeVisible();
     expect(screen.getByText('b'.repeat(64))).toBeVisible();
-    expect(screen.getByText('/target {input}')).toBeVisible();
+    expect(screen.getByText('["/target","--label=two words","{input}"]')).toBeVisible();
     expect(screen.queryByRole('button', { name: /run replay/i })).not.toBeInTheDocument();
   });
 
@@ -149,5 +155,39 @@ describe('Source assurance', () => {
     expect(screen.getByRole('navigation', { name: 'Project source files' })).toBeVisible();
     expect(screen.getByRole('list', { name: 'Source assurance files' })).toBeVisible();
     expect(screen.getByRole('region', { name: 'Selected line evidence' })).toBeVisible();
+  });
+
+  it('pages source and exposes navigation beyond the first five hundred lines', () => {
+    render(<SourceAssuranceView model={model({
+      source: { ...source, start_line: 501, end_line: 742 },
+    })} />);
+
+    expect(screen.getByText('Lines 501–742 of 742')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Previous source lines' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Next source lines' })).toBeDisabled();
+  });
+
+  it('loads a deep-linked covered line beyond line five hundred with evidence', async () => {
+    const deepSource = {
+      ...source,
+      start_line: 501,
+      end_line: 742,
+      lines: [{
+        number: 742, text: 'return decode(data);', covered: true,
+        strategy_count: 1, cpu_exposure_seconds: 7200,
+      }],
+    };
+    const getSourceFile = vi.fn().mockResolvedValue(deepSource);
+    const getLineEvidence = vi.fn().mockResolvedValue(lineEvidence);
+    const api = apiDouble({ getSourceFile, getLineEvidence });
+    window.history.replaceState(null, '', '/#source?path=src%2Fparser.c&line=742');
+
+    const { result } = renderHook(() => useSourceAssurance(
+      api, events, project, true,
+    ));
+
+    await waitFor(() => expect(result.current.selectedLine).toBe(742));
+    expect(getSourceFile).toHaveBeenCalledWith('7', 'src/parser.c', 501, 1000);
+    expect(getLineEvidence).toHaveBeenCalledWith('7', 'src/parser.c', 742);
   });
 });

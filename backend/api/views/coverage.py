@@ -36,6 +36,7 @@ class SourceFileResponse(BaseModel):
     path: str
     start_line: int
     end_line: int
+    total_lines: int
     lines: list[SourceLineResponse]
 
 

@@ -25,6 +25,18 @@ describe('ApiClient source assurance boundaries', () => {
     );
   });
 
+  it('requests an explicit bounded source page beyond line five hundred', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({ lines: [] }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await new ApiClient().getSourceFile('7', 'src/parser name.c', 501, 1000);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/projects/7/coverage/source?path=src%2Fparser+name.c&start_line=501&end_line=1000',
+      undefined,
+    );
+  });
+
   it('uses only the caller-owned fallback for unknown errors', () => {
     expect(friendlyApiError(new Error('secret at /Users/private/key.txt'), 'Safe fallback.')).toBe('Safe fallback.');
   });

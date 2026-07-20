@@ -39,7 +39,7 @@ function apiDouble(overrides: Record<string, unknown> = {}) {
     listTasks: vi.fn().mockResolvedValue([]),
     getTaskLog: vi.fn(),
     getSettings: vi.fn().mockResolvedValue({ database: true, docker: false, openai_api_key_present: true, toolchain: true }),
-    listCampaigns: vi.fn().mockResolvedValue({ project_id: 7, campaigns: [], assets: [] }),
+    listCampaigns: vi.fn().mockResolvedValue({ project_id: 7, project_paused: false, campaigns: [], assets: [] }),
     getCoverageTree: vi.fn().mockResolvedValue({ project_id: 7, commit_sha: activeProject.commit_sha, files: [], pagination: { limit: 1000, offset: 0, total: 0 } }),
     getSourceFile: vi.fn(),
     getLineEvidence: vi.fn(),

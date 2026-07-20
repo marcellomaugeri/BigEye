@@ -26,7 +26,7 @@ interface AppProps {
 const pages: Page[] = ['projects', 'overview', 'source', 'findings', 'activity', 'settings'];
 
 function pageFromLocation(): Page {
-  const candidate = window.location.hash.slice(1);
+  const candidate = window.location.hash.slice(1).split('?', 1)[0];
   return pages.includes(candidate as Page) ? candidate as Page : 'projects';
 }
 

@@ -19,7 +19,13 @@ export function SourceAssuranceView({ model }: { model: SourceAssuranceModel }) 
     {model.loading && <StatusText>Loading clean source evidence…</StatusText>}
     <div className="source-workspace">
       <SourceTree files={model.tree?.files ?? []} onSelect={model.onSelectPath} selectedPath={model.selectedPath} />
-      <SourceCode onSelect={model.onSelectLine} selectedLine={model.selectedLine} source={model.source} />
+      <SourceCode
+        onNextPage={model.onNextSourcePage}
+        onPreviousPage={model.onPreviousSourcePage}
+        onSelect={model.onSelectLine}
+        selectedLine={model.selectedLine}
+        source={model.source}
+      />
       <LineEvidence
         campaigns={model.campaigns}
         evidence={model.evidence}

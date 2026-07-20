@@ -6,6 +6,28 @@ import { friendlyApiError, type BigEyeApi } from '../services/apiClient';
 import type { ProjectEventStream, ProjectInvalidation } from '../services/eventStream';
 
 const UNAVAILABLE = 'BigEye local services are temporarily unavailable.';
+const SOURCE_PAGE_SIZE = 500;
+
+function sourceLocation(): { path: string; line: number | null } | null {
+  const [page, query = ''] = window.location.hash.slice(1).split('?', 2);
+  if (page !== 'source') return null;
+  const parameters = new URLSearchParams(query);
+  const path = parameters.get('path');
+  const rawLine = parameters.get('line');
+  if (!path) return null;
+  const line = rawLine && /^\d+$/.test(rawLine) ? Number(rawLine) : null;
+  return { path, line: line !== null && Number.isSafeInteger(line) && line > 0 ? line : null };
+}
+
+function sourcePageStart(line: number): number {
+  return Math.floor((line - 1) / SOURCE_PAGE_SIZE) * SOURCE_PAGE_SIZE + 1;
+}
+
+function writeSourceLocation(path: string, line: number | null): void {
+  const parameters = new URLSearchParams({ path });
+  if (line !== null) parameters.set('line', String(line));
+  window.history.replaceState(null, '', `#source?${parameters}`);
+}
 
 export interface SourceAssuranceModel {
   project: Project | null;
@@ -20,6 +42,8 @@ export interface SourceAssuranceModel {
   error: string | null;
   onSelectPath: (path: string) => void;
   onSelectLine: (line: number) => void;
+  onPreviousSourcePage: () => void;
+  onNextSourcePage: () => void;
   onStrategyFilter: (strategyId: string) => void;
   testcaseUrl: (evidence: LineEvidence) => string;
 }
@@ -50,20 +74,25 @@ export function useSourceAssurance(
     setError(friendlyApiError(requestError, UNAVAILABLE));
   }, []);
 
-  const loadSource = useCallback(async (projectId: string, path: string) => {
+  const loadSource = useCallback(async (
+    projectId: string, path: string, startLine = 1, preferredLine: number | null = null,
+  ) => {
     const requestGeneration = ++sourceGeneration.current;
     setSource(null);
     setEvidence(null);
     try {
-      const value = await api.getSourceFile(projectId, path);
+      const value = await api.getSourceFile(projectId, path, startLine, startLine + SOURCE_PAGE_SIZE - 1);
       if (
         requestGeneration !== sourceGeneration.current ||
         currentProjectId.current !== projectId || selectedPathRef.current !== path
       ) return;
       setSource(value);
-      const firstLine = value.lines.find((line) => line.covered)?.number ?? null;
-      selectedLineRef.current = firstLine;
-      setSelectedLine(firstLine);
+      const selected = preferredLine !== null && value.lines.some((line) => line.number === preferredLine)
+        ? preferredLine
+        : (value.lines.find((line) => line.covered)?.number ?? null);
+      selectedLineRef.current = selected;
+      setSelectedLine(selected);
+      writeSourceLocation(path, selected);
     } catch (requestError) {
       if (requestGeneration === sourceGeneration.current && currentProjectId.current === projectId) {
         reportError(requestError);
@@ -115,15 +144,26 @@ export function useSourceAssurance(
         const value = await api.getCoverageTree(projectId);
         if (!isCurrent()) return;
         setTree(value);
-        const nextPath = selectedPathRef.current && value.files.some((file) => file.path === selectedPathRef.current)
-          ? selectedPathRef.current
-          : (value.files[0]?.path ?? null);
+        const requested = sourceLocation();
+        const requestedPath = requested && value.files.some((file) => file.path === requested.path)
+          ? requested.path
+          : null;
+        const nextPath = requestedPath ?? (
+          selectedPathRef.current && value.files.some((file) => file.path === selectedPathRef.current)
+            ? selectedPathRef.current
+            : (value.files[0]?.path ?? null)
+        );
         if (nextPath !== selectedPathRef.current) {
           selectedPathRef.current = nextPath;
           setSelectedPath(nextPath);
         }
         if (nextPath) {
-          void loadSource(projectId, nextPath);
+          const requestedLine = requestedPath === nextPath ? requested?.line ?? null : null;
+          void loadSource(
+            projectId, nextPath,
+            requestedLine === null ? 1 : sourcePageStart(requestedLine),
+            requestedLine,
+          );
         } else {
           selectedLineRef.current = null;
           setSelectedLine(null);
@@ -185,17 +225,34 @@ export function useSourceAssurance(
     setSelectedPath(path);
     setSelectedLine(null);
     setStrategyFilter('all');
+    writeSourceLocation(path, null);
     void loadSource(project.id, path);
   }, [loadSource, project]);
 
   const onSelectLine = useCallback((line: number) => {
     selectedLineRef.current = line;
     setSelectedLine(line);
+    if (selectedPathRef.current) writeSourceLocation(selectedPathRef.current, line);
   }, []);
+
+  const onPreviousSourcePage = useCallback(() => {
+    if (!project || !source || !selectedPathRef.current || source.start_line <= 1) return;
+    selectedLineRef.current = null;
+    setSelectedLine(null);
+    void loadSource(project.id, selectedPathRef.current, Math.max(1, source.start_line - SOURCE_PAGE_SIZE));
+  }, [loadSource, project, source]);
+
+  const onNextSourcePage = useCallback(() => {
+    if (!project || !source || !selectedPathRef.current || source.end_line >= source.total_lines) return;
+    selectedLineRef.current = null;
+    setSelectedLine(null);
+    void loadSource(project.id, selectedPathRef.current, source.start_line + SOURCE_PAGE_SIZE);
+  }, [loadSource, project, source]);
 
   return {
     project, tree, source, campaigns, evidence, selectedPath, selectedLine,
     strategyFilter, loading, error, onSelectPath, onSelectLine,
+    onPreviousSourcePage, onNextSourcePage,
     onStrategyFilter: setStrategyFilter,
     testcaseUrl: (item) => (
       project && selectedPath && selectedLine !== null

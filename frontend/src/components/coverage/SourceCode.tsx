@@ -1,16 +1,25 @@
 import type { SourceFile } from '../../models/coverage';
 import { formatCpuExposure } from './CoverageMap';
 
-export function SourceCode({ source, selectedLine, onSelect }: {
+export function SourceCode({ source, selectedLine, onSelect, onPreviousPage, onNextPage }: {
   source: SourceFile | null;
   selectedLine: number | null;
   onSelect: (line: number) => void;
+  onPreviousPage: () => void;
+  onNextPage: () => void;
 }) {
   const compactExposure = (seconds: number) => `${Number((seconds / 3600).toFixed(2))} CPU h`;
   return <section aria-label="Source code" className="source-code">
     <header>
       <p className="eyebrow">Clean revision</p>
       <h2>{source?.path ?? 'Select a source file'}</h2>
+      {source && <nav aria-label="Source line pages" className="source-pagination">
+        <p>Lines {source.start_line}–{source.end_line} of {source.total_lines}</p>
+        <div>
+          <button aria-label="Previous source lines" disabled={source.start_line <= 1} onClick={onPreviousPage} type="button">Previous</button>
+          <button aria-label="Next source lines" disabled={source.end_line >= source.total_lines} onClick={onNextPage} type="button">Next</button>
+        </div>
+      </nav>}
     </header>
     {source && <ol aria-label={`${source.path} source lines`}>
       {source.lines.map((line) => <li key={line.number}>
