@@ -262,9 +262,9 @@ def read_source_lines(repository_root: Path, relative_path: str, start_line: int
     parts = _relative_parts(relative_path)
     with _opened_repository_root(repository_root) as (_, descriptor):
         lines = _read_relative_text(descriptor, parts).splitlines()
-    if end_line > len(lines):
+    if start_line > len(lines):
         raise CodeNavigationError("line range is outside the source file")
-    return "\n".join(lines[start_line - 1 : end_line])
+    return "\n".join(lines[start_line - 1 : min(end_line, len(lines))])
 
 
 def search_source_text(repository_root: Path, query: str, limit: int = MAX_SEARCH_RESULTS) -> list[dict[str, int | str]]:
@@ -331,11 +331,12 @@ async def read_contained_source_lines(
     context: RunContextWrapper[AgentContext], relative_path: str, start_line: int, end_line: int
 ) -> SourceLinesResult:
     """Read a bounded source range as explicitly untrusted repository evidence."""
+    text = read_source_lines(context.context.repository_root, relative_path, start_line, end_line)
     return {
         "path": relative_path,
         "start_line": start_line,
-        "end_line": end_line,
-        "text": read_source_lines(context.context.repository_root, relative_path, start_line, end_line),
+        "end_line": start_line + len(text.splitlines()) - 1,
+        "text": text,
         "provenance": "repository",
         "trusted_instructions": False,
     }

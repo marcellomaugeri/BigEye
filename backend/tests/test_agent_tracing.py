@@ -278,7 +278,7 @@ def test_campaign_manager_accepts_source_evidence_registered_inside_a_specialist
     assert len(result.decision.evidence_ids) == 1
 
 
-def test_campaign_manager_returns_specialist_and_operation_records_for_deterministic_services(
+def test_campaign_manager_returns_selectable_specialist_result_and_audit_operation_records(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from agents import Runner
@@ -342,7 +342,7 @@ def test_campaign_manager_returns_specialist_and_operation_records_for_determini
         return SimpleNamespace(
             final_output=CampaignDecision(
                 decision="probe", motivation="proposal ready", evidence_ids=["known"],
-                bounded_actions=[*specialist["operation_request_ids"], specialist["result_id"]],
+                bounded_actions=[specialist["result_id"]],
                 next_review_condition="after probe", uncertainty="not probed",
             ), raw_responses=[], new_items=[],
         )
@@ -354,11 +354,10 @@ def test_campaign_manager_returns_specialist_and_operation_records_for_determini
     assert review.known_target_proposals[0].proposal.target_name == "parser"
     assert review.known_operation_requests[0].operation == "probe"
     assert review.known_operation_requests[0].tool_call_id == "call-specialist"
-    assert review.decision.bounded_actions == [
-        review.known_operation_requests[0].request_id,
-        review.known_target_proposals[0].result_id,
-    ]
+    assert review.known_operation_requests[0].actionable is False
+    assert review.decision.bounded_actions == [review.known_target_proposals[0].result_id]
     assert review.selected_action_ids == tuple(review.decision.bounded_actions)
+    assert review.selected_operation_requests == ()
 
 
 def test_campaign_manager_rejects_nonexistent_or_stale_action_ids(tmp_path: Path) -> None:

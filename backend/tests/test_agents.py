@@ -15,10 +15,15 @@ from backend.agents.outputs.target_proposal import TargetProposal
 from backend.agents.outputs.triage_result import TriageResult
 from backend.agents.prompts.component_target import COMPONENT_TARGET_PROMPT
 from backend.agents.prompts.crash_triage import CRASH_TRIAGE_PROMPT
+from backend.agents.prompts.manager import MANAGER_PROMPT
 from backend.agents.prompts.system_target import SYSTEM_TARGET_PROMPT
-from backend.agents.outputs.campaign_review import CampaignReviewCollection, SpecialistInvocation
-from backend.agents.tools.agent_dispatch import _validate_target, dispatch_tools
-from backend.agents.tools.contained_operations import contained_operation_request
+from backend.agents.outputs.campaign_review import (
+    CampaignReviewCollection,
+    ContainedOperationRequestRecord,
+    SpecialistInvocation,
+)
+from backend.agents.tools.agent_dispatch import SpecialistValidationError, _validate_target, dispatch_tools
+from backend.agents.tools.contained_operations import contained_operation_request, contained_operation_tools
 from backend.agents.tools.generated_assets import (
     GeneratedAssetError,
     generated_asset_tools,
@@ -70,6 +75,14 @@ def test_navigation_lists_and_reads_contained_text_files(tmp_path: Path) -> None
     assert search_source_text(root, "println") == [
         {"path": "src/main.rs", "line": 2, "text": '    println!("hello");'}
     ]
+
+
+def test_navigation_clamps_a_valid_requested_range_to_source_eof(tmp_path: Path) -> None:
+    root = write_repository(tmp_path)
+
+    assert read_source_lines(root, "src/main.rs", 2, 50) == '    println!("hello");\n}'
+    with pytest.raises(CodeNavigationError, match="outside the source file"):
+        read_source_lines(root, "src/main.rs", 4, 50)
 
 
 @pytest.mark.parametrize(
@@ -253,6 +266,27 @@ def test_specialists_have_narrow_tools_structured_outputs_and_no_handoffs(tmp_pa
     assert {tool.name for tool in evidence_retrieval_tools()} == {"inspect_build_evidence", "retrieve_repository_evidence"}
 
 
+def test_contained_operation_tool_schema_lists_only_supported_operations() -> None:
+    tool = contained_operation_tools()[0]
+
+    assert tool.params_json_schema["properties"]["operation"] == {
+        "enum": ["build", "probe", "replay", "coverage"],
+        "title": "Operation",
+        "type": "string",
+    }
+
+
+def test_agent_prompts_keep_operation_requests_out_of_decision_and_evidence_ids() -> None:
+    assert "result or action IDs" in MANAGER_PROMPT
+    assert "return application-owned result or operation-request IDs" not in MANAGER_PROMPT
+    assert CampaignDecision.model_fields["bounded_actions"].description == (
+        "Selectable result or application-owned action IDs returned in this review."
+    )
+    for prompt in (SYSTEM_TARGET_PROMPT, COMPONENT_TARGET_PROMPT, CRASH_TRIAGE_PROMPT):
+        assert "exactly build, probe, replay, or coverage" in prompt
+        assert "evidence_ids must never contain operation-request IDs" in prompt
+
+
 def test_retrieval_tool_schema_is_bounded_and_overlong_queries_return_correction(tmp_path: Path) -> None:
     context = agent_context(tmp_path)
     tool = next(item for item in evidence_retrieval_tools() if item.name == "retrieve_repository_evidence")
@@ -348,7 +382,7 @@ def test_luna_specialist_retries_once_with_terra_only_after_validation_failure(
     context = agent_context(tmp_path)
     store = ProjectEventStore(tmp_path)
     trace = LocalTrace(store, context.project_id)
-    calls: list[str] = []
+    calls: list[tuple[str, int | None]] = []
 
     class Result:
         interruptions = []
@@ -368,7 +402,7 @@ def test_luna_specialist_retries_once_with_terra_only_after_validation_failure(
 
     async def runner(starting_agent=None, input=None, **kwargs):
         agent = starting_agent
-        calls.append(agent.model)
+        calls.append((agent.model, kwargs.get("max_turns")))
         return Result(_target_proposal("unknown") if agent.model == "gpt-5.6-luna" else _target_proposal("known"))
 
     from agents import Runner
@@ -386,10 +420,9 @@ def test_luna_specialist_retries_once_with_terra_only_after_validation_failure(
         tool_context, '{"assignment":"prepare parser","evidence_ids":["known"]}'
     ))
 
-    assert calls == ["gpt-5.6-luna", "gpt-5.6-terra"]
-    assert set(output) == {"result_id", "result", "operation_request_ids"}
+    assert calls == [("gpt-5.6-luna", 14), ("gpt-5.6-terra", 14)]
+    assert set(output) == {"result_id", "result"}
     assert output["result"] == _target_proposal("known").model_dump(mode="json")
-    assert output["operation_request_ids"] == []
     review = collection.result(CampaignDecision(
         decision="prepare", motivation="validated retry", evidence_ids=["known"],
         bounded_actions=[output["result_id"]], next_review_condition="after probe",
@@ -475,22 +508,26 @@ def test_retry_quarantines_luna_requests_and_returns_only_terra_invocation_ids(
     assert calls == ["gpt-5.6-luna", "gpt-5.6-terra"]
     assert output["result"]["target_name"] == "validated-terra-target"
     assert "failed-luna-target" not in str(output)
-    assert len(output["operation_request_ids"]) == 1
+    assert set(output) == {"result_id", "result"}
     review = collection.result(CampaignDecision(
         decision="select retry", motivation="Terra corrected evidence", evidence_ids=["known"],
-        bounded_actions=[output["result_id"], *output["operation_request_ids"]],
+        bounded_actions=[output["result_id"]],
         next_review_condition="after probe", uncertainty="not probed",
     ))
     assert {record.model for record in review.known_operation_requests} == {"gpt-5.6-terra"}
     assert {record.attempt for record in review.known_operation_requests} == {2}
+    assert {record.actionable for record in review.known_operation_requests} == {False}
     assert {record.model for record in review.quarantined_operation_requests} == {"gpt-5.6-luna"}
-    assert set(output["operation_request_ids"]) == {
-        record.request_id for record in review.known_operation_requests
-    }
-    assert set(output["operation_request_ids"]).isdisjoint({
+    assert {record.request_id for record in review.known_operation_requests}.isdisjoint({
         record.request_id for record in review.quarantined_operation_requests
     })
-    with pytest.raises(ValueError, match="action outside this review"):
+    with pytest.raises(ValueError, match="not selectable"):
+        collection.result(CampaignDecision(
+            decision="select audit request", motivation="invalid", evidence_ids=["known"],
+            bounded_actions=[operations_by_model["gpt-5.6-terra"]],
+            next_review_condition="never", uncertainty="not executable",
+        ))
+    with pytest.raises(ValueError, match="not selectable"):
         collection.result(CampaignDecision(
             decision="select failed attempt", motivation="invalid", evidence_ids=["known"],
             bounded_actions=[operations_by_model["gpt-5.6-luna"]],
@@ -588,7 +625,7 @@ def test_specialist_accepts_only_source_evidence_returned_by_its_retrieval_tool(
     ))
 
     assert calls == ["gpt-5.6-luna"]
-    assert set(output) == {"result_id", "result", "operation_request_ids"}
+    assert set(output) == {"result_id", "result"}
 
 
 def test_specialist_accepts_only_web_citation_returned_by_its_model_response(
@@ -635,7 +672,7 @@ def test_specialist_accepts_only_web_citation_returned_by_its_model_response(
     ))
 
     assert calls == ["gpt-5.6-luna"]
-    assert set(output) == {"result_id", "result", "operation_request_ids"}
+    assert set(output) == {"result_id", "result"}
 
 
 def test_nonofficial_web_citation_triggers_one_terra_validation_retry(
@@ -686,7 +723,7 @@ def test_nonofficial_web_citation_triggers_one_terra_validation_retry(
     ))
 
     assert calls == ["gpt-5.6-luna", "gpt-5.6-terra"]
-    assert set(output) == {"result_id", "result", "operation_request_ids"}
+    assert set(output) == {"result_id", "result"}
     web = next(item for item in tool._agent_instance.tools if item.name == "web_search")
     assert "llvm.org" in web.filters.allowed_domains
     assert "aflplus.plus" in web.filters.allowed_domains
@@ -727,6 +764,75 @@ def test_specialist_transport_failure_is_not_retried(tmp_path: Path, monkeypatch
     assert errors[-1]["parent_tool"] == "prepare_system_target"
     assert errors[-1]["parent_tool_call_id"] == "call-1"
     assert errors[-1]["parent_tool_arguments"]["assignment"] == "prepare parser"
+
+
+def test_max_turns_isolated_to_one_parallel_specialist_and_its_requests_are_audit_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agents import MaxTurnsExceeded, Runner
+
+    context = agent_context(tmp_path)
+    collection = CampaignReviewCollection()
+    tool = next(item for item in dispatch_tools(
+        context, evidence_ids={"known"}, collection=collection,
+    ) if item.name == "prepare_system_target")
+
+    class Result:
+        interruptions = []
+        new_items = []
+        raw_responses = []
+        input = "nested"
+
+        def __init__(self, outer_context):
+            self.final_output = _target_proposal("known")
+            self.agent_tool_invocation = SimpleNamespace(
+                tool_name=outer_context.tool_name,
+                tool_call_id=outer_context.tool_call_id,
+                tool_arguments=outer_context.tool_arguments,
+            )
+
+        def to_input_list(self):
+            return []
+
+    async def runner(starting_agent=None, context=None, **kwargs):
+        assert kwargs["max_turns"] == 14
+        if context.tool_call_id == "call-budget":
+            operation = next(
+                item for item in starting_agent.tools if item.name == "request_contained_operation"
+            )
+            arguments = '{"operation":"probe","asset_paths":[],"assertions":["probe parser"]}'
+            await operation.on_invoke_tool(ToolContext(
+                context.context, tool_name=operation.name, tool_call_id="operation-budget",
+                tool_arguments=arguments, run_config=RunConfig(), agent=starting_agent,
+            ), arguments)
+            raise MaxTurnsExceeded("specialist exceeded 14 turns")
+        return Result(context)
+
+    monkeypatch.setattr(Runner, "run", runner)
+
+    async def invoke(call_id: str):
+        arguments = '{"assignment":"parser","evidence_ids":["known"]}'
+        return await tool.on_invoke_tool(ToolContext(
+            context, tool_name=tool.name, tool_call_id=call_id,
+            tool_arguments=arguments, run_config=RunConfig(),
+        ), arguments)
+
+    async def scenario():
+        return await asyncio.gather(invoke("call-budget"), invoke("call-valid"))
+
+    exhausted, valid = asyncio.run(scenario())
+
+    assert "turn budget exhausted" in exhausted
+    assert "result or action IDs" in exhausted
+    assert set(valid) == {"result_id", "result"}
+    review = collection.result(CampaignDecision(
+        decision="prepare valid sibling", motivation="validated target", evidence_ids=["known"],
+        bounded_actions=[valid["result_id"]], next_review_condition="after probe",
+        uncertainty="other specialist exhausted its budget",
+    ))
+    assert {record.tool_call_id for record in review.known_target_proposals} == {"call-valid"}
+    assert review.known_operation_requests == ()
+    assert {record.tool_call_id for record in review.quarantined_operation_requests} == {"call-budget"}
 
 
 def test_agent_tool_returns_fixed_correction_for_unassigned_evidence_without_running_worker(
@@ -844,15 +950,10 @@ def test_parallel_agent_tool_results_and_requests_never_cross_invocations(
     assert triage["result"]["priority_rationale"] == "reproducible memory-safety failure"
     assert triage["result"]["evidence_ids"] == ["known"]
     assert set(triage["result"]) == set(TriageResult.model_fields)
-    assert len(first["operation_request_ids"]) == len(second["operation_request_ids"]) == 1
-    assert len(triage["operation_request_ids"]) == 1
-    assert first["operation_request_ids"][0] != second["operation_request_ids"][0]
-    assert set(first["operation_request_ids"]).isdisjoint(second["operation_request_ids"])
-    assert set(first["operation_request_ids"]).isdisjoint(triage["operation_request_ids"])
-    assert set(second["operation_request_ids"]).isdisjoint(triage["operation_request_ids"])
+    assert all(set(output) == {"result_id", "result"} for output in (first, second, triage))
     decision = CampaignDecision(
         decision="select first", motivation="first proposal", evidence_ids=["known"],
-        bounded_actions=[first["result_id"], *first["operation_request_ids"]],
+        bounded_actions=[first["result_id"]],
         next_review_condition="after probe", uncertainty="not probed",
     )
     review = collection.result(decision)
@@ -861,8 +962,10 @@ def test_parallel_agent_tool_results_and_requests_never_cross_invocations(
     assert {record.tool_call_id for record in review.known_operation_requests} == {
         "call-a", "call-b", "call-triage",
     }
+    assert len({record.request_id for record in review.known_operation_requests}) == 3
+    assert {record.actionable for record in review.known_operation_requests} == {False}
     assert {record.result_id for record in review.selected_target_proposals} == {first["result_id"]}
-    assert {record.request_id for record in review.selected_operation_requests} == set(first["operation_request_ids"])
+    assert review.selected_operation_requests == ()
 
 
 def test_generated_asset_writes_only_inside_draft_root_with_compare_and_swap(tmp_path: Path) -> None:
@@ -993,9 +1096,19 @@ def test_contained_operation_is_a_bounded_request_not_host_execution(tmp_path: P
     assert request_without_assets["asset_paths"] == []
     with pytest.raises(ValueError):
         contained_operation_request(context, "shell", ["/etc/passwd"], ["run it"])
+    with pytest.raises(ValidationError):
+        ContainedOperationRequestRecord(
+            request_id="operation_" + "a" * 24,
+            specialist="prepare_system_target", tool_call_id="call-1", attempt=1,
+            model="gpt-5.6-luna", operation="probe", asset_paths=(),
+            assertions=("seed reaches parser",), executed=False,
+            provenance="agent_request", trusted_instructions=False, actionable=True,
+        )
 
 
 def test_review_collection_retains_typed_specialist_results_and_operation_requests(tmp_path: Path) -> None:
+    from backend.agents.manager import _decision
+
     context = agent_context(tmp_path)
     collection = CampaignReviewCollection()
     proposal = _target_proposal("known")
@@ -1010,10 +1123,10 @@ def test_review_collection_retains_typed_specialist_results_and_operation_reques
     )
     target_record = collection.record_specialist(invocation, proposal)
     operation_record = collection.record_operation(invocation, request)
-    collection.complete_attempt(invocation, actionable=True)
+    collection.complete_attempt(invocation, accepted=True)
     review = collection.result(CampaignDecision(
         decision="probe target", motivation="proposal is evidence backed", evidence_ids=["known"],
-        bounded_actions=[operation_record.request_id], next_review_condition="after probe",
+        bounded_actions=[target_record.result_id], next_review_condition="after probe",
         uncertainty="probe not run",
     ))
 
@@ -1021,7 +1134,31 @@ def test_review_collection_retains_typed_specialist_results_and_operation_reques
     assert review.known_target_proposals[0].proposal == proposal
     assert review.known_operation_requests[0].request_id == operation_record.request_id
     assert review.known_operation_requests[0].executed is False
-    assert review.selected_action_ids == (operation_record.request_id,)
+    assert review.known_operation_requests[0].actionable is False
+    assert review.selected_operation_requests == ()
+    assert review.selected_action_ids == (target_record.result_id,)
+    with pytest.raises(ValueError, match="not selectable"):
+        collection.result(CampaignDecision(
+            decision="run assertion record", motivation="invalid", evidence_ids=["known"],
+            bounded_actions=[operation_record.request_id], next_review_condition="never",
+            uncertainty="no deterministic executor",
+        ))
+    with pytest.raises(SpecialistValidationError, match="outside this review"):
+        _decision(
+            CampaignDecision(
+                decision="select hidden request", motivation="malicious runner",
+                evidence_ids=["known"], bounded_actions=[operation_record.request_id],
+                next_review_condition="never", uncertainty="not executable",
+            ),
+            frozenset({"known"}), collection.actionable_ids(),
+        )
+
+
+def test_target_proposal_rejects_operation_request_ids_as_evidence() -> None:
+    request_id = "operation_" + "a" * 24
+
+    with pytest.raises(SpecialistValidationError, match="operation-request IDs cannot be evidence"):
+        _validate_target(_target_proposal(request_id), frozenset({request_id}), "system-level")
 
 
 def test_navigation_function_tools_wrap_every_repository_result_as_untrusted(

@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from contextvars import ContextVar
 from pathlib import PurePosixPath
 
-from agents import RunConfig, RunContextWrapper, RunHooks, Runner, function_tool
+from agents import MaxTurnsExceeded, RunConfig, RunContextWrapper, RunHooks, Runner, function_tool
 from agents.agent_tool_input import default_tool_input_builder
 from agents.tool_context import ToolContext
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -18,7 +18,11 @@ from backend.agents.outputs.triage_result import TriageResult
 from backend.agents.specialists.component_target import build_component_target_agent
 from backend.agents.specialists.crash_triage import build_crash_triage_agent
 from backend.agents.specialists.system_target import build_system_target_agent
-from backend.agents.tools.contained_operations import contained_operation_error, contained_operation_request
+from backend.agents.tools.contained_operations import (
+    ContainedOperation,
+    contained_operation_error,
+    contained_operation_request,
+)
 from backend.agents.tools.generated_assets import _relative_path
 from backend.agents.tools.evidence_retrieval import (
     EvidenceLimit,
@@ -48,6 +52,11 @@ _CURRENT_SPECIALIST_INVOCATION: ContextVar[SpecialistInvocation | None] = Contex
 _SPECIALIST_CORRECTION = (
     "Specialist request rejected. Provide one bounded assignment and only evidence IDs supplied "
     "by this review, then call the specialist again."
+)
+_SPECIALIST_TURN_LIMIT = 14
+_SPECIALIST_TURN_LIMIT_CORRECTION = (
+    "Specialist turn budget exhausted without a validated result. Do not select operation-request "
+    "IDs from that attempt; continue with other validated result or action IDs."
 )
 
 
@@ -91,6 +100,16 @@ def _validate_target(output, allowed: frozenset[str], expected_type: str) -> Tar
         )
     if proposal.instance_type != expected_type:
         proposal = proposal.model_copy(update={"instance_type": expected_type})
+    if any(
+        isinstance(value, str)
+        and len(value) == 34
+        and value.startswith("operation_")
+        and all(character in "0123456789abcdef" for character in value[10:])
+        for value in proposal.evidence_ids
+    ):
+        raise SpecialistValidationError(
+            "operation-request IDs cannot be evidence; cite only assigned evidence IDs"
+        )
     _validate_evidence_ids(proposal.evidence_ids, allowed)
     for seed in proposal.seeds:
         _safe_seed_path(seed.path)
@@ -141,7 +160,7 @@ def _tool(
 
     @function_tool(name_override="request_contained_operation", failure_error_function=contained_operation_error)
     async def registered_operation(
-        tool_context: RunContextWrapper[AgentContext], operation: str,
+        tool_context: RunContextWrapper[AgentContext], operation: ContainedOperation,
         asset_paths: list[str], assertions: list[str],
     ) -> dict[str, object]:
         """Retain a typed request for execution by a later deterministic service."""
@@ -227,7 +246,7 @@ def _tool(
             output = validator(getattr(result, "final_output", None), frozenset(validated_ids))
         except (SpecialistValidationError, UnofficialWebCitation) as error:
             validation_error = SpecialistValidationError(str(error))
-            collection.complete_attempt(luna_invocation, actionable=False)
+            collection.complete_attempt(luna_invocation, accepted=False)
             if trace is not None:
                 trace.retry(luna, validation_error, invocation=parent_invocation)
             terra = build("gpt-5.6-terra")
@@ -250,7 +269,8 @@ def _tool(
             try:
                 retry_result = await Runner.run(
                     starting_agent=terra, input=retry_input, context=context,
-                    hooks=specialist_hooks, run_config=run_config,
+                    max_turns=_SPECIALIST_TURN_LIMIT, hooks=specialist_hooks,
+                    run_config=run_config,
                 )
                 if trace is not None:
                     trace.record_result(
@@ -268,13 +288,13 @@ def _tool(
                     }
                 output = validator(getattr(retry_result, "final_output", None), frozenset(validated_ids))
             except (SpecialistValidationError, UnofficialWebCitation) as retry_error:
-                collection.complete_attempt(terra_invocation, actionable=False)
+                collection.complete_attempt(terra_invocation, accepted=False)
                 validation_error = SpecialistValidationError(str(retry_error))
                 if trace is not None:
                     trace.error(terra, validation_error, invocation=parent_invocation)
                 raise validation_error from retry_error
             except Exception as retry_error:
-                collection.complete_attempt(terra_invocation, actionable=False)
+                collection.complete_attempt(terra_invocation, accepted=False)
                 if trace is not None:
                     trace.error(terra, retry_error, invocation=parent_invocation)
                 raise
@@ -284,11 +304,10 @@ def _tool(
         else:
             successful_invocation = luna_invocation
         record = collection.record_specialist(successful_invocation, output)
-        collection.complete_attempt(successful_invocation, actionable=True)
+        collection.complete_attempt(successful_invocation, accepted=True)
         return {
             "result_id": record.result_id,
             "result": output.model_dump(mode="json"),
-            "operation_request_ids": list(collection.operation_ids(successful_invocation)),
         }
 
     def specialist_failure(tool_context, error: Exception):
@@ -298,7 +317,7 @@ def _tool(
             attempt=active_invocation.attempt if active_invocation is not None else 1,
             model=active_invocation.model if active_invocation is not None else "gpt-5.6-luna",
         )
-        collection.complete_attempt(invocation, actionable=False)
+        collection.complete_attempt(invocation, accepted=False)
         if trace is not None:
             trace.error(luna, error, invocation=tool_context)
         try:
@@ -306,6 +325,8 @@ def _tool(
             invalid_envelope = False
         except (ValidationError, ValueError, TypeError):
             invalid_envelope = True
+        if isinstance(error, MaxTurnsExceeded):
+            return _SPECIALIST_TURN_LIMIT_CORRECTION
         if isinstance(error, SpecialistValidationError) or invalid_envelope:
             return _SPECIALIST_CORRECTION
         raise error
@@ -313,7 +334,8 @@ def _tool(
     tool = luna.as_tool(
         tool_name=tool_name, tool_description=description, parameters=SpecialistRequest,
         input_builder=input_builder, include_input_schema=True, custom_output_extractor=output_extractor,
-        hooks=specialist_hooks, failure_error_function=specialist_failure,
+        max_turns=_SPECIALIST_TURN_LIMIT, hooks=specialist_hooks,
+        failure_error_function=specialist_failure,
     )
     invoke_agent_tool = tool.on_invoke_tool
 

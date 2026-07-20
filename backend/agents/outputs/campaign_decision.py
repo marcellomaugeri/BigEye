@@ -13,7 +13,7 @@ class CampaignDecision(BaseModel):
     evidence_ids: list[str] = Field(max_length=64)
     bounded_actions: list[str] = Field(
         max_length=16,
-        description="Result or operation-request IDs returned by specialist tools in this review.",
+        description="Selectable result or application-owned action IDs returned in this review.",
     )
     next_review_condition: str = Field(min_length=1, max_length=1_000)
     uncertainty: str = Field(min_length=1, max_length=2_000)

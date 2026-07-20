@@ -1,6 +1,7 @@
 """Validated requests for deterministic container operations; never a host shell."""
 
 from pathlib import PurePosixPath
+from typing import Literal
 
 from agents import RunContextWrapper, function_tool
 
@@ -8,6 +9,7 @@ from backend.agents.context import AgentContext
 from backend.agents.tools.generated_assets import _relative_path
 
 
+ContainedOperation = Literal["build", "probe", "replay", "coverage"]
 _OPERATIONS = frozenset({"build", "probe", "replay", "coverage"})
 
 
@@ -22,7 +24,7 @@ def contained_operation_error(_context, _error: Exception) -> str:
 
 
 def contained_operation_request(
-    context: AgentContext, operation: str, asset_paths: list[str], assertions: list[str]
+    context: AgentContext, operation: ContainedOperation, asset_paths: list[str], assertions: list[str]
 ) -> dict[str, object]:
     """Validate an operation request for a later deterministic coordinator."""
     if operation not in _OPERATIONS:
@@ -53,7 +55,8 @@ def contained_operation_request(
 
 @function_tool(name_override="request_contained_operation", failure_error_function=contained_operation_error)
 async def request_contained_operation(
-    context: RunContextWrapper[AgentContext], operation: str, asset_paths: list[str], assertions: list[str]
+    context: RunContextWrapper[AgentContext], operation: ContainedOperation,
+    asset_paths: list[str], assertions: list[str],
 ) -> dict[str, object]:
     """Request a bounded build, probe, replay, or coverage job from deterministic services."""
     return contained_operation_request(context.context, operation, asset_paths, assertions)

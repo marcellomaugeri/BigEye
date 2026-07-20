@@ -47,6 +47,98 @@ def test_build_services_creates_real_continuous_project_coordinator(tmp_path) ->
     assert services.project_settings._coordinator_registry is services.recovery
 
 
+def test_manager_selects_target_result_while_operation_requests_remain_audit_only(
+    tmp_path, monkeypatch,
+) -> None:
+    from agents import RunConfig, Runner
+    from agents.tool_context import ToolContext
+
+    from backend.agents.context import AgentContext
+    from backend.agents.manager import CampaignManager
+    from backend.agents.outputs.campaign_decision import CampaignDecision
+    from backend.agents.outputs.target_proposal import TargetProposal
+    from backend.fuzzing.discovery.retrieval import EvidenceRetriever
+    from backend.services.campaigns.decision_executor import DecisionExecutor
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "parser.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    context = AgentContext(
+        7, "a" * 40, repository, tmp_path / "assets", EvidenceRetriever(repository),
+    )
+    proposal = TargetProposal(
+        target_name="parser", instance_type="system-level", byte_path="stdin -> parser",
+        expected_project_reach="parser.c", build_command="clang parser.c -o parser",
+        run_command="/opt/bigeye/parser", seeds=[], configuration="default",
+        sanitizer_plan="ASan and UBSan", generated_asset_intents=[],
+        probe_assertions=["seed reaches parser"], evidence_ids=["source:parser"],
+        uncertainty="not yet probed",
+    )
+
+    class NestedResult:
+        interruptions = []
+        new_items = []
+        raw_responses = []
+        input = "nested"
+        final_output = proposal
+
+        def __init__(self, outer_context):
+            self.agent_tool_invocation = SimpleNamespace(
+                tool_name=outer_context.tool_name,
+                tool_call_id=outer_context.tool_call_id,
+                tool_arguments=outer_context.tool_arguments,
+            )
+
+        def to_input_list(self):
+            return []
+
+    async def nested_runner(starting_agent=None, context=None, **_kwargs):
+        operation = next(
+            tool for tool in starting_agent.tools if tool.name == "request_contained_operation"
+        )
+        arguments = '{"operation":"probe","asset_paths":[],"assertions":["seed reaches parser"]}'
+        await operation.on_invoke_tool(ToolContext(
+            context.context, tool_name=operation.name, tool_call_id="operation-1",
+            tool_arguments=arguments, run_config=RunConfig(), agent=starting_agent,
+        ), arguments)
+        return NestedResult(context)
+
+    monkeypatch.setattr(Runner, "run", nested_runner)
+
+    async def manager_runner(agent, _prompt, **_kwargs):
+        target_tool = next(tool for tool in agent.tools if tool.name == "prepare_system_target")
+        arguments = '{"assignment":"prepare parser","evidence_ids":["source:parser"]}'
+        output = await target_tool.on_invoke_tool(ToolContext(
+            context, tool_name=target_tool.name, tool_call_id="target-1",
+            tool_arguments=arguments, run_config=RunConfig(),
+        ), arguments)
+        assert set(output) == {"result_id", "result"}
+        return SimpleNamespace(
+            final_output=CampaignDecision(
+                decision="prepare parser", motivation="validated target proposal",
+                evidence_ids=["source:parser"], bounded_actions=[output["result_id"]],
+                next_review_condition="after deterministic probe", uncertainty="not probed",
+            ), raw_responses=[], new_items=[],
+        )
+
+    review = run(CampaignManager(runner=manager_runner).review(
+        context, [{"evidence_id": "source:parser", "summary": "parser entry"}],
+        "initial target preparation",
+    ))
+    preparation = AsyncMock(return_value=SimpleNamespace(id=9))
+    executor = DecisionExecutor(SimpleNamespace(prepare=preparation))
+
+    results = run(executor.execute(SimpleNamespace(id=7), review))
+
+    preparation.assert_awaited_once()
+    assert results[0].succeeded is True
+    assert review.selected_target_proposals[0].result_id == review.selected_action_ids[0]
+    assert review.known_action_ids == review.selected_action_ids
+    assert len(review.known_operation_requests) == 1
+    assert review.known_operation_requests[0].actionable is False
+    assert review.selected_operation_requests == ()
+
+
 def test_validated_prepared_target_is_published_and_started(tmp_path) -> None:
     from backend.agents.outputs.campaign_review import TargetProposalRecord
     from backend.agents.outputs.target_proposal import TargetProposal

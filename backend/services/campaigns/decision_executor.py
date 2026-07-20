@@ -8,7 +8,6 @@ from typing import Generic, TypeVar
 
 from backend.agents.outputs.campaign_review import (
     CampaignReviewResult,
-    ContainedOperationRequestRecord,
     ProgressionActionRecord,
     RetirementActionRecord,
     TargetProposalRecord,
@@ -43,9 +42,8 @@ class ActionResult(Generic[ResultValue]):
 class DecisionExecutor:
     """Resolve manager-selected IDs without exposing a shell or Docker client."""
 
-    def __init__(self, target_preparation, bounded_operations=None, campaign_control=None):
+    def __init__(self, target_preparation, campaign_control=None):
         self._target_preparation = target_preparation
-        self._bounded_operations = bounded_operations
         self._campaign_control = campaign_control
 
     async def execute(self, project, decision: CampaignReviewResult) -> list[ActionResult]:
@@ -82,18 +80,6 @@ class DecisionExecutor:
             if isinstance(record, TargetProposalRecord):
                 output = await self._target_preparation.prepare(project, record)
                 return ActionResult(action_id, output)
-            if isinstance(record, ContainedOperationRequestRecord):
-                if (
-                    not record.actionable
-                    or record.executed
-                    or record.provenance != "agent_request"
-                    or record.trusted_instructions
-                ):
-                    raise ValueError("contained operation is not manager-validated for execution")
-                if self._bounded_operations is None:
-                    raise ValueError("no bounded operation service is configured")
-                output = await self._bounded_operations.execute(project, record)
-                return ActionResult(action_id, output)
             if isinstance(record, TriageResultRecord):
                 return ActionResult(action_id, record.triage)
             if isinstance(record, RetirementActionRecord):
@@ -120,7 +106,6 @@ class DecisionExecutor:
         values = (
             *((record.result_id, record) for record in decision.known_target_proposals),
             *((record.result_id, record) for record in decision.known_triage_results),
-            *((record.request_id, record) for record in decision.known_operation_requests),
             *((record.action_id, record) for record in decision.known_retirement_actions),
             *((record.action_id, record) for record in decision.known_progression_actions),
         )
@@ -136,7 +121,6 @@ class DecisionExecutor:
         values = (
             *((record.result_id, record) for record in decision.selected_target_proposals),
             *((record.result_id, record) for record in decision.selected_triage_results),
-            *((record.request_id, record) for record in decision.selected_operation_requests),
             *((record.action_id, record) for record in decision.selected_retirement_actions),
             *((record.action_id, record) for record in decision.selected_progression_actions),
         )

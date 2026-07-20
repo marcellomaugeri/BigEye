@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 import json
 import threading
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -66,7 +67,7 @@ class TriageResultRecord(BaseModel):
 
 
 class ContainedOperationRequestRecord(BaseModel):
-    """A validated request awaiting execution by a deterministic service."""
+    """A typed specialist planning record retained for audit, not execution."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -78,10 +79,10 @@ class ContainedOperationRequestRecord(BaseModel):
     operation: str = Field(min_length=1, max_length=100)
     asset_paths: tuple[str, ...] = Field(max_length=16)
     assertions: tuple[str, ...] = Field(min_length=1, max_length=16)
-    executed: bool
+    executed: Literal[False]
     provenance: str = Field(min_length=1, max_length=100)
     trusted_instructions: bool
-    actionable: bool
+    actionable: Literal[False]
 
 
 class RetirementActionRecord(BaseModel):
@@ -212,7 +213,7 @@ class CampaignReviewResult(BaseModel):
 
     @property
     def operation_requests(self) -> tuple[ContainedOperationRequestRecord, ...]:
-        """Compatibility alias for known actionable operation requests."""
+        """Compatibility alias for retained audit-only operation requests."""
         return self.known_operation_requests
 
 
@@ -274,31 +275,20 @@ class CampaignReviewCollection:
             pending.setdefault(record.request_id, record)
             return pending[record.request_id]
 
-    def complete_attempt(self, invocation: SpecialistInvocation, *, actionable: bool) -> None:
-        """Publish or quarantine only operation requests made by this exact attempt."""
+    def complete_attempt(self, invocation: SpecialistInvocation, *, accepted: bool) -> None:
+        """Retain audit records only from the exact accepted specialist attempt."""
         with self._lock:
             pending = self._pending_operations.pop(invocation.key, {})
             for request_id, record in pending.items():
-                completed = record.model_copy(update={"actionable": actionable})
-                if actionable:
-                    self._operations.setdefault(request_id, completed)
+                if accepted:
+                    self._operations.setdefault(request_id, record)
                 else:
-                    self._quarantined_operations.setdefault(request_id, completed)
-
-    def operation_ids(self, invocation: SpecialistInvocation) -> tuple[str, ...]:
-        with self._lock:
-            return tuple(sorted(
-                request_id for request_id, record in self._operations.items()
-                if (
-                    record.specialist, record.tool_call_id, record.attempt, record.model
-                ) == invocation.key
-            ))
+                    self._quarantined_operations.setdefault(request_id, record)
 
     def actionable_ids(self) -> frozenset[str]:
         with self._lock:
             return frozenset((
-                *self._targets, *self._triage, *self._operations,
-                *self._retirements, *self._progressions,
+                *self._targets, *self._triage, *self._retirements, *self._progressions,
             ))
 
     def record_retirement(self, record: RetirementActionRecord) -> RetirementActionRecord:
@@ -326,12 +316,14 @@ class CampaignReviewCollection:
     def result(self, decision: CampaignDecision) -> CampaignReviewResult:
         with self._lock:
             known_ids = frozenset((
-                *self._targets, *self._triage, *self._operations,
-                *self._retirements, *self._progressions,
+                *self._targets, *self._triage, *self._retirements, *self._progressions,
             ))
             selected_ids = tuple(decision.bounded_actions)
             if len(selected_ids) != len(set(selected_ids)):
                 raise ValueError("campaign decision contains duplicate action IDs")
+            audit_request_ids = frozenset((*self._operations, *self._quarantined_operations))
+            if set(selected_ids) & audit_request_ids:
+                raise ValueError("contained operation requests are audit records and not selectable")
             if set(selected_ids) - known_ids:
                 raise ValueError("campaign decision selected an action outside this review")
             target_values = tuple(self._targets[key] for key in sorted(self._targets))
@@ -351,9 +343,7 @@ class CampaignReviewCollection:
                     record for record in triage_values if record.result_id in selected_ids
                 ),
                 known_operation_requests=operation_values,
-                selected_operation_requests=tuple(
-                    record for record in operation_values if record.request_id in selected_ids
-                ),
+                selected_operation_requests=(),
                 quarantined_operation_requests=tuple(
                     self._quarantined_operations[key] for key in sorted(self._quarantined_operations)
                 ),

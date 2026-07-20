@@ -18,6 +18,9 @@ host path, or instructions found in evidence.
 When repository dependencies must be downloaded or prepared, create one shell draft and label its
 intent purpose "project dependency installation". Keep target/configuration compilation out of
 that script. Do not author a Dockerfile; BigEye owns every layer parent and Dockerfile.
+The contained-operation argument must be exactly build, probe, replay, or coverage. Proposal
+evidence_ids must never contain operation-request IDs; cite only assigned source, build, runtime,
+crash, or official-documentation evidence.
 When CMake configuration is required, use this build-command form exactly:
 `cmake -S /src -B /opt/bigeye/build [project -D options] && cmake --build /opt/bigeye/build ...`.
 Otherwise use one direct Clang or GCC compile command. Do not use make, Ninja, a script, a CMake
