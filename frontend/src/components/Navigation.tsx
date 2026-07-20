@@ -1,8 +1,9 @@
-export type Page = 'projects' | 'overview' | 'source' | 'findings' | 'activity' | 'settings';
+export type Page = 'projects' | 'overview' | 'fuzzing' | 'source' | 'findings' | 'activity' | 'settings';
 
 const pages: { id: Page; label: string }[] = [
   { id: 'projects', label: 'Projects' },
   { id: 'overview', label: 'Overview' },
+  { id: 'fuzzing', label: 'Fuzzing' },
   { id: 'source', label: 'Source' },
   { id: 'findings', label: 'Findings' },
   { id: 'activity', label: 'Activity' },

@@ -8,11 +8,12 @@ import type { Project } from './models/project';
 import type { BigEyeApi } from './services/apiClient';
 import type { ProjectEventStream, ProjectInvalidation } from './services/eventStream';
 import { FindingsView } from './views/FindingsView';
+import type { FindingReproductionModel } from './models/reproduction';
 
 const project: Project = {
   id: '7', repository_url: 'https://github.com/acme/parser.git', requested_revision: 'stable',
   worker_count: 2, commit_sha: 'a'.repeat(40), token_present: false,
-  created_at: '2026-07-20T08:00:00Z', paused_at: null, error: null,
+  created_at: '2026-07-20T08:00:00Z', error: null,
 };
 
 const finding: FindingSummary = {
@@ -47,11 +48,15 @@ const detail: FindingDetail = {
 };
 
 function model(overrides: Partial<FindingsModel> = {}): FindingsModel {
+  const reproduction: FindingReproductionModel = {
+    run: null, output: [], starting: false, error: null, start: vi.fn(),
+  };
   return {
     project, findings: [finding], selectedFindingId: '9', selectedFinding: detail,
     reproducerUrl: '/api/projects/7/findings/9/reproducer', nextCursor: null,
     loading: false, detailLoading: false, error: null, liveError: null,
     onSelectFinding: vi.fn(), onLoadMore: vi.fn(), ...overrides,
+    reproduction,
   };
 }
 
@@ -59,8 +64,8 @@ function apiDouble(overrides: Partial<BigEyeApi> = {}): BigEyeApi {
   return {
     createProject: vi.fn(), listProjects: vi.fn().mockResolvedValue([project]),
     getProject: vi.fn().mockResolvedValue(project), getProjectSettings: vi.fn(), updateProjectSettings: vi.fn(),
-    pauseProject: vi.fn(), resumeProject: vi.fn(), listTasks: vi.fn().mockResolvedValue([]), getTaskLog: vi.fn(),
-    getSettings: vi.fn(), listCampaigns: vi.fn().mockResolvedValue({ project_id: 7, project_paused: false, campaigns: [], assets: [] }),
+    listTasks: vi.fn().mockResolvedValue([]), getTaskLog: vi.fn(),
+    getSettings: vi.fn(), listCampaigns: vi.fn().mockResolvedValue({ project_id: 7, campaigns: [], assets: [] }),
     getCoverageTree: vi.fn().mockResolvedValue({ project_id: 7, commit_sha: project.commit_sha!, files: [], pagination: { limit: 1000, offset: 0, total: 0 } }),
     getSourceFile: vi.fn(), getLineEvidence: vi.fn(),
     retainedTestcaseUrl: vi.fn(),
@@ -103,6 +108,18 @@ describe('Findings', () => {
     await user.click(screen.getByText('Technical evidence'));
     expect(sanitizer).toBeVisible();
     expect(screen.getByText(`sha256:${'c'.repeat(64)}`)).toBeVisible();
+  });
+
+  it('offers read-only reproduction only for deterministic reproduction evidence', async () => {
+    const user = userEvent.setup();
+    const available = model();
+    render(<FindingsView model={available} />);
+    await user.click(screen.getByRole('button', { name: 'Reproduce finding' }));
+    expect(available.reproduction.start).toHaveBeenCalledOnce();
+
+    const unavailableDetail = { ...detail, reproducible: false, replay: { ...detail.replay, matching: 0 } };
+    render(<FindingsView model={model({ selectedFinding: unavailableDetail })} />);
+    expect(screen.getAllByRole('button', { name: 'Reproduce finding' })).toHaveLength(1);
   });
 
   it('links exact source evidence and preserves generic evidence identifiers', () => {

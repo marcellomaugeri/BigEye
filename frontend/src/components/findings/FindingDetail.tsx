@@ -1,4 +1,8 @@
 import type { FindingDetail as FindingDetailModel } from '../../models/finding';
+import type { FindingReproductionModel } from '../../models/reproduction';
+import { Button } from '../design-system/Button';
+import { StatusText } from '../design-system/StatusText';
+import { ReproductionTerminal } from './ReproductionTerminal';
 
 function title(value: string): string {
   return value.length === 0 ? 'Unresolved' : value[0].toUpperCase() + value.slice(1);
@@ -15,9 +19,10 @@ function sourceHref(sourceLocation: string): string | null {
   return `#source?path=${encodeURIComponent(match[1])}&line=${match[2]}`;
 }
 
-export function FindingDetail({ finding, reproducerUrl }: {
+export function FindingDetail({ finding, reproducerUrl, reproduction }: {
   finding: FindingDetailModel | null;
   reproducerUrl: string | null;
+  reproduction: FindingReproductionModel;
 }) {
   if (finding === null) {
     return <section className="finding-detail empty-detail"><p className="muted-copy">Select a finding to inspect its replay evidence.</p></section>;
@@ -27,6 +32,7 @@ export function FindingDetail({ finding, reproducerUrl }: {
     ...(finding.replay.clean_variant ? [finding.replay.clean_variant] : []),
   ];
   const evidenceEvents = new Map(finding.evidence_events.map((event) => [event.evidence_id, event]));
+  const canReproduce = finding.reproducible && finding.replay.matching > 0 && finding.reproducer.sha256.length === 64;
   return <article className="finding-detail">
     <header>
       <div><p className="eyebrow">Priority {finding.priority_rank ?? 'pending'}</p><h2>{title(finding.classification)}</h2></div>
@@ -42,7 +48,14 @@ export function FindingDetail({ finding, reproducerUrl }: {
     {finding.priority_reason && <section><h3>Why this is prioritised</h3><p>{finding.priority_reason}</p></section>}
     <section><h3>Uncertainty</h3><p>{finding.uncertainty}</p></section>
     {finding.repair_intent && <section><h3>Investigation direction</h3><p>{finding.repair_intent}</p></section>}
-    {reproducerUrl && <a className="finding-download" download href={reproducerUrl}>Download minimal reproducer</a>}
+    <div className="finding-actions">
+      {reproducerUrl && <a className="finding-download" download href={reproducerUrl}>Download minimal reproducer</a>}
+      {canReproduce && <Button disabled={reproduction.starting} onClick={() => { void reproduction.start(); }} variant="secondary">
+        {reproduction.starting ? 'Starting reproduction…' : 'Reproduce finding'}
+      </Button>}
+    </div>
+    {reproduction.error && <StatusText tone="error">{reproduction.error}</StatusText>}
+    <ReproductionTerminal output={reproduction.output} run={reproduction.run} />
     <section>
       <h3>Evidence</h3>
       <ul className="evidence-links">{finding.evidence_ids.map((evidenceId) => {

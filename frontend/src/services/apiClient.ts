@@ -2,9 +2,10 @@ import type { CreateProjectRequest, Project } from '../models/project';
 import type { ProjectSettings, Settings, UpdateProjectSettingsRequest } from '../models/settings';
 import type { Task, TaskLog } from '../models/task';
 import type { CampaignList } from '../models/campaign';
-import type { CoverageTree, LineEvidencePage, SourceFile } from '../models/coverage';
+import type { CoverageTree, FunctionCoveragePage, LineEvidencePage, SourceFile } from '../models/coverage';
 import type { ProjectEvent, ProjectEventPage } from '../models/event';
 import type { FindingDetail, FindingPage } from '../models/finding';
+import type { ReproductionRun } from '../models/reproduction';
 
 export interface BigEyeApi {
   createProject(request: CreateProjectRequest): Promise<Project>;
@@ -12,14 +13,13 @@ export interface BigEyeApi {
   getProject(projectId: string): Promise<Project>;
   getProjectSettings(projectId: string): Promise<ProjectSettings>;
   updateProjectSettings(projectId: string, request: UpdateProjectSettingsRequest): Promise<ProjectSettings>;
-  pauseProject(projectId: string): Promise<Project>;
-  resumeProject(projectId: string): Promise<Project>;
   listTasks(projectId: string): Promise<Task[]>;
   getTaskLog(taskId: string, after?: number): Promise<TaskLog>;
   getSettings(): Promise<Settings>;
   listCampaigns(projectId: string): Promise<CampaignList>;
   getCoverageTree(projectId: string): Promise<CoverageTree>;
   getSourceFile(projectId: string, path: string, startLine?: number, endLine?: number): Promise<SourceFile>;
+  getCoverageFunctions(projectId: string, path: string): Promise<FunctionCoveragePage>;
   getLineEvidence(projectId: string, path: string, lineNumber: number): Promise<LineEvidencePage>;
   retainedTestcaseUrl(
     projectId: string, path: string, lineNumber: number,
@@ -28,6 +28,8 @@ export interface BigEyeApi {
   listFindings(projectId: string, cursor?: string): Promise<FindingPage>;
   getFinding(projectId: string, findingId: string): Promise<FindingDetail>;
   findingReproducerUrl(projectId: string, findingId: string): string;
+  startFindingReproduction(projectId: string, findingId: string): Promise<ReproductionRun>;
+  findingReproductionEventsUrl(projectId: string, findingId: string, runId: string): string;
   getProjectLog(
     projectId: string, stream: 'activity' | 'debug', before?: number, limit?: number,
   ): Promise<ProjectEventPage>;
@@ -65,14 +67,6 @@ export class ApiClient implements BigEyeApi {
     });
   }
 
-  pauseProject(projectId: string): Promise<Project> {
-    return this.request(`/api/projects/${encodeURIComponent(projectId)}/pause`, { method: 'POST' });
-  }
-
-  resumeProject(projectId: string): Promise<Project> {
-    return this.request(`/api/projects/${encodeURIComponent(projectId)}/resume`, { method: 'POST' });
-  }
-
   listTasks(projectId: string): Promise<Task[]> {
     return this.request(`/api/projects/${encodeURIComponent(projectId)}/tasks`);
   }
@@ -96,6 +90,11 @@ export class ApiClient implements BigEyeApi {
   getSourceFile(projectId: string, path: string, startLine = 1, endLine = 500): Promise<SourceFile> {
     const query = new URLSearchParams({ path, start_line: String(startLine), end_line: String(endLine) });
     return this.request(`/api/projects/${encodeURIComponent(projectId)}/coverage/source?${query}`);
+  }
+
+  getCoverageFunctions(projectId: string, path: string): Promise<FunctionCoveragePage> {
+    const query = new URLSearchParams({ path });
+    return this.request(`/api/projects/${encodeURIComponent(projectId)}/coverage/functions?${query}`);
   }
 
   getLineEvidence(projectId: string, path: string, lineNumber: number): Promise<LineEvidencePage> {
@@ -126,6 +125,18 @@ export class ApiClient implements BigEyeApi {
   findingReproducerUrl(projectId: string, findingId: string): string {
     return `${this.baseUrl}/api/projects/${encodeURIComponent(projectId)}`
       + `/findings/${encodeURIComponent(findingId)}/reproducer`;
+  }
+
+  startFindingReproduction(projectId: string, findingId: string): Promise<ReproductionRun> {
+    return this.request(
+      `/api/projects/${encodeURIComponent(projectId)}/findings/${encodeURIComponent(findingId)}/reproductions`,
+      { method: 'POST' },
+    );
+  }
+
+  findingReproductionEventsUrl(projectId: string, findingId: string, runId: string): string {
+    return `${this.baseUrl}/api/projects/${encodeURIComponent(projectId)}`
+      + `/findings/${encodeURIComponent(findingId)}/reproductions/${encodeURIComponent(runId)}/events`;
   }
 
   getProjectLog(

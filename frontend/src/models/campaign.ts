@@ -24,11 +24,13 @@ export interface Campaign {
   reached_line_count: number | null;
   unique_line_count: number | null;
   overlapping_line_count: number | null;
+  total_reached_lines: number | null;
+  covered_line_delta_5m: number | null;
+  activity: 'failed' | 'stopped' | 'running' | 'waiting';
 }
 
 export interface CampaignList {
   project_id: number;
-  project_paused: boolean;
   campaigns: Campaign[];
   assets: CampaignAsset[];
 }

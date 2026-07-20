@@ -6,7 +6,6 @@ export interface Project {
   commit_sha: string | null;
   token_present: boolean;
   created_at: string;
-  paused_at: string | null;
   error: string | null;
 }
 

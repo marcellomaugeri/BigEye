@@ -23,7 +23,7 @@ export function FindingsView({ model }: { model: FindingsModel }) {
         </div>
         {model.detailLoading
           ? <section className="finding-detail"><StatusText>Loading replay evidence…</StatusText></section>
-          : <FindingDetail finding={model.selectedFinding} reproducerUrl={model.reproducerUrl} />}
+          : <FindingDetail finding={model.selectedFinding} reproducerUrl={model.reproducerUrl} reproduction={model.reproduction} />}
       </div>}
   </section>;
 }

@@ -12,7 +12,7 @@ import { ActivityView } from './views/ActivityView';
 const project: Project = {
   id: '7', repository_url: 'https://github.com/acme/parser.git', requested_revision: 'stable',
   worker_count: 2, commit_sha: 'a'.repeat(40), token_present: false,
-  created_at: '2026-07-20T08:00:00Z', paused_at: null, error: null,
+  created_at: '2026-07-20T08:00:00Z', error: null,
 };
 
 const activity: ProjectEvent = {
@@ -64,9 +64,9 @@ function model(overrides: Partial<ActivityModel> = {}): ActivityModel {
 function apiDouble(overrides: Partial<BigEyeApi> = {}): BigEyeApi {
   return {
     createProject: vi.fn(), listProjects: vi.fn().mockResolvedValue([project]), getProject: vi.fn().mockResolvedValue(project),
-    getProjectSettings: vi.fn(), updateProjectSettings: vi.fn(), pauseProject: vi.fn(), resumeProject: vi.fn(),
+    getProjectSettings: vi.fn(), updateProjectSettings: vi.fn(),
     listTasks: vi.fn().mockResolvedValue([]), getTaskLog: vi.fn(), getSettings: vi.fn(),
-    listCampaigns: vi.fn().mockResolvedValue({ project_id: 7, project_paused: false, campaigns: [], assets: [] }),
+    listCampaigns: vi.fn().mockResolvedValue({ project_id: 7, campaigns: [], assets: [] }),
     getCoverageTree: vi.fn().mockResolvedValue({ project_id: 7, commit_sha: project.commit_sha!, files: [], pagination: { limit: 1000, offset: 0, total: 0 } }),
     getSourceFile: vi.fn(), getLineEvidence: vi.fn(), listFindings: vi.fn().mockResolvedValue({ items: [], next_cursor: null }),
     retainedTestcaseUrl: vi.fn(),

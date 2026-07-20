@@ -11,12 +11,11 @@ import { OverviewView } from './views/OverviewView';
 const project: Project = {
   id: '7', repository_url: 'https://github.com/acme/parser.git', requested_revision: 'stable',
   worker_count: 2, commit_sha: 'a'.repeat(40), token_present: false,
-  created_at: '2026-07-20T08:00:00Z', paused_at: null, error: null
+  created_at: '2026-07-20T08:00:00Z', error: null
 };
 
 const campaigns = {
   project_id: 7,
-  project_paused: false,
   campaigns: [{
     id: 4, target_asset_id: 31, target_name: 'Parser input path',
     configuration_asset_id: 32, configuration_name: 'Encrypted mode', engine: 'AFL++',
@@ -26,6 +25,7 @@ const campaigns = {
     next_review_reason: 'Coverage is still increasing in the parser.', error: null,
     configuration_purpose: 'Exercise encrypted parser input.', retirement_reason: null,
     reached_line_count: 16, unique_line_count: 12, overlapping_line_count: 4,
+    total_reached_lines: 19, covered_line_delta_5m: 2, activity: 'running' as const,
   }],
   assets: [{ id: 33, kind: 'strategy', name: 'Parser strategy', parent_id: 31 }]
 };
@@ -33,18 +33,22 @@ const campaigns = {
 const coverage = {
   project_id: 7, commit_sha: 'a'.repeat(40),
   files: [
-    { path: 'src/parser/message.c', covered_lines: 12, cpu_exposure_seconds: 5400 },
-    { path: 'src/parser/token.c', covered_lines: 4, cpu_exposure_seconds: 1800 },
-    { path: 'src/io/socket.c', covered_lines: 3, cpu_exposure_seconds: 900 }
+    { path: 'src/parser/message.c', covered_lines: 12, total_lines: 20, covered_functions: 2, total_functions: 3, covered_branches: 4, total_branches: 8, lines: { covered: 12, total: 20, percent: 60 }, functions: { covered: 2, total: 3, percent: 66.67 }, branches: { covered: 4, total: 8, percent: 50 }, cpu_exposure_seconds: 5400 },
+    { path: 'src/parser/token.c', covered_lines: 4, total_lines: 10, covered_functions: null, total_functions: null, covered_branches: null, total_branches: null, lines: { covered: 4, total: 10, percent: 40 }, functions: null, branches: null, cpu_exposure_seconds: 1800 },
+    { path: 'src/io/socket.c', covered_lines: 3, total_lines: 10, covered_functions: null, total_functions: null, covered_branches: null, total_branches: null, lines: { covered: 3, total: 10, percent: 30 }, functions: null, branches: null, cpu_exposure_seconds: 900 }
   ],
+  summary: {
+    lines: { covered: 19, total: 40, percent: 47.5 },
+    functions: null,
+    branches: null,
+  },
   pagination: { limit: 1000, offset: 0, total: 3 }
 };
 
 function viewModel(overrides: Partial<ProjectOverviewModel> = {}): ProjectOverviewModel {
   return {
     project, campaigns, coverage, findingCount: 2, findingsHaveMore: false,
-    loading: false, pauseChanging: false, error: null,
-    onTogglePause: vi.fn(), ...overrides
+    loading: false, error: null, ...overrides
   };
 }
 
@@ -52,13 +56,12 @@ function apiDouble(overrides: Partial<BigEyeApi> = {}): BigEyeApi {
   return {
     createProject: vi.fn(), listProjects: vi.fn().mockResolvedValue([project]),
     getProject: vi.fn().mockResolvedValue(project), getProjectSettings: vi.fn(),
-    updateProjectSettings: vi.fn(), pauseProject: vi.fn().mockResolvedValue({ ...project, paused_at: '2026-07-20T09:00:00Z' }),
-    resumeProject: vi.fn().mockResolvedValue(project), listTasks: vi.fn().mockResolvedValue([]),
+    updateProjectSettings: vi.fn(), listTasks: vi.fn().mockResolvedValue([]),
     getTaskLog: vi.fn(), getSettings: vi.fn(), listCampaigns: vi.fn().mockResolvedValue(campaigns),
-    getCoverageTree: vi.fn().mockResolvedValue(coverage), getSourceFile: vi.fn(), getLineEvidence: vi.fn(),
+    getCoverageTree: vi.fn().mockResolvedValue(coverage), getSourceFile: vi.fn(), getCoverageFunctions: vi.fn(), getLineEvidence: vi.fn(),
     retainedTestcaseUrl: vi.fn(),
     listFindings: vi.fn().mockResolvedValue({ items: [{ id: '1' }, { id: '2' }], next_cursor: null }),
-    getFinding: vi.fn(), findingReproducerUrl: vi.fn(), getProjectLog: vi.fn(), getProjectEvent: vi.fn(),
+    getFinding: vi.fn(), findingReproducerUrl: vi.fn(), startFindingReproduction: vi.fn(), findingReproductionEventsUrl: vi.fn(), getProjectLog: vi.fn(), getProjectEvent: vi.fn(),
     ...overrides
   } as BigEyeApi;
 }
@@ -83,7 +86,10 @@ describe('Overview', () => {
     expect(screen.getByText('2 replayed findings')).toBeVisible();
     expect(screen.getByText('12 covered lines')).toBeVisible();
     expect(screen.getByText('1.5 CPU exposure hours')).toBeVisible();
-    expect(screen.queryByText(/%/)).not.toBeInTheDocument();
+    expect(screen.getByText('19 / 40')).toBeVisible();
+    expect(screen.getByText('47.5%')).toBeVisible();
+    expect(screen.getAllByText('Unavailable')).toHaveLength(2);
+    expect(screen.getByText('1 active heavy job')).toBeVisible();
     expect(screen.queryByText(/gpt-5.6|luna|terra/i)).not.toBeInTheDocument();
 
     const table = screen.getByRole('table', { name: 'Source coverage list' });
@@ -120,14 +126,11 @@ describe('Overview', () => {
     expect(within(evidence).queryByText(/running/i)).not.toBeInTheDocument();
   });
 
-  it('uses the server-backed project pause fact instead of labelling configured campaigns as running', () => {
-    render(<OverviewView model={viewModel({
-      project: { ...project, paused_at: '2026-07-20T09:30:00Z' },
-      campaigns: { ...campaigns, project_paused: true },
-    })} />);
-
-    expect(screen.getAllByText('Paused').length).toBeGreaterThan(0);
-    expect(screen.queryByText(/running/i)).not.toBeInTheDocument();
+  it('does not expose project or campaign lifecycle controls', () => {
+    render(<OverviewView model={viewModel()} />);
+    for (const label of [/pause/i, /resume/i, /stop/i, /restart/i]) {
+      expect(screen.queryByRole('button', { name: label })).not.toBeInTheDocument();
+    }
   });
 
   it('treats absent clean coverage as an empty map without reporting an outage', async () => {
@@ -141,12 +144,28 @@ describe('Overview', () => {
     expect(result.current.error).toBeNull();
   });
 
-  it('preserves the Source route without a selected project', async () => {
+  it('does not request coverage before the repository revision is resolved', async () => {
+    const preparingProject = { ...project, commit_sha: null };
+    const api = apiDouble({
+      getCoverageTree: vi.fn().mockRejectedValue(new Error('coverage not found')),
+    });
+    const events = eventStream();
+    const { result } = renderHook(() => (
+      useProjectOverview(api, events, preparingProject, true, vi.fn())
+    ));
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(api.getCoverageTree).not.toHaveBeenCalled();
+    expect(result.current.error).toBeNull();
+  });
+
+  it('returns to Projects instead of explaining project selection on an empty Source route', async () => {
     window.history.replaceState(null, '', '/#source?path=src%2Fparser.c&line=742');
     render(<App api={apiDouble({ listProjects: vi.fn().mockResolvedValue([]) })} events={eventStream()} />);
 
-    expect(await screen.findByRole('heading', { name: 'Source assurance' })).toBeVisible();
-    expect(screen.getByText('Select or create a project to inspect source assurance.')).toBeVisible();
+    expect(await screen.findByRole('heading', { name: 'Projects' })).toBeVisible();
+    expect(screen.queryByText('Select or create a project to inspect source assurance.')).not.toBeInTheDocument();
     expect(screen.getByRole('navigation', { name: 'Main navigation' })).toBeVisible();
   });
 
@@ -157,7 +176,7 @@ describe('Overview', () => {
     })} events={eventStream()} />);
 
     expect(await screen.findByRole('heading', { name: 'Overview' })).toBeVisible();
-    expect(screen.getByText('BigEye local services are temporarily unavailable.')).toBeVisible();
+    expect(await screen.findByText('BigEye local services are temporarily unavailable.')).toBeVisible();
     expect(screen.queryByText(/500|Request failed/i)).not.toBeInTheDocument();
   });
 
@@ -193,6 +212,25 @@ describe('Overview', () => {
 
     expect(result.current.campaigns?.project_id).toBe(8);
     expect(result.current.campaigns?.campaigns[0].target_name).toBe('Second parser');
+  });
+
+  it('keeps loaded evidence when the selected project facts refresh without changing project', async () => {
+    const api = apiDouble();
+    const events = eventStream();
+    const onProjectChange = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ selected }) => useProjectOverview(api, events, selected, true, onProjectChange),
+      { initialProps: { selected: project } },
+    );
+
+    await waitFor(() => expect(result.current.campaigns).toEqual(campaigns));
+    rerender({ selected: { ...project, worker_count: 3 } });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(result.current.campaigns).toEqual(campaigns);
+    expect(api.listCampaigns).toHaveBeenCalledTimes(1);
+    expect(api.getCoverageTree).toHaveBeenCalledTimes(1);
+    expect(api.listFindings).toHaveBeenCalledTimes(1);
   });
 
   it('refetches only the resource named by SSE invalidation', async () => {

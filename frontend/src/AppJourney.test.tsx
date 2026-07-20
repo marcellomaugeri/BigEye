@@ -13,7 +13,6 @@ const activeProject = {
   commit_sha: 'a'.repeat(40),
   token_present: true,
   created_at: '2026-07-19T10:00:00Z',
-  paused_at: null,
   error: null
 };
 
@@ -34,18 +33,17 @@ function apiDouble(overrides: Record<string, unknown> = {}) {
       worker_count: 4,
       token_present: activeProject.token_present
     }),
-    pauseProject: vi.fn().mockResolvedValue({ ...activeProject, paused_at: '2026-07-19T11:00:00Z' }),
-    resumeProject: vi.fn().mockResolvedValue(activeProject),
     listTasks: vi.fn().mockResolvedValue([]),
     getTaskLog: vi.fn(),
     getSettings: vi.fn().mockResolvedValue({ database: true, docker: false, openai_api_key_present: true, toolchain: true }),
-    listCampaigns: vi.fn().mockResolvedValue({ project_id: 7, project_paused: false, campaigns: [], assets: [] }),
-    getCoverageTree: vi.fn().mockResolvedValue({ project_id: 7, commit_sha: activeProject.commit_sha, files: [], pagination: { limit: 1000, offset: 0, total: 0 } }),
+    listCampaigns: vi.fn().mockResolvedValue({ project_id: 7, campaigns: [], assets: [] }),
+    getCoverageTree: vi.fn().mockResolvedValue({ project_id: 7, commit_sha: activeProject.commit_sha, files: [], summary: { lines: null, functions: null, branches: null }, pagination: { limit: 1000, offset: 0, total: 0 } }),
     getSourceFile: vi.fn(),
+    getCoverageFunctions: vi.fn(),
     getLineEvidence: vi.fn(),
     retainedTestcaseUrl: vi.fn(),
     listFindings: vi.fn().mockResolvedValue({ items: [], next_cursor: null }),
-    getFinding: vi.fn(), findingReproducerUrl: vi.fn(), getProjectLog: vi.fn(), getProjectEvent: vi.fn(),
+    getFinding: vi.fn(), findingReproducerUrl: vi.fn(), startFindingReproduction: vi.fn(), findingReproductionEventsUrl: vi.fn(), getProjectLog: vi.fn(), getProjectEvent: vi.fn(),
     ...overrides
   } as BigEyeApi & Record<string, ReturnType<typeof vi.fn>>;
 }
@@ -63,12 +61,15 @@ function deferred<T>() {
 describe('App journey', () => {
   afterEach(() => { window.history.replaceState(null, '', '/'); });
 
-  it('keeps implementation names out of primary navigation', async () => {
+  it('keeps the application chrome sparse and implementation names out of navigation', async () => {
     render(<App api={apiDouble()} />);
 
     expect(await screen.findByRole('navigation', { name: 'Main navigation' })).toBeVisible();
-    expect(screen.getByText('Continuous assurance')).toBeVisible();
+    expect(screen.getAllByText('BigEye')).toHaveLength(1);
+    expect(screen.queryByText('Continuous assurance')).not.toBeInTheDocument();
+    expect(screen.queryByText('Campaign workspace')).not.toBeInTheDocument();
     expect(screen.queryByText('Repository intelligence')).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Fuzzing' })).toBeVisible();
     for (const label of ['AFL++', 'libFuzzer', 'Luna', 'Terra', 'Docker']) {
       expect(screen.queryByRole('link', { name: label })).not.toBeInTheDocument();
     }
@@ -79,6 +80,7 @@ describe('App journey', () => {
     const user = userEvent.setup();
     render(<App api={api} />);
 
+    await user.click(screen.getByRole('button', { name: 'New project' }));
     await user.type(screen.getByLabelText('Repository URL'), activeProject.repository_url);
     await user.type(screen.getByLabelText('Revision'), 'stable');
     await user.click(screen.getByRole('button', { name: 'Private repository' }));
@@ -93,6 +95,38 @@ describe('App journey', () => {
     expect(await screen.findByRole('heading', { name: 'Overview' })).toBeInTheDocument();
   });
 
+  it('opens project creation in a focus-managed modal and restores focus when dismissed', async () => {
+    const user = userEvent.setup();
+    render(<App api={apiDouble()} />);
+
+    const trigger = await screen.findByRole('button', { name: 'New project' });
+    expect(screen.queryByRole('dialog', { name: 'New project' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Repository URL')).not.toBeInTheDocument();
+
+    await user.click(trigger);
+
+    expect(screen.getByRole('dialog', { name: 'New project' })).toBeVisible();
+    expect(screen.getByLabelText('Repository URL')).toHaveFocus();
+
+    await user.keyboard('{Escape}');
+
+    expect(screen.queryByRole('dialog', { name: 'New project' })).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+
+  it('returns to Projects with exact guidance from every project-dependent page', async () => {
+    const user = userEvent.setup();
+    render(<App api={apiDouble({ listProjects: vi.fn().mockResolvedValue([]) })} />);
+
+    await screen.findByRole('heading', { name: 'Projects' });
+    for (const page of ['Overview', 'Fuzzing', 'Source', 'Findings', 'Activity', 'Settings']) {
+      await user.click(screen.getByRole('link', { name: page }));
+      expect(await screen.findByRole('status')).toHaveTextContent('Select or create a project first.');
+      expect(screen.getByRole('heading', { name: 'Projects' })).toBeVisible();
+      expect(window.location.hash).toBe('#projects');
+    }
+  });
+
   it('keeps revision and commit read-only while saving worker count and a blank token field', async () => {
     const api = apiDouble();
     const user = userEvent.setup();
@@ -104,8 +138,8 @@ describe('App journey', () => {
     expect(screen.getByLabelText('Read-only access token')).toHaveValue('');
     expect(screen.getByText('Token configured')).toBeInTheDocument();
 
-    await user.clear(screen.getByLabelText('Worker count'));
-    await user.type(screen.getByLabelText('Worker count'), '4');
+    await user.clear(screen.getByLabelText('Concurrent jobs'));
+    await user.type(screen.getByLabelText('Concurrent jobs'), '4');
     await user.click(screen.getByRole('button', { name: 'Save settings' }));
 
     expect(api.updateProjectSettings).toHaveBeenCalledWith(activeProject.id, { worker_count: 4 });
@@ -113,7 +147,7 @@ describe('App journey', () => {
 
   it('loads host health with project settings and presents compact local service checks', async () => {
     const api = apiDouble();
-    const { result } = renderHook(() => useProjectSettings(api, activeProject, true, vi.fn()));
+    const { result } = renderHook(() => useProjectSettings(api, activeProject, true));
 
     await waitFor(() => expect(result.current.localServices?.database).toBe(true));
     expect(api.getProjectSettings).toHaveBeenCalledWith('7');
@@ -132,19 +166,14 @@ describe('App journey', () => {
     expect(within(section).queryByText(/sk-|api key/i)).not.toBeInTheDocument();
   });
 
-  it('pauses and resumes the selected project through the API', async () => {
-    const api = apiDouble();
+  it('keeps scheduling autonomous in Settings', async () => {
     const user = userEvent.setup();
-    render(<App api={api} />);
-
+    render(<App api={apiDouble()} />);
     await user.click(screen.getByRole('link', { name: 'Settings' }));
-    await screen.findByRole('button', { name: 'Pause project' });
-    await user.click(screen.getByRole('button', { name: 'Pause project' }));
-    expect(api.pauseProject).toHaveBeenCalledWith(activeProject.id);
-
-    expect(await screen.findByRole('button', { name: 'Resume project' })).toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: 'Resume project' }));
-    expect(api.resumeProject).toHaveBeenCalledWith(activeProject.id);
+    expect(await screen.findByLabelText('Concurrent jobs')).toBeVisible();
+    for (const label of [/pause/i, /resume/i, /stop/i, /restart/i]) {
+      expect(screen.queryByRole('button', { name: label })).not.toBeInTheDocument();
+    }
   });
 
   it('uses a truthful empty state for replayed findings', async () => {
@@ -185,6 +214,7 @@ describe('App journey', () => {
     const user = userEvent.setup();
     render(<App api={api} />);
 
+    await user.click(screen.getByRole('button', { name: 'New project' }));
     await user.type(screen.getByLabelText('Repository URL'), createdProject.repository_url);
     await user.type(screen.getByLabelText('Revision'), createdProject.requested_revision);
     await user.click(screen.getByRole('button', { name: 'Start project' }));
@@ -211,8 +241,8 @@ describe('App journey', () => {
 
     await user.click(screen.getByRole('link', { name: 'Settings' }));
     await screen.findByDisplayValue(String(activeProject.worker_count));
-    await user.clear(screen.getByLabelText('Worker count'));
-    await user.type(screen.getByLabelText('Worker count'), '4');
+    await user.clear(screen.getByLabelText('Concurrent jobs'));
+    await user.type(screen.getByLabelText('Concurrent jobs'), '4');
     await user.click(screen.getByRole('button', { name: 'Save settings' }));
     await user.selectOptions(screen.getByLabelText('Current project'), secondProject.id);
     await waitFor(() => expect(api.getProjectSettings).toHaveBeenCalledWith(secondProject.id));
@@ -221,7 +251,7 @@ describe('App journey', () => {
     expect(await screen.findByDisplayValue('3')).toBeInTheDocument();
     saveA.resolve({ requested_revision: activeProject.requested_revision, commit_sha: activeProject.commit_sha, worker_count: 4, token_present: activeProject.token_present });
 
-    await waitFor(() => expect(screen.getByLabelText('Worker count')).toHaveValue(3));
+    await waitFor(() => expect(screen.getByLabelText('Concurrent jobs')).toHaveValue(3));
   });
 
   it('clears project A settings while project B settings are loading', async () => {
@@ -233,7 +263,7 @@ describe('App journey', () => {
         : secondSettings.promise),
     });
     const { result, rerender } = renderHook(
-      ({ project }) => useProjectSettings(api, project, true, vi.fn()),
+      ({ project }) => useProjectSettings(api, project, true),
       { initialProps: { project: activeProject } },
     );
     await waitFor(() => expect(result.current.workerCount).toBe('2'));
@@ -249,24 +279,4 @@ describe('App journey', () => {
     await waitFor(() => expect(result.current.workerCount).toBe('3'));
   });
 
-  it('ignores delayed pause failure and completion after the selected project changes', async () => {
-    const pauseA = deferred<typeof activeProject>();
-    const secondProject = { ...activeProject, id: '8', repository_url: 'https://example.test/second.git' };
-    const api = apiDouble({ pauseProject: vi.fn().mockReturnValue(pauseA.promise) });
-    const onProjectChange = vi.fn();
-    const { result, rerender } = renderHook(
-      ({ selected }) => useProjectSettings(api, selected, true, onProjectChange),
-      { initialProps: { selected: activeProject } },
-    );
-    await waitFor(() => expect(result.current.settings).not.toBeNull());
-    act(() => { void result.current.setPaused(true); });
-    expect(result.current.saving).toBe(true);
-    rerender({ selected: secondProject });
-    await waitFor(() => expect(api.getProjectSettings).toHaveBeenCalledWith(secondProject.id));
-    pauseA.reject(new Error('stale pause failure'));
-    await act(async () => { await Promise.resolve(); });
-
-    expect(result.current.error).toBeNull();
-    expect(onProjectChange).not.toHaveBeenCalled();
-  });
 });

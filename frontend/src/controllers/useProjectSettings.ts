@@ -3,7 +3,7 @@ import { MAX_WORKER_COUNT, type Project } from '../models/project';
 import type { ProjectSettings, Settings } from '../models/settings';
 import { friendlyApiError, type BigEyeApi } from '../services/apiClient';
 
-export function useProjectSettings(api: BigEyeApi, project: Project | null, enabled: boolean, onProjectChange: (project: Project) => void) {
+export function useProjectSettings(api: BigEyeApi, project: Project | null, enabled: boolean) {
   const [settings, setSettings] = useState<ProjectSettings | null>(null);
   const [localServices, setLocalServices] = useState<Settings | null>(null);
   const [workerCount, setWorkerCount] = useState('');
@@ -101,31 +101,8 @@ export function useProjectSettings(api: BigEyeApi, project: Project | null, enab
     }
   }, [api, project, repositoryToken, settings, workerCount]);
 
-  const setPaused = useCallback(async (paused: boolean) => {
-    if (!project) return;
-    const projectId = project.id;
-    const generation = ++requestGeneration.current;
-    setSaving(true);
-    setError(null);
-    try {
-      const updated = paused ? await api.pauseProject(projectId) : await api.resumeProject(projectId);
-      if (generation !== requestGeneration.current || selectedProjectIdRef.current !== projectId) return;
-      onProjectChange(updated);
-    } catch (requestError) {
-      if (generation === requestGeneration.current && selectedProjectIdRef.current === projectId) {
-        setError(friendlyApiError(
-          requestError, paused ? 'Could not pause the project.' : 'Could not resume the project.',
-        ));
-      }
-    } finally {
-      if (generation === requestGeneration.current && selectedProjectIdRef.current === projectId) {
-        setSaving(false);
-      }
-    }
-  }, [api, onProjectChange, project]);
-
   return {
     settings, localServices, workerCount, repositoryToken, loading, saving, error,
-    setWorkerCount, setRepositoryToken, save, setPaused,
+    setWorkerCount, setRepositoryToken, save,
   };
 }

@@ -14,9 +14,7 @@ export interface ProjectOverviewModel {
   findingCount: number;
   findingsHaveMore: boolean;
   loading: boolean;
-  pauseChanging: boolean;
   error: string | null;
-  onTogglePause: () => void;
 }
 
 export function useProjectOverview(
@@ -31,10 +29,11 @@ export function useProjectOverview(
   const [findingCount, setFindingCount] = useState(0);
   const [findingsHaveMore, setFindingsHaveMore] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [pauseChanging, setPauseChanging] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const generation = useRef(0);
   const selectedProjectId = useRef<string | null>(project?.id ?? null);
+  const projectId = project?.id ?? null;
+  const projectCommit = project?.commit_sha ?? null;
   const onProjectChangeRef = useRef(onProjectChange);
   onProjectChangeRef.current = onProjectChange;
 
@@ -43,10 +42,10 @@ export function useProjectOverview(
   }, []);
 
   useEffect(() => {
-    selectedProjectId.current = project?.id ?? null;
+    selectedProjectId.current = projectId;
     const currentGeneration = ++generation.current;
 
-    if (!enabled || project === null) {
+    if (!enabled || projectId === null) {
       setCampaigns(null);
       setCoverage(null);
       setFindingCount(0);
@@ -56,7 +55,6 @@ export function useProjectOverview(
       return;
     }
 
-    const projectId = project.id;
     const isCurrent = () => generation.current === currentGeneration && selectedProjectId.current === projectId;
     const loadCampaigns = async () => {
       try {
@@ -67,6 +65,7 @@ export function useProjectOverview(
       }
     };
     const loadCoverage = async () => {
+      if (projectCommit === null) return;
       try {
         const value = await api.getCoverageTree(projectId);
         if (isCurrent()) setCoverage(value);
@@ -111,25 +110,10 @@ export function useProjectOverview(
       if (name === 'project') void loadProject();
     });
     return () => unsubscribe();
-  }, [api, enabled, events, project, reportError]);
-
-  const onTogglePause = useCallback(() => {
-    if (!project || pauseChanging) return;
-    const projectId = project.id;
-    setPauseChanging(true);
-    setError(null);
-    const request = project.paused_at === null ? api.pauseProject(projectId) : api.resumeProject(projectId);
-    void request.then((updated) => {
-      if (selectedProjectId.current === projectId) onProjectChangeRef.current(updated);
-    }).catch((requestError: unknown) => {
-      if (selectedProjectId.current === projectId) reportError(requestError);
-    }).finally(() => {
-      if (selectedProjectId.current === projectId) setPauseChanging(false);
-    });
-  }, [api, pauseChanging, project, reportError]);
+  }, [api, enabled, events, projectCommit, projectId, reportError]);
 
   return {
     project, campaigns, coverage, findingCount, findingsHaveMore,
-    loading, pauseChanging, error, onTogglePause,
+    loading, error,
   };
 }

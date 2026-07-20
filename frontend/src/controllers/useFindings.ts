@@ -3,6 +3,8 @@ import type { FindingDetail, FindingSummary } from '../models/finding';
 import type { Project } from '../models/project';
 import { friendlyApiError, type BigEyeApi } from '../services/apiClient';
 import type { ProjectEventStream } from '../services/eventStream';
+import type { FindingReproductionModel } from '../models/reproduction';
+import { useFindingReproduction } from './useFindingReproduction';
 
 const UNAVAILABLE = 'Replayed findings are temporarily unavailable.';
 
@@ -17,6 +19,7 @@ export interface FindingsModel {
   detailLoading: boolean;
   error: string | null;
   liveError: string | null;
+  reproduction: FindingReproductionModel;
   onSelectFinding: (findingId: string) => void;
   onLoadMore: () => void;
 }
@@ -37,6 +40,7 @@ export function useFindings(
   const currentProjectId = useRef<string | null>(project?.id ?? null);
   const selectedIdRef = useRef<string | null>(null);
   const cursorRef = useRef<string | null>(null);
+  const reproduction = useFindingReproduction(api, events, project?.id ?? null, selectedFindingId);
 
   const reportError = useCallback((requestError: unknown) => {
     setError(friendlyApiError(requestError, UNAVAILABLE));
@@ -170,6 +174,6 @@ export function useFindings(
     project, findings, selectedFindingId, selectedFinding,
     reproducerUrl: project && selectedFindingId
       ? api.findingReproducerUrl(project.id, selectedFindingId) : null,
-    nextCursor, loading, detailLoading, error, liveError, onSelectFinding, onLoadMore,
+    nextCursor, loading, detailLoading, error, liveError, onSelectFinding, onLoadMore, reproduction,
   };
 }

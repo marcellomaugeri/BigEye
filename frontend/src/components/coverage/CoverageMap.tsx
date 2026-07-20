@@ -1,4 +1,4 @@
-import type { CoverageFile } from '../../models/coverage';
+import type { CoverageFile, CoverageSummary } from '../../models/coverage';
 
 export function formatCpuExposure(seconds: number): string {
   const hours = seconds / 3600;
@@ -11,7 +11,12 @@ function sourceArea(path: string): string {
   return separator === -1 ? path : path.slice(0, separator);
 }
 
-export function CoverageMap({ files }: { files: CoverageFile[] }) {
+function measurement(value: CoverageSummary['lines']): React.ReactNode {
+  if (value === null) return <dd>Unavailable</dd>;
+  return <dd><strong>{value.covered} / {value.total}</strong><span>{value.percent}%</span></dd>;
+}
+
+export function CoverageMap({ files, summary = null }: { files: CoverageFile[]; summary?: CoverageSummary | null }) {
   const areas = files.reduce<Map<string, CoverageFile[]>>((result, file) => {
     const area = sourceArea(file.path);
     result.set(area, [...(result.get(area) ?? []), file]);
@@ -26,6 +31,12 @@ export function CoverageMap({ files }: { files: CoverageFile[] }) {
       </div>
       <p>{files.length === 0 ? 'No clean coverage has been recorded yet.' : `${files.length} source ${files.length === 1 ? 'file' : 'files'} reached`}</p>
     </div>
+
+    {summary && <dl aria-label="Project coverage totals" className="coverage-totals">
+      <div><dt>Lines</dt>{measurement(summary.lines)}</div>
+      <div><dt>Branches</dt>{measurement(summary.branches)}</div>
+      <div><dt>Functions</dt>{measurement(summary.functions)}</div>
+    </dl>}
 
     {files.length > 0 && <>
       <div aria-label="Source coverage map" className="coverage-map" role="img">

@@ -1,5 +1,4 @@
 import { CoverageMap } from '../components/coverage/CoverageMap';
-import { Button } from '../components/design-system/Button';
 import { EmptyState } from '../components/design-system/EmptyState';
 import { StatusText } from '../components/design-system/StatusText';
 import type { ProjectOverviewModel } from '../controllers/useProjectOverview';
@@ -19,18 +18,13 @@ export function OverviewView({ model }: { model: ProjectOverviewModel }) {
     if (campaign.error) return 'Failed';
     if (campaign.retirement_reason) return 'Retired';
     if (campaign.stopped_at) return 'Stopped';
-    if (model.campaigns?.project_paused) return 'Paused';
     if (campaign.last_heartbeat_at) return `Last observed ${new Date(campaign.last_heartbeat_at).toLocaleString()}`;
     return 'Configured';
   };
+  const activeJobs = campaignEvidence.filter((campaign) => campaign.activity === 'running').length;
 
   return <div className="overview-view">
-    <header className="view-title">
-      <div><p className="eyebrow">Assurance overview</p><h2>Overview</h2></div>
-      <Button disabled={model.pauseChanging} onClick={model.onTogglePause} variant="secondary">
-        {model.project.paused_at === null ? 'Pause project' : 'Resume project'}
-      </Button>
-    </header>
+    <header className="view-title"><div><p className="eyebrow">Assurance overview</p><h2>Overview</h2></div></header>
     {model.error && <StatusText tone="error">{model.error}</StatusText>}
     {model.loading && <StatusText>Loading verified project evidence…</StatusText>}
 
@@ -50,10 +44,11 @@ export function OverviewView({ model }: { model: ProjectOverviewModel }) {
             </details>
           </> : <p>No assurance campaign has been configured yet.</p>}
         </section>
-        <CoverageMap files={model.coverage?.files ?? []} />
+        <CoverageMap files={model.coverage?.files ?? []} summary={model.coverage?.summary ?? null} />
       </div>
 
       <aside className="overview-aside" aria-label="Project assurance summary">
+        <section><p className="eyebrow">Execution</p><h2>{activeJobs} active heavy {activeJobs === 1 ? 'job' : 'jobs'}</h2></section>
         <section>
           <p className="eyebrow">Verified findings</p>
           <h2>{findingLabel}</h2>

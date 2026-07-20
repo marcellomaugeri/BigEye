@@ -10,17 +10,18 @@ import { SourceAssuranceView } from './views/SourceAssuranceView';
 const project: Project = {
   id: '7', repository_url: 'https://github.com/acme/parser.git', requested_revision: 'stable',
   worker_count: 2, commit_sha: 'a'.repeat(40), token_present: false,
-  created_at: '2026-07-20T08:00:00Z', paused_at: null, error: null
+  created_at: '2026-07-20T08:00:00Z', error: null
 };
 
 const campaigns = {
-  project_id: 7, project_paused: false, campaigns: [{
+  project_id: 7, campaigns: [{
     id: 4, target_asset_id: 31, target_name: 'Parser input path', configuration_asset_id: null,
     configuration_name: null, engine: 'component engine', started_at: '2026-07-20T08:00:00Z',
     stopped_at: null, last_heartbeat_at: null, cpu_exposure_seconds: 5400,
     next_review_after: null, next_review_reason: 'Review after coverage plateaus.', error: null,
     configuration_purpose: 'Exercise parser input.', retirement_reason: null,
     reached_line_count: 2, unique_line_count: 2, overlapping_line_count: 0,
+    total_reached_lines: 2, covered_line_delta_5m: null, activity: 'waiting' as const,
   }],
   assets: [
     { id: 33, kind: 'strategy', name: 'Parser strategy', parent_id: 31 },
@@ -30,7 +31,8 @@ const campaigns = {
 
 const tree = {
   project_id: 7, commit_sha: 'a'.repeat(40),
-  files: [{ path: 'src/parser.c', covered_lines: 1, cpu_exposure_seconds: 5400 }],
+  files: [{ path: 'src/parser.c', covered_lines: 1, total_lines: 742, covered_functions: 1, total_functions: 2, covered_branches: 1, total_branches: 2, lines: { covered: 1, total: 742, percent: 0.13 }, functions: { covered: 1, total: 2, percent: 50 }, branches: { covered: 1, total: 2, percent: 50 }, cpu_exposure_seconds: 5400 }],
+  summary: { lines: { covered: 1, total: 742, percent: 0.13 }, functions: { covered: 1, total: 2, percent: 50 }, branches: { covered: 1, total: 2, percent: 50 } },
   pagination: { limit: 1000, offset: 0, total: 1 }
 };
 
@@ -38,23 +40,28 @@ const source = {
   project_id: 7, commit_sha: 'a'.repeat(40), path: 'src/parser.c', start_line: 41, end_line: 43,
   total_lines: 742,
   lines: [
-    { number: 41, text: 'int parse(const char *data) {', covered: true, strategy_count: 1, cpu_exposure_seconds: 1200 },
-    { number: 42, text: '  return decode(data);', covered: true, strategy_count: 2, cpu_exposure_seconds: 5400 },
-    { number: 43, text: '}', covered: false, strategy_count: 0, cpu_exposure_seconds: 0 }
+    { number: 41, text: 'int parse(const char *data) {', covered: true, branches: null, strategy_count: 1, cpu_exposure_seconds: 1200 },
+    { number: 42, text: '  return decode(data);', covered: true, branches: [true, false], strategy_count: 2, cpu_exposure_seconds: 5400 },
+    { number: 43, text: '}', covered: false, branches: [], strategy_count: 0, cpu_exposure_seconds: 0 }
   ]
 };
 
 const lineEvidence = {
   evidence: [
-    { campaign_id: 4, strategy_asset_id: 33, testcase_sha256: 'b'.repeat(64), replay_command: ['/target', '--label=two words', '{input}'], target_asset_id: 31, configuration_asset_id: null, clean_image_id: `sha256:${'c'.repeat(64)}`, cpu_exposure_seconds: 5400 },
-    { campaign_id: 4, strategy_asset_id: 34, testcase_sha256: 'd'.repeat(64), replay_command: ['/socket-target', '{input}'], target_asset_id: 31, configuration_asset_id: null, clean_image_id: `sha256:${'e'.repeat(64)}`, cpu_exposure_seconds: 1800 }
+    { campaign_id: 4, strategy_asset_id: 33, testcase_sha256: 'b'.repeat(64), replay_command: ['/target', '--label=two words', '{input}'], replay_environment: {}, target_asset_id: 31, configuration_asset_id: null, clean_image_id: `sha256:${'c'.repeat(64)}`, cpu_exposure_seconds: 5400 },
+    { campaign_id: 4, strategy_asset_id: 34, testcase_sha256: 'd'.repeat(64), replay_command: ['/socket-target', '{input}'], replay_environment: {}, target_asset_id: 31, configuration_asset_id: null, clean_image_id: `sha256:${'e'.repeat(64)}`, cpu_exposure_seconds: 1800 }
   ],
   pagination: { limit: 500, offset: 0, total: 2 }
 };
 
+const functions = {
+  functions: [{ name: 'decode', path: 'src/parser.c', start_line: 42, start_column: 3, covered: true, covered_lines: 1, cpu_exposure_seconds: 5400 }],
+  pagination: { limit: 1000, offset: 0, total: 1 },
+};
+
 function model(overrides: Partial<SourceAssuranceModel> = {}): SourceAssuranceModel {
   return {
-    project, tree, source, campaigns, evidence: lineEvidence,
+    project, tree, source, functions, campaigns, evidence: lineEvidence,
     selectedPath: 'src/parser.c', selectedLine: 42, strategyFilter: '33',
     loading: false, error: null, onSelectPath: vi.fn(), onSelectLine: vi.fn(),
     onPreviousSourcePage: vi.fn(), onNextSourcePage: vi.fn(),
@@ -65,12 +72,12 @@ function model(overrides: Partial<SourceAssuranceModel> = {}): SourceAssuranceMo
 function apiDouble(overrides: Partial<BigEyeApi> = {}): BigEyeApi {
   return {
     createProject: vi.fn(), listProjects: vi.fn(), getProject: vi.fn(), getProjectSettings: vi.fn(),
-    updateProjectSettings: vi.fn(), pauseProject: vi.fn(), resumeProject: vi.fn(), listTasks: vi.fn(),
+    updateProjectSettings: vi.fn(), listTasks: vi.fn(),
     getTaskLog: vi.fn(), getSettings: vi.fn(), listCampaigns: vi.fn().mockResolvedValue(campaigns),
-    getCoverageTree: vi.fn().mockResolvedValue(tree), getSourceFile: vi.fn().mockResolvedValue(source),
+    getCoverageTree: vi.fn().mockResolvedValue(tree), getSourceFile: vi.fn().mockResolvedValue(source), getCoverageFunctions: vi.fn().mockResolvedValue(functions),
     getLineEvidence: vi.fn().mockResolvedValue(lineEvidence),
     retainedTestcaseUrl: vi.fn().mockReturnValue('/retained/testcase'),
-    getFinding: vi.fn(), findingReproducerUrl: vi.fn(), getProjectLog: vi.fn(), getProjectEvent: vi.fn(),
+    getFinding: vi.fn(), findingReproducerUrl: vi.fn(), startFindingReproduction: vi.fn(), findingReproductionEventsUrl: vi.fn(), getProjectLog: vi.fn(), getProjectEvent: vi.fn(),
     listFindings: vi.fn().mockResolvedValue({ items: [], next_cursor: null }), ...overrides
   } as BigEyeApi;
 }
@@ -101,6 +108,13 @@ describe('Source assurance', () => {
     expect(screen.getByText('b'.repeat(64))).toBeVisible();
     expect(screen.getByText('["/target","--label=two words","{input}"]')).toBeVisible();
     expect(screen.queryByRole('button', { name: /run replay/i })).not.toBeInTheDocument();
+  });
+
+  it('shows reached functions and exact branch state when backend evidence is available', () => {
+    render(<SourceAssuranceView model={model()} />);
+    expect(screen.getByText('decode')).toBeVisible();
+    expect(screen.getByText('1 reached function')).toBeVisible();
+    expect(screen.getByText('Branches 1 / 2')).toBeVisible();
   });
 
   it('generation-guards stale line evidence after keyboard selection changes', async () => {

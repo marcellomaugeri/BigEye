@@ -34,6 +34,7 @@ export function SourceCode({ source, selectedLine, onSelect, onPreviousPage, onN
           <code className="source-line-code">{line.text || ' '}</code>
           <span className="source-line-assurance">
             <span>{line.covered ? 'covered' : 'uncovered'}</span>
+            <small>{line.branches === null ? 'Branches Unavailable' : `Branches ${line.branches.filter(Boolean).length} / ${line.branches.length}`}</small>
             <small>{compactExposure(line.cpu_exposure_seconds)}</small>
           </span>
         </button>

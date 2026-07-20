@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { CampaignList } from '../models/campaign';
-import type { CoverageTree, LineEvidence, LineEvidencePage, SourceFile } from '../models/coverage';
+import type { CoverageTree, FunctionCoveragePage, LineEvidence, LineEvidencePage, SourceFile } from '../models/coverage';
 import type { Project } from '../models/project';
 import { friendlyApiError, type BigEyeApi } from '../services/apiClient';
 import type { ProjectEventStream, ProjectInvalidation } from '../services/eventStream';
@@ -33,6 +33,7 @@ export interface SourceAssuranceModel {
   project: Project | null;
   tree: CoverageTree | null;
   source: SourceFile | null;
+  functions: FunctionCoveragePage | null;
   campaigns: CampaignList | null;
   evidence: LineEvidencePage | null;
   selectedPath: string | null;
@@ -56,6 +57,7 @@ export function useSourceAssurance(
 ): SourceAssuranceModel {
   const [tree, setTree] = useState<CoverageTree | null>(null);
   const [source, setSource] = useState<SourceFile | null>(null);
+  const [functions, setFunctions] = useState<FunctionCoveragePage | null>(null);
   const [campaigns, setCampaigns] = useState<CampaignList | null>(null);
   const [evidence, setEvidence] = useState<LineEvidencePage | null>(null);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
@@ -79,14 +81,19 @@ export function useSourceAssurance(
   ) => {
     const requestGeneration = ++sourceGeneration.current;
     setSource(null);
+    setFunctions(null);
     setEvidence(null);
     try {
-      const value = await api.getSourceFile(projectId, path, startLine, startLine + SOURCE_PAGE_SIZE - 1);
+      const [value, functionPage] = await Promise.all([
+        api.getSourceFile(projectId, path, startLine, startLine + SOURCE_PAGE_SIZE - 1),
+        api.getCoverageFunctions(projectId, path),
+      ]);
       if (
         requestGeneration !== sourceGeneration.current ||
         currentProjectId.current !== projectId || selectedPathRef.current !== path
       ) return;
       setSource(value);
+      setFunctions(functionPage);
       const selected = preferredLine !== null && value.lines.some((line) => line.number === preferredLine)
         ? preferredLine
         : (value.lines.find((line) => line.covered)?.number ?? null);
@@ -126,6 +133,7 @@ export function useSourceAssurance(
     if (!enabled || project === null) {
       setTree(null);
       setSource(null);
+      setFunctions(null);
       setCampaigns(null);
       setEvidence(null);
       setSelectedPath(null);
@@ -185,6 +193,7 @@ export function useSourceAssurance(
 
     setTree(null);
     setSource(null);
+    setFunctions(null);
     setCampaigns(null);
     setEvidence(null);
     selectedPathRef.current = null;
@@ -250,7 +259,7 @@ export function useSourceAssurance(
   }, [loadSource, project, source]);
 
   return {
-    project, tree, source, campaigns, evidence, selectedPath, selectedLine,
+    project, tree, source, functions, campaigns, evidence, selectedPath, selectedLine,
     strategyFilter, loading, error, onSelectPath, onSelectLine,
     onPreviousSourcePage, onNextSourcePage,
     onStrategyFilter: setStrategyFilter,
