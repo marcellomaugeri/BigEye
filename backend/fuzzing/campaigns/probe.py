@@ -68,7 +68,10 @@ class ProbeInvocation:
         markers = self.command.count("{input}") + self.command.count("{stdin}")
         if (
             markers > 1
-            or any("{stdin}" in part and part != "{stdin}" for part in self.command)
+            or any(
+                marker in part and part != marker
+                for part in self.command for marker in ("{input}", "{stdin}")
+            )
             or ("{stdin}" in self.command and self.command[-1] != "{stdin}")
         ):
             raise ValueError("probe command input marker is invalid")
@@ -82,6 +85,48 @@ class ProbeInvocation:
         if not isinstance(self.testcase_bytes, bytes) or len(self.testcase_bytes) > _MAX_TESTCASE_BYTES:
             raise ValueError("probe testcase bytes are invalid")
         object.__setattr__(self, "testcase_sha256", sha256(self.testcase_bytes).hexdigest())
+
+
+def _probe_file_input_path(invocation: ProbeInvocation) -> str:
+    if invocation.role == "empty":
+        if invocation.name != "empty":
+            raise ValueError("probe file input path is invalid")
+        return "/bigeye/target/probe/empty.txt"
+    if invocation.role == "minimum":
+        if invocation.name != "minimum":
+            raise ValueError("probe file input path is invalid")
+        return "/bigeye/target/probe/minimum.txt"
+    prefix = "seed:"
+    if not invocation.name.startswith(prefix):
+        raise ValueError("probe file input path is invalid")
+    relative = invocation.name[len(prefix):]
+    path = PurePosixPath(relative)
+    if (
+        not relative or "\\" in relative or path.is_absolute()
+        or path.as_posix() != relative
+        or any(part in {"", ".", ".."} or part.casefold() == ".git" for part in path.parts)
+    ):
+        raise ValueError("probe file input path is invalid")
+    return f"/src/{relative}"
+
+
+def canonical_probe_replay_command(invocation: ProbeInvocation) -> tuple[str, ...]:
+    """Return one durable replay command from an exact application-owned probe input."""
+
+    if not isinstance(invocation, ProbeInvocation):
+        raise TypeError("probe replay contract requires a ProbeInvocation")
+    command = invocation.command
+    if "{stdin}" in command:
+        return command
+    input_path = _probe_file_input_path(invocation)
+    occurrences = command.count(input_path)
+    if command.count("{input}") == 1:
+        if occurrences:
+            raise ValueError("probe replay contract contains duplicate application input paths")
+        return command
+    if occurrences != 1:
+        raise ValueError("probe replay contract requires one exact application input path")
+    return tuple("{input}" if part == input_path else part for part in command)
 
 
 @dataclass(frozen=True)
@@ -173,6 +218,15 @@ class ProbeRunner:
                 result = await self._bounded_runner.run(
                     image_id, command, timeout, sink,
                     stdin_bytes=invocation.testcase_bytes,
+                    environment=environment,
+                )
+            elif "{input}" in invocation.command:
+                command = [
+                    _probe_file_input_path(invocation) if part == "{input}" else part
+                    for part in canonical_probe_replay_command(invocation)
+                ]
+                result = await self._bounded_runner.run(
+                    image_id, command, timeout, sink,
                     environment=environment,
                 )
             else:

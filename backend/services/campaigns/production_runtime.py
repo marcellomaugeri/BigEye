@@ -28,6 +28,7 @@ from backend.fuzzing.campaigns.coverage_contract import (
     CampaignCoverageContract,
     valid_replay_environment,
 )
+from backend.fuzzing.campaigns.probe import canonical_probe_replay_command
 from backend.fuzzing.campaigns.recovery import (
     CampaignRecovery,
     RecoverableCampaign,
@@ -327,15 +328,10 @@ class CampaignInvocationStore:
         for probe in getattr(prepared, "probe_invocations", ()):
             if getattr(probe, "role", None) != "seed":
                 continue
-            command = tuple(getattr(probe, "command", ()))
-            if not command:
-                raise ValueError("prepared coverage probe has no explicit input")
-            if command[-1] == "{stdin}":
-                commands.append(command)
-            elif command[-1].startswith(("/src/", "/bigeye/target/")):
-                commands.append((*command[:-1], "{input}"))
-            else:
-                raise ValueError("prepared coverage probe has no explicit input")
+            try:
+                commands.append(canonical_probe_replay_command(probe))
+            except (TypeError, ValueError) as error:
+                raise ValueError("prepared coverage probe has no explicit replay contract") from error
         if not commands or len(set(commands)) != 1:
             raise ValueError("prepared coverage probes do not share one replay contract")
         replay_command = commands[0]

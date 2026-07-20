@@ -25,6 +25,7 @@ from backend.agents.tools.generated_assets import (
 from backend.fuzzing.assets.store import AssetStore
 from backend.fuzzing.campaigns.probe import (
     AttestedCoverage,
+    canonical_probe_replay_command,
     CleanCoverageProvenance,
     ProbeInvocation,
     ProbeRunner,
@@ -268,15 +269,7 @@ class PreparedCleanCoverageCollector:
             parent_id = coverage_labels["bigeye.parent-image"]
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError("clean probe layer provenance is incomplete") from error
-        replay_command = list(invocation.command)
-        if not replay_command:
-            raise ValueError("clean probe command is empty")
-        if replay_command[-1] == "{stdin}":
-            pass
-        elif replay_command[-1].startswith(("/bigeye/target/", "/src/")):
-            replay_command[-1] = "{input}"
-        else:
-            raise ValueError("clean probe requires one file or stdin input marker")
+        replay_command = canonical_probe_replay_command(invocation)
         context = self._discovery.context(prepared.project_id)
         root = self._workspace / "projects" / str(prepared.project_id) / "probe-inputs"
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -298,7 +291,7 @@ class PreparedCleanCoverageCollector:
             clean_content_hash=prepared.coverage_manifest.content_hash,
             clean_parent_image_id=parent_id,
             binary_path=replay_command[0],
-            replay_command=tuple(replay_command),
+            replay_command=replay_command,
             cpu_exposure_seconds=0.0,
             repository_root=context.repository_root,
             replay_environment=prepared.replay_environment,
@@ -883,22 +876,17 @@ def _probe_invocations(context, proposal) -> tuple[ProbeInvocation, ...]:
         command = (*command, "{stdin}")
 
     values = [
-        ("empty", "empty", b"", "/bigeye/target/probe/empty.txt"),
-        ("minimum", "minimum", b"0", "/bigeye/target/probe/minimum.txt"),
+        ("empty", "empty", b""),
+        ("minimum", "minimum", b"0"),
     ]
     for seed in proposal.seeds:
         content = _repository_bytes(context.repository_root, seed.path)
-        values.append((f"seed:{seed.path}", "seed", content, f"/src/{seed.path}"))
+        values.append((f"seed:{seed.path}", "seed", content))
     if len(values) == 2:
         raise ValueError("target proposal requires at least one repository seed")
     return tuple(
-        ProbeInvocation(
-            name,
-            role,
-            tuple(actual if part == "{input}" else part for part in command),
-            content,
-        )
-        for name, role, content, actual in values
+        ProbeInvocation(name, role, command, content)
+        for name, role, content in values
     )
 
 

@@ -346,7 +346,9 @@ def test_clean_coverage_contract_survives_restart_and_resolves_exact_validated_a
         target_manifest=SimpleNamespace(labels={"bigeye.target-asset": "31"}),
         probe_invocations=(
             ProbeInvocation(
-                "seed", "seed", ("/opt/bigeye/parser", "--file", "/src/test.seed"), b"seed",
+                "seed:test.seed", "seed",
+                ("/opt/bigeye/parser", "--file", "/src/test.seed", "--mode", "plain"),
+                b"seed",
             ),
         ),
     )
@@ -375,7 +377,9 @@ def test_clean_coverage_contract_survives_restart_and_resolves_exact_validated_a
 
     assert target.clean_image_id == "sha256:" + "c" * 64
     assert target.clean_parent_image_id == IMAGE_ID
-    assert target.replay_command == ("/opt/bigeye/parser", "--file", "{input}")
+    assert target.replay_command == (
+        "/opt/bigeye/parser", "--file", "{input}", "--mode", "plain",
+    )
     assert target.replay_environment == (
         ("ASAN_OPTIONS", "abort_on_error=1:symbolize=0:detect_leaks=0"),
         ("UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1"),
@@ -383,6 +387,49 @@ def test_clean_coverage_contract_survives_restart_and_resolves_exact_validated_a
     assert target.coverage_asset_id == 34
     assert target.repository_root == repository
     assert campaign_root.joinpath("config/coverage.json").is_file()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("/opt/bigeye/parser", "--mode", "plain"),
+        ("/opt/bigeye/parser", "/src/test.seed", "--file", "/src/test.seed"),
+        ("/opt/bigeye/parser", "--file", "{input}", "--also", "/src/test.seed"),
+        ("/opt/bigeye/parser", "--file", "/src/other.seed"),
+    ],
+)
+def test_clean_coverage_publication_rejects_missing_duplicate_or_mismatched_file_paths(
+    tmp_path: Path, command,
+) -> None:
+    from backend.fuzzing.campaigns.probe import ProbeInvocation
+    from backend.services.campaigns.production_runtime import CampaignInvocationStore
+
+    _workspace(tmp_path)
+    prepared = SimpleNamespace(
+        project_id=7,
+        commit_sha=COMMIT,
+        replay_environment=(),
+        coverage_image_id="sha256:" + "c" * 64,
+        coverage_manifest=SimpleNamespace(
+            content_hash="d" * 64,
+            labels={
+                "bigeye.parent-image": IMAGE_ID,
+                "bigeye.configuration-asset-id": "32",
+                "bigeye.coverage-asset-id": "34",
+            },
+        ),
+        target_manifest=SimpleNamespace(labels={"bigeye.target-asset": "31"}),
+        probe_invocations=(
+            ProbeInvocation("seed:test.seed", "seed", command, b"seed"),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="explicit input|replay contract"):
+        asyncio.run(CampaignInvocationStore(tmp_path).publish_coverage(
+            7, 9, COMMIT, prepared,
+        ))
+
+    assert not tmp_path.joinpath("projects/7/campaigns/9/config/coverage.json").exists()
 
 
 def test_clean_coverage_publication_rejects_an_invalid_prepared_environment(
