@@ -24,15 +24,21 @@ class FindingRepository:
         return rows
 
     async def list_page(
-        self, project_id: int, limit: int, before: tuple[datetime, int] | None,
+        self, project_id: int, limit: int, before: tuple[int | None, datetime, int] | None,
     ) -> tuple[list[Finding], bool]:
         if isinstance(project_id, bool) or not isinstance(project_id, int) or project_id <= 0:
             raise ValueError("project ID must be positive")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise ValueError("finding page limit must be between one and one hundred")
-        before_created_at, before_id = before if before is not None else (None, None)
         if before is not None and (
-            not isinstance(before, tuple) or len(before) != 2
+            not isinstance(before, tuple) or len(before) != 3
+        ):
+            raise ValueError("finding cursor boundary is invalid")
+        before_rank, before_created_at, before_id = before if before is not None else (None, None, None)
+        if before is not None and (
+            (before_rank is not None and (
+                isinstance(before_rank, bool) or not isinstance(before_rank, int) or before_rank <= 0
+            ))
             or not isinstance(before_created_at, datetime) or before_created_at.tzinfo is None
             or isinstance(before_id, bool) or not isinstance(before_id, int) or before_id <= 0
         ):
@@ -40,12 +46,19 @@ class FindingRepository:
         rows = await self._pool.fetch(
             """SELECT id, project_id, fingerprint, classification, priority_rank, priority_reason, description,
                       reproducible, occurrence_count, created_at, triaged_at, error
-               FROM findings
+              FROM findings
               WHERE project_id = $1
-                AND ($3::timestamptz IS NULL OR (created_at, id) < ($3::timestamptz, $4::bigint))
-              ORDER BY created_at DESC, id DESC
+                AND (
+                    ($3::bigint IS NULL AND $4::timestamptz IS NULL)
+                    OR COALESCE(priority_rank, 9223372036854775807) > COALESCE($3::bigint, 9223372036854775807)
+                    OR (
+                        COALESCE(priority_rank, 9223372036854775807) = COALESCE($3::bigint, 9223372036854775807)
+                        AND (created_at, id) < ($4::timestamptz, $5::bigint)
+                    )
+                )
+              ORDER BY priority_rank ASC NULLS LAST, created_at DESC, id DESC
               LIMIT $2""",
-            project_id, limit + 1, before_created_at, before_id,
+            project_id, limit + 1, before_rank, before_created_at, before_id,
         )
         has_more = len(rows) > limit
         return [self._finding(row) for row in rows[:limit]], has_more

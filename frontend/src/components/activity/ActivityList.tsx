@@ -1,23 +1,25 @@
-import type { ProjectEvent } from '../../models/event';
+import { eventHasEvidence, type ProjectEvent } from '../../models/event';
 
 function text(payload: Record<string, unknown>, key: string, fallback: string): string {
   return typeof payload[key] === 'string' && payload[key].length > 0 ? payload[key] as string : fallback;
 }
 
 function evidenceHref(evidenceId: string): string {
-  if (evidenceId.startsWith('coverage:')) return '#source';
-  if (evidenceId.startsWith('finding:') || evidenceId.startsWith('crash:')) return '#findings';
-  return '#activity';
+  return `#activity?evidence=${encodeURIComponent(evidenceId)}`;
 }
 
-export function ActivityList({ events }: { events: ProjectEvent[] }) {
+export function ActivityList({ events, focusedEvidenceId = null }: {
+  events: ProjectEvent[];
+  focusedEvidenceId?: string | null;
+}) {
   if (events.length === 0) return <p className="muted-copy">No campaign decisions have been recorded yet.</p>;
   return <ol className="activity-list">
-    {[...events].reverse().map((event) => {
+    {events.map((event) => {
       const evidence = Array.isArray(event.payload.evidence_ids)
         ? event.payload.evidence_ids.filter((item): item is string => typeof item === 'string') : [];
+      const focused = focusedEvidenceId !== null && eventHasEvidence(event, focusedEvidenceId);
       return <li key={event.id}>
-        <article>
+        <article data-evidence-focus={focused ? 'true' : undefined} tabIndex={focused ? -1 : undefined}>
           <time dateTime={event.created_at}>{new Date(event.created_at).toLocaleString()}</time>
           <h2>{text(event.payload, 'decision', 'Campaign activity')}</h2>
           <section><h3>Why BigEye changed this strategy</h3><p>{text(event.payload, 'motivation', 'No structured motivation was recorded.')}</p></section>

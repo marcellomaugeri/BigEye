@@ -35,9 +35,10 @@ class CorruptEventLog(ValueError):
 class EventPage(list[StoredEvent]):
     """A list-compatible event page with the last safely examined cursor."""
 
-    def __init__(self, events=(), next_offset: int = -1):
+    def __init__(self, events=(), next_offset: int = -1, has_more: bool = False):
         super().__init__(events)
         self.next_offset = next_offset
+        self.has_more = has_more
 
 
 class ProjectEventStore:
@@ -89,6 +90,24 @@ class ProjectEventStore:
             return EventPage(next_offset=after)
         try:
             return self._read_records(descriptor, stream, after, limit)
+        finally:
+            os.close(descriptor)
+
+    async def read_latest(self, project_id: int, stream: str, before: int, limit: int) -> EventPage:
+        """Read a public log newest-first, paging backwards from an exclusive byte offset."""
+        self._validate_project_id(project_id)
+        self._validate_stream(stream)
+        if not isinstance(before, int) or isinstance(before, bool) or before < -1:
+            raise ValueError("event offset is invalid")
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ValueError("event limit is invalid")
+        descriptor = self._open_file(project_id, stream, create=False, write=False)
+        if descriptor is None:
+            if before not in (-1, 0):
+                raise InvalidEventCursor("event cursor is not a record boundary")
+            return EventPage(next_offset=0)
+        try:
+            return self._read_latest_records(descriptor, stream, before, limit)
         finally:
             os.close(descriptor)
 
@@ -158,6 +177,60 @@ class ProjectEventStore:
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                     continue
         return EventPage(records, next_offset)
+
+    def _read_latest_records(self, descriptor: int, stream: str, before: int, limit: int) -> EventPage:
+        size = os.fstat(descriptor).st_size
+        boundary = size if before == -1 else before
+        if boundary > size:
+            raise InvalidEventCursor("event cursor is not a record boundary")
+        if boundary > 0 and os.pread(descriptor, 1, boundary - 1) != b"\n":
+            raise InvalidEventCursor("event cursor is not a record boundary")
+        records: list[StoredEvent] = []
+        consumed = 0
+        while boundary > 0 and len(records) < limit:
+            remaining = EVENT_RESPONSE_MAX_BYTES - consumed
+            if remaining <= 0:
+                break
+            start, raw = self._previous_line(descriptor, boundary, remaining)
+            if raw is None:
+                break
+            consumed += len(raw)
+            boundary = start
+            try:
+                value = json.loads(raw.decode("utf-8"))
+                created_at = datetime.fromisoformat(value["created_at"])
+                if value["stream"] != stream:
+                    continue
+                records.append(StoredEvent(start, created_at, value["stream"], value["payload"]))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+        return EventPage(records, boundary if boundary > 0 else 0, boundary > 0)
+
+    @staticmethod
+    def _previous_line(descriptor: int, boundary: int, remaining: int) -> tuple[int, bytes | None]:
+        """Return the complete record ending at boundary using bounded reverse reads."""
+        record_end = boundary - 1
+        cursor = record_end
+        scanned = 0
+        while cursor > 0:
+            chunk_size = min(64 * 1024, cursor, EVENT_RECORD_MAX_BYTES + 1 - scanned, remaining + 1 - scanned)
+            if chunk_size <= 0:
+                return boundary, None
+            chunk_start = cursor - chunk_size
+            chunk = os.pread(descriptor, chunk_size, chunk_start)
+            scanned += len(chunk)
+            newline = chunk.rfind(b"\n")
+            if newline >= 0:
+                start = chunk_start + newline + 1
+                raw = os.pread(descriptor, boundary - start, start)
+                if len(raw) > EVENT_RECORD_MAX_BYTES or len(raw) > remaining or not raw.endswith(b"\n"):
+                    return boundary, None
+                return start, raw
+            cursor = chunk_start
+        raw = os.pread(descriptor, boundary, 0)
+        if len(raw) > EVENT_RECORD_MAX_BYTES or len(raw) > remaining or not raw.endswith(b"\n"):
+            return boundary, None
+        return 0, raw
 
     @staticmethod
     def _read_line(file) -> bytes:

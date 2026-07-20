@@ -1,11 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { ActivityTab, DebugFilter, ProjectEvent } from '../models/event';
+import { eventHasEvidence, type ActivityTab, type DebugFilter, type ProjectEvent } from '../models/event';
 import type { Project } from '../models/project';
 import { friendlyApiError, type BigEyeApi } from '../services/apiClient';
 import type { ProjectEventStream } from '../services/eventStream';
 
 const UNAVAILABLE = 'Campaign activity is temporarily unavailable.';
 const PAGE_SIZE = 100;
+
+function evidenceFromLocation(): string | null {
+  const [page, query = ''] = window.location.hash.slice(1).split('?', 2);
+  if (page !== 'activity') return null;
+  const value = new URLSearchParams(query).get('evidence');
+  return value && value.length <= 2_000 ? value : null;
+}
 
 export interface ActivityModel {
   project: Project | null;
@@ -14,7 +21,10 @@ export interface ActivityModel {
   activeTab: ActivityTab;
   debugFilter: DebugFilter;
   loading: boolean;
-  error: string | null;
+  activityError: string | null;
+  debugError: string | null;
+  liveError: string | null;
+  focusedEvidenceId: string | null;
   activityHasMore: boolean;
   debugHasMore: boolean;
   onTabChange: (tab: ActivityTab) => void;
@@ -33,13 +43,38 @@ export function useActivity(
   const [activityHasMore, setActivityHasMore] = useState(false);
   const [debugHasMore, setDebugHasMore] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [activityError, setActivityError] = useState<string | null>(null);
+  const [debugError, setDebugError] = useState<string | null>(null);
+  const [liveError, setLiveError] = useState<string | null>(null);
+  const [focusedEvidenceId, setFocusedEvidenceId] = useState<string | null>(evidenceFromLocation);
   const generation = useRef(0);
   const currentProjectId = useRef<string | null>(project?.id ?? null);
   const cursors = useRef({ activity: -1, debug: -1 });
 
-  const reportError = useCallback((requestError: unknown) => {
-    setError(friendlyApiError(requestError, UNAVAILABLE));
+  useEffect(() => {
+    const update = () => setFocusedEvidenceId(evidenceFromLocation());
+    update();
+    window.addEventListener('hashchange', update);
+    return () => window.removeEventListener('hashchange', update);
+  }, []);
+
+  useEffect(() => {
+    setFocusedEvidenceId(evidenceFromLocation());
+  }, [enabled]);
+
+  useEffect(() => {
+    if (focusedEvidenceId === null) return;
+    if (activityEvents.some((event) => eventHasEvidence(event, focusedEvidenceId))) {
+      setActiveTab('activity');
+    } else if (debugEvents.some((event) => eventHasEvidence(event, focusedEvidenceId))) {
+      setActiveTab('debug');
+    }
+  }, [activityEvents, debugEvents, focusedEvidenceId]);
+
+  const reportError = useCallback((stream: ActivityTab, requestError: unknown) => {
+    const message = friendlyApiError(requestError, UNAVAILABLE);
+    if (stream === 'activity') setActivityError(message);
+    else setDebugError(message);
   }, []);
 
   useEffect(() => {
@@ -52,7 +87,9 @@ export function useActivity(
       setDebugHasMore(false);
       cursors.current = { activity: -1, debug: -1 };
       setLoading(false);
-      setError(null);
+      setActivityError(null);
+      setDebugError(null);
+      setLiveError(null);
       return;
     }
     const projectId = project.id;
@@ -64,14 +101,15 @@ export function useActivity(
         cursors.current[stream] = page.next_offset;
         if (stream === 'activity') {
           setActivityEvents(page.events);
-          setActivityHasMore(page.events.length === PAGE_SIZE);
+          setActivityHasMore(page.has_more);
+          setActivityError(null);
         } else {
           setDebugEvents(page.events);
-          setDebugHasMore(page.events.length === PAGE_SIZE);
+          setDebugHasMore(page.has_more);
+          setDebugError(null);
         }
-        setError(null);
       } catch (requestError) {
-        if (isCurrent()) reportError(requestError);
+        if (isCurrent()) reportError(stream, requestError);
       }
     };
 
@@ -80,15 +118,18 @@ export function useActivity(
     setActivityHasMore(false);
     setDebugHasMore(false);
     cursors.current = { activity: -1, debug: -1 };
-    setError(null);
+    setActivityError(null);
+    setDebugError(null);
+    setLiveError(null);
     setLoading(true);
     void Promise.allSettled([load('activity'), load('debug')]).finally(() => {
       if (isCurrent()) setLoading(false);
     });
     const unsubscribe = events.subscribe(projectId, (name) => {
+      setLiveError(null);
       if (name === 'activity') void load('activity');
       if (name === 'debug') void load('debug');
-    });
+    }, setLiveError);
     return () => unsubscribe();
   }, [api, enabled, events, project, reportError]);
 
@@ -102,18 +143,21 @@ export function useActivity(
       cursors.current[stream] = page.next_offset;
       if (stream === 'activity') {
         setActivityEvents((current) => [...current, ...page.events]);
-        setActivityHasMore(page.events.length === PAGE_SIZE);
+        setActivityHasMore(page.has_more);
+        setActivityError(null);
       } else {
         setDebugEvents((current) => [...current, ...page.events]);
-        setDebugHasMore(page.events.length === PAGE_SIZE);
+        setDebugHasMore(page.has_more);
+        setDebugError(null);
       }
-    }).catch(reportError).finally(() => {
+    }).catch((requestError) => reportError(stream, requestError)).finally(() => {
       if (generation.current === currentGeneration && currentProjectId.current === projectId) setLoading(false);
     });
   }, [api, loading, project, reportError]);
 
   return {
-    project, activityEvents, debugEvents, activeTab, debugFilter, loading, error,
+    project, activityEvents, debugEvents, activeTab, debugFilter, loading,
+    activityError, debugError, liveError, focusedEvidenceId,
     activityHasMore, debugHasMore, onTabChange: setActiveTab, onDebugFilter: setDebugFilter,
     onLoadMoreActivity: () => loadMore('activity'), onLoadMoreDebug: () => loadMore('debug'),
   };

@@ -1,4 +1,4 @@
-import { render, renderHook, screen, waitFor, within } from '@testing-library/react';
+import { act, render, renderHook, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { App } from './App';
@@ -222,5 +222,30 @@ describe('App journey', () => {
     saveA.resolve({ requested_revision: activeProject.requested_revision, commit_sha: activeProject.commit_sha, worker_count: 4, token_present: activeProject.token_present });
 
     await waitFor(() => expect(screen.getByLabelText('Worker count')).toHaveValue(3));
+  });
+
+  it('clears project A settings while project B settings are loading', async () => {
+    const secondProject = { ...activeProject, id: '8', repository_url: 'https://github.com/acme/second.git' };
+    const secondSettings = deferred<{ requested_revision: string; commit_sha: string | null; worker_count: number; token_present: boolean }>();
+    const api = apiDouble({
+      getProjectSettings: vi.fn((projectId: string) => projectId === activeProject.id
+        ? Promise.resolve({ requested_revision: activeProject.requested_revision, commit_sha: activeProject.commit_sha, worker_count: 2, token_present: true })
+        : secondSettings.promise),
+    });
+    const { result, rerender } = renderHook(
+      ({ project }) => useProjectSettings(api, project, true, vi.fn()),
+      { initialProps: { project: activeProject } },
+    );
+    await waitFor(() => expect(result.current.workerCount).toBe('2'));
+
+    rerender({ project: secondProject });
+    await waitFor(() => expect(api.getProjectSettings).toHaveBeenCalledWith(secondProject.id));
+    expect(result.current.settings).toBeNull();
+    expect(result.current.workerCount).toBe('');
+    await act(async () => { await result.current.save(); });
+    expect(api.updateProjectSettings).not.toHaveBeenCalled();
+
+    secondSettings.resolve({ requested_revision: secondProject.requested_revision, commit_sha: secondProject.commit_sha, worker_count: 3, token_present: false });
+    await waitFor(() => expect(result.current.workerCount).toBe('3'));
   });
 });

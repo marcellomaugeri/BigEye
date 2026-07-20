@@ -5,8 +5,13 @@ function title(value: string): string {
 }
 
 function evidenceHref(evidenceId: string): string {
-  if (evidenceId.startsWith('coverage:')) return '#source';
-  return '#activity';
+  return `#activity?evidence=${encodeURIComponent(evidenceId)}`;
+}
+
+function sourceHref(sourceLocation: string): string | null {
+  const match = /^(.+):([1-9]\d*)$/.exec(sourceLocation);
+  if (!match) return null;
+  return `#source?path=${encodeURIComponent(match[1])}&line=${match[2]}`;
 }
 
 export function FindingDetail({ finding, reproducerUrl }: {
@@ -30,6 +35,7 @@ export function FindingDetail({ finding, reproducerUrl }: {
       <div><dt>Occurrences</dt><dd>{finding.occurrence_count} {finding.occurrence_count === 1 ? 'occurrence' : 'occurrences'}</dd></div>
       <div><dt>Replay</dt><dd>{finding.replay.matching} of {finding.replay.attempts} matching attempts</dd></div>
       <div><dt>Minimal input</dt><dd>{finding.reproducer.size} bytes</dd></div>
+      <div><dt>Reproducer SHA-256</dt><dd><code>{finding.reproducer.sha256}</code></dd></div>
     </dl>
     {finding.priority_reason && <section><h3>Why this is prioritised</h3><p>{finding.priority_reason}</p></section>}
     <section><h3>Uncertainty</h3><p>{finding.uncertainty}</p></section>
@@ -48,7 +54,10 @@ export function FindingDetail({ finding, reproducerUrl }: {
         <div><dt>Result</dt><dd>{variant.crashed ? 'Crashed' : 'Did not crash'}</dd></div>
         {variant.sanitizer && <div><dt>Sanitizer</dt><dd>{variant.sanitizer}</dd></div>}
         {variant.signal && <div><dt>Signal</dt><dd>{variant.signal}</dd></div>}
-        {variant.source_location && <div><dt>Source</dt><dd><code>{variant.source_location}</code></dd></div>}
+        {variant.source_location && <div><dt>Source</dt><dd>{sourceHref(variant.source_location)
+          ? <a href={sourceHref(variant.source_location)!}><code>{variant.source_location}</code></a>
+          : <code>{variant.source_location}</code>}
+        </dd></div>}
         <div><dt>Image</dt><dd><code>{variant.image_id}</code></dd></div>
         {variant.error && <div><dt>Replay error</dt><dd>{variant.error}</dd></div>}
       </dl>)}

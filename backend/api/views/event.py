@@ -19,3 +19,4 @@ class StoredEventResponse(BaseModel):
 class EventLogResponse(BaseModel):
     events: list[StoredEventResponse]
     next_offset: int
+    has_more: bool

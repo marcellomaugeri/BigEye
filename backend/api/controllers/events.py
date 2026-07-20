@@ -16,7 +16,7 @@ async def get_project_log(
     project_id: int,
     stream: Literal["activity", "debug"],
     request: Request,
-    after: int = Query(default=-1, ge=-1),
+    before: int = Query(default=-1, ge=-1),
     limit: int = Query(default=100, ge=1, le=1000),
 ):
     if stream not in {"activity", "debug"}:
@@ -24,10 +24,11 @@ async def get_project_log(
     if await request.app.state.services.projects.get(project_id) is None:
         raise HTTPException(status_code=404, detail="project not found")
     try:
-        events = await request.app.state.services.observability.read(project_id, stream, after, limit)
+        events = await request.app.state.services.observability.read_latest(project_id, stream, before, limit)
     except (ValueError, UnsafeWorkspacePath) as error:
         raise HTTPException(status_code=422, detail="invalid project event log") from error
     return EventLogResponse(
         events=[StoredEventResponse.from_model(event) for event in events],
         next_offset=events.next_offset,
+        has_more=events.has_more,
     )

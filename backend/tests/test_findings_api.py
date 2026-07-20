@@ -139,7 +139,7 @@ def test_findings_list_enforces_limit_and_project_scoped_cursor():
 
     assert first.status_code == 200
     assert continued.status_code == 200
-    assert rows.page_calls[1][2] == (NOW, 5)
+    assert rows.page_calls[1][2] == (1, NOW, 5)
     assert wrong_project.status_code == 422
     assert too_small.status_code == 422
     assert too_large.status_code == 422
@@ -249,7 +249,29 @@ def test_production_services_wire_committed_finding_routes(tmp_path):
     assert response.json() == {"items": [], "next_cursor": None}
     assert isinstance(services.findings, FindingRepository)
     assert isinstance(services.finding_artifacts, FindingArtifactStore)
-    assert pool.fetch_calls[0][1] == (7, 51, None, None)
+    assert pool.fetch_calls[0][1] == (7, 51, None, None, None)
+
+
+def test_repository_pages_by_global_priority_rank_before_creation_time():
+    class Pool:
+        def __init__(self):
+            self.calls = []
+
+        async def fetch(self, query, *arguments):
+            self.calls.append((query, arguments))
+            return []
+
+    from backend.repositories.finding_repository import FindingRepository
+    import asyncio
+
+    pool = Pool()
+    rows, has_more = asyncio.run(FindingRepository(pool).list_page(7, 25, (3, NOW, 5)))
+
+    assert rows == [] and has_more is False
+    query, arguments = pool.calls[0]
+    assert "ORDER BY priority_rank ASC NULLS LAST, created_at DESC, id DESC" in query
+    assert "COALESCE(priority_rank" in query
+    assert arguments == (7, 26, 3, NOW, 5)
 
 
 def test_finding_detail_caps_evidence_identifiers_at_specialist_bound():

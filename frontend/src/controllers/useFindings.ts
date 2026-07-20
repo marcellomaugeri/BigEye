@@ -16,14 +16,9 @@ export interface FindingsModel {
   loading: boolean;
   detailLoading: boolean;
   error: string | null;
+  liveError: string | null;
   onSelectFinding: (findingId: string) => void;
   onLoadMore: () => void;
-}
-
-function priorityOrder(left: FindingSummary, right: FindingSummary): number {
-  const leftRank = left.priority_rank ?? Number.MAX_SAFE_INTEGER;
-  const rightRank = right.priority_rank ?? Number.MAX_SAFE_INTEGER;
-  return leftRank - rightRank || right.created_at.localeCompare(left.created_at);
 }
 
 export function useFindings(
@@ -36,6 +31,7 @@ export function useFindings(
   const [loading, setLoading] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [liveError, setLiveError] = useState<string | null>(null);
   const projectGeneration = useRef(0);
   const detailGeneration = useRef(0);
   const currentProjectId = useRef<string | null>(project?.id ?? null);
@@ -81,12 +77,13 @@ export function useFindings(
       setLoading(false);
       setDetailLoading(false);
       setError(null);
+      setLiveError(null);
       return;
     }
 
     const projectId = project.id;
     const isCurrent = () => generation === projectGeneration.current && currentProjectId.current === projectId;
-    const load = async (append = false) => {
+    const load = async (append = false, refreshSelected = false) => {
       const cursor = append ? cursorRef.current ?? undefined : undefined;
       if (append && cursor === undefined) return;
       setLoading(true);
@@ -95,7 +92,7 @@ export function useFindings(
         if (!isCurrent()) return;
         setFindings((current) => {
           const combined = append ? [...current, ...page.items] : page.items;
-          return [...new Map(combined.map((item) => [item.id, item])).values()].sort(priorityOrder);
+          return [...new Map(combined.map((item) => [item.id, item])).values()];
         });
         cursorRef.current = page.next_cursor;
         setNextCursor(page.next_cursor);
@@ -105,6 +102,7 @@ export function useFindings(
           selectedIdRef.current = retained;
           setSelectedFindingId(retained);
           if (retained === null) setSelectedFinding(null);
+          else if (refreshSelected) void loadDetail(projectId, retained);
         }
         setError(null);
       } catch (requestError) {
@@ -121,10 +119,12 @@ export function useFindings(
     selectedIdRef.current = null;
     cursorRef.current = null;
     setError(null);
+    setLiveError(null);
     void load();
     const unsubscribe = events.subscribe(projectId, (name) => {
-      if (name === 'findings') void load();
-    });
+      setLiveError(null);
+      if (name === 'findings') void load(false, true);
+    }, setLiveError);
     return () => unsubscribe();
   }, [api, enabled, events, project, reportError]);
 
@@ -146,7 +146,7 @@ export function useFindings(
     setLoading(true);
     void api.listFindings(projectId, cursorRef.current).then((page) => {
       if (generation !== projectGeneration.current || currentProjectId.current !== projectId) return;
-      setFindings((current) => [...new Map([...current, ...page.items].map((item) => [item.id, item])).values()].sort(priorityOrder));
+      setFindings((current) => [...new Map([...current, ...page.items].map((item) => [item.id, item])).values()]);
       cursorRef.current = page.next_cursor;
       setNextCursor(page.next_cursor);
     }).catch(reportError).finally(() => {
@@ -158,6 +158,6 @@ export function useFindings(
     project, findings, selectedFindingId, selectedFinding,
     reproducerUrl: project && selectedFindingId
       ? api.findingReproducerUrl(project.id, selectedFindingId) : null,
-    nextCursor, loading, detailLoading, error, onSelectFinding, onLoadMore,
+    nextCursor, loading, detailLoading, error, liveError, onSelectFinding, onLoadMore,
   };
 }

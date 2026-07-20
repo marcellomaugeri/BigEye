@@ -31,10 +31,10 @@ const modelDebug: ProjectEvent = {
   id: 20, created_at: '2026-07-20T09:01:00Z', stream: 'debug',
   payload: {
     event: 'model.end', trace_id: 'trace_abc', parent_id: null,
-    agent: 'Campaign manager', model: 'gpt-5.6-terra', request_id: 'req_1',
+    agent: 'Campaign manager', model: 'gpt-5.6-terra', request_id: 'req_1', response_id: 'resp_1',
     input: { items: [{ role: 'user', content: 'Review the campaign.' }] },
     output: [{ type: 'message', content: 'Continue.' }],
-    usage: { requests: 1, input_tokens: 120, output_tokens: 30, total_tokens: 150 },
+    usage: { requests: 1, input_tokens: 120, output_tokens: 30, total_tokens: 150, cached_tokens: 80, reasoning_tokens: 12 },
     reasoning_summaries: ['Coverage is increasing.'], web_citations: ['https://example.com/reference'],
     command: ['ninja', '-C', 'build'], stdout: 'build complete', stderr: '',
     diff: '--- a/harness.cc\n+++ b/harness.cc', container_id: 'container-123',
@@ -52,7 +52,9 @@ const toolDebug: ProjectEvent = {
 function model(overrides: Partial<ActivityModel> = {}): ActivityModel {
   return {
     project, activityEvents: [activity], debugEvents: [modelDebug, toolDebug],
-    activeTab: 'activity', debugFilter: 'all', loading: false, error: null,
+    activeTab: 'activity', debugFilter: 'all', loading: false,
+    activityError: null, debugError: null, liveError: null,
+    focusedEvidenceId: null,
     activityHasMore: false, debugHasMore: false,
     onTabChange: vi.fn(), onDebugFilter: vi.fn(), onLoadMoreActivity: vi.fn(), onLoadMoreDebug: vi.fn(),
     ...overrides,
@@ -70,7 +72,7 @@ function apiDouble(overrides: Partial<BigEyeApi> = {}): BigEyeApi {
     retainedTestcaseUrl: vi.fn(),
     getFinding: vi.fn(), findingReproducerUrl: vi.fn(),
     getProjectLog: vi.fn((_projectId: string, stream: 'activity' | 'debug') => Promise.resolve(
-      stream === 'activity' ? { events: [activity], next_offset: 10 } : { events: [modelDebug, toolDebug], next_offset: 21 },
+      stream === 'activity' ? { events: [activity], next_offset: 10, has_more: false } : { events: [modelDebug, toolDebug], next_offset: 21, has_more: false },
     )),
     ...overrides,
   } as BigEyeApi;
@@ -113,6 +115,8 @@ describe('Activity and Debug', () => {
     expect(screen.getByText('Advanced local debug evidence')).toBeVisible();
     expect(screen.getByText('model.end')).toBeVisible();
     expect(screen.getByText('120 input tokens')).toBeVisible();
+    expect(screen.getByText('80 cached tokens')).toBeVisible();
+    expect(screen.getByText('12 reasoning tokens')).toBeVisible();
     expect(screen.getByText('ninja -C build')).toBeVisible();
     expect(screen.getByText('build complete')).toBeVisible();
     expect(screen.getByText('https://example.com/reference')).toBeVisible();
@@ -121,6 +125,7 @@ describe('Activity and Debug', () => {
     expect(modelName).not.toBeVisible();
     await user.click(screen.getAllByText('Technical metadata')[0]);
     expect(modelName).toBeVisible();
+    expect(screen.getByText('resp_1')).toBeVisible();
 
     const raw = screen.getAllByText('Raw sanitized JSON')[0];
     await user.click(raw);
@@ -135,6 +140,49 @@ describe('Activity and Debug', () => {
     expect(screen.queryByText('model.end')).not.toBeInTheDocument();
   });
 
+  it('categorises model requests as API activity', () => {
+    render(<ActivityView model={model({ activeTab: 'debug', debugFilter: 'api' })} />);
+
+    expect(screen.getByText('model.end')).toBeVisible();
+    expect(screen.queryByText('tool.end')).not.toBeInTheDocument();
+  });
+
+  it('renders activity records newest first without reversing the server page', () => {
+    const older = { ...activity, id: 9, payload: { ...activity.payload, decision: 'Older decision' } };
+    const newer = { ...activity, id: 11, payload: { ...activity.payload, decision: 'Newer decision' } };
+    render(<ActivityView model={model({ activityEvents: [newer, older] })} />);
+
+    expect([...document.querySelectorAll('.activity-list h2')].map((node) => node.textContent)).toEqual([
+      'Newer decision', 'Older decision',
+    ]);
+  });
+
+  it('selects and marks the stream record addressed by the evidence query', async () => {
+    const debugEvidence = {
+      ...modelDebug,
+      payload: { ...modelDebug.payload, evidence_ids: ['replay:clean'] },
+    };
+    window.history.replaceState(null, '', '/#activity?evidence=replay%3Aclean');
+    const api = apiDouble({
+      getProjectLog: vi.fn((_projectId: string, stream: 'activity' | 'debug') => Promise.resolve(
+        stream === 'activity'
+          ? { events: [activity], next_offset: 0, has_more: false }
+          : { events: [debugEvidence], next_offset: 0, has_more: false },
+      )),
+    });
+    const { result } = renderHook(() => useActivity(api, idleEvents, project, true));
+
+    await waitFor(() => expect(result.current.activeTab).toBe('debug'));
+    expect(result.current.focusedEvidenceId).toBe('replay:clean');
+
+    render(<ActivityView model={model({
+      activeTab: 'debug', debugEvents: [debugEvidence], focusedEvidenceId: 'replay:clean',
+    })} />);
+    const focused = screen.getByText('model.end').closest('article');
+    expect(focused).toHaveAttribute('data-evidence-focus', 'true');
+    expect(focused).toHaveFocus();
+  });
+
   it('keeps the Activity route reachable without a selected project', async () => {
     window.history.replaceState(null, '', '/#activity');
     render(<App api={apiDouble({ listProjects: vi.fn().mockResolvedValue([]) })} events={idleEvents} />);
@@ -145,11 +193,51 @@ describe('Activity and Debug', () => {
 
   it('does not describe unavailable activity as a genuinely empty history', () => {
     render(<ActivityView model={model({
-      activityEvents: [], debugEvents: [], error: 'Campaign activity is temporarily unavailable.',
+      activityEvents: [], debugEvents: [], activityError: 'Campaign activity is temporarily unavailable.',
     })} />);
 
     expect(screen.getByText('Campaign activity is temporarily unavailable.')).toBeVisible();
     expect(screen.queryByText('No campaign decisions have been recorded yet.')).not.toBeInTheDocument();
+  });
+
+  it('keeps stream failures independent and surfaces live update failures', async () => {
+    let reportLiveError!: (message: string) => void;
+    const events: ProjectEventStream = {
+      subscribe: vi.fn((_projectId, _onEvent, onError) => {
+        reportLiveError = onError!;
+        return () => undefined;
+      }),
+    };
+    const api = apiDouble({
+      getProjectLog: vi.fn((_projectId: string, stream: 'activity' | 'debug') => stream === 'activity'
+        ? Promise.reject(new Error('unavailable'))
+        : Promise.resolve({ events: [modelDebug], next_offset: 20, has_more: false })),
+    });
+    const { result } = renderHook(() => useActivity(api, events, project, true));
+
+    await waitFor(() => expect(result.current.activityError).toBe('Campaign activity is temporarily unavailable.'));
+    expect(result.current.debugError).toBeNull();
+    expect(result.current.debugEvents).toEqual([modelDebug]);
+    act(() => reportLiveError('Live updates are temporarily unavailable.'));
+    expect(result.current.liveError).toBe('Live updates are temporarily unavailable.');
+  });
+
+  it('uses the truthful server cursor and has-more flag when loading older records', async () => {
+    const older = { ...activity, id: 5 };
+    const getProjectLog = vi.fn((_projectId: string, stream: 'activity' | 'debug', before: number) => {
+      if (stream === 'debug') return Promise.resolve({ events: [], next_offset: 0, has_more: false });
+      return Promise.resolve(before === -1
+        ? { events: [activity], next_offset: 10, has_more: true }
+        : { events: [older], next_offset: 0, has_more: false });
+    });
+    const api = apiDouble({ getProjectLog });
+    const { result } = renderHook(() => useActivity(api, idleEvents, project, true));
+    await waitFor(() => expect(result.current.activityHasMore).toBe(true));
+
+    act(() => result.current.onLoadMoreActivity());
+    await waitFor(() => expect(result.current.activityEvents).toEqual([activity, older]));
+    expect(getProjectLog).toHaveBeenCalledWith('7', 'activity', 10, 100);
+    expect(result.current.activityHasMore).toBe(false);
   });
 
   it('refetches only the named activity or debug resource', async () => {

@@ -45,7 +45,7 @@ describe('ApiClient source assurance boundaries', () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(Response.json({ items: [], next_cursor: null }))
       .mockResolvedValueOnce(Response.json({ id: '9' }))
-      .mockResolvedValueOnce(Response.json({ events: [], next_offset: -1 }));
+      .mockResolvedValueOnce(Response.json({ events: [], next_offset: -1, has_more: false }));
     vi.stubGlobal('fetch', fetchMock);
     const api = new ApiClient('http://127.0.0.1:8000');
 
@@ -56,7 +56,7 @@ describe('ApiClient source assurance boundaries', () => {
     expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
       'http://127.0.0.1:8000/api/projects/project%2F7/findings?cursor=cursor+value',
       'http://127.0.0.1:8000/api/projects/project%2F7/findings/finding%2F9',
-      'http://127.0.0.1:8000/api/projects/project%2F7/logs/debug?after=12&limit=50',
+      'http://127.0.0.1:8000/api/projects/project%2F7/logs/debug?before=12&limit=50',
     ]);
     expect(api.findingReproducerUrl('project/7', 'finding/9')).toBe(
       'http://127.0.0.1:8000/api/projects/project%2F7/findings/finding%2F9/reproducer',

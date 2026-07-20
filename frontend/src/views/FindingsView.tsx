@@ -11,6 +11,7 @@ export function FindingsView({ model }: { model: FindingsModel }) {
   }
   return <section aria-labelledby="findings-heading" className="findings-view">
     <header className="view-title"><div><p className="eyebrow">Deterministic crash evidence</p><h2 id="findings-heading">Findings</h2></div></header>
+    {model.liveError && <StatusText tone="error">{model.liveError}</StatusText>}
     {model.error && <StatusText tone="error">{model.error}</StatusText>}
     {model.loading && <StatusText>Loading replayed findings…</StatusText>}
     {!model.loading && model.error === null && model.findings.length === 0

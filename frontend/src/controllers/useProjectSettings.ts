@@ -13,10 +13,16 @@ export function useProjectSettings(api: BigEyeApi, project: Project | null, enab
   const [error, setError] = useState<string | null>(null);
   const requestGeneration = useRef(0);
   const selectedProjectIdRef = useRef<string | null>(project?.id ?? null);
+  const settingsProjectIdRef = useRef<string | null>(null);
   selectedProjectIdRef.current = project?.id ?? null;
 
   const load = useCallback(async (projectId: string) => {
     const generation = ++requestGeneration.current;
+    settingsProjectIdRef.current = null;
+    setSettings(null);
+    setWorkerCount('');
+    setRepositoryToken('');
+    setLocalServices(null);
     setLoading(true);
     setError(null);
     try {
@@ -25,6 +31,7 @@ export function useProjectSettings(api: BigEyeApi, project: Project | null, enab
       ]);
       if (generation !== requestGeneration.current) return;
       if (projectResult.status === 'fulfilled') {
+        settingsProjectIdRef.current = projectId;
         setSettings(projectResult.value);
         setWorkerCount(String(projectResult.value.worker_count));
         setRepositoryToken('');
@@ -49,13 +56,23 @@ export function useProjectSettings(api: BigEyeApi, project: Project | null, enab
   }, [api]);
 
   useEffect(() => {
-    if (!enabled || !project) return;
+    if (!enabled || !project) {
+      requestGeneration.current += 1;
+      settingsProjectIdRef.current = null;
+      setSettings(null);
+      setLocalServices(null);
+      setWorkerCount('');
+      setRepositoryToken('');
+      setLoading(false);
+      setSaving(false);
+      return;
+    }
     setSaving(false);
     void load(project.id);
   }, [enabled, load, project]);
 
   const save = useCallback(async () => {
-    if (!project || !settings) return;
+    if (!project || !settings || settingsProjectIdRef.current !== project.id) return;
     const workerCountValue = Number(workerCount);
     if (!Number.isInteger(workerCountValue) || workerCountValue <= 0 || workerCountValue > MAX_WORKER_COUNT) {
       setError('Worker count must be a positive whole number.');

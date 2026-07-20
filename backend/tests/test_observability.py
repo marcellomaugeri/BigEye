@@ -184,6 +184,39 @@ def test_page_cursor_at_eof_still_receives_a_later_append(tmp_path: Path, stream
     assert [event.payload["message"] for event in later] == ["second"]
 
 
+def test_public_event_pages_are_newest_first_and_page_towards_older_records(tmp_path: Path) -> None:
+    from backend.services.observability.event_store import ProjectEventStore
+
+    store = ProjectEventStore(tmp_path)
+    first = run(store.append(7, "activity", {"message": "first"}))
+    second = run(store.append(7, "activity", {"message": "second"}))
+    third = run(store.append(7, "activity", {"message": "third"}))
+
+    newest = run(store.read_latest(7, "activity", -1, 2))
+    older = run(store.read_latest(7, "activity", newest.next_offset, 2))
+
+    assert [event.id for event in newest] == [third.id, second.id]
+    assert newest.has_more is True
+    assert newest.next_offset == second.id
+    assert [event.id for event in older] == [first.id]
+    assert older.has_more is False
+    assert older.next_offset == 0
+
+
+def test_public_event_page_refresh_restarts_at_the_newest_record(tmp_path: Path) -> None:
+    from backend.services.observability.event_store import ProjectEventStore
+
+    store = ProjectEventStore(tmp_path)
+    run(store.append(7, "debug", {"message": "first"}))
+    initial = run(store.read_latest(7, "debug", -1, 100))
+    latest = run(store.append(7, "debug", {"message": "latest"}))
+
+    refreshed = run(store.read_latest(7, "debug", -1, 100))
+
+    assert [event.id for event in initial] != [event.id for event in refreshed]
+    assert refreshed[0].id == latest.id
+
+
 def test_event_log_read_stays_bounded_and_at_record_boundaries(tmp_path: Path, monkeypatch) -> None:
     from backend.services.observability import event_store
     from backend.services.observability.event_store import ProjectEventStore
@@ -343,6 +376,7 @@ def test_activity_and_debug_query_routes_exclude_internal_events(tmp_path: Path)
         run(get_project_log(7, "events", request, -1, 100))
 
     assert activity.events[0].payload["repository_token"] == "[REDACTED]"
+    assert activity.has_more is False
     assert error.value.status_code == 422
 
 

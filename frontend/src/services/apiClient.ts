@@ -29,7 +29,7 @@ export interface BigEyeApi {
   getFinding(projectId: string, findingId: string): Promise<FindingDetail>;
   findingReproducerUrl(projectId: string, findingId: string): string;
   getProjectLog(
-    projectId: string, stream: 'activity' | 'debug', after?: number, limit?: number,
+    projectId: string, stream: 'activity' | 'debug', before?: number, limit?: number,
   ): Promise<ProjectEventPage>;
 }
 
@@ -128,9 +128,9 @@ export class ApiClient implements BigEyeApi {
   }
 
   getProjectLog(
-    projectId: string, stream: 'activity' | 'debug', after = -1, limit = 100,
+    projectId: string, stream: 'activity' | 'debug', before = -1, limit = 100,
   ): Promise<ProjectEventPage> {
-    const query = new URLSearchParams({ after: String(after), limit: String(limit) });
+    const query = new URLSearchParams({ before: String(before), limit: String(limit) });
     return this.request(
       `/api/projects/${encodeURIComponent(projectId)}/logs/${stream}?${query}`,
     );

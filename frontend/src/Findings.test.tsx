@@ -47,7 +47,7 @@ function model(overrides: Partial<FindingsModel> = {}): FindingsModel {
   return {
     project, findings: [finding], selectedFindingId: '9', selectedFinding: detail,
     reproducerUrl: '/api/projects/7/findings/9/reproducer', nextCursor: null,
-    loading: false, detailLoading: false, error: null,
+    loading: false, detailLoading: false, error: null, liveError: null,
     onSelectFinding: vi.fn(), onLoadMore: vi.fn(), ...overrides,
   };
 }
@@ -64,7 +64,7 @@ function apiDouble(overrides: Partial<BigEyeApi> = {}): BigEyeApi {
     listFindings: vi.fn().mockResolvedValue({ items: [finding], next_cursor: null }),
     getFinding: vi.fn().mockResolvedValue(detail),
     findingReproducerUrl: vi.fn().mockReturnValue('/api/projects/7/findings/9/reproducer'),
-    getProjectLog: vi.fn().mockResolvedValue({ events: [], next_offset: -1 }),
+    getProjectLog: vi.fn().mockResolvedValue({ events: [], next_offset: -1, has_more: false }),
     ...overrides,
   } as BigEyeApi;
 }
@@ -93,11 +93,33 @@ describe('Findings', () => {
     expect(screen.getByRole('link', { name: 'Download minimal reproducer' })).toHaveAttribute(
       'href', '/api/projects/7/findings/9/reproducer',
     );
+    expect(screen.getByText('b'.repeat(64))).toBeVisible();
     const sanitizer = screen.getByText('AddressSanitizer');
     expect(sanitizer).not.toBeVisible();
     await user.click(screen.getByText('Technical evidence'));
     expect(sanitizer).toBeVisible();
     expect(screen.getByText(`sha256:${'c'.repeat(64)}`)).toBeVisible();
+  });
+
+  it('links exact source evidence and preserves generic evidence identifiers', () => {
+    render(<FindingsView model={model()} />);
+
+    expect(screen.getByRole('link', { name: 'coverage:src/parser.c:42' })).toHaveAttribute(
+      'href', '#activity?evidence=coverage%3Asrc%2Fparser.c%3A42',
+    );
+    expect(screen.getByRole('link', { name: 'crash:sha256:abc' })).toHaveAttribute(
+      'href', '#activity?evidence=crash%3Asha256%3Aabc',
+    );
+  });
+
+  it('deep-links a validated replay source location rather than guessing from an evidence ID', async () => {
+    const user = userEvent.setup();
+    render(<FindingsView model={model()} />);
+
+    await user.click(screen.getByText('Technical evidence'));
+    for (const link of screen.getAllByRole('link', { name: 'src/parser.c:42' })) {
+      expect(link).toHaveAttribute('href', '#source?path=src%2Fparser.c&line=42');
+    }
   });
 
   it('keeps the Findings route reachable without a selected project', async () => {
@@ -153,10 +175,46 @@ describe('Findings', () => {
     const api = apiDouble();
     renderHook(() => useFindings(api, events, project, true));
     await waitFor(() => expect(api.listFindings).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(api.getFinding).toHaveBeenCalledTimes(1));
 
     act(() => invalidate('activity'));
     expect(api.listFindings).toHaveBeenCalledTimes(1);
     act(() => invalidate('findings'));
     await waitFor(() => expect(api.listFindings).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(api.getFinding).toHaveBeenCalledTimes(2));
+  });
+
+  it('preserves the backend priority order across pages', async () => {
+    const second = { ...finding, id: '10', priority_rank: 2, created_at: '2026-07-20T11:00:00Z' };
+    const third = { ...finding, id: '11', priority_rank: 3, created_at: '2026-07-20T12:00:00Z' };
+    const api = apiDouble({
+      listFindings: vi.fn()
+        .mockResolvedValueOnce({ items: [finding, second], next_cursor: 'older' })
+        .mockResolvedValueOnce({ items: [third], next_cursor: null }),
+    });
+    const { result } = renderHook(() => useFindings(api, idleEvents, project, true));
+    await waitFor(() => expect(result.current.nextCursor).toBe('older'));
+
+    act(() => result.current.onLoadMore());
+    await waitFor(() => expect(result.current.findings).toHaveLength(3));
+    expect(result.current.findings.map((item) => item.id)).toEqual(['9', '10', '11']);
+  });
+
+  it('surfaces findings live-update loss without discarding retained findings', async () => {
+    let reportLiveError!: (message: string) => void;
+    const events: ProjectEventStream = {
+      subscribe: vi.fn((_projectId, _onEvent, onError) => {
+        reportLiveError = onError!;
+        return () => undefined;
+      }),
+    };
+    const api = apiDouble();
+    const { result } = renderHook(() => useFindings(api, events, project, true));
+    await waitFor(() => expect(result.current.findings).toEqual([finding]));
+
+    act(() => reportLiveError('Live updates are temporarily unavailable.'));
+
+    expect(result.current.liveError).toBe('Live updates are temporarily unavailable.');
+    expect(result.current.findings).toEqual([finding]);
   });
 });

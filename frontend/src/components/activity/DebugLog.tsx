@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { DebugFilter, ProjectEvent } from '../../models/event';
+import { eventHasEvidence, type DebugFilter, type ProjectEvent } from '../../models/event';
 
 const filters: Array<{ value: DebugFilter; label: string }> = [
   { value: 'all', label: 'All debug evidence' }, { value: 'agent', label: 'Agent calls' },
@@ -20,7 +20,7 @@ function category(event: ProjectEvent): DebugFilter {
   if (name.includes('coverage')) return 'coverage';
   if (name.includes('fuzz')) return 'fuzzer';
   if (name.includes('build')) return 'build';
-  if (name.includes('api')) return 'api';
+  if (name.startsWith('model.') || name.includes('api')) return 'api';
   return 'agent';
 }
 
@@ -37,6 +37,7 @@ function usageText(value: unknown): string[] {
   const usage = value as Record<string, unknown>;
   const labels = [
     ['input_tokens', 'input tokens'], ['output_tokens', 'output tokens'],
+    ['cached_tokens', 'cached tokens'], ['reasoning_tokens', 'reasoning tokens'],
     ['total_tokens', 'total tokens'], ['requests', 'requests'],
   ] as const;
   return labels.flatMap(([key, label]) => typeof usage[key] === 'number' ? [`${usage[key]} ${label}`] : []);
@@ -50,9 +51,10 @@ function RawJson({ payload }: { payload: Record<string, unknown> }) {
   </details>;
 }
 
-export function DebugLog({ events, filter, onFilter }: {
+export function DebugLog({ events, filter, focusedEvidenceId = null, onFilter }: {
   events: ProjectEvent[];
   filter: DebugFilter;
+  focusedEvidenceId?: string | null;
   onFilter: (filter: DebugFilter) => void;
 }) {
   const visible = events.filter((event) => filter === 'all' || category(event) === filter);
@@ -72,7 +74,10 @@ export function DebugLog({ events, filter, onFilter }: {
         const citations = stringList(payload.web_citations);
         const summaries = stringList(payload.reasoning_summaries);
         return <li key={event.id}>
-          <article>
+          <article
+            data-evidence-focus={focusedEvidenceId !== null && eventHasEvidence(event, focusedEvidenceId) ? 'true' : undefined}
+            tabIndex={focusedEvidenceId !== null && eventHasEvidence(event, focusedEvidenceId) ? -1 : undefined}
+          >
             <header><h3>{eventName(event)}</h3><time dateTime={event.created_at}>{new Date(event.created_at).toLocaleString()}</time></header>
             {usageText(payload.usage).length > 0 && <p className="debug-usage">{usageText(payload.usage).map((item) => <span key={item}>{item}</span>)}</p>}
             {summaries.length > 0 && <section><h4>Reasoning summary</h4>{summaries.map((summary) => <p key={summary}>{summary}</p>)}</section>}
@@ -88,7 +93,7 @@ export function DebugLog({ events, filter, onFilter }: {
             <details>
               <summary>Technical metadata</summary>
               <dl>
-                {['trace_id', 'parent_id', 'agent', 'model', 'request_id', 'tool', 'tool_call_id', 'container_id'].map((key) => (
+                {['trace_id', 'parent_id', 'agent', 'model', 'request_id', 'response_id', 'tool', 'tool_call_id', 'container_id'].map((key) => (
                   payload[key] !== undefined && payload[key] !== null
                     ? <div key={key}><dt>{key.replaceAll('_', ' ')}</dt><dd><code>{String(payload[key])}</code></dd></div>
                     : null

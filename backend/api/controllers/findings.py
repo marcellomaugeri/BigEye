@@ -28,28 +28,38 @@ async def _finding(project_id: PositiveId, finding_id: PositiveId, request: Requ
 
 def _encode_cursor(project_id: int, finding) -> str:
     payload = json.dumps(
-        {"project_id": project_id, "created_at": finding.created_at.isoformat(), "id": finding.id},
+        {
+            "project_id": project_id, "priority_rank": finding.priority_rank,
+            "created_at": finding.created_at.isoformat(), "id": finding.id,
+        },
         ensure_ascii=True, sort_keys=True, separators=(",", ":"),
     ).encode("ascii")
     return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
 
 
-def _decode_cursor(value: str | None, project_id: int) -> tuple[datetime, int] | None:
+def _decode_cursor(value: str | None, project_id: int) -> tuple[int | None, datetime, int] | None:
     if value is None:
         return None
     try:
         padding = "=" * (-len(value) % 4)
         payload = base64.b64decode(value + padding, altchars=b"-_", validate=True)
         decoded = json.loads(payload)
-        if not isinstance(decoded, dict) or set(decoded) != {"project_id", "created_at", "id"}:
+        if not isinstance(decoded, dict) or set(decoded) != {"project_id", "priority_rank", "created_at", "id"}:
             raise ValueError
         if decoded["project_id"] != project_id:
             raise ValueError
         created_at = datetime.fromisoformat(decoded["created_at"])
+        priority_rank = decoded["priority_rank"]
         finding_id = decoded["id"]
-        if created_at.tzinfo is None or isinstance(finding_id, bool) or not isinstance(finding_id, int) or finding_id <= 0:
+        if (
+            (priority_rank is not None and (
+                isinstance(priority_rank, bool) or not isinstance(priority_rank, int) or priority_rank <= 0
+            ))
+            or created_at.tzinfo is None
+            or isinstance(finding_id, bool) or not isinstance(finding_id, int) or finding_id <= 0
+        ):
             raise ValueError
-        return created_at, finding_id
+        return priority_rank, created_at, finding_id
     except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise HTTPException(status_code=422, detail="invalid findings cursor") from error
 
