@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 
 COMMIT = "a" * 40
@@ -152,6 +153,145 @@ def test_recovery_quarantines_a_same_campaign_identity_mismatch(tmp_path: Path) 
     assert control.calls == [("quarantine", 3, "container-3", "container identity does not match durable campaign evidence")]
     assert [record.action for record in records] == ["quarantined", "retained"]
     assert all(record.pending_evidence_ids == ("review:3",) for record in records)
+
+
+def test_recovery_quarantines_runtime_mismatch_without_hiding_an_exact_candidate(
+    tmp_path: Path,
+) -> None:
+    from backend.fuzzing.campaigns.recovery import CampaignRecovery
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _campaign_workspace(workspace)
+    control = RecoveryControl()
+    mismatched = _container(
+        container_id="container-mismatch", runtime_contract_matches=False,
+    )
+    exact = _container(container_id="container-exact")
+
+    records = CampaignRecovery(workspace, control).recover(
+        project_id=7,
+        campaigns=(_campaign(),),
+        containers=(mismatched, exact),
+    )
+
+    assert control.calls == [
+        (
+            "quarantine", 3, "container-mismatch",
+            "container identity does not match durable campaign evidence",
+        ),
+        ("adopt", 3, "container-exact"),
+    ]
+    assert [record.action for record in records] == ["quarantined", "adopted"]
+
+
+def test_production_recovery_routes_mismatch_quarantine_through_container_service(
+    tmp_path: Path,
+) -> None:
+    from backend.fuzzing.docker.fuzz_container import ContainerCandidateObservation
+    from backend.services.campaigns.production_runtime import DeferredCampaignContainers
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    mismatch = ContainerCandidateObservation("container-a", 3, 7, "running", False)
+    exact = ContainerCandidateObservation("container-b", 3, 7, "running", True)
+
+    class Service:
+        def __init__(self): self.calls = []
+        def observe_candidates(self, campaign, invocation):
+            assert (campaign.project_id, campaign.id, invocation.image_id) == (7, 3, IMAGE_ID)
+            return mismatch, exact
+        def quarantine_candidate(self, candidate):
+            self.calls.append(("quarantine", candidate.container_id))
+        def adopt_candidate(self, candidate):
+            self.calls.append(("adopt", candidate.container_id))
+
+    class Invocations:
+        def load(self, project_id, campaign_id):
+            assert (project_id, campaign_id) == (7, 3)
+            return SimpleNamespace(image_id=IMAGE_ID)
+
+    service = Service()
+    client = SimpleNamespace(api=SimpleNamespace(inspect_image=lambda _image: {
+        "Id": IMAGE_ID, "Os": "linux", "Architecture": "amd64",
+    }))
+    deferred = DeferredCampaignContainers(
+        workspace, docker_client=SimpleNamespace(), invocation_store=Invocations(),
+    )
+    project = SimpleNamespace(id=7, commit_sha=COMMIT)
+    campaign = SimpleNamespace(
+        id=3, project_id=7, target_asset_id=31, configuration_asset_id=32,
+        next_review_reason=None, error=None,
+    )
+    assets = (
+        SimpleNamespace(
+            id=31, project_id=7, validated_at=NOW, error=None, content_hash=TARGET_HASH,
+        ),
+        SimpleNamespace(
+            id=32, project_id=7, validated_at=NOW, error=None,
+            content_hash=CONFIGURATION_HASH,
+        ),
+    )
+
+    evidence = deferred._recover_lifecycle(client, service, project, (campaign,), assets)
+
+    assert service.calls == [("quarantine", "container-a"), ("adopt", "container-b")]
+    assert [item["action"] for item in evidence] == ["quarantined", "adopted"]
+
+
+def test_production_recovery_quarantines_every_duplicate_exact_candidate(
+    tmp_path: Path,
+) -> None:
+    from backend.fuzzing.docker.fuzz_container import ContainerCandidateObservation
+    from backend.services.campaigns.production_runtime import DeferredCampaignContainers
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    candidates = (
+        ContainerCandidateObservation("container-a", 3, 7, "running", True),
+        ContainerCandidateObservation("container-b", 3, 7, "running", True),
+    )
+
+    class Service:
+        def __init__(self): self.calls = []
+        def observe_candidates(self, _campaign, _invocation): return candidates
+        def quarantine_candidate(self, candidate):
+            self.calls.append(("quarantine", candidate.container_id))
+
+    service = Service()
+    deferred = DeferredCampaignContainers(
+        workspace,
+        docker_client=SimpleNamespace(),
+        invocation_store=SimpleNamespace(load=lambda _project, _campaign: SimpleNamespace(
+            image_id=IMAGE_ID,
+        )),
+    )
+    client = SimpleNamespace(api=SimpleNamespace(inspect_image=lambda _image: {
+        "Id": IMAGE_ID, "Os": "linux", "Architecture": "amd64",
+    }))
+    project = SimpleNamespace(id=7, commit_sha=COMMIT)
+    campaign = SimpleNamespace(
+        id=3, project_id=7, target_asset_id=31, configuration_asset_id=32,
+        next_review_reason=None, error=None,
+    )
+    assets = (
+        SimpleNamespace(
+            id=31, project_id=7, validated_at=NOW, error=None, content_hash=TARGET_HASH,
+        ),
+        SimpleNamespace(
+            id=32, project_id=7, validated_at=NOW, error=None,
+            content_hash=CONFIGURATION_HASH,
+        ),
+    )
+
+    evidence = deferred._recover_lifecycle(client, service, project, (campaign,), assets)
+
+    assert service.calls == [
+        ("quarantine", "container-a"), ("quarantine", "container-b"),
+    ]
+    assert [item["action"] for item in evidence] == [
+        "quarantined", "quarantined", "retained",
+    ]
 
 
 def test_recovery_never_controls_a_container_from_another_project(tmp_path: Path) -> None:

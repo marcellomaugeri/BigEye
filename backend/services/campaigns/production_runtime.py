@@ -38,7 +38,11 @@ from backend.fuzzing.campaigns.cleanup import (
 )
 from backend.fuzzing.docker.campaign_workspace import CampaignWorkspace
 from backend.fuzzing.docker.client import DockerClient
-from backend.fuzzing.docker.fuzz_container import FuzzCampaign, FuzzContainerService
+from backend.fuzzing.docker.fuzz_container import (
+    ContainerCandidateObservation,
+    FuzzCampaign,
+    FuzzContainerService,
+)
 from backend.fuzzing.docker.fuzz_contract import validate_invocation
 from backend.fuzzing.engines.contracts import ContainerInvocation
 from backend.fuzzing.coverage.overlap import OverlapAnalyzer
@@ -99,7 +103,8 @@ class CampaignProgressObservation:
                 not isinstance(item, tuple) or len(item) != 3
                 or item[0] not in {"queue", "crashes"}
                 or type(item[1]) is not int or item[1] < 0
-                or not isinstance(item[2], str) or not item[2]
+                or not isinstance(item[2], str)
+                or (not item[2] and item[1] != 0)
                 for item in self.next_artifact_cursors
             )
         ):
@@ -797,7 +802,9 @@ class DeferredCampaignContainers:
                 pending = (f"campaign-review:{campaign.id}:" + sha256(
                     campaign.next_review_reason.encode("utf-8")
                 ).hexdigest(),)
-            current = service.inspect(self._fuzz_campaign(project, campaign), invocation)
+            observed = service.observe_candidates(
+                self._fuzz_campaign(project, campaign), invocation,
+            )
             recoverable.append(RecoverableCampaign(
                 project.id,
                 campaign.id,
@@ -807,13 +814,18 @@ class DeferredCampaignContainers:
                 campaign.error is None,
                 pending,
             ))
-            controls[campaign.id] = (campaign, invocation, current)
-            if current is not None:
+            controls[campaign.id] = (
+                campaign,
+                invocation,
+                {candidate.container_id: candidate for candidate in observed},
+            )
+            if observed:
                 image = client.api.inspect_image(invocation.image_id)
                 if image.get("Id") != invocation.image_id:
                     raise ValueError("campaign recovery image identity changed")
+            for candidate in observed:
                 containers.append(RecoveryContainer(
-                    current.container_id,
+                    candidate.container_id,
                     "fuzz-campaign",
                     project.id,
                     campaign.id,
@@ -821,7 +833,8 @@ class DeferredCampaignContainers:
                     invocation.image_id,
                     tuple(identities),
                     f"{image.get('Os')}/{image.get('Architecture')}",
-                    current.state,
+                    candidate.state,
+                    candidate.runtime_contract_matches,
                 ))
         if not recoverable:
             return []
@@ -907,33 +920,31 @@ class _ProductionRecoveryControl:
         self._controls = controls
 
     def adopt(self, campaign, container) -> None:
-        self._exact(campaign, container)
+        self._service.adopt_candidate(self._candidate(campaign, container))
 
     def restart(self, campaign, container) -> None:
-        persisted, invocation, current = self._record(campaign)
+        persisted, invocation, _observed = self._record(campaign)
+        current = None
         if container is not None:
-            self._exact(campaign, container)
+            candidate = self._candidate(campaign, container)
+            if candidate.state == "paused":
+                self._service.resume_candidate(candidate)
+                return
+            current = self._service.adopt_candidate(candidate)
         fuzz_campaign = DeferredCampaignContainers._fuzz_campaign(self._project, persisted)
-        if current is not None and current.state == "paused":
-            selected = self._client.containers.get(current.container_id)
-            selected.unpause()
-            selected.reload()
-            return
         if current is not None:
             self._service.stop(current)
         self._service.start(fuzz_campaign, invocation)
 
     def quarantine(self, campaign, container, _reason) -> None:
-        # FuzzContainerService verifies the complete runtime contract before this control exists.
-        self._exact(campaign, container)
-        _persisted, _invocation, current = self._record(campaign)
-        if current is not None:
-            self._service.stop(current)
+        self._service.quarantine_candidate(self._candidate(campaign, container))
 
-    def _exact(self, campaign, container) -> None:
-        _persisted, _invocation, current = self._record(campaign)
-        if current is None or current.container_id != container.container_id:
+    def _candidate(self, campaign, container) -> ContainerCandidateObservation:
+        _persisted, _invocation, observed = self._record(campaign)
+        current = observed.get(container.container_id)
+        if current is None:
             raise ValueError("campaign recovery control identity changed")
+        return current
 
     def _record(self, campaign):
         try:

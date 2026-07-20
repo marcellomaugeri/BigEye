@@ -17,6 +17,7 @@ _MAX_LOG_BYTES = 256 * 1024
 _MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 _MAX_DIRECTORY_ENTRIES = 100_000
 _MAX_OBSERVED_ARTIFACTS = 512
+_CYCLE_START = (0, "")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _LIBFUZZER_PROGRESS = re.compile(
     rb"#(?P<executions>[0-9]+)\s+[^\r\n]*?\bcorp:\s*[0-9]+/[0-9]+[A-Za-z]*"
@@ -76,7 +77,8 @@ class CampaignEngineSample:
                 not isinstance(item, tuple) or len(item) != 3
                 or item[0] not in {"queue", "crashes"}
                 or type(item[1]) is not int or item[1] < 0
-                or not isinstance(item[2], str) or not item[2]
+                or not isinstance(item[2], str)
+                or (not item[2] and item[1] != 0)
                 for item in self.next_artifact_cursors
             )
         ):
@@ -221,10 +223,13 @@ def _artifacts(
         if after is not None and (
             not isinstance(after, tuple) or len(after) != 2
             or type(after[0]) is not int or after[0] < 0
-            or not isinstance(after[1], str) or not after[1]
+            or not isinstance(after[1], str)
+            or (not after[1] and after[0] != 0)
         ):
             raise ValueError("campaign artifact cursor is invalid")
         start = bisect_right(entries, after) if after is not None else 0
+        if after is not None and after != _CYCLE_START and start >= len(entries):
+            return len(entries), (), _CYCLE_START
         selected = entries[start:start + _MAX_OBSERVED_ARTIFACTS]
         observations = []
         for _observed_ns, name in selected:

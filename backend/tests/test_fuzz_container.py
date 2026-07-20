@@ -517,6 +517,95 @@ class TestWorkspaceContainment:
 
 
 class TestFuzzContainerRecovery:
+    def test_observation_keeps_runtime_mismatches_separate_from_exact_candidates(
+        self, tmp_path: Path,
+    ) -> None:
+        service, client = _service(tmp_path)
+        service.start(_campaign(), _invocation())
+        image, command, options, mismatched = client.containers.created[0]
+        exact = client.containers.create(image, command, **options)
+        exact.start()
+        mismatched.attrs["Config"]["Cmd"] = ["afl-fuzz", "--", "/opt/bigeye/target"]
+        recovered, _ = _service(tmp_path, client)
+
+        candidates = recovered.observe_candidates(_campaign(), _invocation())
+
+        assert [(item.container_id, item.runtime_contract_matches) for item in candidates] == [
+            ("container-3", False),
+            ("container-4", True),
+        ]
+        assert recovered.adopt_candidate(candidates[1]).container_id == "container-4"
+
+    def test_observation_reports_duplicate_exact_candidates_without_early_failure(
+        self, tmp_path: Path,
+    ) -> None:
+        service, client = _service(tmp_path)
+        service.start(_campaign(), _invocation())
+        image, command, options, _first = client.containers.created[0]
+        second = client.containers.create(image, command, **options)
+        second.start()
+        recovered, _ = _service(tmp_path, client)
+
+        candidates = recovered.observe_candidates(_campaign(), _invocation())
+
+        assert [item.container_id for item in candidates] == ["container-3", "container-4"]
+        assert all(item.runtime_contract_matches for item in candidates)
+
+    def test_one_uninspectable_candidate_does_not_hide_an_exact_candidate(
+        self, tmp_path: Path,
+    ) -> None:
+        service, client = _service(tmp_path)
+        service.start(_campaign(), _invocation())
+        image, command, options, unavailable = client.containers.created[0]
+        exact = client.containers.create(image, command, **options)
+        exact.start()
+        unavailable.reload = lambda: (_ for _ in ()).throw(RuntimeError("unavailable"))
+        recovered, _ = _service(tmp_path, client)
+
+        candidates = recovered.observe_candidates(_campaign(), _invocation())
+
+        assert [(item.container_id, item.runtime_contract_matches) for item in candidates] == [
+            ("container-4", True),
+        ]
+
+    def test_quarantine_rechecks_bigeye_ownership_before_any_container_mutation(
+        self, tmp_path: Path,
+    ) -> None:
+        from backend.fuzzing.docker.fuzz_container import ContainerOwnershipMismatch
+
+        service, client = _service(tmp_path)
+        service.start(_campaign(), _invocation())
+        container = client.containers.created[0][3]
+        container.attrs["Config"]["Cmd"] = ["afl-fuzz", "--", "/opt/bigeye/target"]
+        recovered, _ = _service(tmp_path, client)
+        candidate = recovered.observe_candidates(_campaign(), _invocation())[0]
+        del container.attrs["Config"]["Labels"]["com.bigeye.project-id"]
+
+        with pytest.raises(ContainerOwnershipMismatch, match="ownership"):
+            recovered.quarantine_candidate(candidate)
+
+        assert not any(
+            call[0] in {"stop", "kill", "remove"} for call in container.calls[2:]
+        )
+
+    def test_quarantine_removes_only_the_reinspected_mismatched_candidate(
+        self, tmp_path: Path,
+    ) -> None:
+        service, client = _service(tmp_path)
+        service.start(_campaign(), _invocation())
+        image, command, options, mismatched = client.containers.created[0]
+        exact = client.containers.create(image, command, **options)
+        exact.start()
+        mismatched.attrs["Config"]["Cmd"] = ["afl-fuzz", "--", "/opt/bigeye/target"]
+        recovered, _ = _service(tmp_path, client)
+        candidates = recovered.observe_candidates(_campaign(), _invocation())
+
+        recovered.quarantine_candidate(candidates[0])
+
+        assert ("stop", 10) in mismatched.calls
+        assert mismatched.calls[-1] == ("remove", False)
+        assert not any(call[0] in {"stop", "kill", "remove"} for call in exact.calls)
+
     def test_adopts_only_container_with_complete_service_owned_runtime_contract(self, tmp_path: Path) -> None:
         service, client = _service(tmp_path)
         service.start(_campaign(), _invocation())

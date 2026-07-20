@@ -71,6 +71,7 @@ class RecoveryContainer:
     asset_identities: tuple[RecoveryAssetIdentity, ...]
     platform: str
     state: str
+    runtime_contract_matches: bool = True
 
     def __post_init__(self) -> None:
         if not _bounded(self.container_id, 256) or not _bounded(self.managed_as, 64):
@@ -84,6 +85,8 @@ class RecoveryContainer:
             raise ValueError("recovery container platform is invalid")
         if self.state not in {"created", "running", "restarting", "paused", "exited", "dead"}:
             raise ValueError("recovery container state is invalid")
+        if not isinstance(self.runtime_contract_matches, bool):
+            raise ValueError("recovery runtime contract evidence is invalid")
 
 
 @dataclass(frozen=True)
@@ -174,6 +177,7 @@ class CampaignRecovery:
             and container.image_id == campaign.image_id
             and container.asset_identities == campaign.asset_identities
             and container.platform == "linux/amd64"
+            and container.runtime_contract_matches
         )
 
     def _has_durable_corpus(self, campaign: RecoverableCampaign) -> bool:

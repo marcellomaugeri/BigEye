@@ -58,7 +58,7 @@ class CampaignArtifactRepository:
             raise ValueError("campaign artifact count is invalid")
         return count
 
-    async def cursors(self, project_id: int, campaign_id: int) -> dict[str, str]:
+    async def cursors(self, project_id: int, campaign_id: int) -> dict[str, tuple[int, str]]:
         rows = await self._pool.fetch(
             """SELECT kind, last_seen_ns, last_name FROM campaign_artifact_cursors
                WHERE project_id = $1 AND campaign_id = $2 ORDER BY kind""",
@@ -94,13 +94,8 @@ class CampaignArtifactRepository:
                    SELECT $1, $2, $3, $4, $5 FROM campaigns
                    WHERE id = $2 AND project_id = $1
                    ON CONFLICT (project_id, campaign_id, kind) DO UPDATE
-                   SET last_name = CASE
-                           WHEN (EXCLUDED.last_seen_ns, EXCLUDED.last_name) >
-                                (campaign_artifact_cursors.last_seen_ns, campaign_artifact_cursors.last_name)
-                           THEN EXCLUDED.last_name ELSE campaign_artifact_cursors.last_name END,
-                       last_seen_ns = GREATEST(
-                           campaign_artifact_cursors.last_seen_ns, EXCLUDED.last_seen_ns
-                       )
+                   SET last_name = EXCLUDED.last_name,
+                       last_seen_ns = EXCLUDED.last_seen_ns
                    RETURNING last_name""",
                 project_id, campaign_id, kind, observed_ns, name,
             )
@@ -113,9 +108,10 @@ class CampaignArtifactRepository:
         if (
             kind not in {"queue", "crashes"}
             or type(observed_ns) is not int or observed_ns < 0
-            or not isinstance(name, str) or not name or len(name) > 500
-            or path.is_absolute() or len(path.parts) != 1
-            or path.parts[0] in {".", ".."} or "\x00" in name
+            or not isinstance(name, str) or len(name) > 500
+            or (not name and observed_ns != 0)
+            or path.is_absolute() or (name and len(path.parts) != 1)
+            or (name and path.parts[0] in {".", ".."}) or "\x00" in name
         ):
             raise ValueError("campaign artifact cursor is invalid")
 

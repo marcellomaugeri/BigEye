@@ -143,6 +143,13 @@ def test_monitor_cursor_eventually_visits_more_than_one_bounded_artifact_page(
             for kind, observed_ns, name in second.next_artifact_cursors
         },
     )
+    fourth = _observe_with_monitor(
+        DockerCampaignMonitor(tmp_path, clock=lambda: NOW), tmp_path, "afl",
+        artifact_cursors={
+            kind: (observed_ns, name)
+            for kind, observed_ns, name in third.next_artifact_cursors
+        },
+    )
 
     visited = {item.relative_path for item in (*first.artifacts, *second.artifacts)}
     assert first.queue_files == second.queue_files == 520
@@ -150,7 +157,133 @@ def test_monitor_cursor_eventually_visits_more_than_one_bounded_artifact_page(
     assert len(second.artifacts) == 8
     assert len(visited) == 520
     assert third.artifacts == ()
-    assert third.next_artifact_cursors == second.next_artifact_cursors
+    assert third.next_artifact_cursors == (("queue", 0, ""),)
+    assert len(fourth.artifacts) == 512
+    assert fourth.artifacts == first.artifacts
+
+
+def test_durable_cursor_wrap_observes_a_backdated_file_after_restart(
+    tmp_path: Path,
+) -> None:
+    from backend.services.campaigns.production_runtime import DockerCampaignMonitor
+
+    campaign = _campaign_workspace(tmp_path, "libfuzzer")
+    first_path = campaign / "corpus" / "first"
+    first_path.write_bytes(b"first")
+    os.utime(first_path, ns=(2_000_000_000, 2_000_000_000))
+    first = _observe_with_monitor(
+        DockerCampaignMonitor(tmp_path, clock=lambda: NOW), tmp_path, "libfuzzer",
+    )
+    backdated = campaign / "corpus" / "late-but-backdated"
+    backdated.write_bytes(b"late")
+    os.utime(backdated, ns=(1_000_000_000, 1_000_000_000))
+
+    wrapped = _observe_with_monitor(
+        DockerCampaignMonitor(tmp_path, clock=lambda: NOW), tmp_path, "libfuzzer",
+        artifact_cursors={
+            kind: (observed_ns, name)
+            for kind, observed_ns, name in first.next_artifact_cursors
+        },
+    )
+    restarted = _observe_with_monitor(
+        DockerCampaignMonitor(tmp_path, clock=lambda: NOW), tmp_path, "libfuzzer",
+        artifact_cursors={
+            kind: (observed_ns, name)
+            for kind, observed_ns, name in wrapped.next_artifact_cursors
+        },
+    )
+
+    assert wrapped.artifacts == ()
+    assert wrapped.next_artifact_cursors == (("queue", 0, ""),)
+    assert [item.relative_path for item in restarted.artifacts] == [
+        "corpus/first", "corpus/late-but-backdated",
+    ]
+    assert len(restarted.artifacts) <= 512
+
+
+def test_cursor_wrap_still_rejects_unsafe_entries(tmp_path: Path) -> None:
+    from backend.services.campaigns.production_runtime import DockerCampaignMonitor
+
+    campaign = _campaign_workspace(tmp_path, "libfuzzer")
+    safe = campaign / "corpus" / "safe"
+    safe.write_bytes(b"safe")
+    first = _observe_with_monitor(
+        DockerCampaignMonitor(tmp_path, clock=lambda: NOW), tmp_path, "libfuzzer",
+    )
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"outside")
+    (campaign / "corpus" / "unsafe").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="unsafe entry"):
+        _observe_with_monitor(
+            DockerCampaignMonitor(tmp_path, clock=lambda: NOW), tmp_path, "libfuzzer",
+            artifact_cursors={
+                kind: (observed_ns, name)
+                for kind, observed_ns, name in first.next_artifact_cursors
+            },
+        )
+
+
+def test_queue_and_crash_cursors_wrap_independently(tmp_path: Path) -> None:
+    from backend.services.campaigns.production_runtime import DockerCampaignMonitor
+
+    campaign = _campaign_workspace(tmp_path, "afl")
+    queue = campaign / "output" / "main" / "queue" / "id:000001"
+    crash = campaign / "output" / "main" / "crashes" / "id:000001"
+    queue.write_bytes(b"queue")
+    crash.write_bytes(b"crash-one")
+    first = _observe_with_monitor(
+        DockerCampaignMonitor(tmp_path, clock=lambda: NOW), tmp_path, "afl",
+    )
+    later_crash = campaign / "output" / "main" / "crashes" / "id:000002"
+    later_crash.write_bytes(b"crash-two")
+    previous = {
+        kind: (observed_ns, name)
+        for kind, observed_ns, name in first.next_artifact_cursors
+    }
+    os.utime(later_crash, ns=(previous["crashes"][0] + 1, previous["crashes"][0] + 1))
+
+    second = _observe_with_monitor(
+        DockerCampaignMonitor(tmp_path, clock=lambda: NOW), tmp_path, "afl",
+        artifact_cursors=previous,
+    )
+
+    cursors = {
+        kind: (observed_ns, name)
+        for kind, observed_ns, name in second.next_artifact_cursors
+    }
+    assert cursors["queue"] == (0, "")
+    assert cursors["crashes"] == (previous["crashes"][0] + 1, "id:000002")
+    assert [item.relative_path for item in second.artifacts] == [
+        "output/main/crashes/id:000002",
+    ]
+
+
+def test_cursor_repository_persists_cycle_reset_for_a_fresh_process() -> None:
+    from backend.repositories.campaign_artifact_repository import CampaignArtifactRepository
+
+    class Pool:
+        def __init__(self): self.values = {}
+        async def fetchval(self, query, project_id, campaign_id, kind, observed_ns, name):
+            assert "GREATEST" not in query
+            self.values[(project_id, campaign_id, kind)] = (observed_ns, name)
+            return name
+        async def fetch(self, _query, project_id, campaign_id):
+            return [
+                {"kind": kind, "last_seen_ns": value[0], "last_name": value[1]}
+                for (stored_project, stored_campaign, kind), value in self.values.items()
+                if (stored_project, stored_campaign) == (project_id, campaign_id)
+            ]
+
+    async def exercise() -> None:
+        pool = Pool()
+        first_process = CampaignArtifactRepository(pool)
+        await first_process.advance_cursors(7, 9, (("queue", 100, "latest"),))
+        await first_process.advance_cursors(7, 9, (("queue", 0, ""),))
+        restarted_process = CampaignArtifactRepository(pool)
+        assert await restarted_process.cursors(7, 9) == {"queue": (0, "")}
+
+    asyncio.run(exercise())
 
 
 def test_libfuzzer_durable_cursor_observes_a_later_low_hash_name_after_restart(
