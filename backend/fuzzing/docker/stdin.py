@@ -21,3 +21,17 @@ def send_exact_stdin(attached, content: bytes, timeout_seconds: float) -> None:
         settimeout(timeout_seconds)
     raw.sendall(content)
     raw.shutdown(socket.SHUT_WR)
+
+
+def close_attached_stdin(attached) -> None:
+    """Close Docker's retained HTTP response before its attached socket."""
+    response = getattr(attached, "_response", None)
+    if response is not None:
+        try:
+            response.close()
+        except Exception:
+            pass
+    try:
+        attached.close()
+    except Exception:
+        pass

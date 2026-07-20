@@ -352,6 +352,7 @@ def test_docker_executor_is_isolated_and_returns_stdout_only(tmp_path: Path):
     assert created["read_only"] is True
     assert created["cap_drop"] == ["ALL"]
     assert created["user"] == f"{__import__('os').getuid()}:{__import__('os').getgid()}"
+    assert created["detach"] is True
 
     with pytest.raises(ValueError, match="shell"):
         DockerCoverageExecutor(client, timeout_seconds=30).run(
@@ -413,10 +414,16 @@ def test_docker_coverage_executor_feeds_exact_stdin_without_mounting_input(tmp_p
     from backend.fuzzing.coverage.llvm_coverage import DockerCoverageExecutor
 
     class AttachedSocket:
-        def __init__(self): self._sock = self; self.sent = bytearray(); self.closed = False
+        def __init__(self):
+            self._sock = self
+            self.sent = bytearray()
+            self.closed = False
+            self.events = []
+            self._response = SimpleNamespace(close=self._close_response)
         def sendall(self, value): self.sent.extend(value)
         def shutdown(self, value): self.shutdown_mode = value
-        def close(self): self.closed = True
+        def _close_response(self): self.events.append("response")
+        def close(self): self.events.append("socket"); self.closed = True
 
     class Container:
         def __init__(self): self.socket = AttachedSocket()
@@ -444,9 +451,11 @@ def test_docker_coverage_executor_feeds_exact_stdin_without_mounting_input(tmp_p
         str(tmp_path.resolve()): {"bind": "/coverage/profiles", "mode": "rw"},
     }
     assert containers.kwargs["stdin_open"] is True
+    assert containers.kwargs["detach"] is False
     assert bytes(container.socket.sent) == b"\x00coverage\xff"
     assert container.socket.shutdown_mode == socket.SHUT_WR
     assert container.socket.closed is True
+    assert container.socket.events == ["response", "socket"]
 
 
 def test_docker_coverage_executor_removes_container_when_stdin_attach_fails(tmp_path: Path):

@@ -19,7 +19,11 @@ from backend.fuzzing.campaigns.coverage_contract import (
     valid_replay_environment,
 )
 from backend.fuzzing.coverage.source_paths import is_forbidden_source_path
-from backend.fuzzing.docker.stdin import MAX_STDIN_BYTES, send_exact_stdin
+from backend.fuzzing.docker.stdin import (
+    MAX_STDIN_BYTES,
+    close_attached_stdin,
+    send_exact_stdin,
+)
 
 
 class CoverageIntegrityError(ValueError):
@@ -144,7 +148,7 @@ class DockerCoverageExecutor:
             detach=True,
         )
         if stdin_bytes is not None:
-            options.update({"stdin_open": True, "tty": False})
+            options.update({"detach": False, "stdin_open": True, "tty": False})
         container = self._client.containers.create(
             image_id,
             list(command),
@@ -173,10 +177,7 @@ class DockerCoverageExecutor:
             return bytes(output)
         finally:
             if attached is not None:
-                try:
-                    attached.close()
-                except Exception:
-                    pass
+                close_attached_stdin(attached)
             try:
                 container.remove(force=True)
             except Exception:

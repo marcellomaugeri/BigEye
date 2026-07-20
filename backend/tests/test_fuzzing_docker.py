@@ -355,10 +355,13 @@ class TestContainerRunner:
                 self.sent = bytearray()
                 self.shutdown_mode = None
                 self.closed = False
+                self.events = []
+                self._response = SimpleNamespace(close=self._close_response)
 
             def sendall(self, value): self.sent.extend(value)
             def shutdown(self, value): self.shutdown_mode = value
-            def close(self): self.closed = True
+            def _close_response(self): self.events.append("response")
+            def close(self): self.events.append("socket"); self.closed = True
 
         class Container:
             id = "container-stdin"
@@ -382,42 +385,101 @@ class TestContainerRunner:
         ))
 
         assert result.exit_code == 0
+        assert containers.kwargs["detach"] is False
         assert containers.kwargs["stdin_open"] is True
         assert containers.kwargs["tty"] is False
         assert bytes(containers.container.socket.sent) == b"\x00exact\xff"
         assert containers.container.socket.shutdown_mode == socket.SHUT_WR
         assert containers.container.socket.closed is True
+        assert containers.container.socket.events == ["response", "socket"]
 
-    def test_runner_closes_stdin_socket_when_wait_fails(self) -> None:
-        from backend.fuzzing.docker.container_runner import ContainerRunner
+    def test_runner_timeout_closes_stdin_response_before_socket_and_container(self) -> None:
+        from backend.fuzzing.docker.container_runner import ContainerRunner, ContainerTimedOut
+
+        events = []
 
         class AttachedSocket:
-            def __init__(self): self._sock = self; self.closed = False
+            def __init__(self):
+                self._sock = self
+                self.closed = False
+                self._response = SimpleNamespace(close=lambda: events.append("response"))
             def sendall(self, _value): pass
             def shutdown(self, _value): pass
-            def close(self): self.closed = True
+            def close(self): events.append("socket"); self.closed = True
 
         class Container:
             id = "container-stdin-error"
             def __init__(self): self.socket = AttachedSocket()
             def attach_socket(self, params): return self.socket
             def start(self): pass
-            def wait(self, timeout): raise RuntimeError("wait failed")
-            def stop(self, timeout=0): pass
-            def kill(self): pass
-            def remove(self, force=False): pass
+            def wait(self, timeout): raise TimeoutError("wait timed out")
+            def stop(self, timeout=0): events.append("stop")
+            def kill(self): events.append("kill")
+            def remove(self, force=False): events.append("remove")
 
         container = Container()
         class Containers:
             def create(self, *args, **kwargs): return container
 
-        with pytest.raises(RuntimeError, match="wait failed"):
+        with pytest.raises(ContainerTimedOut, match="exceeded"):
             run(ContainerRunner(SimpleNamespace(containers=Containers())).run(
                 "image", ["/opt/bigeye/parser"], 2, lambda _text: None,
                 stdin_bytes=b"exact",
             ))
 
         assert container.socket.closed is True
+        assert events == ["response", "socket", "stop", "kill", "remove"]
+
+    def test_runner_cancellation_closes_stdin_response_before_socket(self) -> None:
+        from backend.fuzzing.docker.container_runner import ContainerRunner
+
+        waiting = threading.Event()
+        stopped = threading.Event()
+        removed = threading.Event()
+        events = []
+
+        class AttachedSocket:
+            def __init__(self):
+                self._sock = self
+                self._response = SimpleNamespace(close=lambda: events.append("response"))
+            def sendall(self, _value): pass
+            def shutdown(self, _value): pass
+            def close(self): events.append("socket")
+
+        class Container:
+            id = "container-stdin-cancel"
+            def __init__(self): self.socket = AttachedSocket()
+            def attach_socket(self, params): return self.socket
+            def start(self): pass
+            def wait(self, timeout):
+                waiting.set()
+                assert stopped.wait(1)
+                raise RuntimeError("stopped")
+            def stop(self, timeout=0): stopped.set()
+            def kill(self): pass
+            def remove(self, force=False): removed.set()
+
+        container = Container()
+        created = {}
+        class Containers:
+            def create(self, *args, **kwargs): created.update(kwargs); return container
+
+        async def scenario():
+            operation = asyncio.create_task(ContainerRunner(
+                SimpleNamespace(containers=Containers()),
+            ).run(
+                "image", ["/opt/bigeye/parser"], 10, lambda _text: None,
+                stdin_bytes=b"exact",
+            ))
+            assert await asyncio.to_thread(waiting.wait, 1)
+            operation.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await operation
+            assert await asyncio.to_thread(removed.wait, 1)
+
+        run(scenario())
+        assert created["detach"] is False
+        assert events == ["response", "socket"]
 
     def test_runner_removes_exact_container_when_stdin_attach_fails(self) -> None:
         from backend.fuzzing.docker.container_runner import ContainerRunner

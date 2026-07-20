@@ -353,6 +353,73 @@ def test_real_linux_amd64_probe_uses_the_application_sanitizer_runtime(tmp_path:
         client.close()
 
 
+def test_real_linux_amd64_target_and_coverage_stdin_reach_eof(tmp_path: Path) -> None:
+    from backend.fuzzing.coverage.llvm_coverage import DockerCoverageExecutor
+    from backend.fuzzing.docker.container_runner import ContainerRunner
+    from backend.fuzzing.docker.image_builder import ImageBuilder
+    from backend.fuzzing.docker.image_inspector import ImageInspector
+    from backend.fuzzing.sanitizer_environment import BASELINE_SANITIZER_ENVIRONMENT
+    from backend.fuzzing.toolchain.builder import ToolchainBuilder
+
+    client = _docker_client()
+    image_ids = []
+    try:
+        toolchain = ToolchainBuilder(
+            Path("backend/fuzzing/images/Dockerfile"),
+            ImageBuilder(client),
+            ImageInspector(client),
+        )
+        toolchain_info = toolchain.ensure(lambda _text: None)
+        target_image = _fixture_image(
+            client, tmp_path, "system_project", toolchain.tag(), toolchain_info.image_id,
+        )
+        image_ids.append(target_image)
+        coverage_image, _content_hash = _coverage_fixture_image(
+            client, tmp_path, toolchain.tag(), toolchain_info.image_id,
+        )
+        image_ids.append(coverage_image)
+
+        target_runner = ContainerRunner(client)
+        coverage_runner = DockerCoverageExecutor(client, timeout_seconds=10)
+        profile_directory = tmp_path / "stdin-profiles"
+        profile_directory.mkdir()
+        for index, content in enumerate((b"stdin-eof\n", b"")):
+            target = asyncio.run(target_runner.run(
+                target_image,
+                ["/opt/bigeye/bigeye_system_fixture", "--mode", "plain"],
+                10,
+                lambda _text: None,
+                stdin_bytes=content,
+                environment=dict(BASELINE_SANITIZER_ENVIRONMENT),
+            ))
+            assert target.exit_code == 0
+            assert target.output.endswith("\n")
+
+            profile_name = f"stdin-{index}.profraw"
+            coverage_environment = dict(BASELINE_SANITIZER_ENVIRONMENT)
+            coverage_environment["LLVM_PROFILE_FILE"] = f"/coverage/profiles/{profile_name}"
+            coverage_output = coverage_runner.run(
+                coverage_image,
+                ("/opt/bigeye/bigeye_system_coverage", "--mode", "plain"),
+                coverage_environment,
+                profile_directory,
+                stdin_bytes=content,
+            )
+            assert coverage_output.endswith(b"\n")
+            assert (profile_directory / profile_name).is_file()
+
+        for image_id in image_ids:
+            inspected = client.api.inspect_image(image_id)
+            assert (inspected["Os"], inspected["Architecture"]) == ("linux", "amd64")
+    finally:
+        for image_id in reversed(image_ids):
+            try:
+                client.images.remove(image_id, force=True)
+            except Exception:
+                pass
+        client.close()
+
+
 class _RealHarnessCorrection:
     def __init__(
         self, replay, corrected_image_id, base_manifest_hash, corrected_manifest_hash,

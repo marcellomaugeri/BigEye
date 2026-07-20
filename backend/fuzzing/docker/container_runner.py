@@ -9,7 +9,11 @@ from dataclasses import dataclass
 from requests.exceptions import ReadTimeout
 
 from backend.fuzzing.docker.image_builder import PLATFORM
-from backend.fuzzing.docker.stdin import MAX_STDIN_BYTES, send_exact_stdin
+from backend.fuzzing.docker.stdin import (
+    MAX_STDIN_BYTES,
+    close_attached_stdin,
+    send_exact_stdin,
+)
 
 
 class ContainerTimedOut(RuntimeError):
@@ -81,7 +85,7 @@ class ContainerRunner:
             "tmpfs": {"/tmp": "rw,nosuid,nodev,exec,size=64m,mode=1777"},
         }
         if stdin_bytes is not None:
-            options.update({"stdin_open": True, "tty": False})
+            options.update({"detach": False, "stdin_open": True, "tty": False})
         if environment:
             options["environment"] = environment
         container = self._client.containers.create(image, command, **options)
@@ -100,7 +104,7 @@ class ContainerRunner:
                     cancelled = holder["cancel_requested"] or holder["cleanup_started"]
                 if cancelled:
                     try:
-                        attached.close()
+                        close_attached_stdin(attached)
                     finally:
                         raise ContainerCancelled(
                             f"container {container.id} was cancelled during stdin attachment"
@@ -147,10 +151,7 @@ class ContainerRunner:
             holder["cleanup_started"] = True
             attached = holder.get("attached")
         if attached is not None:
-            try:
-                attached.close()
-            except Exception:
-                pass
+            close_attached_stdin(attached)
         self._cleanup(container, stop)
 
     @staticmethod
