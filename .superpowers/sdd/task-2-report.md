@@ -93,3 +93,41 @@ backend/.venv/lib/python3.14/site-packages/fastapi/testclient.py:1
   /Users/marcellomaugeri/Documents/BigEye/.worktrees/bigeye-backbone/backend/.venv/lib/python3.14/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
     from starlette.testclient import TestClient as TestClient  # noqa
 ```
+
+## Re-review stale project limit fix
+
+- `configure(project)` remains the authoritative replacement path used by
+  `ProjectSettingsService`. Slot operations now initialise a ledger from their
+  supplied project only if its limit is unset, so a later stale project object
+  cannot lower an already configured limit.
+
+### RED
+
+```text
+backend/.venv/bin/python -m pytest backend/tests/test_execution_slots.py backend/tests/test_project_settings.py -q
+1 failed, 4 passed in 0.07s
+
+assert 1 == 2
+ +  where 1 = ProjectExecutionSnapshot(compilation_count=0, pending_start_count=0, running_campaign_ids=frozenset({31}), limit=1).limit
+```
+
+### GREEN
+
+```text
+backend/.venv/bin/python -m pytest backend/tests/test_execution_slots.py backend/tests/test_project_settings.py -q
+5 passed in 0.03s
+
+backend/.venv/bin/python -m pytest backend/tests/test_execution_slots.py backend/tests/test_target_preparation.py backend/tests/test_campaign_monitor.py backend/tests/test_project_coordinator.py backend/tests/test_coordinator_production_wiring.py backend/tests/test_project_settings.py -q
+149 passed in 2.53s
+
+backend/.venv/bin/python -m pytest backend/tests -q
+1127 passed, 1 skipped, 3 deselected, 1 warning in 13.45s
+```
+
+### Warning
+
+```text
+backend/.venv/lib/python3.14/site-packages/fastapi/testclient.py:1
+  /Users/marcellomaugeri/Documents/BigEye/.worktrees/bigeye-backbone/backend/.venv/lib/python3.14/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+```

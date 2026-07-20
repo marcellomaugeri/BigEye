@@ -104,8 +104,7 @@ class ProjectExecutionSlots:
     @asynccontextmanager
     async def compilation(self, project, operation_id: str):
         """Reserve one heavy-job slot and allow atomic promotion to a running fuzzer."""
-        project_id, _ = _project(project)
-        await self.configure(project)
+        project_id = await self._ensure_initial_limit(project)
         if (
             not isinstance(operation_id, str) or not operation_id.strip()
             or len(operation_id) > 256 or "\x00" in operation_id
@@ -125,8 +124,7 @@ class ProjectExecutionSlots:
 
     async def try_fuzzing_start(self, project, campaign_id: int) -> _FuzzingStartReservation | None:
         """Return one exclusive start reservation, or None when capacity is full."""
-        project_id, _ = _project(project)
-        await self.configure(project)
+        project_id = await self._ensure_initial_limit(project)
         _positive(campaign_id, "campaign ID")
         ledger = self._ledger(project_id)
         async with ledger.condition:
@@ -163,8 +161,7 @@ class ProjectExecutionSlots:
 
     async def snapshot(self, project) -> ProjectExecutionSnapshot:
         """Return capacity derived solely from Docker-heavy project work."""
-        project_id, _ = _project(project)
-        await self.configure(project)
+        project_id = await self._ensure_initial_limit(project)
         ledger = self._ledger(project_id)
         async with ledger.condition:
             return ProjectExecutionSnapshot(
@@ -184,6 +181,15 @@ class ProjectExecutionSlots:
 
     def _ledger(self, project_id: int) -> _ProjectLedger:
         return self._ledgers.setdefault(project_id, _ProjectLedger())
+
+    async def _ensure_initial_limit(self, project) -> int:
+        project_id, limit = _project(project)
+        ledger = self._ledger(project_id)
+        async with ledger.condition:
+            if ledger.limit == 0:
+                ledger.limit = limit
+                ledger.condition.notify_all()
+        return project_id
 
     @staticmethod
     def _available(ledger: _ProjectLedger) -> bool:

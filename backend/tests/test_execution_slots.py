@@ -83,7 +83,7 @@ def test_recovery_reservations_are_exclusive_and_release_after_cancellation() ->
     run(exercise())
 
 
-def test_configuring_a_higher_limit_admits_a_waiting_compilation() -> None:
+def test_stale_project_snapshot_does_not_overwrite_a_configured_limit() -> None:
     from backend.services.campaigns.execution_slots import ProjectExecutionSlots
 
     async def exercise():
@@ -104,9 +104,27 @@ def test_configuring_a_higher_limit_admits_a_waiting_compilation() -> None:
         assert entered.is_set() is False
 
         await slots.configure(expanded)
+        snapshot = await slots.snapshot(constrained)
+        assert snapshot.limit == 2
         await asyncio.wait_for(entered.wait(), 0.2)
 
         release.set()
         await waiter
+
+    run(exercise())
+
+
+def test_first_operation_initialises_a_fresh_project_ledger_limit() -> None:
+    from backend.services.campaigns.execution_slots import ProjectExecutionSlots
+
+    async def exercise():
+        slots = ProjectExecutionSlots()
+        value = project(worker_count=1)
+
+        reservation = await slots.try_fuzzing_start(value, 31)
+
+        assert reservation is not None
+        assert (await slots.snapshot(value)).limit == 1
+        await reservation.__aexit__(None, None, None)
 
     run(exercise())
