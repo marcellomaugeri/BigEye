@@ -23,6 +23,7 @@ def history(
     purpose=None,
     commit="a" * 40,
     project_id=7,
+    compatibility_group_id="c" * 64,
 ):
     from backend.fuzzing.coverage.overlap import CampaignCoverageHistory
 
@@ -31,6 +32,7 @@ def history(
         project_id=project_id,
         strategy_asset_id=strategy_asset_id,
         commit_sha=commit,
+        compatibility_group_id=compatibility_group_id,
         checkpoints=tuple(checkpoints),
         crash_group_ids=frozenset(crashes),
         configuration_purpose=purpose,
@@ -69,6 +71,37 @@ def test_subset_requires_two_checkpoints_and_no_unique_crash() -> None:
     assert candidate[0].campaign_id == 9
     assert candidate[0].retained_campaign_id == 4
     assert analyzer.compare(redundant_for_two_checkpoints(unique_crashes=1)) == []
+
+
+@pytest.mark.parametrize("crash_groups", [["crash:known"], frozenset({"crash:known"})])
+def test_crash_group_collections_are_normalized_before_comparison(crash_groups) -> None:
+    from backend.fuzzing.coverage.overlap import CampaignCoverageHistory, OverlapAnalyzer
+
+    candidate_checkpoints = (
+        checkpoint("candidate:1", {("a.c", 10)}),
+        checkpoint("candidate:2", {("a.c", 10)}),
+    )
+    candidate = CampaignCoverageHistory(
+        campaign_id=9,
+        project_id=7,
+        strategy_asset_id=90,
+        commit_sha="a" * 40,
+        compatibility_group_id="c" * 64,
+        checkpoints=candidate_checkpoints,
+        crash_group_ids=crash_groups,
+    )
+    retained = history(
+        4,
+        40,
+        (
+            checkpoint("retained:1", {("a.c", 10), ("a.c", 11)}),
+            checkpoint("retained:2", {("a.c", 10), ("a.c", 11)}),
+        ),
+        crashes=("crash:known",),
+    )
+
+    assert candidate.crash_group_ids == frozenset({"crash:known"})
+    assert OverlapAnalyzer().compare((candidate, retained))[0].campaign_id == 9
 
 
 def test_one_subset_checkpoint_is_not_enough() -> None:
@@ -125,6 +158,20 @@ def test_different_project_is_never_compared_even_at_the_same_commit() -> None:
     assert OverlapAnalyzer().compare((candidate, other_project)) == []
 
 
+def test_unrelated_target_contract_is_never_compared() -> None:
+    from backend.fuzzing.coverage.overlap import OverlapAnalyzer
+
+    candidate, retained = redundant_for_two_checkpoints()
+    unrelated_target = history(
+        retained.campaign_id,
+        retained.strategy_asset_id,
+        retained.checkpoints,
+        compatibility_group_id="d" * 64,
+    )
+
+    assert OverlapAnalyzer().compare((candidate, unrelated_target)) == []
+
+
 def test_equal_coverage_retains_lower_campaign_id_once() -> None:
     from backend.fuzzing.coverage.overlap import OverlapAnalyzer
 
@@ -176,6 +223,7 @@ def test_invalid_or_unbounded_history_is_rejected() -> None:
             project_id=7,
             strategy_asset_id=1,
             commit_sha="a" * 40,
+            compatibility_group_id="c" * 64,
             checkpoints=(),
         )
 

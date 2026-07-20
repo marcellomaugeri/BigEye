@@ -8,6 +8,7 @@ from pathlib import PurePosixPath
 
 
 _COMMIT = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
+_SHA256 = re.compile(r"[0-9a-fA-F]{64}")
 _MAX_CAMPAIGNS = 256
 _MAX_CHECKPOINTS = 64
 _MAX_LINES = 100_000
@@ -46,6 +47,8 @@ class CampaignCoverageHistory:
     campaign_id: int
     strategy_asset_id: int
     commit_sha: str
+    # SHA-256 derived from the validated target, input contract, and configuration identities.
+    compatibility_group_id: str
     checkpoints: tuple[CleanCoverageCheckpoint, ...]
     crash_group_ids: frozenset[str] = frozenset()
     configuration_purpose: str | None = None
@@ -60,16 +63,22 @@ class CampaignCoverageHistory:
             or self.strategy_asset_id <= 0
             or not isinstance(self.commit_sha, str)
             or _COMMIT.fullmatch(self.commit_sha) is None
+            or not isinstance(self.compatibility_group_id, str)
+            or _SHA256.fullmatch(self.compatibility_group_id) is None
             or not isinstance(self.checkpoints, tuple)
             or len(self.checkpoints) > _MAX_CHECKPOINTS
             or any(not isinstance(item, CleanCoverageCheckpoint) for item in self.checkpoints)
         ):
             raise ValueError("campaign history is invalid")
         object.__setattr__(self, "commit_sha", self.commit_sha.lower())
-        if len(self.crash_group_ids) > _MAX_CRASH_GROUPS or any(
+        object.__setattr__(self, "compatibility_group_id", self.compatibility_group_id.lower())
+        if not isinstance(self.crash_group_ids, (list, tuple, set, frozenset)) or (
+            len(self.crash_group_ids) > _MAX_CRASH_GROUPS
+        ) or any(
             not _bounded_text(identifier, 256) for identifier in self.crash_group_ids
         ):
             raise ValueError("campaign history crash groups are invalid")
+        object.__setattr__(self, "crash_group_ids", frozenset(self.crash_group_ids))
         if self.configuration_purpose is not None and not _bounded_text(self.configuration_purpose, 1_024):
             raise ValueError("campaign history configuration purpose is invalid")
         if self.configuration_purpose is not None:
@@ -153,6 +162,7 @@ def _can_retain(candidate: CampaignCoverageHistory, retained: CampaignCoverageHi
         candidate.campaign_id == retained.campaign_id
         or candidate.project_id != retained.project_id
         or candidate.commit_sha != retained.commit_sha
+        or candidate.compatibility_group_id != retained.compatibility_group_id
     ):
         return False
     if len(candidate.checkpoints) < 2 or len(retained.checkpoints) < 2:
