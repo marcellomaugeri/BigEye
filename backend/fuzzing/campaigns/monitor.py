@@ -98,6 +98,7 @@ def collect_campaign_sample(
         statistics = _afl_statistics(root_descriptor)
         queue_count, queue, queue_cursor = _artifacts(
             root_descriptor, ("output", "main", "queue"), "corpus",
+            ignored=frozenset({".state"}),
             after=cursors.get("queue"),
         )
         crash_count, crashes, crash_cursor = _artifacts(

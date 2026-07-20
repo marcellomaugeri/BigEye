@@ -89,6 +89,56 @@ def test_afl_monitor_parses_bounded_stats_and_hashes_new_artifacts(tmp_path: Pat
     assert all(len(item.content_sha256) == 64 for item in observed.artifacts)
 
 
+def test_afl_monitor_excludes_standard_queue_state_without_changing_artifacts_or_cursors(
+    tmp_path: Path,
+) -> None:
+    campaign = _campaign_workspace(tmp_path, "afl")
+    queue_root = campaign / "output" / "main" / "queue"
+    state_root = queue_root / ".state"
+    for name in ("auto_extras", "deterministic_done"):
+        state_directory = state_root / name
+        state_directory.mkdir(parents=True)
+        (state_directory / "id:000000").write_bytes(b"engine state")
+    queue = queue_root / "id:000001"
+    crash = campaign / "output" / "main" / "crashes" / "id:000002"
+    queue.write_bytes(b"queue")
+    crash.write_bytes(b"crash")
+    os.utime(queue, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(crash, ns=(2_000_000_000, 2_000_000_000))
+
+    observed = _observe(tmp_path, "afl")
+
+    assert observed.queue_files == 1
+    assert observed.crash_files == 1
+    assert [(item.kind, item.relative_path) for item in observed.artifacts] == [
+        ("crash", "output/main/crashes/id:000002"),
+        ("corpus", "output/main/queue/id:000001"),
+    ]
+    assert observed.next_artifact_cursors == (
+        ("queue", 1_000_000_000, "id:000001"),
+        ("crashes", 2_000_000_000, "id:000002"),
+    )
+
+
+@pytest.mark.parametrize("unsafe_kind", ("directory", "symlink"))
+def test_afl_monitor_still_rejects_unexpected_queue_entries(
+    tmp_path: Path,
+    unsafe_kind: str,
+) -> None:
+    campaign = _campaign_workspace(tmp_path, "afl")
+    queue_root = campaign / "output" / "main" / "queue"
+    unsafe = queue_root / "unexpected"
+    if unsafe_kind == "directory":
+        unsafe.mkdir()
+    else:
+        outside = tmp_path / "outside"
+        outside.write_bytes(b"outside")
+        unsafe.symlink_to(outside)
+
+    with pytest.raises(ValueError, match="unsafe entry"):
+        _observe(tmp_path, "afl")
+
+
 def test_libfuzzer_monitor_uses_bounded_logs_and_never_follows_artifact_symlinks(
     tmp_path: Path,
 ) -> None:
