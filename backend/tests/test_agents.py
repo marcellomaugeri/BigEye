@@ -17,6 +17,7 @@ from backend.agents.prompts.component_target import COMPONENT_TARGET_PROMPT
 from backend.agents.prompts.crash_triage import CRASH_TRIAGE_PROMPT
 from backend.agents.prompts.manager import MANAGER_PROMPT
 from backend.agents.prompts.system_target import SYSTEM_TARGET_PROMPT
+from backend.agents.prompts.target_repair import TARGET_REPAIR_ASSIGNMENT
 from backend.agents.outputs.campaign_review import (
     CampaignReviewCollection,
     ContainedOperationRequestRecord,
@@ -422,8 +423,113 @@ def test_target_validator_normalizes_a_descriptive_suffix_to_the_authoritative_t
     assert validated.instance_type == "system-level"
 
 
+@pytest.mark.parametrize(
+    "run_command",
+    [
+        "/opt/bigeye/parser < @@",
+        "/opt/bigeye/parser | /opt/bigeye/consumer",
+        "/opt/bigeye/parser > /tmp/output",
+        "/opt/bigeye/parser && /opt/bigeye/other",
+        "/opt/bigeye/parser $(id)",
+        "/opt/bigeye/parser `id`",
+        '/opt/bigeye/parser --literal "$(id)"',
+        '/opt/bigeye/parser --literal "`id`"',
+    ],
+)
+def test_target_validator_rejects_shell_syntax_before_action_selection(run_command: str) -> None:
+    proposal = _target_proposal("known").model_copy(update={"run_command": run_command})
+
+    with pytest.raises(SpecialistValidationError, match="shell-free argv"):
+        _validate_target(proposal, frozenset({"known"}), "system-level")
+
+
+@pytest.mark.parametrize(
+    "run_command",
+    [
+        "/opt/bigeye/parser --stream",
+        "/opt/bigeye/parser --file @@",
+        '/opt/bigeye/parser --url "https://host/?a=1&b=2" --literal "a|b;c"',
+        r"/opt/bigeye/parser --literal a\|b\;c",
+        r'/opt/bigeye/parser --literal "\$(id)" --tick "\`id\`"',
+        "/opt/bigeye/parser --literal '$(id)' --tick '`id`'",
+    ],
+)
+def test_target_validator_accepts_afl_stdin_and_literal_file_input_argv(run_command: str) -> None:
+    proposal = _target_proposal("known").model_copy(update={"run_command": run_command})
+
+    validated = _validate_target(proposal, frozenset({"known"}), "system-level")
+
+    assert validated.run_command == run_command
+
+
+@pytest.mark.parametrize(
+    "run_command",
+    [
+        "/opt/bigeye/parser --file=@@",
+        "/opt/bigeye/parser @@ @@",
+        "/opt/bigeye/parser {input}",
+        "/opt/bigeye/parser --file={input}",
+    ],
+)
+def test_system_target_validator_rejects_invalid_input_placeholder_contract(
+    run_command: str,
+) -> None:
+    proposal = _target_proposal("known").model_copy(update={"run_command": run_command})
+
+    with pytest.raises(SpecialistValidationError, match="input placeholder"):
+        _validate_target(proposal, frozenset({"known"}), "system-level")
+
+
+@pytest.mark.parametrize("placeholder", ["@@", "{input}", "--file=@@"])
+def test_component_target_validator_rejects_input_placeholders(placeholder: str) -> None:
+    proposal = _target_proposal("known").model_copy(update={
+        "instance_type": "component-level",
+        "run_command": f"/opt/bigeye/parser {placeholder}",
+    })
+
+    with pytest.raises(SpecialistValidationError, match="component-level.*placeholder"):
+        _validate_target(proposal, frozenset({"known"}), "component-level")
+
+
+@pytest.mark.parametrize(
+    "control", ["\0", "\n", "\r", "\t", "\x7f", "\x85", "\u2028", "\u2029"],
+)
+def test_target_validator_rejects_control_characters(control: str) -> None:
+    proposal = _target_proposal("known").model_copy(update={
+        "run_command": f"/opt/bigeye/parser --value a{control}b",
+    })
+
+    with pytest.raises(SpecialistValidationError, match="control characters"):
+        _validate_target(proposal, frozenset({"known"}), "system-level")
+
+
+def test_target_prompts_require_shell_free_run_commands_and_afl_input_modes() -> None:
+    for prompt in (SYSTEM_TARGET_PROMPT, COMPONENT_TARGET_PROMPT, TARGET_REPAIR_ASSIGNMENT):
+        lowered = prompt.casefold()
+        assert "shell-free argv" in lowered
+        assert "redirection" in lowered
+        assert "command substitution" in lowered
+
+    system = SYSTEM_TARGET_PROMPT.casefold()
+    assert "stdin" in system
+    assert "omit" in system
+    assert "literal @@" in system
+    assert "do not use {input}" in system
+    component = COMPONENT_TARGET_PROMPT.casefold()
+    assert "must not include @@ or {input}" in component
+
+
+@pytest.mark.parametrize(
+    "luna_update",
+    [
+        {"evidence_ids": ["unknown"]},
+        {"run_command": "/opt/bigeye/parser < @@"},
+        {"run_command": "/opt/bigeye/parser {input}"},
+    ],
+    ids=["unknown-evidence", "shell-run-command", "invalid-input-placeholder"],
+)
 def test_luna_specialist_retries_once_with_terra_only_after_validation_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, luna_update: dict[str, object],
 ) -> None:
     context = agent_context(tmp_path)
     store = ProjectEventStore(tmp_path)
@@ -449,7 +555,11 @@ def test_luna_specialist_retries_once_with_terra_only_after_validation_failure(
     async def runner(starting_agent=None, input=None, **kwargs):
         agent = starting_agent
         calls.append((agent.model, kwargs.get("max_turns")))
-        return Result(_target_proposal("unknown") if agent.model == "gpt-5.6-luna" else _target_proposal("known"))
+        proposal = _target_proposal("known")
+        return Result(
+            proposal.model_copy(update=luna_update)
+            if agent.model == "gpt-5.6-luna" else proposal
+        )
 
     from agents import Runner
 

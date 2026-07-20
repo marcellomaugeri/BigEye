@@ -25,5 +25,8 @@ When CMake configuration is required, use this build-command form exactly:
 `cmake -S /src -B /opt/bigeye/build [project -D options] && cmake --build /opt/bigeye/build ...`.
 Otherwise use one direct Clang or GCC compile command. Do not use make, Ninja, a script, a CMake
 preset, a cache preload, or a CMake include/rule override as the build command.
+Return run_command as shell-free argv text. It must not contain shell operators, redirection,
+pipes, or command substitution. It must not include @@ or {input}; libFuzzer receives its corpus
+through BigEye's invocation.
 Do not set compilers, compiler flags, linker flags, or sanitizer flags; BigEye applies them.
 """.strip()

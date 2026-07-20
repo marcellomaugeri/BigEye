@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shlex
+import unicodedata
 from collections.abc import Iterable
 from contextvars import ContextVar
 from pathlib import PurePosixPath
@@ -103,6 +105,71 @@ def _safe_seed_path(value: str) -> None:
         raise SpecialistValidationError("specialist returned an unsafe seed path")
 
 
+def _has_unquoted_shell_syntax(value: str) -> bool:
+    quote: str | None = None
+    escaped = False
+    for index, character in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if quote == "'":
+            if character == "'":
+                quote = None
+            continue
+        if quote == '"':
+            if character == '"':
+                quote = None
+            elif character == "\\":
+                escaped = True
+            elif character == "`":
+                return True
+            elif character == "$" and value[index + 1:index + 2] == "(":
+                return True
+            continue
+        if character == "\\":
+            escaped = True
+        elif character in {"'", '"'}:
+            quote = character
+        elif character in ";|&<>()`":
+            return True
+        elif character == "$" and value[index + 1:index + 2] == "(":
+            return True
+    return False
+
+
+def _validate_run_command(value: str, expected_type: str) -> None:
+    if any(unicodedata.category(character) in {"Cc", "Zl", "Zp"} for character in value):
+        raise SpecialistValidationError(
+            "specialist run_command cannot contain control characters"
+        )
+    try:
+        arguments = shlex.split(value, posix=True)
+    except ValueError as error:
+        raise SpecialistValidationError(
+            "specialist run_command must be valid shell-free argv"
+        ) from error
+    if not arguments or _has_unquoted_shell_syntax(value):
+        raise SpecialistValidationError(
+            "specialist run_command must be shell-free argv without shell operators, "
+            "redirection, pipes, or command substitution"
+        )
+    placeholders = tuple(
+        argument for argument in arguments if "@@" in argument or "{input}" in argument
+    )
+    if expected_type == "component-level" and placeholders:
+        raise SpecialistValidationError(
+            "component-level run_command cannot contain an input placeholder"
+        )
+    if expected_type == "system-level" and (
+        any("{input}" in argument for argument in arguments)
+        or any("@@" in argument and argument != "@@" for argument in arguments)
+        or sum(argument == "@@" for argument in arguments) > 1
+    ):
+        raise SpecialistValidationError(
+            "system-level run_command has an invalid input placeholder contract"
+        )
+
+
 def _validate_target(output, allowed: frozenset[str], expected_type: str) -> TargetProposal:
     try:
         proposal = output if isinstance(output, TargetProposal) else TargetProposal.model_validate(output)
@@ -114,6 +181,7 @@ def _validate_target(output, allowed: frozenset[str], expected_type: str) -> Tar
         )
     if proposal.instance_type != expected_type:
         proposal = proposal.model_copy(update={"instance_type": expected_type})
+    _validate_run_command(proposal.run_command, expected_type)
     _validate_evidence_ids(proposal.evidence_ids, allowed)
     for seed in proposal.seeds:
         _safe_seed_path(seed.path)
