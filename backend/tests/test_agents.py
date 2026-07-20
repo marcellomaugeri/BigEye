@@ -325,6 +325,8 @@ def test_contained_operation_tool_schema_lists_only_supported_operations() -> No
 
 def test_agent_prompts_keep_operation_requests_out_of_decision_and_evidence_ids() -> None:
     assert "result or action IDs" in MANAGER_PROMPT
+    assert "Evidence IDs contain only factual assigned evidence" in MANAGER_PROMPT
+    assert "belong only in bounded actions" in MANAGER_PROMPT
     assert "return application-owned result or operation-request IDs" not in MANAGER_PROMPT
     assert CampaignDecision.model_fields["bounded_actions"].description == (
         "Selectable result or application-owned action IDs returned in this review."
@@ -1325,6 +1327,57 @@ def test_review_collection_retains_typed_specialist_results_and_operation_reques
         )
 
 
+def test_manager_normalizes_only_selected_action_ids_out_of_factual_evidence() -> None:
+    from backend.agents.manager import _decision
+
+    action_id = "target_" + "a" * 24
+    decision = _decision(CampaignDecision(
+        decision="prepare target", motivation="source evidence supports the target",
+        evidence_ids=["source:parser.c:8", action_id], bounded_actions=[action_id],
+        next_review_condition="after probe", uncertainty="probe not run",
+    ), frozenset({"source:parser.c:8"}), frozenset({action_id}))
+
+    assert decision.evidence_ids == ["source:parser.c:8"]
+    assert decision.bounded_actions == [action_id]
+
+
+@pytest.mark.parametrize(
+    ("evidence_ids", "bounded_actions", "actionable_ids", "message"),
+    [
+        (
+            ["source:parser.c:8", "fabricated"], ["fabricated"], frozenset(),
+            "manager selected an action outside this review",
+        ),
+        (
+            ["source:parser.c:8", "target_" + "b" * 24], [],
+            frozenset({"target_" + "b" * 24}),
+            "manager cited an unselected action as evidence",
+        ),
+        (
+            ["source:parser.c:8", "target_" + "c" * 24, "target_" + "c" * 24],
+            ["target_" + "c" * 24], frozenset({"target_" + "c" * 24}),
+            "manager returned duplicate evidence identifiers",
+        ),
+        (
+            ["source:parser.c:8", "operation_" + "d" * 24], [], frozenset(),
+            "manager returned an operation-request ID as evidence",
+        ),
+    ],
+)
+def test_manager_evidence_normalization_fails_closed(
+    evidence_ids: list[str], bounded_actions: list[str],
+    actionable_ids: frozenset[str], message: str,
+) -> None:
+    from backend.agents.manager import _decision
+
+    with pytest.raises(SpecialistValidationError, match=message):
+        _decision(CampaignDecision(
+            decision="prepare target", motivation="invalid decision boundary",
+            evidence_ids=evidence_ids, bounded_actions=bounded_actions,
+            next_review_condition="after probe", uncertainty="probe not run",
+        ), frozenset({"source:parser.c:8"}), actionable_ids)
+
+
 def test_target_proposal_rejects_operation_request_ids_as_evidence() -> None:
     request_id = "operation_" + "a" * 24
 
@@ -1346,7 +1399,7 @@ def test_operation_request_ids_are_rejected_across_every_agent_evidence_boundary
         _validate_evidence_ids([request_id], frozenset({request_id}))
     with pytest.raises(SpecialistValidationError, match="operation-request IDs cannot be evidence"):
         _validate_triage(triage, frozenset({request_id}))
-    with pytest.raises(SpecialistValidationError, match="operation-request IDs cannot be evidence"):
+    with pytest.raises(SpecialistValidationError, match="manager returned an operation-request ID as evidence"):
         _decision(CampaignDecision(
             decision="wait", motivation="malicious evidence", evidence_ids=[request_id],
             bounded_actions=[], next_review_condition="new evidence", uncertainty="unknown",

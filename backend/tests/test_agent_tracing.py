@@ -13,7 +13,11 @@ import pytest
 from backend.agents.context import AgentContext
 from backend.agents.manager import CampaignManager
 from backend.agents.outputs.campaign_decision import CampaignDecision
-from backend.agents.outputs.campaign_review import CampaignReviewResult
+from backend.agents.outputs.campaign_review import (
+    CampaignReviewResult,
+    ProgressionActionRecord,
+    RetirementActionRecord,
+)
 from backend.agents.tracing.hooks import AgentTraceHooks
 from backend.agents.tracing.local_trace import LocalTrace
 from backend.fuzzing.discovery.retrieval import EvidenceRetriever
@@ -33,6 +37,22 @@ def context_for(tmp_path: Path) -> AgentContext:
 
 def read_payloads(store: ProjectEventStore, stream: str):
     return [event.payload for event in run(store.read(7, stream, -1, 100))]
+
+
+def prepared_action(kind: str):
+    if kind == "retirement":
+        return RetirementActionRecord(
+            action_id="retirement:7:9:90:4:40", project_id=7, campaign_id=9,
+            strategy_asset_id=90, retained_campaign_id=4, retained_strategy_asset_id=40,
+            evidence_ids=("checkpoint:1", "checkpoint:2"),
+            reason="clean subset at two checkpoints", reversible=True,
+        )
+    return ProgressionActionRecord(
+        action_id="campaign-progression:7:9:abcd1234abcd1234",
+        project_id=7, base_campaign_id=9, target_asset_id=31,
+        action_name="enable dictionary", evidence_ids=("checkpoint:1",),
+        dictionary_content='token_000="MAGIC"\n',
+    )
 
 
 def test_trace_contains_model_tool_usage_reasoning_citations_and_no_secrets(tmp_path: Path) -> None:
@@ -331,7 +351,11 @@ def test_campaign_manager_returns_selectable_specialist_result_and_audit_operati
 
     monkeypatch.setattr(Runner, "run", nested_runner)
 
+    manager_calls = 0
+
     async def manager_runner(agent, prompt, **kwargs):
+        nonlocal manager_calls
+        manager_calls += 1
         target_tool = next(tool for tool in agent.tools if tool.name == "prepare_system_target")
         target_context = ToolContext(
             context, tool_name=target_tool.name, tool_call_id="call-specialist",
@@ -341,23 +365,126 @@ def test_campaign_manager_returns_selectable_specialist_result_and_audit_operati
         specialist = await target_tool.on_invoke_tool(target_context, target_context.tool_arguments)
         return SimpleNamespace(
             final_output=CampaignDecision(
-                decision="probe", motivation="proposal ready", evidence_ids=["known"],
+                decision="probe", motivation="proposal ready",
+                evidence_ids=["known", specialist["result_id"]],
                 bounded_actions=[specialist["result_id"]],
                 next_review_condition="after probe", uncertainty="not probed",
             ), raw_responses=[], new_items=[],
         )
 
-    review = run(CampaignManager(ProjectEventStore(tmp_path), runner=manager_runner).review(
+    store = ProjectEventStore(tmp_path)
+    review = run(CampaignManager(store, runner=manager_runner).review(
         context, [{"evidence_id": "known", "summary": "parser"}], "prepare parser",
     ))
 
+    assert manager_calls == 1
     assert review.known_target_proposals[0].proposal.target_name == "parser"
     assert review.known_operation_requests[0].operation == "probe"
     assert review.known_operation_requests[0].tool_call_id == "call-specialist"
     assert review.known_operation_requests[0].actionable is False
     assert review.decision.bounded_actions == [review.known_target_proposals[0].result_id]
+    assert review.decision.evidence_ids == ["known"]
     assert review.selected_action_ids == tuple(review.decision.bounded_actions)
     assert review.selected_operation_requests == ()
+    debug = read_payloads(store, "debug")
+    workflow_result = next(
+        event for event in debug
+        if event["event"] == "workflow.result" and event["agent"] == "Campaign manager"
+    )
+    assert workflow_result["output"]["evidence_ids"] == [
+        "known", review.known_target_proposals[0].result_id,
+    ]
+    normalized = next(event for event in debug if event["event"] == "manager.decision.normalized")
+    assert normalized["removed_action_ids"] == [review.known_target_proposals[0].result_id]
+    assert normalized["normalized_evidence_ids"] == ["known"]
+    assert read_payloads(store, "activity")[-1]["evidence_ids"] == ["known"]
+
+
+@pytest.mark.parametrize("kind", ["retirement", "progression"])
+def test_campaign_manager_normalizes_selected_prepared_action_ids(
+    tmp_path: Path, kind: str,
+) -> None:
+    store = ProjectEventStore(tmp_path)
+    context = context_for(tmp_path)
+    record = prepared_action(kind)
+    calls = 0
+
+    async def runner(_agent, _prompt, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(
+            final_output=CampaignDecision(
+                decision="apply prepared action", motivation="factual checkpoint supports it",
+                evidence_ids=["checkpoint:1", record.action_id],
+                bounded_actions=[record.action_id],
+                next_review_condition="after deterministic execution", uncertainty="not executed",
+            ),
+            raw_responses=[], new_items=[],
+        )
+
+    review = run(CampaignManager(store, runner=runner).review(
+        context,
+        [
+            {"evidence_id": "checkpoint:1", "trusted_instructions": False},
+            {"evidence_id": record.action_id, "trusted_instructions": False},
+        ],
+        "prepared campaign action",
+        prepared_actions=(record,),
+    ))
+
+    assert calls == 1
+    assert review.decision.evidence_ids == ["checkpoint:1"]
+    assert review.selected_action_ids == (record.action_id,)
+    selected = (
+        review.selected_retirement_actions
+        if kind == "retirement" else review.selected_progression_actions
+    )
+    assert selected == (record,)
+    debug = read_payloads(store, "debug")
+    raw = next(event for event in debug if event["event"] == "workflow.result")
+    assert raw["output"]["evidence_ids"] == ["checkpoint:1", record.action_id]
+    normalized = next(event for event in debug if event["event"] == "manager.decision.normalized")
+    assert normalized["removed_action_ids"] == [record.action_id]
+    assert normalized["normalized_evidence_ids"] == ["checkpoint:1"]
+    assert read_payloads(store, "activity")[-1]["evidence_ids"] == ["checkpoint:1"]
+
+
+@pytest.mark.parametrize("kind", ["retirement", "progression"])
+def test_campaign_manager_rejects_unselected_prepared_action_ids_as_evidence(
+    tmp_path: Path, kind: str,
+) -> None:
+    store = ProjectEventStore(tmp_path)
+    context = context_for(tmp_path)
+    record = prepared_action(kind)
+    calls = 0
+
+    async def runner(_agent, _prompt, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(
+            final_output=CampaignDecision(
+                decision="wait", motivation="action was not selected",
+                evidence_ids=["checkpoint:1", record.action_id], bounded_actions=[],
+                next_review_condition="new evidence", uncertainty="not selected",
+            ),
+            raw_responses=[], new_items=[],
+        )
+
+    with pytest.raises(
+        ValueError, match="manager cited an unselected action as evidence",
+    ):
+        run(CampaignManager(store, runner=runner).review(
+            context,
+            [
+                {"evidence_id": "checkpoint:1", "trusted_instructions": False},
+                {"evidence_id": record.action_id, "trusted_instructions": False},
+            ],
+            "prepared campaign action",
+            prepared_actions=(record,),
+        ))
+
+    assert calls == 1
+    assert read_payloads(store, "activity") == []
 
 
 def test_campaign_manager_rejects_nonexistent_or_stale_action_ids(tmp_path: Path) -> None:

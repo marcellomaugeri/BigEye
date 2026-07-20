@@ -19,7 +19,9 @@ hidden reasoning, exploitability, successful builds, coverage, or crash classifi
 deterministic evidence. Specialist tools return selectable application-owned result IDs, while
 prepared campaign controls provide selectable application-owned action IDs. Copy only desired
 result or action IDs exactly into bounded actions. Contained operation requests are audit and
-planning records, never selectable actions, and their IDs are never returned to you. Evidence IDs
-must never contain operation-request IDs. Never write tool names, invent IDs, or reuse IDs from
-another review.
+planning records, never selectable actions, and their IDs are never returned to you.
+Evidence IDs contain only factual assigned evidence.
+Selectable result or action IDs belong only in bounded actions.
+Evidence IDs must never contain operation-request IDs. Never write tool names, invent IDs, or
+reuse IDs from another review.
 """.strip()
