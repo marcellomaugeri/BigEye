@@ -1,5 +1,7 @@
 """Remove known credentials before observability payloads are persisted."""
 
+from base64 import b64decode
+from binascii import Error as Base64Error
 from collections.abc import Mapping
 import re
 from urllib.parse import parse_qsl, urlsplit
@@ -12,11 +14,14 @@ _SECRET_KEYS = frozenset({
     "private_key", "credential", "credentials",
 })
 _BEARER_CREDENTIAL = re.compile(r"\bbearer\s+\S+", re.IGNORECASE)
+_BASIC_CREDENTIAL = re.compile(
+    r"\bbasic[ \t]+([A-Za-z0-9+/]+={0,2})(?![A-Za-z0-9+/=])", re.IGNORECASE,
+)
 _PRIVATE_KEY_MATERIAL = re.compile(
     r"-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----", re.IGNORECASE,
 )
-_MAX_URL_QUERY_FIELDS = 64
-_MAX_DECODED_QUERY_VALUES = 256
+_MAX_REPLAY_VALUE_CHARS = 4_096
+_MAX_DECODED_QUERY_VALUES = 4_096
 
 
 def is_secret_key(key: object) -> bool:
@@ -40,9 +45,13 @@ def is_secret_value(value: object) -> bool:
     while pending:
         inspected += 1
         if inspected > _MAX_DECODED_QUERY_VALUES:
-            return True
+            break
         candidate = pending.pop().strip()
-        if _BEARER_CREDENTIAL.search(candidate) or _PRIVATE_KEY_MATERIAL.search(candidate):
+        if (
+            _BEARER_CREDENTIAL.search(candidate)
+            or _PRIVATE_KEY_MATERIAL.search(candidate)
+            or _has_basic_credential(candidate)
+        ):
             return True
         try:
             parsed = urlsplit(candidate)
@@ -56,19 +65,32 @@ def is_secret_value(value: object) -> bool:
             return True
         try:
             query = parse_qsl(
-                parsed.query,
+                parsed.query[:_MAX_REPLAY_VALUE_CHARS],
                 keep_blank_values=True,
-                max_num_fields=_MAX_URL_QUERY_FIELDS,
             )
         except ValueError:
-            return True
+            continue
         for key, item in query:
             if is_secret_key(key):
                 return True
             if item:
                 if inspected + len(pending) >= _MAX_DECODED_QUERY_VALUES:
-                    return True
+                    continue
                 pending.append(item)
+    return False
+
+
+def _has_basic_credential(value: str) -> bool:
+    for match in _BASIC_CREDENTIAL.finditer(value):
+        encoded = match.group(1)
+        if len(encoded) > _MAX_REPLAY_VALUE_CHARS:
+            return True
+        try:
+            decoded = b64decode(encoded, validate=True)
+        except (Base64Error, ValueError):
+            continue
+        if b":" in decoded:
+            return True
     return False
 
 

@@ -473,6 +473,7 @@ def test_traceability_rejects_unbounded_or_secret_replay_environment(
     (("REMOTE_ENDPOINT", "https://user:password@example.test/path"),),
     (("DATABASE_URL", "postgresql://db/bigeye?user=admin&password=secret"),),
     (("REMOTE_ENDPOINT", "https://example.test/?payload=Bearer%20must-not-persist"),),
+    (("REMOTE_ENDPOINT", "https://example.test/?payload=bAsIc%20dXNlcjpwYXNz"),),
     ((
         "REMOTE_ENDPOINT",
         "https://example.test/?next=https%3A%2F%2Fuser%3Apass%40internal.test%2F",
@@ -498,9 +499,24 @@ def test_clean_coverage_contract_preserves_benign_replay_configuration() -> None
         ("REMOTE_ENDPOINT", "https://example.test/path?user=reader&mode=encrypted&ssl=true"),
         (
             "DOCUMENTATION_URL",
-            "https://example.test/?next=https%3A%2F%2Fdocs.example.test%2Fguide%3Fmode%3Dencrypted",
+            "https://example.test/?mode=basic&description=basic%20fuzzing&next="
+            "https%3A%2F%2Fdocs.example.test%2Fguide%3Fmode%3Dencrypted",
         ),
     )) is True
+
+
+def test_clean_coverage_contract_scans_past_64_benign_query_fields() -> None:
+    from backend.fuzzing.campaigns.coverage_contract import valid_replay_environment
+
+    benign = "&".join(f"flag{index}=on" for index in range(65))
+    late_secret = benign + "&payload=Basic%20dXNlcjpwYXNz"
+
+    assert valid_replay_environment((
+        ("REMOTE_ENDPOINT", f"https://example.test/?{benign}"),
+    )) is True
+    assert valid_replay_environment((
+        ("REMOTE_ENDPOINT", f"https://example.test/?{late_secret}"),
+    )) is False
 
 
 def test_new_first_hit_invalidates_coverage_only_after_durable_publication(tmp_path: Path):

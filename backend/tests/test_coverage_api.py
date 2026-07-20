@@ -106,6 +106,7 @@ def test_line_evidence_response_redacts_credential_shaped_environment_defensivel
                 "DATABASE_URL": "postgresql://user:password@db/bigeye",
                 "DATABASE_QUERY_URL": "postgresql://db/bigeye?user=admin&password=secret",
                 "ENCODED_AUTH_URL": "https://example.test/?payload=Bearer%20must-not-persist",
+                "ENCODED_BASIC_URL": "https://example.test/?payload=Basic%20dXNlcjpwYXNz",
                 "authentication": "Bearer bearer-secret",
             }
             return result
@@ -122,6 +123,7 @@ def test_line_evidence_response_redacts_credential_shaped_environment_defensivel
         "DATABASE_URL": "[REDACTED]",
         "DATABASE_QUERY_URL": "[REDACTED]",
         "ENCODED_AUTH_URL": "[REDACTED]",
+        "ENCODED_BASIC_URL": "[REDACTED]",
         "authentication": "[REDACTED]",
     }
 

@@ -150,6 +150,7 @@ def test_redaction_removes_credential_shaped_names_and_values() -> None:
         "DATABASE_URL": "postgresql://user:password@db/bigeye",
         "DATABASE_QUERY_URL": "postgresql://db/bigeye?user=admin&password=secret",
         "ENCODED_BEARER_URL": "https://example.test/?payload=Bearer%20must-not-persist",
+        "ENCODED_BASIC_URL": "https://example.test/?payload=Basic%20dXNlcjpwYXNz",
         "NESTED_CREDENTIAL_URL": (
             "https://example.test/?next="
             "https%3A%2F%2Fuser%3Apass%40internal.test%2F"
@@ -167,6 +168,7 @@ def test_redaction_removes_credential_shaped_names_and_values() -> None:
         "DATABASE_URL": "[REDACTED]",
         "DATABASE_QUERY_URL": "[REDACTED]",
         "ENCODED_BEARER_URL": "[REDACTED]",
+        "ENCODED_BASIC_URL": "[REDACTED]",
         "NESTED_CREDENTIAL_URL": "[REDACTED]",
         "EMPTY_PASSWORD_URL": "[REDACTED]",
         "authentication": "[REDACTED]",
@@ -180,11 +182,22 @@ def test_redaction_preserves_benign_url_query_configuration() -> None:
     from backend.services.observability.redaction import redact
 
     value = (
-        "https://example.test/path?user=reader&mode=encrypted&ssl=true&next="
+        "https://example.test/path?user=reader&mode=basic&description=basic%20fuzzing&next="
         "https%3A%2F%2Fdocs.example.test%2Fguide%3Fmode%3Dencrypted"
     )
 
     assert redact({"REMOTE_ENDPOINT": value}) == {"REMOTE_ENDPOINT": value}
+
+
+def test_redaction_scans_past_64_benign_query_fields_without_false_secret() -> None:
+    from backend.services.observability.redaction import redact
+
+    benign = "&".join(f"flag{index}=on" for index in range(65))
+    benign_url = f"https://example.test/?{benign}"
+    secret_url = benign_url + "&payload=Basic%20dXNlcjpwYXNz"
+
+    assert redact({"REMOTE_ENDPOINT": benign_url}) == {"REMOTE_ENDPOINT": benign_url}
+    assert redact({"REMOTE_ENDPOINT": secret_url}) == {"REMOTE_ENDPOINT": "[REDACTED]"}
 
 
 def test_activity_and_debug_are_separate_from_internal_events_stream(tmp_path: Path) -> None:
