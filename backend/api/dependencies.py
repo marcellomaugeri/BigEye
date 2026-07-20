@@ -20,6 +20,7 @@ from backend.services.observability.event_stream import ProjectEventStream
 from backend.services.stream_task_output import TaskLogReader
 from backend.services.stream_task_output import TaskLogWriter
 from backend.services.execute_project_backbone import ExecuteProjectBackbone
+from backend.services.campaigns.project_coordinator import PostgresProjectLock
 from backend.agents.workflow import RepositoryAnalysisWorkflow
 from backend.fuzzing.toolchain.deferred import DeferredToolchain
 from backend.fuzzing.coverage.traceability import ProjectCheckoutRegistry, TraceabilityService
@@ -67,7 +68,7 @@ def build_services(pool, workspace: Path) -> Services:
     toolchain = DeferredToolchain(Path(__file__).parents[1] / "fuzzing/images/Dockerfile", logs)
     analysis = RepositoryAnalysisWorkflow(workspace, event_store=observability)
     executor = ExecuteProjectBackbone(projects, tasks, clone, toolchain, analysis, logs, workspace, observability)
-    backbone = ProjectBackboneService(projects, executor)
+    backbone = ProjectBackboneService(projects, executor, PostgresProjectLock(pool))
     checkout_registry = ProjectCheckoutRegistry(workspace, projects)
     replay_verifier = FirstHitReplayVerifier(
         CleanCoverageTargetResolver(checkout_registry, campaigns, assets),
@@ -85,6 +86,6 @@ def build_services(pool, workspace: Path) -> Services:
         logs=logs, events=ProjectEventStream(observability),
         settings=SettingsService(pool, toolchain.docker_available, toolchain.toolchain_available),
         recovery=backbone, analysis=AnalysisReader(workspace),
-        project_settings=ProjectSettingsService(projects), observability=observability,
+        project_settings=ProjectSettingsService(projects, backbone), observability=observability,
         coverage=coverage, findings=findings, finding_artifacts=finding_artifacts,
     )

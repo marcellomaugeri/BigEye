@@ -1,40 +1,66 @@
-"""Coordinate recovery and genuine project update observation."""
+"""Compatibility entry point for the project coordinator registry."""
 
-import asyncio
+from __future__ import annotations
 
-from backend.fuzzing.docker.client import DOCKER_REQUEST_TIMEOUT_SECONDS
+import inspect
+
+from backend.services.campaigns.coordinator_registry import CoordinatorRegistry
 
 
 class AnalysisNotReady(RuntimeError):
-    """Raised while repository analysis has not produced its artifact."""
+    """Raised while the initial campaign decision has not been published."""
 
 
-class ProjectBackboneService:
-    def __init__(self, projects, scheduler):
-        self._projects = projects
+class _BootstrapCoordinator:
+    """Adapt the release backbone bootstrap to the continuous registry lifecycle."""
+
+    def __init__(self, scheduler, advisory_lock=None):
         self._scheduler = scheduler
-        self._background_tasks: set[asyncio.Task] = set()
+        self._advisory_lock = advisory_lock
 
-    def schedule(self, project_id: int) -> None:
-        task = asyncio.create_task(self._scheduler.schedule(project_id))
-        self._background_tasks.add(task)
-        task.add_done_callback(self._observe)
+    async def run(self, project_id: int) -> None:
+        if self._advisory_lock is None:
+            await self._scheduler.schedule(project_id)
+            return
+        async with self._advisory_lock.acquire(project_id) as acquired:
+            if acquired:
+                await self._scheduler.schedule(project_id)
 
-    def _observe(self, task: asyncio.Task) -> None:
-        self._background_tasks.discard(task)
-        if not task.cancelled():
-            task.exception()
+    def notify(self, project_id: int) -> None:
+        notify = getattr(self._scheduler, "notify", None)
+        if notify is not None:
+            notify(project_id)
 
-    async def recover(self) -> None:
-        for project in await self._projects.list_unfinished():
-            self.schedule(project.id)
+    async def pause(self, project_id: int) -> None:
+        await _optional_call(self._scheduler, "pause", project_id)
 
-    async def close(self) -> None:
-        tasks = tuple(self._background_tasks)
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            try:
-                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=DOCKER_REQUEST_TIMEOUT_SECONDS + 5)
-            except TimeoutError:
-                return
+    async def resume(self, project_id: int) -> None:
+        await _optional_call(self._scheduler, "resume", project_id)
+
+
+class ProjectBackboneService(CoordinatorRegistry):
+    """Retain the public backbone name while enforcing one task per project."""
+
+    def __init__(self, projects, scheduler, advisory_lock=None):
+        self._scheduler = scheduler
+        self._advisory_lock = advisory_lock
+        super().__init__(
+            projects,
+            lambda _project_id: _BootstrapCoordinator(scheduler, advisory_lock),
+        )
+
+    @property
+    def _background_tasks(self):
+        return set(self.tasks.values())
+
+    def schedule(self, project_id: int) -> bool:
+        return self.start(project_id)
+
+
+async def _optional_call(target, method_name: str, *arguments) -> None:
+    method = getattr(target, method_name, None)
+    if method is None:
+        return
+    result = method(*arguments)
+    if inspect.isawaitable(result):
+        await result
