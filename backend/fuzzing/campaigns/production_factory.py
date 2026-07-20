@@ -417,13 +417,12 @@ def _application_file(context, relative_path: str, content: str) -> Path:
     return context.generated_assets_root / relative_path
 
 
-def _application_preparation_file(context, name: str, content: str) -> Path:
+def _application_preparation_file(context, name: str, content: str) -> tuple[Path, str]:
     digest = sha256(content.encode("utf-8")).hexdigest()
-    return _application_file(
-        context,
-        f"application/preparation/{digest}/{name}",
-        content,
+    source = _application_file(
+        context, f"application/preparation/{digest}/{name}", content,
     )
+    return source, digest
 
 
 def _is_dependency_intent(intent) -> bool:

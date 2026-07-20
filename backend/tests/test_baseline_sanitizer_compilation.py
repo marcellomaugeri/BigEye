@@ -6,6 +6,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -198,18 +199,81 @@ def test_same_content_preparation_source_is_idempotent_during_concurrent_creatio
     monkeypatch.setattr(production_factory, "read_asset_file", read_together)
 
     with ThreadPoolExecutor(max_workers=2) as workers:
-        paths = tuple(workers.map(
+        sources = tuple(workers.map(
             lambda _index: production_factory._application_preparation_file(
                 context, "target-build.sh", content,
             ),
             range(2),
         ))
 
+    paths = tuple(source[0] for source in sources)
     assert paths[0] == paths[1]
+    assert sources[0][1] == sources[1][1] == sha256(content.encode()).hexdigest()
     assert paths[0].read_text() == content
     assert len(tuple(context.generated_assets_root.glob(
         "application/preparation/*/target-build.sh"
     ))) == 1
+
+
+def test_preparation_source_is_bound_before_asset_store_normalization(tmp_path) -> None:
+    from backend.agents.tools.generated_assets import read_asset_file, write_asset_file
+    import backend.fuzzing.campaigns.production_factory as production_factory
+    from backend.fuzzing.assets.store import AssetStore
+
+    workspace = tmp_path / "workspace"
+    repository_root = workspace / "projects/7/repository"
+    repository_root.mkdir(parents=True)
+    context = SimpleNamespace(
+        repository_root=repository_root,
+        generated_assets_root=repository_root.parent / "generated",
+    )
+    source = production_factory._application_preparation_file(
+        context,
+        "target-build.sh",
+        "#!/bin/sh\nset -eu\nexit 0\n",
+    )
+
+    class Assets:
+        def __init__(self):
+            self.created = False
+
+        async def create(self, project_id, kind, name, content_hash, parent_id):
+            self.created = True
+            return SimpleNamespace(
+                id=1, project_id=project_id, kind=kind, name=name,
+                content_hash=content_hash, parent_id=parent_id,
+                validated_at=None, error=None,
+            )
+
+        async def mark_validated(self, asset_id):
+            assert asset_id == 1
+            return SimpleNamespace(id=asset_id)
+
+        async def record_error(self, _asset_id, _error):
+            pass
+
+    class ReplacingStore(AssetStore):
+        def _normalise(self, project_id, kind, files):
+            selected = files["target-build.sh"]
+            path = selected[0] if isinstance(selected, tuple) else selected
+            relative_path = path.relative_to(context.generated_assets_root).as_posix()
+            existing = read_asset_file(context, relative_path)
+            write_asset_file(
+                context,
+                relative_path,
+                "#!/bin/sh\nset -eu\nexit 2\n",
+                existing["sha256"],
+            )
+            return super()._normalise(project_id, kind, files)
+
+    assets = Assets()
+    with pytest.raises(ValueError, match="declared hash"):
+        asyncio.run(ReplacingStore(workspace, assets).create(
+            7, "script", "target-build.sh", {"target-build.sh": source}, None,
+        ))
+
+    assert assets.created is False
+    assert not (workspace / "projects/7/assets").exists()
 
 
 @pytest.mark.parametrize("prompt", (SYSTEM_TARGET_PROMPT, COMPONENT_TARGET_PROMPT))
