@@ -64,6 +64,79 @@ def _generated_scripts(
     )
 
 
+def test_retry_replaces_application_build_drafts_but_keeps_published_versions_immutable(
+    tmp_path,
+) -> None:
+    project_root = tmp_path / "projects" / "7"
+    repository = project_root / "repository"
+    repository.mkdir(parents=True)
+    (repository / "seed").write_bytes(b"seed")
+    generated = project_root / "generated"
+    context = SimpleNamespace(
+        repository_root=repository,
+        generated_assets_root=generated,
+    )
+
+    class AssetStore:
+        def __init__(self):
+            self.next_id = 1
+            self.published = []
+
+        async def create(self, _project_id, kind, name, files, _parent_id):
+            contents = {
+                path: source.read_text()
+                for path, source in files.items()
+            }
+            asset = SimpleNamespace(
+                id=self.next_id, kind=kind, name=name, contents=contents,
+            )
+            self.next_id += 1
+            self.published.append(asset)
+            return asset
+
+    store = AssetStore()
+    planner = ProposalPreparationPlanner(
+        discovery=SimpleNamespace(context=lambda _project_id: context),
+        asset_store=store,
+    )
+
+    def selected(command: str):
+        return SimpleNamespace(
+            instance_type="system-level",
+            build_command=command,
+            run_command="/opt/bigeye/fuzz-target",
+            seeds=(SimpleNamespace(path="seed"),),
+            generated_asset_intents=(),
+        )
+
+    first = asyncio.run(planner.plan(
+        SimpleNamespace(id=7),
+        selected(
+            "cmake -S /src -B /opt/bigeye/build -DFEATURE=OFF && "
+            "cmake --build /opt/bigeye/build --target fuzz-target"
+        ),
+    ))
+    first_target = first.existing_assets["configuration"]
+    first_coverage = first.existing_assets["coverage_configuration"]
+
+    second = asyncio.run(planner.plan(
+        SimpleNamespace(id=7),
+        selected(
+            "cmake -S /src -B /opt/bigeye/build -DFEATURE=ON && "
+            "cmake --build /opt/bigeye/build --target fuzz-target"
+        ),
+    ))
+
+    assert "-DFEATURE=OFF" in first_target.contents["target-build.sh"]
+    assert "-DFEATURE=OFF" in first_coverage.contents["coverage-build.sh"]
+    assert "-DFEATURE=ON" in second.existing_assets["configuration"].contents["target-build.sh"]
+    assert "-DFEATURE=ON" in second.existing_assets["coverage_configuration"].contents["coverage-build.sh"]
+    assert first_target.id != second.existing_assets["configuration"].id
+    assert first_coverage.id != second.existing_assets["coverage_configuration"].id
+    assert "-DFEATURE=ON" in (generated / "application" / "target-build.sh").read_text()
+    assert "-DFEATURE=ON" in (generated / "application" / "coverage-build.sh").read_text()
+
+
 @pytest.mark.parametrize("prompt", (SYSTEM_TARGET_PROMPT, COMPONENT_TARGET_PROMPT))
 def test_target_specialists_receive_the_supported_explicit_cmake_form(prompt: str) -> None:
     assert "cmake -S" in prompt

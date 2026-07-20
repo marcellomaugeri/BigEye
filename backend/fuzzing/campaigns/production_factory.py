@@ -402,7 +402,7 @@ def _application_file(context, relative_path: str, content: str) -> Path:
         write_asset_file(context, relative_path, content, None)
     else:
         if existing["content"] != content:
-            raise ValueError("application-owned generated preparation file changed")
+            write_asset_file(context, relative_path, content, existing["sha256"])
     return context.generated_assets_root / relative_path
 
 
