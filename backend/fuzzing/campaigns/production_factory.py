@@ -630,7 +630,8 @@ def _instrument_cmake_build(
         )
 
     profile = f"{instance_type.removesuffix('-level')}-{'coverage' if coverage else 'target'}"
-    build_directory = f"$BIGEYE_BUILD_ROOT/build-{profile}"
+    build_name = f"build-{profile}"
+    build_directory = f"$BIGEYE_BUILD_ROOT/{build_name}"
     definitions = (
         f"-DCMAKE_C_COMPILER:FILEPATH={compiler}",
         f"-DCMAKE_CXX_COMPILER:FILEPATH={cxx_compiler}",
@@ -657,7 +658,11 @@ def _instrument_cmake_build(
     build = f'cmake --build "{build_directory}"'
     if len(build_arguments) > 3:
         build += " " + shlex.join(build_arguments[3:])
-    return configure + "\n" + build
+    publish = (
+        'rm -rf "$BIGEYE_BUILD_ROOT/build"\n'
+        f'ln -s "{build_name}" "$BIGEYE_BUILD_ROOT/build"'
+    )
+    return configure + "\n" + build + "\n" + publish
 
 
 def _cmake_build_directory(arguments: list[str]) -> str:

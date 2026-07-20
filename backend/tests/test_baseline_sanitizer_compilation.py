@@ -105,6 +105,14 @@ def test_cmake_build_is_reconfigured_in_application_owned_target_directory(tmp_p
     assert 'cmake --build "$BIGEYE_BUILD_ROOT/build-system-target" --target fuzz-target --parallel 2' in target
     assert 'cmake -S "$BIGEYE_SOURCE_DIR" -B "$BIGEYE_BUILD_ROOT/build-system-coverage"' in coverage
     assert 'cmake --build "$BIGEYE_BUILD_ROOT/build-system-coverage" --target fuzz-target --parallel 2' in coverage
+    assert (
+        'ln -s "build-system-target" "$BIGEYE_BUILD_ROOT/build"'
+        in target
+    )
+    assert (
+        'ln -s "build-system-coverage" "$BIGEYE_BUILD_ROOT/build"'
+        in coverage
+    )
     assert "cmake --build /opt/bigeye/build" not in target + coverage
 
 
@@ -620,12 +628,13 @@ def test_real_cmake_reconfiguration_compiles_and_links_with_system_policy(tmp_pa
     )
     script = tmp_path / "target-build.sh"
     script.write_text(target, encoding="utf-8")
-    build_root = tmp_path / "application-builds"
+    relative_build_root = Path("application-builds")
+    build_root = tmp_path / relative_build_root
     environment = os.environ.copy()
     environment.update({
         "PATH": f"{wrappers}{os.pathsep}{environment['PATH']}",
         "BIGEYE_SOURCE_DIR": str(source),
-        "BIGEYE_BUILD_ROOT": str(build_root),
+        "BIGEYE_BUILD_ROOT": str(relative_build_root),
     })
 
     subprocess.run(
@@ -634,9 +643,11 @@ def test_real_cmake_reconfiguration_compiles_and_links_with_system_policy(tmp_pa
         capture_output=True,
         text=True,
         env=environment,
+        cwd=tmp_path,
     )
 
     actual_build = build_root / "build-system-target"
+    canonical_build = build_root / "build"
     commands = json.loads((actual_build / "compile_commands.json").read_text())
     compile_command = commands[0]["command"]
     link_command = (actual_build / "CMakeFiles/fuzz-target.dir/link.txt").read_text()
@@ -648,6 +659,14 @@ def test_real_cmake_reconfiguration_compiles_and_links_with_system_policy(tmp_pa
     assert "-fsanitize=address,undefined" in link_command
     assert compiler_log.read_text()
     assert str(legacy) not in compile_command + link_command
+    assert canonical_build.is_symlink()
+    assert canonical_build.resolve() == actual_build.resolve()
+    subprocess.run(
+        [str(canonical_build / "fuzz-target")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_real_cmake_component_and_coverage_builds_use_required_instrumentation(tmp_path) -> None:
@@ -713,13 +732,24 @@ def test_real_cmake_component_and_coverage_builds_use_required_instrumentation(t
             env=environment,
         )
 
+    canonical_build = tmp_path / "component-builds/build"
+    coverage_build = tmp_path / "component-builds/build-component-coverage"
+    assert canonical_build.is_symlink()
+    assert canonical_build.resolve() == coverage_build.resolve()
+    subprocess.run(
+        [str(canonical_build / "fuzz-target")],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+    )
+
     target_build = tmp_path / "component-builds/build-component-target"
     target_compile = json.loads((target_build / "compile_commands.json").read_text())[0]["command"]
     target_link = (target_build / "CMakeFiles/fuzz-target.dir/link.txt").read_text()
     assert "-fsanitize=fuzzer-no-link,address,undefined" in target_compile
     assert "-fsanitize=fuzzer,address,undefined" in target_link
 
-    coverage_build = tmp_path / "component-builds/build-component-coverage"
     coverage_compile = json.loads((coverage_build / "compile_commands.json").read_text())[0]["command"]
     coverage_link = (coverage_build / "CMakeFiles/fuzz-target.dir/link.txt").read_text()
     assert "-fprofile-instr-generate" in coverage_compile
