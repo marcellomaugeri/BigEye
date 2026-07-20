@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
+import json
 from pathlib import Path
 import socket
 from types import SimpleNamespace
@@ -1262,6 +1263,245 @@ def test_native_afl_tmin_runner_mounts_only_the_selected_cmin_input(tmp_path: Pa
     assert output.read_bytes() == b"min"
 
 
+def _triage_evidence():
+    from backend.fuzzing.crashes.triage import CrashTriageEvidence
+
+    return CrashTriageEvidence(
+        project_id=7, campaign_id=9, fingerprint="f" * 64, reproducible=True,
+        original_attempts=3, matching_original_runs=3, signal="SIGSEGV",
+        sanitizer="address", source_location="src/parser.c:4", stack=("parse",),
+        coverage=("src/parser.c:4",), compatible_variants=(), clean_variant=None,
+        minimisation={"reduced": True}, correction=None, harness_misuse_evidence=(),
+        evidence_ids=("replay:original:1",),
+    )
+
+
+def _triage_context(tmp_path: Path, source: str = "int parse(const char *input);\n"):
+    from backend.agents.context import AgentContext
+    from backend.fuzzing.discovery.retrieval import EvidenceRetriever
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "parser.c").write_text(source, encoding="utf-8")
+    return AgentContext(
+        7, COMMIT, repository, tmp_path / "generated", EvidenceRetriever(repository),
+    )
+
+
+def _triage_output(evidence_ids):
+    return {
+        "classification": "true vulnerability", "description": "stable fault",
+        "evidence_ids": list(evidence_ids), "uncertainty": "impact unknown",
+        "priority_rationale": "stable", "repair_intent": "inspect parser",
+    }
+
+
+def _triage_result(output, citation: str | None = None):
+    raw_responses = ()
+    if citation is not None:
+        raw_responses = (SimpleNamespace(output=[{
+            "type": "message", "content": [{
+                "type": "output_text", "text": "official documentation", "annotations": [{
+                    "type": "url_citation", "url": citation,
+                }],
+            }],
+        }]),)
+    return SimpleNamespace(
+        final_output=output, raw_responses=raw_responses, new_items=(),
+    )
+
+
+async def _retrieve_for_triage(agent, context, question: str, limit: int):
+    from agents import RunConfig
+    from agents.tool_context import ToolContext
+
+    tool = next(item for item in agent.tools if item.name == "retrieve_repository_evidence")
+    arguments = json.dumps({"question": question, "limit": limit})
+    return await tool.on_invoke_tool(ToolContext(
+        context, tool_name=tool.name, tool_call_id="retrieve-" + question[:20],
+        tool_arguments=arguments, run_config=RunConfig(), agent=agent,
+    ), arguments)
+
+
+def test_crash_triage_luna_registers_repository_evidence_returned_by_its_tool(
+    tmp_path: Path,
+) -> None:
+    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageSpecialist
+
+    context = _triage_context(tmp_path)
+    calls = []
+
+    async def runner(agent, _prompt, **kwargs):
+        calls.append((agent.model, kwargs["max_turns"]))
+        excerpts = await _retrieve_for_triage(agent, context, "parse input", 1)
+        return _triage_result(_triage_output([
+            excerpts[0]["evidence_id"], "replay:original:1",
+        ]))
+
+    result = asyncio.run(ProductionCrashTriageSpecialist(
+        SimpleNamespace(context=lambda _project_id: context), runner=runner,
+    ).triage(_triage_evidence()))
+
+    assert result.classification == "true vulnerability"
+    assert result.evidence_ids == ["replay:original:1"]
+    assert calls == [("gpt-5.6-luna", 14)]
+
+
+def test_crash_triage_terra_registers_only_its_own_retry_retrieval(
+    tmp_path: Path,
+) -> None:
+    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageSpecialist
+
+    context = _triage_context(
+        tmp_path,
+        "int luna_parser(const char *input);\nint terra_parser(const char *input);\n",
+    )
+    calls = []
+    retrieved = {}
+
+    async def runner(agent, _prompt, **kwargs):
+        calls.append((agent.model, kwargs["max_turns"]))
+        model = "luna" if agent.model == "gpt-5.6-luna" else "terra"
+        excerpts = await _retrieve_for_triage(agent, context, f"{model} parser", 1)
+        retrieved[model] = excerpts[0]["evidence_id"]
+        cited = [excerpts[0]["evidence_id"]]
+        if model == "terra":
+            cited.append("replay:original:1")
+        return _triage_result(_triage_output(cited))
+
+    result = asyncio.run(ProductionCrashTriageSpecialist(
+        SimpleNamespace(context=lambda _project_id: context), runner=runner,
+    ).triage(_triage_evidence()))
+
+    assert result.classification == "true vulnerability"
+    assert result.evidence_ids == ["replay:original:1"]
+    assert retrieved["luna"] != retrieved["terra"]
+    assert calls == [("gpt-5.6-luna", 14), ("gpt-5.6-terra", 14)]
+
+
+def test_crash_triage_fails_after_two_attempts_invent_evidence_and_traces_raw_results(
+    tmp_path: Path,
+) -> None:
+    from backend.agents.tools.agent_dispatch import SpecialistValidationError
+    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageSpecialist
+    from backend.services.observability.event_store import ProjectEventStore
+
+    context = _triage_context(tmp_path)
+    store = ProjectEventStore(tmp_path)
+    calls = []
+
+    async def runner(agent, _prompt, **kwargs):
+        calls.append((agent.model, kwargs["max_turns"]))
+        return _triage_result(_triage_output(["invented:" + agent.model]))
+
+    with pytest.raises(
+        SpecialistValidationError, match="failed deterministic validation twice",
+    ):
+        asyncio.run(ProductionCrashTriageSpecialist(
+            SimpleNamespace(context=lambda _project_id: context), events=store, runner=runner,
+        ).triage(_triage_evidence()))
+
+    debug = [
+        event.payload
+        for event in asyncio.run(store.read(7, "debug", -1, 100))
+    ]
+    assert calls == [("gpt-5.6-luna", 14), ("gpt-5.6-terra", 14)]
+    assert [event["event"] for event in debug] == [
+        "workflow.result", "specialist.retry", "workflow.result", "workflow.error",
+    ]
+    assert [event["output"]["evidence_ids"] for event in debug if event["event"] == "workflow.result"] == [
+        ["invented:gpt-5.6-luna"], ["invented:gpt-5.6-terra"],
+    ]
+
+
+def test_crash_triage_accepts_an_exact_official_citation_id(tmp_path: Path) -> None:
+    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageSpecialist
+
+    context = _triage_context(tmp_path)
+    citation = "https://llvm.org/docs/LibFuzzer.html"
+    calls = []
+
+    async def runner(agent, _prompt, **kwargs):
+        calls.append((agent.model, kwargs["max_turns"]))
+        return _triage_result(
+            _triage_output([citation, "replay:original:1"]), citation,
+        )
+
+    result = asyncio.run(ProductionCrashTriageSpecialist(
+        SimpleNamespace(context=lambda _project_id: context), runner=runner,
+    ).triage(_triage_evidence()))
+
+    assert result.evidence_ids == ["replay:original:1"]
+    assert calls == [("gpt-5.6-luna", 14)]
+
+
+def test_crash_triage_retries_a_nonofficial_citation_then_accepts_terra_official_source(
+    tmp_path: Path,
+) -> None:
+    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageSpecialist
+
+    context = _triage_context(tmp_path)
+    rejected = "https://example.org/fuzzing"
+    accepted = "https://llvm.org/docs/LibFuzzer.html"
+    calls = []
+
+    async def runner(agent, _prompt, **kwargs):
+        calls.append((agent.model, kwargs["max_turns"]))
+        citation = rejected if agent.model == "gpt-5.6-luna" else accepted
+        return _triage_result(
+            _triage_output([citation, "replay:original:1"]), citation,
+        )
+
+    result = asyncio.run(ProductionCrashTriageSpecialist(
+        SimpleNamespace(context=lambda _project_id: context), runner=runner,
+    ).triage(_triage_evidence()))
+
+    assert result.evidence_ids == ["replay:original:1"]
+    assert calls == [("gpt-5.6-luna", 14), ("gpt-5.6-terra", 14)]
+
+
+def test_crash_triage_retrieval_bounds_requests_and_caps_dynamic_evidence_at_64(
+    tmp_path: Path,
+) -> None:
+    from backend.agents.tools.evidence_retrieval import evidence_request_error
+    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageSpecialist
+
+    source = "".join(
+        f"int group{group}_parser_{index}(const char *input);\n"
+        for group in range(6) for index in range(12)
+    )
+    context = _triage_context(tmp_path, source)
+    observations = {}
+
+    async def runner(agent, _prompt, **kwargs):
+        tool = next(item for item in agent.tools if item.name == "retrieve_repository_evidence")
+        observations["question_schema"] = tool.params_json_schema["properties"]["question"]
+        observations["limit_schema"] = tool.params_json_schema["properties"]["limit"]
+        retained = []
+        for group in range(5):
+            retained.extend(await _retrieve_for_triage(agent, context, f"group{group}", 12))
+        retained.extend(await _retrieve_for_triage(agent, context, "group5", 4))
+        observations["overflow"] = await _retrieve_for_triage(agent, context, "group5", 5)
+        observations["overlong"] = await _retrieve_for_triage(agent, context, "x" * 201, 12)
+        observations["max_turns"] = kwargs["max_turns"]
+        return _triage_result(_triage_output([
+            retained[-1]["evidence_id"], "replay:original:1",
+        ]))
+
+    result = asyncio.run(ProductionCrashTriageSpecialist(
+        SimpleNamespace(context=lambda _project_id: context), runner=runner,
+    ).triage(_triage_evidence()))
+
+    correction = evidence_request_error(None, ValueError("bounded"))
+    assert result.classification == "true vulnerability"
+    assert result.evidence_ids == ["replay:original:1"]
+    assert observations["question_schema"]["maxLength"] == 200
+    assert observations["limit_schema"]["maximum"] == 12
+    assert observations["overflow"] == correction
+    assert observations["overlong"] == correction
+    assert observations["max_turns"] == 14
+
+
 def test_crash_triage_retries_invalid_luna_output_once_with_terra_and_same_evidence() -> None:
     from backend.fuzzing.crashes.triage import CrashTriageEvidence
     from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageSpecialist
@@ -1314,7 +1554,7 @@ def test_crash_triage_does_not_escalate_a_transport_failure_to_terra() -> None:
     calls = []
 
     async def runner(agent, prompt, **kwargs):
-        calls.append(agent.model)
+        calls.append((agent.model, kwargs.get("max_turns")))
         raise ConnectionError("transport unavailable")
 
     context = SimpleNamespace(evidence=SimpleNamespace(inventory=SimpleNamespace(build_files=())))
@@ -1324,7 +1564,7 @@ def test_crash_triage_does_not_escalate_a_transport_failure_to_terra() -> None:
 
     with pytest.raises(ConnectionError, match="transport unavailable"):
         asyncio.run(specialist.triage(evidence))
-    assert calls == ["gpt-5.6-luna"]
+    assert calls == [("gpt-5.6-luna", 14)]
 
 
 def test_replay_workspace_rejects_a_symlinked_intermediate_project_root(tmp_path: Path) -> None:

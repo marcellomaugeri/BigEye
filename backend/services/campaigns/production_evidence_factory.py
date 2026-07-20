@@ -15,17 +15,24 @@ import stat
 from tempfile import mkdtemp
 from uuid import uuid4
 
-from agents import Runner
+from agents import RunContextWrapper, Runner, function_tool
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import ReadTimeout as RequestsReadTimeout
 from urllib3.exceptions import ReadTimeoutError
 
 from backend.agents.outputs.triage_result import TriageResult
+from backend.agents.context import AgentContext
 from backend.agents.specialists.crash_triage import build_crash_triage_agent
 from backend.agents.tracing.hooks import AgentTraceHooks
 from backend.agents.tracing.local_trace import LocalTrace
 from backend.agents.tracing.local_trace import web_citations
 from backend.agents.tools.agent_dispatch import SpecialistValidationError, _validate_triage
+from backend.agents.tools.evidence_retrieval import (
+    EvidenceLimit,
+    EvidenceQuestion,
+    evidence_request_error,
+    retrieve_repository_evidence,
+)
 from backend.agents.tools.web_research import (
     UnofficialWebCitation,
     official_documentation_domains,
@@ -58,6 +65,8 @@ from backend.services.campaigns.production_evidence import CampaignEvidenceProce
 
 _MAX_OUTPUT_BYTES = 1024 * 1024
 _MAX_CORPUS_INPUTS = 10_000
+_MAX_TRIAGE_DYNAMIC_EVIDENCE_IDS = 64
+_CRASH_TRIAGE_MAX_TURNS = 14
 _SOURCE_LOCATION = re.compile(r"(?:^|\s)(?:/src/)?([^\s:]+\.[A-Za-z0-9_+.-]+):([1-9][0-9]*)")
 
 
@@ -633,21 +642,35 @@ class ProductionCrashTriageSpecialist:
         )
         last_error = None
         for attempt, model in enumerate(("gpt-5.6-luna", "gpt-5.6-terra")):
-            agent = build_crash_triage_agent(model, domains)
+            agent, allowed_ids = _crash_triage_attempt_agent(
+                model, domains, evidence.evidence_ids,
+            )
             try:
                 result = await self._runner(
                     agent, prompt, context=context, hooks=hooks,
+                    max_turns=_CRASH_TRIAGE_MAX_TURNS,
                     run_config=trace.run_config(
                         "BigEye crash triage" if attempt == 0 else "BigEye crash triage validation retry",
                     ),
                 )
                 trace.record_result(agent, prompt, result, retry_count=attempt)
-                validate_official_citations(
+                citations = validate_official_citations(
                     web_citations(getattr(result, "raw_responses", ())), domains,
                 )
-                return _validate_triage(
-                    getattr(result, "final_output", None), frozenset(evidence.evidence_ids),
+                allowed_ids.update(citations)
+                validated = _validate_triage(
+                    getattr(result, "final_output", None), frozenset(allowed_ids),
                 )
+                cited = set(validated.evidence_ids)
+                deterministic_ids = [
+                    evidence_id for evidence_id in evidence.evidence_ids
+                    if evidence_id in cited
+                ]
+                if not deterministic_ids:
+                    raise SpecialistValidationError(
+                        "crash triage cited no deterministic crash evidence"
+                    )
+                return validated.model_copy(update={"evidence_ids": deterministic_ids})
             except (SpecialistValidationError, UnofficialWebCitation) as error:
                 last_error = error
                 if attempt == 0:
@@ -659,6 +682,47 @@ class ProductionCrashTriageSpecialist:
                 trace.error(agent, error)
                 raise
         raise SpecialistValidationError("crash triage validation retry was unavailable") from last_error
+
+
+def _crash_triage_attempt_agent(
+    model: str, domains: frozenset[str], deterministic_ids,
+):
+    allowed_ids = set(deterministic_ids)
+    dynamic_ids: set[str] = set()
+
+    @function_tool(
+        name_override="retrieve_repository_evidence",
+        failure_error_function=evidence_request_error,
+    )
+    async def registered_retrieval(
+        context: RunContextWrapper[AgentContext],
+        question: EvidenceQuestion,
+        limit: EvidenceLimit = 12,
+    ) -> list[dict[str, int | str | bool]]:
+        """Retrieve and register only exact bounded repository evidence returned to this attempt."""
+        results = retrieve_repository_evidence(context.context.evidence, question, limit)
+        returned_ids = []
+        for value in results:
+            evidence_id = value.get("evidence_id") if isinstance(value, dict) else None
+            if not isinstance(evidence_id, str) or not evidence_id or len(evidence_id) > 2_000:
+                raise ValueError("repository retrieval returned an invalid evidence identifier")
+            returned_ids.append(evidence_id)
+        if len(returned_ids) != len(set(returned_ids)):
+            raise ValueError("repository retrieval returned duplicate evidence identifiers")
+        additions = set(returned_ids)
+        if len(dynamic_ids | additions) > _MAX_TRIAGE_DYNAMIC_EVIDENCE_IDS:
+            raise ValueError("crash triage dynamic evidence limit exceeded")
+        dynamic_ids.update(additions)
+        allowed_ids.update(additions)
+        return results
+
+    agent = build_crash_triage_agent(model, domains)
+    tools = [
+        registered_retrieval
+        if getattr(tool, "name", None) == "retrieve_repository_evidence" else tool
+        for tool in agent.tools
+    ]
+    return agent.clone(tools=tools), allowed_ids
 
 
 def _regular_inputs(root: Path, maximum: int) -> tuple[Path, ...]:

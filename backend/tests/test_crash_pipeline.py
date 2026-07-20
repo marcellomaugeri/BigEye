@@ -7,6 +7,7 @@ import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -180,6 +181,79 @@ def test_finding_publication_invalidates_findings_after_the_durable_write(tmp_pa
     assert repository.rows[(7, finding.fingerprint)] == finding
     assert repository.links == [(11, 7, finding.fingerprint)]
     events.append.assert_awaited_once_with(7, "events", {"name": "findings"})
+
+
+def test_dynamic_repository_evidence_does_not_escape_the_specialist_boundary(
+    tmp_path: Path,
+) -> None:
+    from agents import RunConfig
+    from agents.tool_context import ToolContext
+
+    from backend.agents.context import AgentContext
+    from backend.fuzzing.discovery.retrieval import EvidenceRetriever
+    from backend.services.campaigns.production_evidence_factory import (
+        ProductionCrashTriageSpecialist,
+    )
+    from backend.services.observability.event_store import ProjectEventStore
+
+    repository_root = tmp_path / "repository"
+    repository_root.mkdir()
+    (repository_root / "parser.c").write_text(
+        "int parse(const char *input);\n", encoding="utf-8",
+    )
+    context = AgentContext(
+        7, "a" * 40, repository_root, tmp_path / "generated",
+        EvidenceRetriever(repository_root),
+    )
+    events = ProjectEventStore(tmp_path)
+    observed: dict[str, object] = {}
+
+    async def runner(agent, prompt, **_kwargs):
+        tool = next(
+            item for item in agent.tools if item.name == "retrieve_repository_evidence"
+        )
+        arguments = json.dumps({"question": "parse input", "limit": 1})
+        excerpts = await tool.on_invoke_tool(ToolContext(
+            context, tool_name=tool.name, tool_call_id="retrieve-parser",
+            tool_arguments=arguments, run_config=RunConfig(), agent=agent,
+        ), arguments)
+        dynamic_id = excerpts[0]["evidence_id"]
+        deterministic_ids = json.loads(prompt.split("\n", 1)[1])["evidence_ids"]
+        observed.update(dynamic_id=dynamic_id, deterministic_ids=deterministic_ids)
+        return SimpleNamespace(
+            final_output={
+                "classification": "true vulnerability",
+                "description": "stable fault",
+                "evidence_ids": [dynamic_id, deterministic_ids[0]],
+                "uncertainty": "impact unknown",
+                "priority_rationale": "stable",
+                "repair_intent": "inspect parser",
+            },
+            raw_responses=(), new_items=(),
+        )
+
+    specialist = ProductionCrashTriageSpecialist(
+        SimpleNamespace(context=lambda _project_id: context),
+        events=events,
+        runner=runner,
+    )
+    service, findings, _native = pipeline(
+        tmp_path, specialist=specialist, events=events,
+    )
+
+    finding = run(service.process(observation()))
+
+    dynamic_id = observed["dynamic_id"]
+    deterministic_ids = observed["deterministic_ids"]
+    assert finding.classification == "true vulnerability"
+    assert findings.calls[0]["classification"] == "true vulnerability"
+    assert service.artifacts.detail(finding)["evidence_ids"] == deterministic_ids
+    assert dynamic_id not in service.artifacts.detail(finding)["evidence_ids"]
+    debug = [event.payload for event in run(events.read(7, "debug", -1, 100))]
+    workflow_result = next(event for event in debug if event["event"] == "workflow.result")
+    assert workflow_result["output"]["evidence_ids"] == [
+        dynamic_id, deterministic_ids[0],
+    ]
 
 
 def artifact_evidence(fingerprint: str) -> CrashTriageEvidence:
