@@ -68,7 +68,7 @@ class CoverageSnapshot:
     build_kind: str
     lines: tuple[CoverageLine, ...]
     hits: tuple[CoverageHit, ...]
-    replay_environment: tuple[tuple[str, str], ...] = ()
+    replay_environment: tuple[tuple[str, str], ...]
 
 
 class CoverageExecutor(Protocol):
@@ -264,7 +264,7 @@ class LlvmCoverage:
                     for value in campaign.replay_command if value != "{stdin}"
                 )
                 profile_pattern = f"/coverage/profiles/{stem}-%p.profraw"
-                replay_environment = dict(getattr(campaign, "replay_environment", ()))
+                replay_environment = dict(campaign.replay_environment)
                 replay_environment["LLVM_PROFILE_FILE"] = profile_pattern
                 if stdin_mode:
                     self._executor.run(
@@ -358,7 +358,7 @@ class LlvmCoverage:
                 build_kind="clean",
                 lines=merged_lines,
                 hits=tuple(first_hits[key] for key in sorted(first_hits) if key in merged_keys),
-                replay_environment=tuple(getattr(campaign, "replay_environment", ())),
+                replay_environment=campaign.replay_environment,
             )
         finally:
             shutil.rmtree(work)
@@ -447,7 +447,10 @@ class LlvmCoverage:
             raise ValueError("coverage replay binary must exactly match the clean binary")
         if not valid_replay_command_markers(command):
             raise ValueError("coverage replay command must contain one input marker")
-        replay_environment_items = getattr(campaign, "replay_environment", ())
+        try:
+            replay_environment_items = campaign.replay_environment
+        except AttributeError as error:
+            raise ValueError("coverage replay environment is required") from error
         if not valid_replay_environment(replay_environment_items):
             raise ValueError("coverage replay environment is invalid")
         replay_environment = dict(replay_environment_items)

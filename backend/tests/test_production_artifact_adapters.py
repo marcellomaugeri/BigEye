@@ -330,6 +330,10 @@ def test_clean_coverage_contract_survives_restart_and_resolves_exact_validated_a
     prepared = SimpleNamespace(
         project_id=7,
         commit_sha=COMMIT,
+        replay_environment=(
+            ("ASAN_OPTIONS", "abort_on_error=1:symbolize=0:detect_leaks=0"),
+            ("UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1"),
+        ),
         coverage_image_id="sha256:" + "c" * 64,
         coverage_manifest=SimpleNamespace(
             content_hash="d" * 64,
@@ -372,9 +376,82 @@ def test_clean_coverage_contract_survives_restart_and_resolves_exact_validated_a
     assert target.clean_image_id == "sha256:" + "c" * 64
     assert target.clean_parent_image_id == IMAGE_ID
     assert target.replay_command == ("/opt/bigeye/parser", "--file", "{input}")
+    assert target.replay_environment == (
+        ("ASAN_OPTIONS", "abort_on_error=1:symbolize=0:detect_leaks=0"),
+        ("UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1"),
+    )
     assert target.coverage_asset_id == 34
     assert target.repository_root == repository
     assert campaign_root.joinpath("config/coverage.json").is_file()
+
+
+def test_clean_coverage_publication_rejects_an_invalid_prepared_environment(
+    tmp_path: Path,
+) -> None:
+    from backend.fuzzing.campaigns.probe import ProbeInvocation
+    from backend.services.campaigns.production_runtime import CampaignInvocationStore
+
+    _workspace(tmp_path)
+    prepared = SimpleNamespace(
+        project_id=7,
+        commit_sha=COMMIT,
+        replay_environment=(("OPENAI_API_KEY", "must-not-be-published"),),
+        coverage_image_id="sha256:" + "c" * 64,
+        coverage_manifest=SimpleNamespace(
+            content_hash="d" * 64,
+            labels={
+                "bigeye.parent-image": IMAGE_ID,
+                "bigeye.configuration-asset-id": "32",
+                "bigeye.coverage-asset-id": "34",
+            },
+        ),
+        target_manifest=SimpleNamespace(labels={"bigeye.target-asset": "31"}),
+        probe_invocations=(
+            ProbeInvocation(
+                "seed", "seed", ("/opt/bigeye/parser", "/src/test.seed"), b"seed",
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="contract"):
+        asyncio.run(CampaignInvocationStore(tmp_path).publish_coverage(
+            7, 9, COMMIT, prepared,
+        ))
+
+    assert not tmp_path.joinpath("projects/7/campaigns/9/config/coverage.json").exists()
+
+
+def test_clean_coverage_publication_requires_the_prepared_environment(tmp_path: Path) -> None:
+    from backend.fuzzing.campaigns.probe import ProbeInvocation
+    from backend.services.campaigns.production_runtime import CampaignInvocationStore
+
+    _workspace(tmp_path)
+    prepared = SimpleNamespace(
+        project_id=7,
+        commit_sha=COMMIT,
+        coverage_image_id="sha256:" + "c" * 64,
+        coverage_manifest=SimpleNamespace(
+            content_hash="d" * 64,
+            labels={
+                "bigeye.parent-image": IMAGE_ID,
+                "bigeye.configuration-asset-id": "32",
+                "bigeye.coverage-asset-id": "34",
+            },
+        ),
+        target_manifest=SimpleNamespace(labels={"bigeye.target-asset": "31"}),
+        probe_invocations=(
+            ProbeInvocation(
+                "seed", "seed", ("/opt/bigeye/parser", "/src/test.seed"), b"seed",
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="environment"):
+        asyncio.run(CampaignInvocationStore(tmp_path).publish_coverage(
+            7, 9, COMMIT, prepared,
+        ))
+
+    assert not tmp_path.joinpath("projects/7/campaigns/9/config/coverage.json").exists()
 
 
 def test_stdin_clean_coverage_contract_survives_restart_without_argv_input_path(
@@ -387,6 +464,10 @@ def test_stdin_clean_coverage_contract_survives_restart_without_argv_input_path(
     prepared = SimpleNamespace(
         project_id=7,
         commit_sha=COMMIT,
+        replay_environment=(
+            ("ASAN_OPTIONS", "abort_on_error=1:symbolize=0:detect_leaks=0"),
+            ("UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1"),
+        ),
         coverage_image_id="sha256:" + "c" * 64,
         coverage_manifest=SimpleNamespace(
             content_hash="d" * 64,
@@ -437,6 +518,22 @@ def test_campaign_coverage_contract_requires_one_application_input_marker(replay
             target_asset_id=31, configuration_asset_id=32,
             clean_build_configuration_asset_id=32, coverage_asset_id=34,
             binary_path="/opt/bigeye/parser", replay_command=replay_command,
+            replay_environment=(),
+        )
+
+
+def test_campaign_coverage_contract_requires_an_explicit_replay_environment() -> None:
+    from backend.fuzzing.campaigns.coverage_contract import CampaignCoverageContract
+
+    with pytest.raises(TypeError, match="replay_environment"):
+        CampaignCoverageContract(
+            project_id=7, commit_sha=COMMIT,
+            clean_image_id="sha256:" + "c" * 64,
+            clean_content_hash="d" * 64, clean_parent_image_id=IMAGE_ID,
+            target_asset_id=31, configuration_asset_id=32,
+            clean_build_configuration_asset_id=32, coverage_asset_id=34,
+            binary_path="/opt/bigeye/parser",
+            replay_command=("/opt/bigeye/parser", "{input}"),
         )
 
 
@@ -492,6 +589,7 @@ def test_configuration_variant_updates_fuzzer_and_clean_replay_without_rebuildin
         clean_build_configuration_asset_id=32, coverage_asset_id=34,
         binary_path="/opt/bigeye/parser",
         replay_command=("/opt/bigeye/parser", "--file", "{input}"),
+        replay_environment=(),
     )
     (campaign_root / "config/coverage.json").write_text(json.dumps(asdict(contract)))
     invocation = ContainerInvocation(
@@ -538,9 +636,36 @@ def test_clean_coverage_loader_rejects_string_pairs_in_replay_environment(tmp_pa
         clean_build_configuration_asset_id=32, coverage_asset_id=34,
         binary_path="/opt/bigeye/parser",
         replay_command=("/opt/bigeye/parser", "{input}"),
+        replay_environment=(),
     )
     document = asdict(contract)
     document["replay_environment"] = ["AB"]
+    (campaign_root / "config/coverage.json").write_text(json.dumps(document))
+
+    with pytest.raises(ValueError, match="contract file is invalid"):
+        CampaignInvocationStore(tmp_path).load_coverage(7, 9)
+
+
+def test_clean_coverage_loader_rejects_a_missing_replay_environment(tmp_path: Path) -> None:
+    import json
+    from dataclasses import asdict
+
+    from backend.fuzzing.campaigns.coverage_contract import CampaignCoverageContract
+    from backend.services.campaigns.production_runtime import CampaignInvocationStore
+
+    campaign_root = _workspace(tmp_path)
+    contract = CampaignCoverageContract(
+        project_id=7, commit_sha=COMMIT,
+        clean_image_id="sha256:" + "c" * 64,
+        clean_content_hash="d" * 64, clean_parent_image_id=IMAGE_ID,
+        target_asset_id=31, configuration_asset_id=32,
+        clean_build_configuration_asset_id=32, coverage_asset_id=34,
+        binary_path="/opt/bigeye/parser",
+        replay_command=("/opt/bigeye/parser", "{input}"),
+        replay_environment=(("BIGEYE_MODE", "encrypted"),),
+    )
+    document = asdict(contract)
+    del document["replay_environment"]
     (campaign_root / "config/coverage.json").write_text(json.dumps(document))
 
     with pytest.raises(ValueError, match="contract file is invalid"):

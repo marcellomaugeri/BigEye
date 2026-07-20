@@ -447,6 +447,7 @@ def test_variant_clean_coverage_keeps_build_provenance_without_rebuilding(tmp_pa
         coverage_asset_id=34,
         binary_path="/opt/bigeye/parser",
         replay_command=("/opt/bigeye/parser", "{input}"),
+        replay_environment=(),
     )
     (base / "config/coverage.json").write_text(json.dumps(asdict(contract)))
     invocation = ContainerInvocation(
@@ -486,6 +487,7 @@ def test_variant_clean_coverage_keeps_build_provenance_without_rebuilding(tmp_pa
         coverage_asset_id=34,
         cpu_exposure_seconds=0.0,
         repository_root=tmp_path,
+        replay_environment=cloned.replay_environment,
     )
     client = SimpleNamespace(api=SimpleNamespace(inspect_image=lambda _image: {
         "Id": cloned.clean_image_id,

@@ -7,8 +7,8 @@ from hashlib import sha256
 from pathlib import PurePosixPath
 from typing import Protocol
 
+from backend.fuzzing.campaigns.coverage_contract import valid_replay_environment
 from backend.fuzzing.docker.container_runner import ContainerTimedOut
-from backend.fuzzing.sanitizer_environment import BASELINE_SANITIZER_ENVIRONMENT
 
 
 _INPUT_ROLES = frozenset({"empty", "minimum", "seed"})
@@ -155,20 +155,30 @@ class ProbeRunner:
     def __init__(self, bounded_runner):
         self._bounded_runner = bounded_runner
 
-    async def run(self, image_id: str, invocation: ProbeInvocation, timeout: float, sink) -> ProbeProcessObservation:
+    async def run(
+        self,
+        image_id: str,
+        invocation: ProbeInvocation,
+        timeout: float,
+        sink,
+        replay_environment: tuple[tuple[str, str], ...],
+    ) -> ProbeProcessObservation:
         _exact_image_id(image_id, "probe image")
+        if not valid_replay_environment(replay_environment):
+            raise ValueError("probe replay environment is invalid")
+        environment = dict(replay_environment)
         try:
             if "{stdin}" in invocation.command:
                 command = [part for part in invocation.command if part != "{stdin}"]
                 result = await self._bounded_runner.run(
                     image_id, command, timeout, sink,
                     stdin_bytes=invocation.testcase_bytes,
-                    environment=dict(BASELINE_SANITIZER_ENVIRONMENT),
+                    environment=environment,
                 )
             else:
                 result = await self._bounded_runner.run(
                     image_id, list(invocation.command), timeout, sink,
-                    environment=dict(BASELINE_SANITIZER_ENVIRONMENT),
+                    environment=environment,
                 )
         except ContainerTimedOut:
             return ProbeProcessObservation(None, False, True, False, "")
@@ -413,7 +423,13 @@ class ProbeService:
         return ProbeEvidence.from_inputs(evidence)
 
     async def _execution(self, target, invocation: ProbeInvocation) -> ProbeExecutionEvidence:
-        process = await self._runner.run(target.image, invocation, self._timeout, self._sink)
+        process = await self._runner.run(
+            target.image,
+            invocation,
+            self._timeout,
+            self._sink,
+            target.replay_environment,
+        )
         coverage = await self._clean_coverage.collect(target, invocation, process)
         if not isinstance(coverage, AttestedCoverage):
             raise ValueError("clean coverage collector returned invalid evidence")
@@ -453,6 +469,8 @@ class ProbeService:
         _hex(getattr(target, "commit_sha", None), {40, 64}, "prepared target commit")
         _exact_image_id(getattr(target, "image", None), "prepared target image")
         _exact_image_id(getattr(target, "coverage_image_id", None), "prepared coverage image")
+        if not valid_replay_environment(getattr(target, "replay_environment", None)):
+            raise ValueError("prepared target replay environment is invalid")
         invocations = getattr(target, "probe_invocations", None)
         if not isinstance(invocations, tuple) or any(not isinstance(item, ProbeInvocation) for item in invocations):
             raise ValueError("prepared target contains invalid probe invocations")

@@ -337,6 +337,7 @@ def test_real_linux_amd64_probe_uses_the_application_sanitizer_runtime(tmp_path:
 
         observation = asyncio.run(ProbeRunner(ContainerRunner(client)).run(
             image_id, invocation, 10.0, lambda _text: None,
+            BASELINE_SANITIZER_ENVIRONMENT,
         ))
 
         inspected = client.api.inspect_image(image_id)

@@ -285,7 +285,7 @@ class CampaignInvocationStore:
             document = json.loads(content)
             if not isinstance(document, dict) or not isinstance(document.get("replay_command"), list):
                 raise TypeError("coverage contract must be a JSON object with a command list")
-            environment = document.get("replay_environment", [])
+            environment = document["replay_environment"]
             if not isinstance(environment, list) or any(
                 not isinstance(item, list) or len(item) != 2
                 for item in environment
@@ -310,6 +310,9 @@ class CampaignInvocationStore:
             or getattr(prepared, "commit_sha", None) != commit_sha
         ):
             raise ValueError("prepared coverage contract belongs to another project revision")
+        replay_environment = getattr(prepared, "replay_environment", None)
+        if not valid_replay_environment(replay_environment):
+            raise ValueError("prepared coverage contract environment is invalid")
         target_labels = getattr(getattr(prepared, "target_manifest", None), "labels", None)
         coverage_manifest = getattr(prepared, "coverage_manifest", None)
         coverage_labels = getattr(coverage_manifest, "labels", None)
@@ -348,6 +351,7 @@ class CampaignInvocationStore:
             coverage_asset_id=coverage_asset_id,
             binary_path=replay_command[0],
             replay_command=replay_command,
+            replay_environment=replay_environment,
         )
         encoded = json.dumps(
             asdict(contract), ensure_ascii=False, sort_keys=True, separators=(",", ":"),

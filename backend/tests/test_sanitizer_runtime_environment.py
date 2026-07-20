@@ -98,6 +98,7 @@ def test_deterministic_probe_applies_baseline_sanitizer_environment(
 
     result = run(ProbeRunner(bounded).run(
         "sha256:" + "b" * 64, invocation, 2.0, lambda _text: None,
+        BASELINE_SANITIZER_ENVIRONMENT,
     ))
 
     assert result.exit_code == 0

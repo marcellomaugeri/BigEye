@@ -39,6 +39,7 @@ from backend.fuzzing.campaigns.target_preparation import (
 from backend.fuzzing.docker.container_runner import ContainerResult, ContainerTimedOut
 from backend.fuzzing.docker.image_builder import ImageBuildCancelled, ImageBuildFailed, ImageCompilationFailed
 from backend.fuzzing.layers.manifest import LayerManifest
+from backend.fuzzing.sanitizer_environment import BASELINE_SANITIZER_ENVIRONMENT
 from backend.services.campaigns.decision_executor import ActionError, ActionResult, DecisionExecutor
 
 
@@ -193,7 +194,7 @@ class _ProbeRunner:
         self.calls = []
 
     async def run(self, image, command, timeout, sink, **_options):
-        self.calls.append((image, tuple(command), timeout))
+        self.calls.append((image, tuple(command), timeout, _options))
         value = self.outputs.pop(0)
         if isinstance(value, BaseException):
             raise value
@@ -235,6 +236,7 @@ def test_probe_runs_empty_minimum_and_real_seed_twice_and_records_exact_evidence
     target.project_id = 7
     target.commit_sha = "a" * 40
     target.coverage_image_id = "sha256:" + "c" * 64
+    target.replay_environment = BASELINE_SANITIZER_ENVIRONMENT
     evidence = run(ProbeService(
         ProbeRunner(runner), _CleanCoverage(_attestations_for(target)), timeout_seconds=2.0,
     ).run(target))
@@ -267,6 +269,7 @@ def test_probe_runner_strips_internal_stdin_marker_and_feeds_exact_testcase_byte
 
     result = run(ProbeRunner(bounded).run(
         "sha256:" + "b" * 64, invocation, 2.0, lambda _text: None,
+        BASELINE_SANITIZER_ENVIRONMENT,
     ))
 
     assert result.exit_code == 0
@@ -276,6 +279,21 @@ def test_probe_runner_strips_internal_stdin_marker_and_feeds_exact_testcase_byte
         2.0,
         b"\x00seed\xff",
     )
+
+
+def test_probe_service_rejects_an_invalid_environment_before_execution() -> None:
+    target = _probe_target()
+    target.replay_environment = (("OPENAI_API_KEY", "must-not-reach-docker"),)
+    runner = _ProbeRunner([])
+    clean = _CleanCoverage([])
+
+    with pytest.raises(ValueError, match="environment"):
+        run(ProbeService(
+            ProbeRunner(runner), clean, timeout_seconds=1.0,
+        ).run(target))
+
+    assert runner.calls == []
+    assert clean.calls == []
 
 
 @pytest.mark.parametrize(
@@ -364,6 +382,7 @@ def test_clean_probe_coverage_replays_same_stdin_bytes_without_an_argv_path(
     prepared = SimpleNamespace(
         project_id=7,
         commit_sha="a" * 40,
+        replay_environment=(("BIGEYE_MODE", "encrypted"),),
         coverage_image_id="sha256:" + "c" * 64,
         target_manifest=SimpleNamespace(labels={"bigeye.target-asset": "31"}),
         coverage_manifest=SimpleNamespace(
@@ -389,10 +408,7 @@ def test_clean_probe_coverage_replays_same_stdin_bytes_without_an_argv_path(
 
     assert captured == {
         "command": ("/opt/bigeye/stdin-parser", "--plain", "{stdin}"),
-        "environment": (
-            ("ASAN_OPTIONS", "abort_on_error=1:symbolize=0:detect_leaks=0"),
-            ("UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1"),
-        ),
+        "environment": (("BIGEYE_MODE", "encrypted"),),
         "bytes": b"\x00exact-clean\xff",
     }
     assert evidence.provenance.testcase_sha256 == invocation.testcase_sha256
@@ -415,6 +431,7 @@ def test_probe_timeout_is_retained_as_evidence_instead_of_retried_as_transport()
     target.project_id = 7
     target.commit_sha = "a" * 40
     target.coverage_image_id = "sha256:" + "c" * 64
+    target.replay_environment = BASELINE_SANITIZER_ENVIRONMENT
     evidence = run(ProbeService(
         ProbeRunner(runner), _CleanCoverage(_attestations_for(target)), timeout_seconds=1.0,
     ).run(target))
@@ -440,6 +457,7 @@ def test_probe_preserves_sanitizer_report_emitted_outside_the_result_record() ->
     target.project_id = 7
     target.commit_sha = "a" * 40
     target.coverage_image_id = "sha256:" + "c" * 64
+    target.replay_environment = BASELINE_SANITIZER_ENVIRONMENT
     evidence = run(ProbeService(
         ProbeRunner(runner), _CleanCoverage(_attestations_for(target)), timeout_seconds=1.0,
     ).run(target))
@@ -627,8 +645,94 @@ def test_preparation_validates_normal_build_publishes_only_plan_assets_and_build
     assert prepared.coverage_manifest.tag.startswith("bigeye-coverage:")
     assert prepared.image == "sha256:" + "b" * 64
     assert prepared.coverage_image_id == "sha256:" + "c" * 64
+    assert prepared.replay_environment == (
+        ("ASAN_OPTIONS", "abort_on_error=1:symbolize=0:detect_leaks=0"),
+        ("UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1"),
+    )
     assert prepared.agent_attempts == ("gpt-5.6-luna",)
     assert prepared.probe.accepted is True
+
+
+def test_exact_probed_environment_is_published_with_the_accepted_target(
+    tmp_path, monkeypatch,
+) -> None:
+    from backend.fuzzing.campaigns import target_preparation
+    from backend.services.campaigns.production_runtime import CampaignInvocationStore
+
+    replay_environment = (("BIGEYE_MODE", "encrypted"),)
+    monkeypatch.setattr(
+        target_preparation, "BASELINE_SANITIZER_ENVIRONMENT", replay_environment,
+    )
+
+    class ReplayPlanner(_Planner):
+        def plan(self, selected_project, selected_proposal):
+            plan = super().plan(selected_project, selected_proposal)
+            return replace(plan, probe_invocations=(
+                ProbeInvocation(
+                    "empty", "empty", ("/opt/bigeye/probe", "/src/empty"), b"",
+                ),
+                ProbeInvocation(
+                    "minimum", "minimum", ("/opt/bigeye/probe", "/src/minimum"), b"\x00",
+                ),
+                ProbeInvocation(
+                    "seed", "seed", ("/opt/bigeye/probe", "/src/seed"), b"seed",
+                ),
+            ))
+
+    class CleanCoverage:
+        def __init__(self):
+            self.environments = []
+            self.observations = None
+
+        async def collect(self, built, _invocation, _process):
+            self.environments.append(built.replay_environment)
+            return self.observations.pop(0)
+
+    class ExactProbe:
+        def __init__(self):
+            self.target_environments = []
+            self.clean_coverage = CleanCoverage()
+
+        async def run(self, built):
+            bounded = _ProbeRunner([ContainerResult(0, "healthy\n") for _ in range(6)])
+            self.clean_coverage.observations = _attestations_for(built)
+            evidence = await ProbeService(
+                ProbeRunner(bounded), self.clean_coverage, timeout_seconds=1.0,
+            ).run(built)
+            self.target_environments = [
+                call[3]["environment"] for call in bounded.calls
+            ]
+            return evidence
+
+    probe = ExactProbe()
+    prepared = run(preparation(planner=ReplayPlanner(), probe=probe).prepare(
+        project(), proposal(),
+    ))
+
+    assert probe.target_environments == [dict(replay_environment)] * 6
+    assert probe.clean_coverage.environments == [replay_environment] * 6
+    assert prepared.replay_environment == replay_environment
+
+    prepared = replace(
+        prepared,
+        target_manifest=replace(
+            prepared.target_manifest,
+            labels={"bigeye.target-asset": "1"},
+        ),
+        coverage_manifest=replace(
+            prepared.coverage_manifest,
+            content_hash="d" * 64,
+            labels={
+                "bigeye.parent-image": "sha256:" + "e" * 64,
+                "bigeye.configuration-asset-id": "101",
+                "bigeye.coverage-asset-id": "102",
+            },
+        ),
+    )
+    store = CampaignInvocationStore(tmp_path)
+    run(store.publish_coverage(7, 9, project().commit_sha, prepared))
+
+    assert store.load_coverage(7, 9).replay_environment == replay_environment
 
 
 def test_preparation_rejects_asset_versions_not_declared_by_the_proposal() -> None:
@@ -1186,6 +1290,7 @@ def _probe_target():
         commit_sha="a" * 40,
         image="sha256:" + "b" * 64,
         coverage_image_id="sha256:" + "c" * 64,
+        replay_environment=BASELINE_SANITIZER_ENVIRONMENT,
         probe_invocations=(
             ProbeInvocation("empty", "empty", ("/opt/bigeye/probe", "empty"), b""),
             ProbeInvocation("minimum", "minimum", ("/opt/bigeye/probe", "minimum"), b"\x00"),

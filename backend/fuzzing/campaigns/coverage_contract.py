@@ -26,7 +26,7 @@ class CampaignCoverageContract:
     coverage_asset_id: int
     binary_path: str
     replay_command: tuple[str, ...]
-    replay_environment: tuple[tuple[str, str], ...] = ()
+    replay_environment: tuple[tuple[str, str], ...]
 
     def __post_init__(self) -> None:
         if (

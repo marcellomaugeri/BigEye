@@ -75,6 +75,7 @@ def _campaign(tmp_path: Path, **changes):
         "clean_image_id": CLEAN_IMAGE_ID,
         "clean_content_hash": "c" * 64,
         "clean_parent_image_id": PARENT_IMAGE_ID,
+        "replay_environment": (),
     }
     return SimpleNamespace(**(values | changes))
 
@@ -280,6 +281,20 @@ def test_replay_uses_unique_profiles_exact_tools_and_only_clean_project_source(t
     assert {(line.source_path, line.line_number) for line in snapshot.lines} == {("src/a.c", 12)}
     assert len(snapshot.hits) == 1
     assert snapshot.hits[0].testcase == b"first"
+
+
+def test_clean_coverage_validation_requires_an_explicit_replay_environment(
+    tmp_path: Path,
+) -> None:
+    from backend.fuzzing.coverage.llvm_coverage import LlvmCoverage
+
+    campaign = _campaign(tmp_path)
+    del campaign.replay_environment
+
+    with pytest.raises(ValueError, match="replay environment"):
+        LlvmCoverage(_client(), _CoverageExecutor({}, {}), tmp_path / "work")._validate_campaign(
+            campaign,
+        )
 
 
 @pytest.mark.parametrize("labels", [
@@ -898,7 +913,8 @@ def test_line_query_rejects_invalid_persisted_replay_environment(tmp_path: Path)
         run(service.line_evidence(7, "src/a.c", 1))
 
 
-def test_line_query_treats_missing_legacy_replay_environment_as_empty(tmp_path: Path):
+def test_line_query_rejects_missing_replay_environment(tmp_path: Path):
+    from backend.fuzzing.coverage.llvm_coverage import CoverageIntegrityError
     from backend.fuzzing.coverage.traceability import TraceabilityService
 
     checkout = tmp_path / "repository"
@@ -917,9 +933,8 @@ def test_line_query_treats_missing_legacy_replay_environment_as_empty(tmp_path: 
     metadata.chmod(0o400)
     directory.chmod(0o500)
 
-    line = run(service.line_evidence(7, "src/a.c", 1))["evidence"][0]
-
-    assert line["replay_environment"] == {}
+    with pytest.raises(CoverageIntegrityError, match="metadata is invalid"):
+        run(service.line_evidence(7, "src/a.c", 1))
 
 
 def test_coverage_repository_inserts_existing_minimal_row_contract():

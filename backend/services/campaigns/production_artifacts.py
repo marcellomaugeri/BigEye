@@ -388,6 +388,10 @@ def _coverage_contract(target) -> str:
     provided = getattr(target, "contract_hash", None)
     if isinstance(provided, str) and provided:
         return provided
+    try:
+        replay_environment = target.replay_environment
+    except AttributeError as error:
+        raise ValueError("clean coverage target contract is incomplete") from error
     fields = (
         getattr(target, "commit_sha", ""), getattr(target, "clean_image_id", ""),
         str(getattr(target, "target_asset_id", "")),
@@ -396,7 +400,7 @@ def _coverage_contract(target) -> str:
         str(getattr(target, "coverage_asset_id", "")),
         "\0".join(getattr(target, "replay_command", ())),
         "\0".join(
-            f"{key}={value}" for key, value in getattr(target, "replay_environment", ())
+            f"{key}={value}" for key, value in replay_environment
         ) or "no-environment",
     )
     if any(not isinstance(value, str) or not value for value in fields):

@@ -95,7 +95,7 @@ class ReplayVerification:
     testcase_path: Path
     testcase_sha256: str
     replay_command: tuple[str, ...]
-    replay_environment: tuple[tuple[str, str], ...] = ()
+    replay_environment: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True)
@@ -534,7 +534,7 @@ class TraceabilityService:
         replay_environment = (
             _stored_replay_environment(document["replay_environment"])
             if isinstance(document, dict) and "replay_environment" in document
-            else ()
+            else None
         )
         if (
             not isinstance(document.get("clean_image_id"), str)

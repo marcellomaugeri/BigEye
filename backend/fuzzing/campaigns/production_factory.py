@@ -40,7 +40,6 @@ from backend.fuzzing.docker.container_runner import ContainerRunner
 from backend.fuzzing.docker.client import DockerClient
 from backend.fuzzing.docker.image_builder import ImageBuilder
 from backend.fuzzing.docker.image_inspector import ImageInspector
-from backend.fuzzing.sanitizer_environment import BASELINE_SANITIZER_ENVIRONMENT
 from backend.fuzzing.layers.coverage_layer import CoverageLayerService
 from backend.fuzzing.layers.project_layer import ProjectLayerService
 from backend.fuzzing.layers.repository_layer import RepositoryLayerService
@@ -302,6 +301,7 @@ class PreparedCleanCoverageCollector:
             replay_command=tuple(replay_command),
             cpu_exposure_seconds=0.0,
             repository_root=context.repository_root,
+            replay_environment=prepared.replay_environment,
         )
         try:
             snapshot = await asyncio.to_thread(
@@ -351,8 +351,8 @@ class _CleanCampaign:
     replay_command: tuple[str, ...]
     cpu_exposure_seconds: float
     repository_root: Path
+    replay_environment: tuple[tuple[str, str], ...]
     source_root: str = "/src"
-    replay_environment: tuple[tuple[str, str], ...] = BASELINE_SANITIZER_ENVIRONMENT
 
 
 class ProductionTargetPreparationFactory:

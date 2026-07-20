@@ -26,6 +26,7 @@ from backend.fuzzing.docker.image_builder import (
     ImageCompilationFailed,
 )
 from backend.fuzzing.layers.manifest import LayerManifest
+from backend.fuzzing.sanitizer_environment import BASELINE_SANITIZER_ENVIRONMENT
 
 
 _REQUIRED_ASSET_ROLES = frozenset({
@@ -182,6 +183,7 @@ class PreparedTarget:
     probe_evidence: ProbeEvidence
     probe: ProbeAcceptance
     agent_attempts: tuple[str, ...]
+    replay_environment: tuple[tuple[str, str], ...]
 
     @property
     def image(self) -> str:
@@ -200,6 +202,7 @@ class _BuiltTarget:
     coverage_image_id: str
     assets: tuple[object, ...]
     probe_invocations: tuple[ProbeInvocation, ...]
+    replay_environment: tuple[tuple[str, str], ...]
 
     @property
     def image(self) -> str:
@@ -440,6 +443,7 @@ class TargetPreparationService:
                     coverage_image_id,
                     tuple(assets[role] for role in sorted(assets)),
                     plan.probe_invocations,
+                    BASELINE_SANITIZER_ENVIRONMENT,
                 )
                 evidence = await self._probe.run(built)
                 acceptance = ProbePolicy.accept(evidence)
@@ -459,6 +463,7 @@ class TargetPreparationService:
                     evidence,
                     acceptance,
                     attempts,
+                    built.replay_environment,
                 )
         except DeterministicPreparationError:
             raise
