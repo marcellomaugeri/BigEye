@@ -54,6 +54,7 @@ class CampaignTargetPreparation:
         containers,
         events=None,
         clock=None,
+        execution_slots=None,
     ):
         self._preparation = preparation
         self._campaigns = campaigns
@@ -61,11 +62,23 @@ class CampaignTargetPreparation:
         self._containers = containers
         self._events = events
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._execution_slots = execution_slots
 
     async def prepare(self, project, record: TargetProposalRecord):
         if not isinstance(record, TargetProposalRecord):
             raise TypeError("campaign preparation requires a validated target proposal record")
-        prepared = await self._preparation.prepare(project, record)
+        if self._execution_slots is None:
+            prepared = await self._preparation.prepare(project, record)
+            return await self._publish_and_start(project, record, prepared)
+        async with self._execution_slots.compilation(
+            project, f"prepare-target:{record.result_id}",
+        ) as lease:
+            prepared = await self._preparation.prepare(project, record)
+            campaign = await self._publish_and_start(project, record, prepared)
+            await lease.promote(campaign.id)
+            return campaign
+
+    async def _publish_and_start(self, project, record: TargetProposalRecord, prepared):
         target_asset_id, configuration_asset_id, _coverage_asset_id = self._identity(
             project, prepared,
         )

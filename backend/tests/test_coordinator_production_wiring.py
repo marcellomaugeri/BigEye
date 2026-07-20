@@ -202,6 +202,55 @@ def test_validated_prepared_target_is_published_and_started(tmp_path) -> None:
     assert result is campaign
 
 
+def test_target_preparation_promotes_its_compilation_lease_only_after_exact_start() -> None:
+    from backend.agents.outputs.campaign_review import TargetProposalRecord
+    from backend.agents.outputs.target_proposal import TargetProposal
+    from backend.services.campaigns.execution_slots import ProjectExecutionSlots
+    from backend.services.campaigns.production_preparation import CampaignTargetPreparation
+
+    proposal = TargetProposal(
+        target_name="parser", instance_type="system-level",
+        byte_path="bytes to parser", expected_project_reach="src/parser.c",
+        build_command="cmake --build build", run_command="/opt/bigeye/parser {input}",
+        seeds=[], configuration="default", sanitizer_plan="address and undefined",
+        generated_asset_intents=[], probe_assertions=["seed reaches project code"],
+        evidence_ids=["source:parser"], uncertainty="probe required",
+    )
+    record = TargetProposalRecord(
+        result_id="target_1", specialist="system", tool_call_id="call_1",
+        attempt=1, model="gpt-5.6-luna", proposal=proposal,
+    )
+    prepared = SimpleNamespace(
+        project_id=7, commit_sha="a" * 40, target_image_id="sha256:" + "b" * 64,
+        target_manifest=SimpleNamespace(labels={"bigeye.target-asset": "31"}),
+        coverage_manifest=SimpleNamespace(labels={
+            "bigeye.configuration-asset-id": "32", "bigeye.coverage-asset-id": "34",
+        }),
+        probe_invocations=(),
+    )
+    preparation = AsyncMock()
+    preparation.prepare.return_value = prepared
+    campaign = SimpleNamespace(id=9, project_id=7, target_asset_id=31, configuration_asset_id=32)
+    campaigns = AsyncMock()
+    campaigns.create.return_value = campaign
+    containers = AsyncMock()
+    slots = ProjectExecutionSlots()
+    service = CampaignTargetPreparation(
+        preparation=preparation, campaigns=campaigns,
+        invocation_store=AsyncMock(), containers=containers,
+        execution_slots=slots,
+    )
+    project = SimpleNamespace(id=7, commit_sha="a" * 40, worker_count=1)
+
+    result = run(service.prepare(project, record))
+
+    assert result is campaign
+    assert containers.start_exact.await_args.args == (project, campaign)
+    snapshot = run(slots.snapshot(project))
+    assert snapshot.compilation_count == 0
+    assert snapshot.running_campaign_ids == frozenset({9})
+
+
 def test_system_campaign_uses_file_mode_only_for_an_explicit_input_placeholder() -> None:
     from backend.agents.outputs.campaign_review import TargetProposalRecord
     from backend.agents.outputs.target_proposal import TargetProposal

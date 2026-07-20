@@ -413,6 +413,71 @@ def test_runtime_periodically_resamples_without_a_review_deadline() -> None:
     asyncio.run(exercise())
 
 
+def test_recovery_queues_stopped_campaigns_when_attested_running_campaigns_use_the_limit(
+    tmp_path: Path,
+) -> None:
+    from backend.fuzzing.docker.fuzz_container import ContainerCandidateObservation
+    from backend.services.campaigns.execution_slots import ProjectExecutionSlots
+    from backend.services.campaigns.production_runtime import DeferredCampaignContainers
+
+    image_id = "sha256:" + "b" * 64
+    for name in ("corpus", "output", "config", "logs"):
+        (tmp_path / "projects/7/campaigns/3" / name).mkdir(parents=True, exist_ok=True)
+    (tmp_path / "projects/7/campaigns/3/corpus/seed").write_bytes(b"seed")
+
+    class Service:
+        def __init__(self):
+            self.calls = []
+
+        def observe_candidates(self, campaign, _invocation):
+            if campaign.id == 9:
+                return (ContainerCandidateObservation("running-9", 9, 7, "running", True),)
+            return ()
+
+        def adopt_candidate(self, candidate):
+            self.calls.append(("adopt", candidate.container_id))
+
+        def start(self, campaign, _invocation):
+            self.calls.append(("start", campaign.id))
+
+    class Invocations:
+        def load(self, _project_id, _campaign_id):
+            return SimpleNamespace(image_id=image_id)
+
+    service = Service()
+    slots = ProjectExecutionSlots()
+    deferred = DeferredCampaignContainers(
+        tmp_path, docker_client=SimpleNamespace(), invocation_store=Invocations(),
+        execution_slots=slots,
+    )
+    project = SimpleNamespace(id=7, commit_sha="a" * 40, worker_count=1)
+    campaigns = (
+        SimpleNamespace(
+            id=9, project_id=7, target_asset_id=31, configuration_asset_id=32,
+            next_review_reason=None, error=None,
+        ),
+        SimpleNamespace(
+            id=3, project_id=7, target_asset_id=31, configuration_asset_id=32,
+            next_review_reason=None, error=None,
+        ),
+    )
+    assets = (
+        SimpleNamespace(id=31, project_id=7, validated_at=NOW, error=None, content_hash="c" * 64),
+        SimpleNamespace(id=32, project_id=7, validated_at=NOW, error=None, content_hash="d" * 64),
+    )
+    client = SimpleNamespace(api=SimpleNamespace(inspect_image=lambda _image: {
+        "Id": image_id, "Os": "linux", "Architecture": "amd64",
+    }))
+
+    evidence = asyncio.run(deferred._recover_lifecycle_with_slots(
+        client, service, project, campaigns, assets,
+    ))
+
+    assert service.calls == [("adopt", "running-9")]
+    assert [item["action"] for item in evidence] == ["queued", "adopted"]
+    assert asyncio.run(slots.snapshot(project)).running_campaign_ids == frozenset({9})
+
+
 def test_artifact_processor_runs_crash_pipeline_before_corpus_and_persists_observability() -> None:
     from backend.fuzzing.campaigns.monitor import CampaignArtifactObservation
     from backend.services.campaigns.production_evidence import (

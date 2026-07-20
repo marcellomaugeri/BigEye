@@ -90,6 +90,7 @@ class ProjectCoordinator:
         events=None,
         wake_evaluator: WakeEvaluator | None = None,
         clock=None,
+        execution_slots=None,
     ):
         self.projects = projects
         self._bootstrap = bootstrap
@@ -101,6 +102,7 @@ class ProjectCoordinator:
         self._events = events
         self._wake_evaluator = wake_evaluator or WakeEvaluator()
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._execution_slots = execution_slots
         self._previous: dict[int, CampaignSnapshot] = {}
         self._pending_reviews: dict[int, _PendingReview] = {}
         self._signals: dict[int, asyncio.Event] = {}
@@ -178,7 +180,11 @@ class ProjectCoordinator:
                 await self._runtime.enforce_worker_count(
                     project, snapshot.active_workers - project.worker_count,
                 )
-            free_slots = max(project.worker_count - snapshot.active_workers, 0)
+            free_slots = (
+                (await self._execution_slots.snapshot(project)).free_slots
+                if self._execution_slots is not None
+                else max(project.worker_count - snapshot.active_workers, 0)
+            )
             if snapshot.free_slots != free_slots:
                 snapshot = replace(snapshot, free_slots=free_slots)
 
@@ -265,6 +271,8 @@ class ProjectCoordinator:
     def notify(self, project_id: int) -> None:
         """Wake one event wait after settings, Docker, asset, or evidence changes."""
         _project_id(project_id)
+        if self._execution_slots is not None:
+            self._execution_slots.notify(project_id)
         self._signals.setdefault(project_id, asyncio.Event()).set()
 
     async def _discover(self, project) -> None:

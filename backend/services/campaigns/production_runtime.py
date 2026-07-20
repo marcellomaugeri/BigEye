@@ -624,12 +624,14 @@ class DeferredCampaignContainers:
         invocation_store=None,
         service_factory=FuzzContainerService,
         monitor=None,
+        execution_slots=None,
     ):
         self._workspace = Path(workspace)
         self._docker_client = docker_client or DockerClient()
         self._invocations = invocation_store or CampaignInvocationStore(workspace)
         self._service_factory = service_factory
         self._monitor = monitor or DockerCampaignMonitor(workspace)
+        self._execution_slots = execution_slots
 
     async def reconcile(
         self, project, campaigns, assets=(), artifact_cursors=None,
@@ -647,9 +649,14 @@ class DeferredCampaignContainers:
         progress: list[CampaignProgressObservation] = []
         try:
             service = self._service_factory(client, self._workspace)
-            evidence.extend(self._recover_lifecycle(
-                client, service, project, active, assets,
-            ))
+            if self._execution_slots is None:
+                evidence.extend(self._recover_lifecycle(
+                    client, service, project, active, assets,
+                ))
+            else:
+                evidence.extend(await self._recover_lifecycle_with_slots(
+                    client, service, project, active, assets,
+                ))
             for campaign in active:
                 try:
                     invocation = self._invocations.load(project.id, campaign.id)
@@ -787,7 +794,50 @@ class DeferredCampaignContainers:
             raise ValueError("cleanup image ID has conflicting persisted identities")
         values[identity.image_id] = identity
 
-    def _recover_lifecycle(self, client, service, project, campaigns, assets) -> list[dict]:
+    async def _recover_lifecycle_with_slots(self, client, service, project, campaigns, assets) -> list[dict]:
+        """Reserve only currently stopped candidates after attesting running Docker identities."""
+        running_ids = frozenset({
+            candidate.campaign_id
+            for campaign in campaigns
+            for candidate in service.observe_candidates(
+                self._fuzz_campaign(project, campaign),
+                self._invocations.load(project.id, campaign.id),
+            )
+            if candidate.state == "running" and candidate.runtime_contract_matches
+        })
+        await self._execution_slots.observe_running(project.id, running_ids)
+        reservations = {}
+        for campaign in sorted(campaigns, key=lambda item: item.id):
+            if campaign.id in running_ids:
+                continue
+            reservation = await self._execution_slots.try_fuzzing_start(project, campaign.id)
+            if reservation is not None:
+                reservations[campaign.id] = reservation
+        all_reservations = tuple(reservations.values())
+        started = []
+        queued = set()
+        try:
+            evidence = self._recover_lifecycle(
+                client, service, project, campaigns, assets,
+                start_reservations=reservations, started_reservations=started,
+                queued_campaign_ids=queued,
+            )
+            for reservation in started:
+                await reservation.promote()
+            return [
+                dict(item, action="queued", reason="project heavy-job limit is occupied")
+                if item["campaign_id"] in queued and item["action"] == "restarted" else item
+                for item in evidence
+            ]
+        finally:
+            for reservation in all_reservations:
+                if reservation not in started:
+                    await reservation.__aexit__(None, None, None)
+
+    def _recover_lifecycle(
+        self, client, service, project, campaigns, assets, *, start_reservations=None,
+        started_reservations=None, queued_campaign_ids=None,
+    ) -> list[dict]:
         asset_by_id = {asset.id: asset for asset in assets}
         recoverable = []
         containers = []
@@ -848,7 +898,12 @@ class DeferredCampaignContainers:
             return []
         records = CampaignRecovery(
             self._workspace,
-            _ProductionRecoveryControl(client, service, project, controls),
+            _ProductionRecoveryControl(
+                client, service, project, controls,
+                start_reservations=start_reservations,
+                started_reservations=started_reservations,
+                queued_campaign_ids=queued_campaign_ids,
+            ),
         ).recover(project.id, tuple(recoverable), tuple(containers))
         return [{
             "evidence_id": (
@@ -921,28 +976,44 @@ class DeferredCampaignContainers:
 class _ProductionRecoveryControl:
     """Apply only service-verified recovery actions selected by CampaignRecovery."""
 
-    def __init__(self, client, service, project, controls):
+    def __init__(
+        self, client, service, project, controls, *, start_reservations=None,
+        started_reservations=None, queued_campaign_ids=None,
+    ):
         self._client = client
         self._service = service
         self._project = project
         self._controls = controls
+        self._start_reservations = start_reservations
+        self._started_reservations = started_reservations
+        self._queued_campaign_ids = queued_campaign_ids
 
     def adopt(self, campaign, container) -> None:
         self._service.adopt_candidate(self._candidate(campaign, container))
 
     def restart(self, campaign, container) -> None:
+        reservation = None
+        if self._start_reservations is not None:
+            reservation = self._start_reservations.pop(campaign.campaign_id, None)
+            if reservation is None:
+                self._queued_campaign_ids.add(campaign.campaign_id)
+                return
         persisted, invocation, _observed = self._record(campaign)
         current = None
         if container is not None:
             candidate = self._candidate(campaign, container)
             if candidate.state == "paused":
                 self._service.resume_candidate(candidate)
+                if reservation is not None:
+                    self._started_reservations.append(reservation)
                 return
             current = self._service.adopt_candidate(candidate)
         fuzz_campaign = DeferredCampaignContainers._fuzz_campaign(self._project, persisted)
         if current is not None:
             self._service.stop(current)
         self._service.start(fuzz_campaign, invocation)
+        if reservation is not None:
+            self._started_reservations.append(reservation)
 
     def quarantine(self, campaign, container, _reason) -> None:
         self._service.quarantine_candidate(self._candidate(campaign, container))
@@ -981,6 +1052,7 @@ class RepositoryCampaignRuntime:
         artifact_state=None,
         progression=None,
         progression_assets=None,
+        execution_slots=None,
     ):
         if (
             isinstance(monitor_interval_seconds, bool)
@@ -1008,6 +1080,7 @@ class RepositoryCampaignRuntime:
         self._artifact_state = artifact_state
         self._progression = progression or ProductionProgression()
         self._progression_assets = progression_assets
+        self._execution_slots = execution_slots
         if evidence_processor is not None and invocations is None:
             raise ValueError("campaign evidence processing requires the invocation store")
         self._observations: dict[int, ContainerObservation] = {}
@@ -1228,7 +1301,11 @@ class RepositoryCampaignRuntime:
             unhealthy_worker=bool(observation.unhealthy_campaign_ids or processing_failures),
             documented_configuration="try configuration" in progression_names,
             system_gap="prepare component gap target" in progression_names,
-            free_slots=max(project.worker_count - len(active_campaigns), 0),
+            free_slots=(
+                (await self._execution_slots.snapshot(project)).free_slots
+                if self._execution_slots is not None
+                else max(project.worker_count - len(active_campaigns), 0)
+            ),
             material_change=(
                 previous_state is not None and previous_state != state
             ) or processing_corpus or processing_crashes or bool(
@@ -1271,6 +1348,10 @@ class RepositoryCampaignRuntime:
             ))
             if stopped is not True:
                 raise RuntimeError("worker-limit campaign identity changed before persistence")
+        if campaigns[:overflow]:
+            await self._notify_execution_slots(project, {
+                campaign.id for campaign in campaigns[:overflow]
+            })
         if campaigns[:overflow] and self._events is not None:
             await self._events.append(project.id, "events", {"name": "campaigns"})
 
@@ -1335,7 +1416,15 @@ class RepositoryCampaignRuntime:
                 ),
                 configuration_asset_id=configuration_asset.id,
             )
-            await _await(self._containers.start_exact(project, campaign))
+            if self._execution_slots is None:
+                await _await(self._containers.start_exact(project, campaign))
+            else:
+                reservation = await self._execution_slots.try_fuzzing_start(project, campaign.id)
+                if reservation is None:
+                    return campaign
+                async with reservation:
+                    await _await(self._containers.start_exact(project, campaign))
+                    await reservation.promote()
             cleared = await _await(self._campaigns.clear_progression_error(
                 record.action_id, campaign.id,
             ))
@@ -1386,6 +1475,7 @@ class RepositoryCampaignRuntime:
         )
         if stopped is not True:
             raise RuntimeError("retirement identity changed before persistence")
+        await self._notify_execution_slots(project, {campaign.id})
         if self._events is not None:
             await self._events.append(project.id, "events", {"name": "campaigns"})
         return record.action_id
@@ -1479,6 +1569,17 @@ class RepositoryCampaignRuntime:
             campaign = campaigns.get(campaign_id)
             if campaign is not None:
                 await _await(self._containers.stop_exact(project, campaign))
+        await self._notify_execution_slots(project, set(observation.active_campaign_ids))
+
+    async def _notify_execution_slots(self, project, stopped_campaign_ids: set[int]) -> None:
+        if self._execution_slots is None:
+            return
+        observation = self._observations.get(project.id, ContainerObservation())
+        await self._execution_slots.observe_running(
+            project.id,
+            frozenset(set(observation.active_campaign_ids) - set(stopped_campaign_ids)),
+        )
+        self._execution_slots.notify(project.id)
 
     @staticmethod
     def _validate_retirement_campaign(project, campaign, campaign_id: int, strategy_id: int) -> None:

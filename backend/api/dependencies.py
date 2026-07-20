@@ -27,6 +27,7 @@ from backend.services.campaigns.production_preparation import (
     CampaignTargetPreparation,
     DeferredTargetPreparationGraph,
 )
+from backend.services.campaigns.execution_slots import ProjectExecutionSlots
 from backend.services.campaigns.production_runtime import (
     CampaignInvocationStore,
     DeferredCampaignContainers,
@@ -113,8 +114,9 @@ def build_services(pool, workspace: Path) -> Services:
     )
     discovery = ProjectDiscovery(workspace)
     invocation_store = CampaignInvocationStore(workspace)
+    execution_slots = ProjectExecutionSlots()
     campaign_containers = DeferredCampaignContainers(
-        workspace, invocation_store=invocation_store,
+        workspace, invocation_store=invocation_store, execution_slots=execution_slots,
     )
     checkout_registry = ProjectCheckoutRegistry(workspace, projects)
     replay_verifier = FirstHitReplayVerifier(
@@ -157,6 +159,7 @@ def build_services(pool, workspace: Path) -> Services:
         evidence_processor=evidence_processor,
         artifact_state=campaign_artifacts,
         progression_assets=ProgressionAssetPublisher(AssetStore(workspace, assets)),
+        execution_slots=execution_slots,
     )
     campaign_manager = CampaignWorkflow(observability)
     preparation_graph = DeferredTargetPreparationGraph(
@@ -174,6 +177,7 @@ def build_services(pool, workspace: Path) -> Services:
         invocation_store=invocation_store,
         containers=campaign_containers,
         events=observability,
+        execution_slots=execution_slots,
     )
     decision_executor = DecisionExecutor(
         campaign_preparation, campaign_control=campaign_runtime,
@@ -192,6 +196,7 @@ def build_services(pool, workspace: Path) -> Services:
             runtime=campaign_runtime,
             advisory_lock=advisory_lock,
             events=observability,
+            execution_slots=execution_slots,
         ),
     )
     finding_artifacts = FindingArtifactStore(CrashQuarantine(workspace))
