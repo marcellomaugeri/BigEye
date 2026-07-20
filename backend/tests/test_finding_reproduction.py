@@ -7,6 +7,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 
+import pytest
+
 
 IMAGE_ID = "sha256:" + "a" * 64
 
@@ -105,6 +107,47 @@ def test_registry_rejects_duplicate_and_capacity_then_prunes_terminal_state(tmp_
 
     run(scenario())
     assert registry._runs == registry._tasks == registry._locks == registry._queues == {}
+
+
+@pytest.mark.parametrize("failure_stage", ["directory", "identity", "event", "task"])
+def test_registry_releases_admission_after_each_pre_task_failure(
+    tmp_path: Path, monkeypatch, failure_stage: str,
+) -> None:
+    from backend.services.findings.reproduction_registry import ReproductionRegistry
+
+    service = FakeReproducer()
+    service.testcase = tmp_path / "input"
+    service.testcase.write_bytes(b"crash")
+    registry = ReproductionRegistry(tmp_path / "workspace", service, max_concurrent=1)
+
+    original_directory = registry._directory
+    original_atomic = registry._atomic_json
+    original_emit = registry._emit
+
+    if failure_stage == "directory":
+        monkeypatch.setattr(registry, "_directory", lambda _key: (_ for _ in ()).throw(OSError("directory")))
+    elif failure_stage == "identity":
+        monkeypatch.setattr(registry, "_atomic_json", lambda *_args: (_ for _ in ()).throw(OSError("identity")))
+    elif failure_stage == "event":
+        async def fail_event(*_args): raise OSError("event")
+        monkeypatch.setattr(registry, "_emit", fail_event)
+    else:
+        monkeypatch.setattr(registry, "_launch", lambda *_args: (_ for _ in ()).throw(OSError("task")), raising=False)
+
+    async def scenario():
+        with pytest.raises(OSError, match=failure_stage):
+            await registry.start(7, 5)
+        monkeypatch.setattr(registry, "_directory", original_directory)
+        monkeypatch.setattr(registry, "_atomic_json", original_atomic)
+        monkeypatch.setattr(registry, "_emit", original_emit)
+        if failure_stage == "task":
+            monkeypatch.undo()
+        admitted = await registry.start(7, 5)
+        events = [event async for event in registry.stream(7, 5, admitted.run_id)]
+        await registry.close()
+        return events
+
+    assert run(scenario())[-1]["data"]["phase"] == "completed"
 
 
 def test_sealed_bundle_verifies_itself_without_mutable_resolver(tmp_path: Path) -> None:

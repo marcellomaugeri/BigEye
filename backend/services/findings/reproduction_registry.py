@@ -65,32 +65,44 @@ class ReproductionRegistry:
                 raise ReproductionBusy("local reproduction capacity is occupied")
             self._active_findings.add(finding_key)
             self._reserved += 1
+        key = None
+        reservation_owned = True
         try:
             prepared = await self._reproducer.prepare(project_id, finding_id)
+            now = datetime.now(UTC)
+            run_id = uuid4().hex
+            if hasattr(prepared, "run_id"):
+                prepared = replace(prepared, run_id=run_id)
+            run = ReproductionRun(
+                run_id, project_id, finding_id, "starting", now, None,
+                prepared.image_id, prepared.command,
+            )
+            key = (project_id, finding_id, run.run_id)
+            self._runs[key] = run
+            self._queues[key] = set()
+            self._locks[key] = asyncio.Lock()
+            self._directory(key).mkdir(parents=True, mode=0o700)
+            self._atomic_json(
+                self._directory(key) / "container.json",
+                reproduction_container_identity(run_id, project_id, finding_id),
+            )
+            await self._emit(key, "reproduction", self._view(run))
+            task = self._launch(key, prepared)
+            self._tasks[key] = task
+            reservation_owned = False
+            return run
         except BaseException:
-            await self._release(finding_key)
+            if key is not None:
+                self._runs.pop(key, None)
+                self._tasks.pop(key, None)
+                self._locks.pop(key, None)
+                self._queues.pop(key, None)
+            if reservation_owned:
+                await self._release(finding_key)
             raise
-        now = datetime.now(UTC)
-        run_id = uuid4().hex
-        if hasattr(prepared, "run_id"):
-            prepared = replace(prepared, run_id=run_id)
-        run = ReproductionRun(
-            run_id, project_id, finding_id, "starting", now, None,
-            prepared.image_id, prepared.command,
-        )
-        key = (project_id, finding_id, run.run_id)
-        self._runs[key] = run
-        self._queues[key] = set()
-        self._locks[key] = asyncio.Lock()
-        self._directory(key).mkdir(parents=True, mode=0o700)
-        self._atomic_json(
-            self._directory(key) / "container.json",
-            reproduction_container_identity(run_id, project_id, finding_id),
-        )
-        await self._emit(key, "reproduction", self._view(run))
-        task = asyncio.create_task(self._drive(key, prepared))
-        self._tasks[key] = task
-        return run
+
+    def _launch(self, key, prepared) -> asyncio.Task:
+        return asyncio.create_task(self._drive(key, prepared))
 
     async def stream(self, project_id: int, finding_id: int, run_id: str):
         key = self._key(project_id, finding_id, run_id)
