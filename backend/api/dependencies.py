@@ -207,7 +207,9 @@ def build_services(pool, workspace: Path) -> Services:
         logs=logs, events=ProjectEventStream(observability),
         settings=SettingsService(pool, toolchain.docker_available, toolchain.toolchain_available),
         recovery=backbone, analysis=AnalysisReader(workspace),
-        project_settings=ProjectSettingsService(projects, backbone), observability=observability,
+        project_settings=ProjectSettingsService(
+            projects, backbone, execution_slots=execution_slots,
+        ), observability=observability,
         campaigns=campaigns, campaign_reader=CampaignReadService(campaigns, coverage_history),
         coverage=coverage, findings=findings, finding_artifacts=finding_artifacts,
     )

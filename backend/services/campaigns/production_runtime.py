@@ -641,6 +641,8 @@ class DeferredCampaignContainers:
             if campaign.stopped_at is None and campaign.error is None
         )
         if not active:
+            if self._execution_slots is not None:
+                await self._execution_slots.observe_running(project.id, frozenset())
             return ContainerObservation()
         client = self._docker_client.connect()
         active_ids: list[int] = []

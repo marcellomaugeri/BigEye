@@ -81,3 +81,32 @@ def test_recovery_reservations_are_exclusive_and_release_after_cancellation() ->
         assert snapshot.free_slots == 0
 
     run(exercise())
+
+
+def test_configuring_a_higher_limit_admits_a_waiting_compilation() -> None:
+    from backend.services.campaigns.execution_slots import ProjectExecutionSlots
+
+    async def exercise():
+        slots = ProjectExecutionSlots()
+        constrained = project(worker_count=1)
+        expanded = project(worker_count=2)
+        await slots.observe_running(constrained.id, frozenset({31}))
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def compile_waiter():
+            async with slots.compilation(constrained, "compile:waiting"):
+                entered.set()
+                await release.wait()
+
+        waiter = asyncio.create_task(compile_waiter())
+        await asyncio.sleep(0)
+        assert entered.is_set() is False
+
+        await slots.configure(expanded)
+        await asyncio.wait_for(entered.wait(), 0.2)
+
+        release.set()
+        await waiter
+
+    run(exercise())

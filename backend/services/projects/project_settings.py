@@ -8,9 +8,12 @@ class CoordinatorRegistry(Protocol):
 
 
 class ProjectSettingsService:
-    def __init__(self, projects, coordinator_registry: CoordinatorRegistry | None = None):
+    def __init__(
+        self, projects, coordinator_registry: CoordinatorRegistry | None = None, execution_slots=None,
+    ):
         self._projects = projects
         self._coordinator_registry = coordinator_registry
+        self._execution_slots = execution_slots
 
     async def get(self, project_id: int):
         project = await self._projects.get(project_id)
@@ -23,6 +26,8 @@ class ProjectSettingsService:
         project = await self._projects.update_settings(
             project_id, current.worker_count if worker_count is None else worker_count, repository_token
         )
+        if self._execution_slots is not None:
+            await self._execution_slots.configure(project)
         if self._coordinator_registry is not None:
             await self._coordinator_registry.settings_changed(project_id)
         return project

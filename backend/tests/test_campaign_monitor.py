@@ -478,6 +478,31 @@ def test_recovery_queues_stopped_campaigns_when_attested_running_campaigns_use_t
     assert asyncio.run(slots.snapshot(project)).running_campaign_ids == frozenset({9})
 
 
+def test_reconcile_with_no_active_campaigns_clears_observed_running_slots(tmp_path: Path) -> None:
+    from backend.services.campaigns.execution_slots import ProjectExecutionSlots
+    from backend.services.campaigns.production_runtime import DeferredCampaignContainers
+
+    async def exercise():
+        slots = ProjectExecutionSlots()
+        project = SimpleNamespace(id=7, commit_sha="a" * 40, worker_count=1)
+        await slots.observe_running(project.id, frozenset({9}))
+        deferred = DeferredCampaignContainers(
+            tmp_path,
+            docker_client=SimpleNamespace(connect=lambda: (_ for _ in ()).throw(AssertionError())),
+            execution_slots=slots,
+        )
+
+        observation = await deferred.reconcile(
+            project,
+            (SimpleNamespace(id=9, stopped_at=NOW, error=None),),
+        )
+
+        assert observation.active_campaign_ids == ()
+        assert (await slots.snapshot(project)).running_campaign_ids == frozenset()
+
+    asyncio.run(exercise())
+
+
 def test_artifact_processor_runs_crash_pipeline_before_corpus_and_persists_observability() -> None:
     from backend.fuzzing.campaigns.monitor import CampaignArtifactObservation
     from backend.services.campaigns.production_evidence import (

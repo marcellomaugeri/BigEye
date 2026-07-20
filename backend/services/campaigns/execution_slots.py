@@ -28,6 +28,7 @@ class ProjectExecutionSnapshot:
 @dataclass
 class _ProjectLedger:
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
+    limit: int = 0
     compilations: dict[str, int | None] = field(default_factory=dict)
     pending_starts: set[int] = field(default_factory=set)
     running_campaign_ids: frozenset[int] = frozenset()
@@ -103,7 +104,8 @@ class ProjectExecutionSlots:
     @asynccontextmanager
     async def compilation(self, project, operation_id: str):
         """Reserve one heavy-job slot and allow atomic promotion to a running fuzzer."""
-        project_id, limit = _project(project)
+        project_id, _ = _project(project)
+        await self.configure(project)
         if (
             not isinstance(operation_id, str) or not operation_id.strip()
             or len(operation_id) > 256 or "\x00" in operation_id
@@ -113,7 +115,7 @@ class ProjectExecutionSlots:
         async with ledger.condition:
             if operation_id in ledger.compilations:
                 raise ValueError("compilation operation ID is already active")
-            await ledger.condition.wait_for(lambda: self._available(ledger, limit))
+            await ledger.condition.wait_for(lambda: self._available(ledger))
             ledger.compilations[operation_id] = None
         lease = _CompilationLease(self, project_id, operation_id)
         try:
@@ -123,7 +125,8 @@ class ProjectExecutionSlots:
 
     async def try_fuzzing_start(self, project, campaign_id: int) -> _FuzzingStartReservation | None:
         """Return one exclusive start reservation, or None when capacity is full."""
-        project_id, limit = _project(project)
+        project_id, _ = _project(project)
+        await self.configure(project)
         _positive(campaign_id, "campaign ID")
         ledger = self._ledger(project_id)
         async with ledger.condition:
@@ -131,7 +134,7 @@ class ProjectExecutionSlots:
                 return None
             if campaign_id in ledger.pending_starts:
                 return None
-            if not self._available(ledger, limit):
+            if not self._available(ledger):
                 return None
             ledger.pending_starts.add(campaign_id)
         return _FuzzingStartReservation(self, project_id, campaign_id)
@@ -150,16 +153,25 @@ class ProjectExecutionSlots:
             ledger.pending_starts.difference_update(campaign_ids)
             ledger.condition.notify_all()
 
+    async def configure(self, project) -> None:
+        """Refresh a project's configured heavy-job limit and wake admission waiters."""
+        project_id, limit = _project(project)
+        ledger = self._ledger(project_id)
+        async with ledger.condition:
+            ledger.limit = limit
+            ledger.condition.notify_all()
+
     async def snapshot(self, project) -> ProjectExecutionSnapshot:
         """Return capacity derived solely from Docker-heavy project work."""
-        project_id, limit = _project(project)
+        project_id, _ = _project(project)
+        await self.configure(project)
         ledger = self._ledger(project_id)
         async with ledger.condition:
             return ProjectExecutionSnapshot(
                 compilation_count=len(ledger.compilations),
                 pending_start_count=len(ledger.pending_starts),
                 running_campaign_ids=ledger.running_campaign_ids,
-                limit=limit,
+                limit=ledger.limit,
             )
 
     def notify(self, project_id: int) -> None:
@@ -174,12 +186,12 @@ class ProjectExecutionSlots:
         return self._ledgers.setdefault(project_id, _ProjectLedger())
 
     @staticmethod
-    def _available(ledger: _ProjectLedger, limit: int) -> bool:
+    def _available(ledger: _ProjectLedger) -> bool:
         return (
             len(ledger.compilations)
             + len(ledger.pending_starts)
             + len(ledger.running_campaign_ids)
-        ) < limit
+        ) < ledger.limit
 
     @staticmethod
     async def _notify(ledger: _ProjectLedger) -> None:
