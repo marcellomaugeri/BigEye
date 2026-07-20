@@ -343,6 +343,43 @@ def test_cmake_source_directory_rejects_expansion_and_traversal(
         )
 
 
+@pytest.mark.parametrize(
+    "build_command",
+    (
+        (
+            "cmake -S '/src/sub\"; : injected; # ' -B /opt/bigeye/build && "
+            "cmake --build /opt/bigeye/build --target fuzz-target"
+        ),
+        (
+            "cmake '-S/src/sub\"; : injected; # ' -B /opt/bigeye/build && "
+            "cmake --build /opt/bigeye/build --target fuzz-target"
+        ),
+    ),
+)
+def test_cmake_source_directory_rejects_double_quote_shell_breakout(
+    tmp_path, build_command: str,
+) -> None:
+    with pytest.raises(ValueError, match="inside /src"):
+        _generated_scripts(
+            tmp_path,
+            instance_type="system-level",
+            build_command=build_command,
+        )
+
+
+def test_cmake_source_directory_preserves_safe_spaces_and_apostrophes(tmp_path) -> None:
+    target, _coverage = _generated_scripts(
+        tmp_path,
+        instance_type="system-level",
+        build_command=(
+            'cmake -S "/src/sub dir/o\'clock" -B /opt/bigeye/build && '
+            "cmake --build /opt/bigeye/build --target fuzz-target"
+        ),
+    )
+
+    assert 'cmake -S "$BIGEYE_SOURCE_DIR/sub dir/o\'clock"' in target
+
+
 def test_build_only_cmake_command_refuses_to_guess_existing_cache_options(tmp_path) -> None:
     target, _coverage = _generated_scripts(
         tmp_path,

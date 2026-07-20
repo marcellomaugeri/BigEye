@@ -711,7 +711,7 @@ def _cmake_source_expression(source: str) -> str:
         if (
             not relative
             or any(part in {"", ".", ".."} for part in relative.split("/"))
-            or any(character in relative for character in "$~\\`")
+            or any(character in relative for character in '"$~\\`')
         ):
             raise ValueError("CMake source directory must stay inside /src")
         return "$BIGEYE_SOURCE_DIR/" + relative
