@@ -187,6 +187,54 @@ class ReproductionBundleStore:
                 return False
         return False
 
+    def load_sealed(self, project_id: int, finding_id: int) -> ReproductionBundle:
+        """Self-verify one finding-scoped bundle after mutable lifecycle data is gone."""
+        if type(project_id) is not int or project_id <= 0 or type(finding_id) is not int or finding_id <= 0:
+            raise ValueError("sealed reproduction bundle identity is invalid")
+        parent = self._workspace / "projects" / str(project_id) / "findings" / str(finding_id) / "bundle"
+        if parent.is_symlink() or not parent.is_dir():
+            raise ValueError("sealed reproduction bundle is unavailable")
+        candidates = [
+            item for item in parent.iterdir()
+            if item.is_dir() and not item.is_symlink() and _DIGEST.fullmatch(item.name)
+        ]
+        if len(candidates) != 1:
+            raise ValueError("sealed reproduction bundle selection is ambiguous or incomplete")
+        root = candidates[0]
+        manifest_path, testcase_path = root / "manifest.json", root / "testcase.input"
+        if manifest_path.is_symlink() or testcase_path.is_symlink():
+            raise ValueError("sealed reproduction bundle path is unsafe")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                raise ValueError("sealed reproduction manifest is not an object")
+            testcase = testcase_path.read_bytes()
+            identity = {key: value for key, value in manifest.items() if key != "bundle_id"}
+            encoded = json.dumps(
+                identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")
+            request = ReproductionBundleRequest(
+                project_id=identity["project_id"], finding_id=identity["finding_id"],
+                commit_sha=identity["commit_sha"], image_id=identity["image_id"],
+                command=tuple(identity["command"]),
+                environment=tuple(tuple(item) for item in identity["environment"]),
+                sanitizer=identity["sanitizer"], configuration=identity["configuration"],
+                minimal_testcase=testcase,
+                target_asset_hash=identity["target_asset_hash"],
+                configuration_asset_hash=identity["configuration_asset_hash"],
+                coverage_asset_hash=identity["coverage_asset_hash"],
+            )
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError("sealed reproduction bundle verification failed") from error
+        if (
+            request.project_id != project_id or request.finding_id != finding_id
+            or manifest.get("bundle_id") != root.name
+            or sha256(encoded).hexdigest() != root.name
+            or sha256(testcase).hexdigest() != identity.get("testcase_sha256")
+        ):
+            raise ValueError("sealed reproduction bundle verification failed")
+        return self._verified_bundle(request, root, manifest)
+
     async def pinned_image_ids(self, project_id: int) -> tuple[str, ...]:
         if type(project_id) is not int or project_id <= 0:
             raise ValueError("reproduction bundle project ID is invalid")

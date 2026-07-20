@@ -104,7 +104,7 @@ class Services:
             await close()
 
 
-def build_services(pool, workspace: Path) -> Services:
+def build_services(pool, workspace: Path, *, reproduction_limit: int = 2) -> Services:
     workspace = Path(workspace)
     if workspace.is_symlink():
         raise ValueError("workspace root must not be a symlink")
@@ -147,6 +147,7 @@ def build_services(pool, workspace: Path) -> Services:
         FindingReproductionService(
             workspace, findings, reproduction_bundles, DockerClient(),
         ),
+        max_concurrent=reproduction_limit,
     )
     execution_slots = ProjectExecutionSlots()
     campaign_containers = DeferredCampaignContainers(

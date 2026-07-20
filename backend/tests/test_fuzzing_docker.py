@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
+import docker
 import pytest
 
 
@@ -316,11 +317,16 @@ class TestContainerRunner:
             def create(self, image, command, **kwargs):
                 created.append((image, command, kwargs))
                 return Container()
+            def get(self, _container_id):
+                raise docker.errors.NotFound("removed")
 
-        result = run(ContainerRunner(SimpleNamespace(containers=Containers())).run_reproduction(
+        result = run(ContainerRunner(SimpleNamespace(
+            containers=Containers(), errors=docker.errors,
+        )).run_reproduction(
             "sha256:" + "a" * 64, ["/opt/bigeye/reproduce", "/finding/input"], 12,
             lambda stream, text: output.append((stream, text)), testcase,
             environment={"ASAN_OPTIONS": "abort_on_error=1"},
+            run_id="e" * 32, project_id=7, finding_id=5,
         ))
 
         assert result.exit_code == 1
@@ -334,7 +340,60 @@ class TestContainerRunner:
             "detach": True, "user": "65534:65534",
             "volumes": {str(testcase.resolve()): {"bind": "/finding/input", "mode": "ro"}},
             "environment": {"ASAN_OPTIONS": "abort_on_error=1"},
+            "name": "bigeye-reproduction-" + "e" * 32,
+            "labels": {
+                "com.bigeye.managed": "finding-reproduction",
+                "com.bigeye.reproduction.run_id": "e" * 32,
+                "com.bigeye.project_id": "7", "com.bigeye.finding_id": "5",
+            },
         }
+
+    def test_reproduction_cleanup_failure_is_not_reported_as_success(self, tmp_path: Path) -> None:
+        from backend.fuzzing.docker.container_runner import ContainerCleanupFailed, ContainerRunner
+
+        testcase = tmp_path / "minimal.input"
+        testcase.write_bytes(b"crash")
+        class Container:
+            id = "still-present"
+            def start(self): pass
+            def attach(self, **_kwargs): return iter(())
+            def wait(self, timeout): return {"StatusCode": 1}
+            def remove(self, force=False): raise RuntimeError("remove failed")
+        container = Container()
+        class Containers:
+            def create(self, *_args, **_kwargs): return container
+            def get(self, _container_id): return container
+        with pytest.raises(ContainerCleanupFailed, match="could not be verified"):
+            run(ContainerRunner(SimpleNamespace(containers=Containers())).run_reproduction(
+                "sha256:" + "a" * 64, ["/reproduce", "/finding/input"], 1,
+                lambda *_args: None, testcase, run_id="f" * 32, project_id=7, finding_id=5,
+            ))
+
+    def test_reproduction_recovery_removes_only_exact_owned_orphan(self) -> None:
+        from backend.fuzzing.docker.container_runner import ContainerRunner, reproduction_container_identity
+
+        identity = reproduction_container_identity("a" * 32, 7, 5)
+        removed = []
+        class Container:
+            def __init__(self, name, labels):
+                self.id, self.name, self.labels = name, name, labels
+            def stop(self, timeout=0): pass
+            def kill(self): pass
+            def remove(self, force=False): removed.append(self.name); containers.items.remove(self)
+        exact = Container(identity["name"], identity["labels"])
+        unrelated = Container("other", {"com.bigeye.managed": "fuzz-campaign"})
+        class Containers:
+            def __init__(self): self.items = [exact, unrelated]
+            def list(self, **_kwargs): return list(self.items)
+            def get(self, container_id):
+                for item in self.items:
+                    if item.id == container_id: return item
+                raise docker.errors.NotFound("removed")
+        containers = Containers()
+        client = SimpleNamespace(containers=containers, errors=docker.errors)
+        ContainerRunner(client).reconcile_reproduction(identity)
+        assert removed == [identity["name"]]
+        assert containers.items == [unrelated]
 
     def test_runner_forces_bounded_non_privileged_container_and_removes_it(self) -> None:
         from backend.fuzzing.docker.container_runner import ContainerRunner

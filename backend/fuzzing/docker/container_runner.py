@@ -5,6 +5,7 @@ from collections.abc import Mapping
 import re
 import threading
 from dataclasses import dataclass
+import docker
 
 from requests.exceptions import ReadTimeout
 
@@ -29,11 +30,31 @@ class ContainerCancelled(RuntimeError):
     """Raised in the worker after its caller has already cancelled it."""
 
 
+class ContainerCleanupFailed(RuntimeError):
+    """A managed reproduction container could not be proven absent."""
+
+
 MAX_OUTPUT_BYTES = 1_048_576
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 _MAX_ENVIRONMENT_ENTRIES = 16
 _MAX_ENVIRONMENT_VALUE_BYTES = 4_096
 _MAX_ENVIRONMENT_BYTES = 16 * 1_024
+_RUN_ID = re.compile(r"[0-9a-f]{32}\Z")
+
+
+def reproduction_container_identity(run_id: str, project_id: int, finding_id: int) -> dict:
+    if _RUN_ID.fullmatch(run_id or "") is None or type(project_id) is not int or project_id <= 0 or type(finding_id) is not int or finding_id <= 0:
+        raise ValueError("reproduction container identity is invalid")
+    return {
+        "run_id": run_id,
+        "name": f"bigeye-reproduction-{run_id}",
+        "labels": {
+            "com.bigeye.managed": "finding-reproduction",
+            "com.bigeye.reproduction.run_id": run_id,
+            "com.bigeye.project_id": str(project_id),
+            "com.bigeye.finding_id": str(finding_id),
+        },
+    }
 
 
 @dataclass(frozen=True)
@@ -78,6 +99,7 @@ class ContainerRunner:
     async def run_reproduction(
         self, image: str, command: list[str], timeout: float, sink,
         testcase_path, *, environment: Mapping[str, str] | None = None,
+        run_id: str, project_id: int, finding_id: int,
     ) -> ContainerResult:
         """Stream one read-only testcase without exposing stdin or a shell."""
         from pathlib import Path
@@ -89,13 +111,14 @@ class ContainerRunner:
             raise ValueError("reproduction testcase is unavailable or unsafe")
         testcase = testcase.resolve(strict=True)
         bounded_environment = _bounded_environment(environment)
+        identity = reproduction_container_identity(run_id, project_id, finding_id)
         holder: dict[str, object] = {
             "cancel_requested": False, "cleanup_started": False,
-            "lock": threading.Lock(),
+            "lock": threading.Lock(), "strict_cleanup": True,
         }
         worker = asyncio.create_task(asyncio.to_thread(
             self._run_reproduction_blocking, holder, image, command, timeout,
-            sink, testcase, bounded_environment,
+            sink, testcase, bounded_environment, identity,
         ))
         worker.add_done_callback(self._observe_worker)
         try:
@@ -111,7 +134,7 @@ class ContainerRunner:
 
     def _run_reproduction_blocking(
         self, holder, image: str, command: list[str], timeout: float, sink,
-        testcase, environment: dict[str, str],
+        testcase, environment: dict[str, str], identity: dict,
     ) -> ContainerResult:
         options = {
             "platform": PLATFORM, "network_disabled": True, "read_only": True,
@@ -120,6 +143,7 @@ class ContainerRunner:
             "tmpfs": {"/tmp": "rw,nosuid,nodev,exec,size=64m,mode=1777"},
             "detach": True, "user": "65534:65534",
             "volumes": {str(testcase): {"bind": "/finding/input", "mode": "ro"}},
+            "name": identity["name"], "labels": identity["labels"],
         }
         if environment:
             options["environment"] = environment
@@ -242,13 +266,65 @@ class ContainerRunner:
             holder["cleanup_started"] = True
             attached = holder.get("attached")
         if attached is not None:
-            close_attached_stdin(attached)
+            try:
+                close_attached_stdin(attached)
+            except Exception:
+                pass
         output = holder.get("output")
         if output is not None:
             close = getattr(output, "close", None)
             if close is not None:
-                close()
-        self._cleanup(container, stop)
+                try:
+                    close()
+                except Exception:
+                    pass
+        if holder.get("strict_cleanup"):
+            self._cleanup_reproduction(container, stop)
+        else:
+            self._cleanup(container, stop)
+
+    def _cleanup_reproduction(self, container, stop: bool) -> None:
+        if stop:
+            for operation in (lambda: container.stop(timeout=0), container.kill):
+                for _attempt in range(2):
+                    try:
+                        operation()
+                        break
+                    except Exception:
+                        continue
+        not_found = getattr(self._client, "errors", docker.errors).NotFound
+        for _attempt in range(2):
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
+            try:
+                self._client.containers.get(container.id)
+            except not_found:
+                return
+            except Exception:
+                continue
+        raise ContainerCleanupFailed("reproduction container removal could not be verified")
+
+    def reconcile_reproduction(self, identity: dict) -> None:
+        expected = reproduction_container_identity(
+            identity.get("run_id"), int(identity.get("labels", {}).get("com.bigeye.project_id", 0)),
+            int(identity.get("labels", {}).get("com.bigeye.finding_id", 0)),
+        )
+        if identity != expected:
+            raise ContainerCleanupFailed("persisted reproduction container identity is invalid")
+        filters = {"label": [f"{key}={value}" for key, value in expected["labels"].items()]}
+        candidates = self._client.containers.list(all=True, filters=filters)
+        for container in candidates:
+            labels = getattr(container, "labels", None) or getattr(container, "attrs", {}).get("Config", {}).get("Labels", {})
+            if labels == expected["labels"] and getattr(container, "name", expected["name"]) == expected["name"]:
+                self._cleanup_reproduction(container, stop=True)
+        remaining = self._client.containers.list(all=True, filters=filters)
+        if any(
+            (getattr(item, "labels", None) or getattr(item, "attrs", {}).get("Config", {}).get("Labels", {})) == expected["labels"]
+            for item in remaining
+        ):
+            raise ContainerCleanupFailed("orphan reproduction container removal could not be verified")
 
     @staticmethod
     def _cleanup(container, stop: bool) -> None:

@@ -11,10 +11,15 @@ import re
 from uuid import uuid4
 
 from backend.fuzzing.crashes.artifacts import sanitise_terminal_output
+from backend.fuzzing.docker.container_runner import reproduction_container_identity
 
 
 _RUN_ID = re.compile(r"[0-9a-f]{32}\Z")
 _TERMINAL = {"completed", "failed", "timed_out", "interrupted"}
+
+
+class ReproductionBusy(RuntimeError):
+    """The small local reproduction safety capacity is already occupied."""
 
 
 @dataclass(frozen=True)
@@ -32,13 +37,19 @@ class ReproductionRun:
 
 
 class ReproductionRegistry:
-    def __init__(self, workspace: Path, reproducer):
+    def __init__(self, workspace: Path, reproducer, *, max_concurrent: int = 2):
         candidate = Path(workspace)
         if candidate.is_symlink():
             raise ValueError("reproduction workspace must not be a symlink")
         candidate.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._workspace = candidate.resolve(strict=True)
         self._reproducer = reproducer
+        if type(max_concurrent) is not int or max_concurrent <= 0:
+            raise ValueError("reproduction concurrency limit must be positive")
+        self._max_concurrent = max_concurrent
+        self._admission = asyncio.Lock()
+        self._active_findings: set[tuple[int, int]] = set()
+        self._reserved = 0
         self._runs: dict[tuple[int, int, str], ReproductionRun] = {}
         self._tasks: dict[tuple[int, int, str], asyncio.Task] = {}
         self._queues: dict[tuple[int, int, str], set[asyncio.Queue]] = {}
@@ -46,10 +57,25 @@ class ReproductionRegistry:
         self._recover_incomplete()
 
     async def start(self, project_id: int, finding_id: int) -> ReproductionRun:
-        prepared = await self._reproducer.prepare(project_id, finding_id)
+        finding_key = (project_id, finding_id)
+        async with self._admission:
+            if finding_key in self._active_findings:
+                raise ReproductionBusy("finding reproduction is already active")
+            if self._reserved >= self._max_concurrent:
+                raise ReproductionBusy("local reproduction capacity is occupied")
+            self._active_findings.add(finding_key)
+            self._reserved += 1
+        try:
+            prepared = await self._reproducer.prepare(project_id, finding_id)
+        except BaseException:
+            await self._release(finding_key)
+            raise
         now = datetime.now(UTC)
+        run_id = uuid4().hex
+        if hasattr(prepared, "run_id"):
+            prepared = replace(prepared, run_id=run_id)
         run = ReproductionRun(
-            uuid4().hex, project_id, finding_id, "starting", now, None,
+            run_id, project_id, finding_id, "starting", now, None,
             prepared.image_id, prepared.command,
         )
         key = (project_id, finding_id, run.run_id)
@@ -57,10 +83,13 @@ class ReproductionRegistry:
         self._queues[key] = set()
         self._locks[key] = asyncio.Lock()
         self._directory(key).mkdir(parents=True, mode=0o700)
+        self._atomic_json(
+            self._directory(key) / "container.json",
+            reproduction_container_identity(run_id, project_id, finding_id),
+        )
         await self._emit(key, "reproduction", self._view(run))
         task = asyncio.create_task(self._drive(key, prepared))
         self._tasks[key] = task
-        task.add_done_callback(lambda _task, current=key: self._tasks.pop(current, None))
         return run
 
     async def stream(self, project_id: int, finding_id: int, run_id: str):
@@ -83,11 +112,20 @@ class ReproductionRegistry:
                     continue
                 terminal = event["event"] == "reproduction" and event["data"].get("phase") in _TERMINAL
                 yield event
+            task = self._tasks.get(key)
+            if task is not None and not task.done():
+                await asyncio.shield(task)
         finally:
-            self._queues.get(key, set()).discard(queue)
+            subscribers = self._queues.get(key, set())
+            subscribers.discard(queue)
             task = self._tasks.get(key)
             if not terminal and task is not None and not task.done():
                 task.cancel()
+            elif terminal and not subscribers and (task is None or task.done()):
+                self._runs.pop(key, None)
+                self._tasks.pop(key, None)
+                self._locks.pop(key, None)
+                self._queues.pop(key, None)
 
     async def close(self) -> None:
         tasks = tuple(self._tasks.values())
@@ -108,6 +146,18 @@ class ReproductionRegistry:
         except Exception as error:
             phase = "timed_out" if error.__class__.__name__ == "ContainerTimedOut" else "failed"
             await self._finish(key, phase, None, "reproduction timed out" if phase == "timed_out" else "reproduction failed")
+        finally:
+            self._tasks.pop(key, None)
+            self._runs.pop(key, None)
+            self._locks.pop(key, None)
+            self._queues.pop(key, None)
+            await self._release((key[0], key[1]))
+
+    async def _release(self, finding_key: tuple[int, int]) -> None:
+        async with self._admission:
+            if finding_key in self._active_findings:
+                self._active_findings.remove(finding_key)
+                self._reserved -= 1
 
     async def _finish(self, key, phase: str, exit_code: int | None, reason: str) -> None:
         current = self._runs[key]
@@ -117,8 +167,8 @@ class ReproductionRegistry:
         )
         self._runs[key] = run
         data = self._view(run)
-        await self._emit(key, "reproduction", data)
         self._atomic_json(self._directory(key) / "final.json", data)
+        await self._emit(key, "reproduction", data)
 
     async def _emit(self, key, event: str, data: dict) -> None:
         if event == "output":
@@ -181,11 +231,20 @@ class ReproductionRegistry:
             try:
                 project_id = int(events.parents[4].name)
                 finding_id = int(events.parents[2].name)
-                now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                identity_path = run_root / "container.json"
+                if identity_path.is_symlink() or not identity_path.is_file():
+                    raise ValueError("reproduction container identity is unavailable")
+                identity = json.loads(identity_path.read_text(encoding="utf-8"))
+                self._reproducer.reconcile_orphan(identity)
+                reason = "backend restarted before reproduction completed"
+            except Exception:
+                reason = "backend restarted; container cleanup could not be verified"
+            try:
                 data = {
                     "run_id": run_root.name, "phase": "interrupted", "started_at": None,
-                    "completed_at": now, "image_id": None, "command": [], "exit_code": None,
-                    "terminal_reason": "backend restarted before reproduction completed",
+                    "completed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    "image_id": None, "command": [], "exit_code": None,
+                    "terminal_reason": reason,
                 }
                 with events.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps({"event": "reproduction", "data": data}, sort_keys=True) + "\n")

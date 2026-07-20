@@ -10,6 +10,7 @@ from fastapi.responses import StreamingResponse
 
 from backend.api.views.reproduction import ReproductionResponse
 from backend.services.findings.reproduce_finding import FindingNotFound, FindingNotReproducible
+from backend.services.findings.reproduction_registry import ReproductionBusy
 
 
 router = APIRouter()
@@ -27,6 +28,8 @@ async def start_reproduction(project_id: PositiveId, finding_id: PositiveId, req
         run = await request.app.state.services.reproductions.start(project_id, finding_id)
     except FindingNotFound as error:
         raise HTTPException(status_code=404, detail="finding not found") from error
+    except ReproductionBusy as error:
+        raise HTTPException(status_code=409, detail="finding reproduction is already active") from error
     except (FindingNotReproducible, OSError, ValueError) as error:
         raise HTTPException(status_code=409, detail="finding reproduction is unavailable") from error
     return ReproductionResponse.from_run(run)

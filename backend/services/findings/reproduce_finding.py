@@ -34,6 +34,7 @@ class PreparedReproduction:
     command: tuple[str, ...]
     environment: MappingProxyType
     testcase: Path
+    run_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -58,19 +59,11 @@ class FindingReproductionService:
             raise FindingNotFound("finding not found")
         if not finding.reproducible or finding.error is not None:
             raise FindingNotReproducible("finding is not reproducible")
-        root = self._workspace / "projects" / str(project_id) / "findings" / str(finding_id) / "bundle"
-        if root.is_symlink() or not root.is_dir():
-            raise FindingNotReproducible("finding reproduction bundle is unavailable")
-        verified = []
-        for candidate in sorted(root.iterdir(), key=lambda value: value.name):
-            if candidate.is_symlink() or not candidate.is_dir() or _DIGEST.fullmatch(candidate.name) is None:
-                continue
-            if await self._bundles.verify(project_id, candidate.name):
-                verified.append(candidate)
-        if len(verified) != 1:
-            raise FindingNotReproducible("finding requires one complete verified reproduction bundle")
-        bundle = verified[0]
-        manifest_path, testcase = bundle / "manifest.json", bundle / "testcase.input"
+        try:
+            bundle = self._bundles.load_sealed(project_id, finding_id)
+        except Exception as error:
+            raise FindingNotReproducible("finding reproduction bundle is unavailable") from error
+        manifest_path, testcase = bundle.root / "manifest.json", bundle.root / "testcase.input"
         if manifest_path.is_symlink() or testcase.is_symlink() or not testcase.is_file():
             raise FindingNotReproducible("finding reproduction bundle is unsafe")
         try:
@@ -82,7 +75,7 @@ class FindingReproductionService:
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise FindingNotReproducible("finding reproduction bundle is incomplete") from error
         if (
-            manifest.get("bundle_id") != bundle.name
+            manifest.get("bundle_id") != bundle.bundle_id
             or manifest.get("project_id") != project_id
             or manifest.get("finding_id") != finding_id
             or sha256(content).hexdigest() != manifest.get("testcase_sha256")
@@ -90,15 +83,23 @@ class FindingReproductionService:
             or not command or len(environment) != len(environment_items)
         ):
             raise FindingNotReproducible("finding reproduction bundle identity is invalid")
-        client = self._docker.connect()
+        client = None
         try:
+            client = self._docker.connect()
             inspected = ImageInspector(client).inspect(manifest["image_id"])
             if inspected.image_id != manifest["image_id"]:
                 raise FindingNotReproducible("finding reproduction image identity changed")
+        except FindingNotReproducible:
+            raise
+        except Exception as error:
+            raise FindingNotReproducible("finding reproduction image is unavailable") from error
         finally:
-            close = getattr(client, "close", None)
+            close = getattr(client, "close", None) if client is not None else None
             if close is not None:
-                close()
+                try:
+                    close()
+                except Exception:
+                    pass
         return PreparedReproduction(
             project_id, finding_id, manifest["image_id"], command,
             MappingProxyType(environment), testcase.resolve(strict=True),
@@ -118,6 +119,8 @@ class FindingReproductionService:
             result = await ContainerRunner(client).run_reproduction(
                 prepared.image_id, list(prepared.command), self._timeout, sink,
                 prepared.testcase, environment=prepared.environment,
+                run_id=prepared.run_id, project_id=prepared.project_id,
+                finding_id=prepared.finding_id,
             )
             return ReproductionOutcome(result.exit_code, "exited")
         finally:
@@ -126,3 +129,12 @@ class FindingReproductionService:
                 closed = close()
                 if inspect.isawaitable(closed):
                     await closed
+
+    def reconcile_orphan(self, identity: dict) -> None:
+        client = self._docker.connect()
+        try:
+            ContainerRunner(client).reconcile_reproduction(identity)
+        finally:
+            close = getattr(client, "close", None)
+            if close is not None:
+                close()

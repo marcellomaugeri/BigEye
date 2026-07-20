@@ -53,12 +53,17 @@ class FindingArtifacts:
 
 
 class Reproductions:
+    def __init__(self): self.started = False
     async def start(self, project_id, finding_id):
         from backend.services.findings.reproduction_registry import ReproductionRun
         from backend.services.findings.reproduce_finding import FindingNotFound
 
         if (project_id, finding_id) != (7, 5):
             raise FindingNotFound("finding not found")
+        if self.started:
+            from backend.services.findings.reproduction_registry import ReproductionBusy
+            raise ReproductionBusy("already active")
+        self.started = True
         return ReproductionRun(
             "c" * 32, 7, 5, "starting", NOW, None,
             "sha256:" + "d" * 64,
@@ -158,6 +163,7 @@ def test_reproducer_download_has_fixed_safe_headers_and_no_host_path():
 def test_exact_reproduction_is_accepted_and_streamed_only_as_sse():
     with client() as api:
         started = api.post("/api/projects/7/findings/5/reproductions")
+        duplicate = api.post("/api/projects/7/findings/5/reproductions")
         wrong_project = api.post("/api/projects/8/findings/5/reproductions")
         stream = api.get(
             "/api/projects/7/findings/5/reproductions/" + "c" * 32 + "/events",
@@ -167,6 +173,7 @@ def test_exact_reproduction_is_accepted_and_streamed_only_as_sse():
         )
 
     assert started.status_code == 202
+    assert duplicate.status_code == 409
     assert started.json()["command"] == ["/opt/bigeye/reproduce", "/finding/input"]
     assert wrong_project.status_code == 404
     assert stream.headers["content-type"].startswith("text/event-stream")
