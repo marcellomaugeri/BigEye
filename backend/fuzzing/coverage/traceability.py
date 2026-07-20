@@ -12,6 +12,7 @@ from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
+from backend.fuzzing.campaigns.coverage_contract import valid_replay_environment
 from backend.fuzzing.coverage.llvm_coverage import CoverageIntegrityError
 from backend.fuzzing.coverage.source_paths import is_forbidden_source_path
 from backend.services.projects.clone_repository import GitCommandFailed, run_command
@@ -94,6 +95,7 @@ class ReplayVerification:
     testcase_path: Path
     testcase_sha256: str
     replay_command: tuple[str, ...]
+    replay_environment: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -279,6 +281,7 @@ class TraceabilityService:
                 "strategy_asset_id": item.asset_id,
                 "testcase_sha256": item.first_testcase_sha256,
                 "replay_command": metadata["replay_command"],
+                "replay_environment": dict(metadata["replay_environment"]),
                 "target_asset_id": metadata["target_asset_id"],
                 "configuration_asset_id": metadata["configuration_asset_id"],
                 "clean_image_id": metadata["clean_image_id"],
@@ -528,6 +531,7 @@ class TraceabilityService:
             raise CoverageIntegrityError("first-hit metadata identity does not match its evidence")
         for key in ("source_sha256", "clean_content_hash"):
             _digest(document.get(key), key.replace("_", " "))
+        replay_environment = _stored_replay_environment(document.get("replay_environment"))
         if (
             not isinstance(document.get("clean_image_id"), str)
             or not _is_image_id(document["clean_image_id"])
@@ -545,8 +549,10 @@ class TraceabilityService:
             or not 1 <= len(document["replay_command"]) <= 64
             or any(not isinstance(argument, str) or not argument or len(argument) > 4096 for argument in document["replay_command"])
             or sum(len(argument) for argument in document["replay_command"]) > 16 * 1024
+            or replay_environment is None
         ):
             raise CoverageIntegrityError("first-hit metadata is invalid")
+        document["replay_environment"] = replay_environment
         return document, testcase
 
     @staticmethod
@@ -565,6 +571,7 @@ class TraceabilityService:
             "configuration_asset_id": snapshot.configuration_asset_id,
             "coverage_asset_id": snapshot.coverage_asset_id,
             "replay_command": list(snapshot.replay_command),
+            "replay_environment": [list(item) for item in snapshot.replay_environment],
             "target_asset_id": snapshot.target_asset_id,
             "testcase_sha256": hit.testcase_sha256,
             "source_sha256": source_hash,
@@ -579,6 +586,7 @@ class TraceabilityService:
             snapshot.clean_parent_image_id, hit.source_path, hit.line_number,
             retained.directory / retained.testcase_name, hit.testcase_sha256,
             snapshot.replay_command,
+            snapshot.replay_environment,
         )
 
     @staticmethod
@@ -607,6 +615,8 @@ class TraceabilityService:
             or sum(len(argument) for argument in snapshot.replay_command) > 16 * 1024
         ):
             raise CoverageIntegrityError("replay command is invalid")
+        if not valid_replay_environment(snapshot.replay_environment):
+            raise CoverageIntegrityError("replay environment is invalid")
         if (
             isinstance(snapshot.cpu_exposure_seconds, bool)
             or not isinstance(snapshot.cpu_exposure_seconds, (int, float))
@@ -717,6 +727,16 @@ def _is_image_id(value):
         and len(value) == 71
         and all(character in "0123456789abcdef" for character in value[7:])
     )
+
+
+def _stored_replay_environment(value):
+    if not isinstance(value, list) or any(
+        not isinstance(item, list) or len(item) != 2
+        for item in value
+    ):
+        return None
+    environment = tuple(tuple(item) for item in value)
+    return environment if valid_replay_environment(environment) else None
 
 
 def _digest(value, label):

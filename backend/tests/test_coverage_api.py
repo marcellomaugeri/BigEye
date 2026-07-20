@@ -35,6 +35,7 @@ class _Coverage:
             "evidence": [{
                 "campaign_id": 4, "strategy_asset_id": 33, "testcase_sha256": "b" * 64,
                 "replay_command": ["/target", "{input}"], "target_asset_id": 31,
+                "replay_environment": {"BIGEYE_MODE": "encrypted"},
                 "configuration_asset_id": None, "clean_image_id": "sha256:clean",
                 "cpu_exposure_seconds": 2.0,
             }],
@@ -87,6 +88,7 @@ def test_coverage_routes_expose_tree_source_functions_and_first_hit_evidence():
     assert functions.json()["pagination"]["total"] == 1
     assert evidence.status_code == 200
     assert evidence.json()["evidence"][0]["strategy_asset_id"] == 33
+    assert evidence.json()["evidence"][0]["replay_environment"] == {"BIGEYE_MODE": "encrypted"}
     assert evidence.json()["pagination"]["total"] == 1
     assert testcase.status_code == 200
     assert testcase.content == b"retained-testcase"

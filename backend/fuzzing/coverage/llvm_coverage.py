@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 from tempfile import mkdtemp
 from typing import Protocol
 
+from backend.fuzzing.campaigns.coverage_contract import valid_replay_environment
 from backend.fuzzing.coverage.source_paths import is_forbidden_source_path
 
 
@@ -348,7 +349,10 @@ class LlvmCoverage:
             raise ValueError("coverage replay binary must exactly match the clean binary")
         if command.count("{input}") != 1:
             raise ValueError("coverage replay command must contain one input placeholder")
-        replay_environment = dict(getattr(campaign, "replay_environment", ()))
+        replay_environment_items = getattr(campaign, "replay_environment", ())
+        if not valid_replay_environment(replay_environment_items):
+            raise ValueError("coverage replay environment is invalid")
+        replay_environment = dict(replay_environment_items)
         if (
             "LLVM_PROFILE_FILE" in replay_environment
             or not _valid_coverage_environment(replay_environment)

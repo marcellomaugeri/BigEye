@@ -57,6 +57,7 @@ class LineEvidenceResponse(BaseModel):
     strategy_asset_id: int
     testcase_sha256: str
     replay_command: list[str]
+    replay_environment: dict[str, str]
     target_asset_id: int
     configuration_asset_id: int | None
     clean_image_id: str

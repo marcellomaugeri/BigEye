@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 import re
 
+from backend.services.observability.redaction import is_secret_key
+
 
 _OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
@@ -45,25 +47,30 @@ class CampaignCoverageContract:
                 not isinstance(value, str) or not value or "\x00" in value or len(value) > 4_096
                 for value in self.replay_command
             )
-            or not _valid_environment(self.replay_environment)
+            or not valid_replay_environment(self.replay_environment)
         ):
             raise ValueError("campaign clean-coverage contract is invalid")
 
 
-def _valid_environment(values) -> bool:
+def valid_replay_environment(values) -> bool:
     if not isinstance(values, tuple) or len(values) > 32:
         return False
     seen = set()
+    total_bytes = 0
     for item in values:
         if not isinstance(item, tuple) or len(item) != 2:
             return False
         key, value = item
         if (
-            not isinstance(key, str) or _ENVIRONMENT_NAME.fullmatch(key) is None
+            not isinstance(key, str) or len(key) > 128 or _ENVIRONMENT_NAME.fullmatch(key) is None
             or key in seen or key in _FORBIDDEN_ENVIRONMENT
             or key.startswith(("LD_", "DYLD_"))
+            or is_secret_key(key)
             or not isinstance(value, str) or not value or "\x00" in value or len(value) > 4_096
         ):
+            return False
+        total_bytes += len(key.encode("utf-8")) + len(value.encode("utf-8"))
+        if total_bytes > 16 * 1024:
             return False
         seen.add(key)
     return True

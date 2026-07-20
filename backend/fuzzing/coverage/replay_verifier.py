@@ -137,6 +137,7 @@ class FirstHitReplayVerifier:
             request.clean_content_hash,
             request.clean_parent_image_id,
             request.replay_command,
+            request.replay_environment,
         )
         actual = (
             snapshot.project_id,
@@ -150,6 +151,7 @@ class FirstHitReplayVerifier:
             snapshot.clean_content_hash,
             snapshot.clean_parent_image_id,
             snapshot.replay_command,
+            snapshot.replay_environment,
         )
         if actual != expected or snapshot.build_kind != "clean":
             raise CoverageIntegrityError("first-hit replay changed immutable coverage identity")

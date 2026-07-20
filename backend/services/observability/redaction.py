@@ -11,7 +11,7 @@ _SECRET_KEYS = frozenset({
 })
 
 
-def _is_secret_key(key: object) -> bool:
+def is_secret_key(key: object) -> bool:
     if not isinstance(key, str):
         return False
     normalized = key.lower().replace("-", "_")
@@ -25,7 +25,7 @@ def redact(value):
     """Return a recursively redacted, JSON-compatible payload value."""
     if isinstance(value, Mapping):
         return {
-            key: REDACTED if _is_secret_key(key) else redact(item)
+            key: REDACTED if is_secret_key(key) else redact(item)
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):

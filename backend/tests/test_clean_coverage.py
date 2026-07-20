@@ -228,7 +228,10 @@ class _MemoryCoverageRepository:
         return SimpleNamespace(items=tuple(rows[offset:offset + limit]), total=len(rows))
 
 
-def _snapshot(source_path="src/a.c", line=1, testcase=b"seed", build_kind="clean", source_hash=None):
+def _snapshot(
+    source_path="src/a.c", line=1, testcase=b"seed", build_kind="clean", source_hash=None,
+    replay_environment=(),
+):
     from backend.fuzzing.coverage.llvm_coverage import CoverageHit, CoverageLine, CoverageSnapshot
 
     return CoverageSnapshot(
@@ -238,6 +241,7 @@ def _snapshot(source_path="src/a.c", line=1, testcase=b"seed", build_kind="clean
         coverage_asset_id=34, replay_command=("/target", "{input}"), cpu_exposure_seconds=1.0,
         build_kind=build_kind, lines=(CoverageLine(source_path, line, "parse", source_hash),),
         hits=(CoverageHit(source_path, line, testcase, sha256(testcase).hexdigest()),),
+        replay_environment=replay_environment,
     )
 
 
@@ -406,7 +410,9 @@ def test_first_testcase_is_stable_per_strategy_and_replayed_before_insert(tmp_pa
 
     service = TraceabilityService(tmp_path, repository, verifier, _Registry(repository_root))
     first_digest = sha256(b"first").hexdigest()
-    first = _snapshot(line=2, testcase=b"first")
+    first = _snapshot(
+        line=2, testcase=b"first", replay_environment=(("BIGEYE_MODE", "encrypted"),),
+    )
     later = _snapshot(line=2, testcase=b"later")
 
     created = run(service.record(first))
@@ -421,6 +427,36 @@ def test_first_testcase_is_stable_per_strategy_and_replayed_before_insert(tmp_pa
     assert metadata["source_path"] == "src/a.c"
     assert metadata["line_number"] == 2
     assert metadata["coverage_asset_id"] == 34
+    assert metadata["replay_environment"] == [["BIGEYE_MODE", "encrypted"]]
+
+    line = run(service.line_evidence(7, "src/a.c", 2))["evidence"][0]
+    assert line["replay_environment"] == {"BIGEYE_MODE": "encrypted"}
+
+
+@pytest.mark.parametrize("replay_environment", [
+    (("BIGEYE_MODE", "x" * 4097),),
+    tuple((f"MODE_{index}", "enabled") for index in range(33)),
+    (("OPENAI_API_KEY", "must-not-be-persisted"),),
+])
+def test_traceability_rejects_unbounded_or_secret_replay_environment(
+    tmp_path: Path, replay_environment,
+):
+    from backend.fuzzing.coverage.llvm_coverage import CoverageIntegrityError
+    from backend.fuzzing.coverage.traceability import TraceabilityService
+
+    checkout = tmp_path / "repository"
+    (checkout / "src").mkdir(parents=True)
+    (checkout / "src/a.c").write_text("x\n")
+
+    with pytest.raises(CoverageIntegrityError, match="replay environment"):
+        run(TraceabilityService(
+            tmp_path, _MemoryCoverageRepository(), lambda _request: True, _Registry(checkout),
+        ).record(_snapshot(
+            source_hash=sha256(b"x\n").hexdigest(),
+            replay_environment=replay_environment,
+        )))
+
+    assert list((tmp_path / "projects/7/coverage/first-hits").rglob("evidence.json")) == []
 
 
 def test_new_first_hit_invalidates_coverage_only_after_durable_publication(tmp_path: Path):
@@ -602,6 +638,30 @@ def test_line_query_rejects_sidecar_identity_tampering(tmp_path: Path):
     directory.chmod(0o500)
 
     with pytest.raises(CoverageIntegrityError, match="metadata identity"):
+        run(service.line_evidence(7, "src/a.c", 1))
+
+
+def test_line_query_rejects_invalid_persisted_replay_environment(tmp_path: Path):
+    from backend.fuzzing.coverage.llvm_coverage import CoverageIntegrityError
+    from backend.fuzzing.coverage.traceability import TraceabilityService
+
+    checkout = tmp_path / "repository"
+    (checkout / "src").mkdir(parents=True)
+    (checkout / "src/a.c").write_text("x\n")
+    repository = _MemoryCoverageRepository()
+    service = TraceabilityService(tmp_path, repository, lambda _request: True, _Registry(checkout))
+    run(service.record(_snapshot(source_hash=sha256(b"x\n").hexdigest())))
+    metadata = next((tmp_path / "projects/7/coverage/first-hits").rglob("evidence.json"))
+    directory = metadata.parent
+    directory.chmod(0o700)
+    metadata.chmod(0o600)
+    document = json.loads(metadata.read_text())
+    document["replay_environment"] = [["OPENAI_API_KEY", "must-not-be-exposed"]]
+    metadata.write_text(json.dumps(document))
+    metadata.chmod(0o400)
+    directory.chmod(0o500)
+
+    with pytest.raises(CoverageIntegrityError, match="metadata is invalid"):
         run(service.line_evidence(7, "src/a.c", 1))
 
 
@@ -967,6 +1027,7 @@ def test_first_hit_replay_verifier_requires_exact_clean_replay_identity(tmp_path
         CLEAN_IMAGE_ID, "c" * 64, PARENT_IMAGE_ID,
         "src/a.c", 12, testcase, sha256(b"seed").hexdigest(),
         ("/src/build/clean-target", "{input}"),
+        (("BIGEYE_MODE", "encrypted"),),
     )
     target = _campaign(tmp_path)
 
@@ -984,14 +1045,53 @@ def test_first_hit_replay_verifier_requires_exact_clean_replay_identity(tmp_path
                 **{
                     name: getattr(snapshot, name)
                     for name in snapshot.__dataclass_fields__
-                    if name not in {"replay_command", "lines", "hits"}
+                    if name not in {"replay_command", "replay_environment", "lines", "hits"}
                 },
                 replay_command=("/src/build/clean-target", "{input}"),
                 lines=(CoverageLine("src/a.c", 12, "parse", sha256(b"x\n").hexdigest()),),
                 hits=(CoverageHit("src/a.c", 12, b"seed", sha256(b"seed").hexdigest()),),
+                replay_environment=(("BIGEYE_MODE", "encrypted"),),
             )
 
     assert run(FirstHitReplayVerifier(Resolver(), Replay())(request)) is True
+
+
+def test_first_hit_replay_verifier_rejects_changed_replay_environment(tmp_path: Path):
+    from backend.fuzzing.coverage.llvm_coverage import CoverageIntegrityError
+    from backend.fuzzing.coverage.replay_verifier import FirstHitReplayVerifier
+    from backend.fuzzing.coverage.traceability import ReplayVerification
+
+    testcase = tmp_path / "seed"
+    testcase.write_bytes(b"seed")
+    request = ReplayVerification(
+        7, "a" * 40, 4, 33, 31, 32, 34,
+        CLEAN_IMAGE_ID, "c" * 64, PARENT_IMAGE_ID,
+        "src/a.c", 12, testcase, sha256(b"seed").hexdigest(),
+        ("/src/build/clean-target", "{input}"),
+        (("BIGEYE_MODE", "encrypted"),),
+    )
+
+    class Resolver:
+        async def resolve(self, _request):
+            return _campaign(tmp_path, replay_environment=request.replay_environment)
+
+    class Replay:
+        async def replay(self, _target, _inputs):
+            snapshot = _snapshot(
+                line=12, testcase=b"seed", source_hash=sha256(b"x\n").hexdigest(),
+                replay_environment=(("BIGEYE_MODE", "plain"),),
+            )
+            return snapshot.__class__(**{
+                name: (
+                    ("/src/build/clean-target", "{input}")
+                    if name == "replay_command"
+                    else getattr(snapshot, name)
+                )
+                for name in snapshot.__dataclass_fields__
+            })
+
+    with pytest.raises(CoverageIntegrityError, match="immutable coverage identity"):
+        run(FirstHitReplayVerifier(Resolver(), Replay())(request))
 
 
 def test_repository_conflict_returns_existing_first_winner():
@@ -1127,7 +1227,10 @@ def test_production_first_hit_record_replays_through_bounded_docker_executor(tmp
     )
     service = TraceabilityService(tmp_path, _MemoryCoverageRepository(), verifier, registry)
 
-    created = run(service.record(_snapshot(source_hash=sha256(b"x\n").hexdigest())))
+    created = run(service.record(_snapshot(
+        source_hash=sha256(b"x\n").hexdigest(),
+        replay_environment=(("BIGEYE_MODE", "encrypted"),),
+    )))
 
     assert len(created) == 1
     assert client.closed is True
@@ -1136,4 +1239,10 @@ def test_production_first_hit_record_replays_through_bounded_docker_executor(tmp
     assert any(
         mount["bind"] == "/coverage/input" and mount["mode"] == "ro"
         for _command, options in client.calls for mount in options["volumes"].values()
+    )
+    assert any(
+        options["environment"].get("BIGEYE_MODE") == "encrypted"
+        and "LLVM_PROFILE_FILE" in options["environment"]
+        for command, options in client.calls
+        if command[0] == "/target"
     )
