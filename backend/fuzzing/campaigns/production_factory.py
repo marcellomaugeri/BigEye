@@ -182,12 +182,20 @@ class ProposalPreparationPlanner:
         target_script = _application_file(
             context,
             "application/target-build.sh",
-            _build_script(proposal.build_command, coverage=False),
+            _build_script(
+                proposal.build_command,
+                instance_type=proposal.instance_type,
+                coverage=False,
+            ),
         )
         coverage_script = _application_file(
             context,
             "application/coverage-build.sh",
-            _build_script(proposal.build_command, coverage=True),
+            _build_script(
+                proposal.build_command,
+                instance_type=proposal.instance_type,
+                coverage=True,
+            ),
         )
         coverage_manifest = _application_file(
             context,
@@ -407,19 +415,85 @@ def _dependency_intent(proposal):
     return values[0] if values else None
 
 
-def _build_script(command: str, *, coverage: bool) -> str:
+def _build_script(command: str, *, instance_type: str, coverage: bool) -> str:
     if not isinstance(command, str) or not command.strip() or any(
         character in command for character in ("\x00", "\r", "\n")
     ):
         raise ValueError("target build command must be one non-empty line")
-    flags = ""
+    if instance_type not in {"system-level", "component-level"}:
+        raise ValueError("target instance type must be system-level or component-level")
+
+    component = instance_type == "component-level"
+    compiler = "clang-18" if coverage or component else "afl-clang-fast"
+    cxx_compiler = "clang++-18" if coverage or component else "afl-clang-fast++"
+    compile_sanitizers = (
+        "-fsanitize=fuzzer-no-link,address,undefined"
+        if component
+        else "-fsanitize=address,undefined"
+    )
+    link_sanitizers = (
+        "-fsanitize=fuzzer,address,undefined"
+        if component
+        else "-fsanitize=address,undefined"
+    )
+    compile_flags = f"{compile_sanitizers} -fno-omit-frame-pointer"
+    link_flags = link_sanitizers
     if coverage:
-        flags = (
-            'export CFLAGS="${CFLAGS:-} -fprofile-instr-generate -fcoverage-mapping"\n'
-            'export CXXFLAGS="${CXXFLAGS:-} -fprofile-instr-generate -fcoverage-mapping"\n'
-            'export RUSTFLAGS="${RUSTFLAGS:-} -C instrument-coverage"\n'
-        )
-    return "#!/bin/sh\nset -eu\n" + flags + command + "\n"
+        compile_flags += " -fprofile-instr-generate -fcoverage-mapping"
+        link_flags += " -fprofile-instr-generate"
+    direct_command = _instrument_direct_compiler(
+        command,
+        instance_type=instance_type,
+        coverage=coverage,
+        compile_flags=compile_flags,
+        link_flags=link_flags,
+    )
+    flags = (
+        f"export CC={compiler}\n"
+        f"export CXX={cxx_compiler}\n"
+        f'export CFLAGS="${{CFLAGS:-}} {compile_flags}"\n'
+        f'export CXXFLAGS="${{CXXFLAGS:-}} {compile_flags}"\n'
+        f'export LDFLAGS="${{LDFLAGS:-}} {link_flags}"\n'
+    )
+    if coverage:
+        flags += 'export RUSTFLAGS="${RUSTFLAGS:-} -C instrument-coverage"\n'
+    return "#!/bin/sh\nset -eu\n" + flags + direct_command + "\n"
+
+
+def _instrument_direct_compiler(
+    command: str,
+    *,
+    instance_type: str,
+    coverage: bool,
+    compile_flags: str,
+    link_flags: str,
+) -> str:
+    try:
+        arguments = shlex.split(command, posix=True)
+    except ValueError:
+        return command
+    compiler_name = Path(arguments[0]).name
+    direct_compilers = {
+        "clang", "clang-18", "clang++", "clang++-18",
+        "afl-clang-fast", "afl-clang-fast++",
+    }
+    if compiler_name not in direct_compilers:
+        return command
+    if any(argument in _SHELL_OPERATOR_TOKENS for argument in arguments):
+        raise ValueError("direct compiler build command must be shell-free")
+
+    cxx = "++" in compiler_name
+    if coverage or instance_type == "component-level":
+        selected_compiler = "clang++-18" if cxx else "clang-18"
+    else:
+        selected_compiler = "afl-clang-fast++" if cxx else "afl-clang-fast"
+    if "-c" in arguments:
+        direct_flags = compile_flags
+    else:
+        direct_flags = link_flags + " -fno-omit-frame-pointer"
+        if coverage:
+            direct_flags += " -fcoverage-mapping"
+    return shlex.join((selected_compiler, *shlex.split(direct_flags), *arguments[1:]))
 
 
 def _probe_invocations(context, proposal) -> tuple[ProbeInvocation, ...]:
