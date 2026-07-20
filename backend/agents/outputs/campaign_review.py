@@ -7,7 +7,7 @@ from hashlib import sha256
 import json
 import threading
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from backend.agents.outputs.campaign_decision import CampaignDecision
 from backend.agents.outputs.target_proposal import TargetProposal
@@ -83,6 +83,44 @@ class ContainedOperationRequestRecord(BaseModel):
     actionable: bool
 
 
+class RetirementActionRecord(BaseModel):
+    """Application-validated reversible release of one redundant worker."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    action_id: str = Field(min_length=1, max_length=200)
+    project_id: int = Field(ge=1)
+    campaign_id: int = Field(ge=1)
+    strategy_asset_id: int = Field(ge=1)
+    retained_campaign_id: int = Field(ge=1)
+    retained_strategy_asset_id: int = Field(ge=1)
+    evidence_ids: tuple[str, ...] = Field(min_length=1, max_length=32)
+    reason: str = Field(min_length=1, max_length=1_000)
+    reversible: bool
+
+    @model_validator(mode="after")
+    def validate_identity_and_evidence(self):
+        expected = (
+            f"retirement:{self.project_id}:{self.campaign_id}:{self.strategy_asset_id}:"
+            f"{self.retained_campaign_id}:{self.retained_strategy_asset_id}"
+        )
+        if self.action_id != expected:
+            raise ValueError("retirement action identity does not match its exact records")
+        if (
+            self.campaign_id == self.retained_campaign_id
+            or self.strategy_asset_id == self.retained_strategy_asset_id
+        ):
+            raise ValueError("retirement action must preserve a different retained strategy")
+        if (
+            len(self.evidence_ids) != len(set(self.evidence_ids))
+            or any(not value.strip() or len(value) > 2_000 for value in self.evidence_ids)
+        ):
+            raise ValueError("retirement action evidence identifiers are invalid")
+        if self.reversible is not True:
+            raise ValueError("retirement action must be reversible")
+        return self
+
+
 class CampaignReviewResult(BaseModel):
     """The decision plus every validated typed result produced while reaching it."""
 
@@ -98,6 +136,8 @@ class CampaignReviewResult(BaseModel):
     known_operation_requests: tuple[ContainedOperationRequestRecord, ...]
     selected_operation_requests: tuple[ContainedOperationRequestRecord, ...]
     quarantined_operation_requests: tuple[ContainedOperationRequestRecord, ...]
+    known_retirement_actions: tuple[RetirementActionRecord, ...] = ()
+    selected_retirement_actions: tuple[RetirementActionRecord, ...] = ()
 
     @property
     def target_proposals(self) -> tuple[TargetProposalRecord, ...]:
@@ -132,6 +172,7 @@ class CampaignReviewCollection:
         self._targets: dict[str, TargetProposalRecord] = {}
         self._triage: dict[str, TriageResultRecord] = {}
         self._operations: dict[str, ContainedOperationRequestRecord] = {}
+        self._retirements: dict[str, RetirementActionRecord] = {}
         self._pending_operations: dict[
             tuple[str, str, int, str], dict[str, ContainedOperationRequestRecord]
         ] = {}
@@ -193,11 +234,24 @@ class CampaignReviewCollection:
 
     def actionable_ids(self) -> frozenset[str]:
         with self._lock:
-            return frozenset((*self._targets, *self._triage, *self._operations))
+            return frozenset((*self._targets, *self._triage, *self._operations, *self._retirements))
+
+    def record_retirement(self, record: RetirementActionRecord) -> RetirementActionRecord:
+        if not isinstance(record, RetirementActionRecord) or record.reversible is not True:
+            raise TypeError("retirement action must be validated and reversible")
+        if len(record.evidence_ids) != len(set(record.evidence_ids)) or any(
+            not value.strip() for value in record.evidence_ids
+        ):
+            raise ValueError("retirement action evidence must be unique non-blank identifiers")
+        with self._lock:
+            self._retirements.setdefault(record.action_id, record)
+            if self._retirements[record.action_id] != record:
+                raise ValueError("retirement action identifier is not unique")
+            return self._retirements[record.action_id]
 
     def result(self, decision: CampaignDecision) -> CampaignReviewResult:
         with self._lock:
-            known_ids = frozenset((*self._targets, *self._triage, *self._operations))
+            known_ids = frozenset((*self._targets, *self._triage, *self._operations, *self._retirements))
             selected_ids = tuple(decision.bounded_actions)
             if len(selected_ids) != len(set(selected_ids)):
                 raise ValueError("campaign decision contains duplicate action IDs")
@@ -206,6 +260,7 @@ class CampaignReviewCollection:
             target_values = tuple(self._targets[key] for key in sorted(self._targets))
             triage_values = tuple(self._triage[key] for key in sorted(self._triage))
             operation_values = tuple(self._operations[key] for key in sorted(self._operations))
+            retirement_values = tuple(self._retirements[key] for key in sorted(self._retirements))
             return CampaignReviewResult(
                 decision=decision,
                 known_action_ids=tuple(sorted(known_ids)), selected_action_ids=selected_ids,
@@ -223,5 +278,9 @@ class CampaignReviewCollection:
                 ),
                 quarantined_operation_requests=tuple(
                     self._quarantined_operations[key] for key in sorted(self._quarantined_operations)
+                ),
+                known_retirement_actions=retirement_values,
+                selected_retirement_actions=tuple(
+                    record for record in retirement_values if record.action_id in selected_ids
                 ),
             )

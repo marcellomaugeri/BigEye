@@ -89,6 +89,45 @@ class AssetStore:
             if assets_descriptor is not None:
                 os.close(assets_descriptor)
 
+    async def create_reusable(
+        self, project_id: int, kind: str, name: str, files, parent_id: int | None,
+    ):
+        """Reuse one validated content-identical asset when the repository supports lookup."""
+        safe_relative_name(name)
+        normalised = self._normalise(project_id, kind, files)
+        content_hash = self._collection_hash(self._hash_sources(project_id, kind, normalised))
+        finder = getattr(self._repository, "find_validated", None)
+        if finder is not None:
+            existing = await finder(project_id, kind, name, content_hash, parent_id)
+            if existing is not None and self._existing_matches(project_id, existing):
+                return existing
+        return await self.create(project_id, kind, name, normalised, parent_id)
+
+    def _existing_matches(self, project_id: int, asset) -> bool:
+        if (
+            getattr(asset, "project_id", None) != project_id
+            or getattr(asset, "validated_at", None) is None
+            or getattr(asset, "error", None) is not None
+        ):
+            return False
+        root = self._asset_root(project_id) / str(asset.id)
+        if root.is_symlink() or not root.is_dir():
+            return False
+        entries = tuple(root.rglob("*"))
+        if any(
+            entry.is_symlink() or not (entry.is_file() or entry.is_dir())
+            for entry in entries
+        ):
+            return False
+        files = {
+            entry.relative_to(root).as_posix(): (entry, None)
+            for entry in entries if entry.is_file()
+        }
+        if not files:
+            return False
+        from backend.fuzzing.assets.validation import collection_hash
+        return collection_hash(files, asset.kind) == asset.content_hash
+
     def _normalise(self, project_id: int, kind: str, files) -> dict[str, Path]:
         if not isinstance(files, dict) or not files:
             raise ValueError("asset files must be a non-empty mapping")

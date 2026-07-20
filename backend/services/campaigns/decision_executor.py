@@ -9,6 +9,7 @@ from typing import Generic, TypeVar
 from backend.agents.outputs.campaign_review import (
     CampaignReviewResult,
     ContainedOperationRequestRecord,
+    RetirementActionRecord,
     TargetProposalRecord,
     TriageResultRecord,
 )
@@ -41,9 +42,10 @@ class ActionResult(Generic[ResultValue]):
 class DecisionExecutor:
     """Resolve manager-selected IDs without exposing a shell or Docker client."""
 
-    def __init__(self, target_preparation, bounded_operations=None):
+    def __init__(self, target_preparation, bounded_operations=None, campaign_control=None):
         self._target_preparation = target_preparation
         self._bounded_operations = bounded_operations
+        self._campaign_control = campaign_control
 
     async def execute(self, project, decision: CampaignReviewResult) -> list[ActionResult]:
         if not isinstance(decision, CampaignReviewResult):
@@ -93,6 +95,11 @@ class DecisionExecutor:
                 return ActionResult(action_id, output)
             if isinstance(record, TriageResultRecord):
                 return ActionResult(action_id, record.triage)
+            if isinstance(record, RetirementActionRecord):
+                if self._campaign_control is None:
+                    raise ValueError("no campaign control service is configured")
+                output = await self._campaign_control.retire(project, record)
+                return ActionResult(action_id, output)
             raise TypeError("manager-selected action record type is unsupported")
         except Exception as error:
             return ActionResult(
@@ -108,6 +115,7 @@ class DecisionExecutor:
             *((record.result_id, record) for record in decision.known_target_proposals),
             *((record.result_id, record) for record in decision.known_triage_results),
             *((record.request_id, record) for record in decision.known_operation_requests),
+            *((record.action_id, record) for record in decision.known_retirement_actions),
         )
         for action_id, record in values:
             if action_id in records:
@@ -122,6 +130,7 @@ class DecisionExecutor:
             *((record.result_id, record) for record in decision.selected_target_proposals),
             *((record.result_id, record) for record in decision.selected_triage_results),
             *((record.request_id, record) for record in decision.selected_operation_requests),
+            *((record.action_id, record) for record in decision.selected_retirement_actions),
         )
         for action_id, record in values:
             if action_id in records:

@@ -97,6 +97,7 @@ class Findings:
     def __init__(self):
         self.rows = {}
         self.calls = []
+        self.links = []
 
     async def create_or_increment(self, **values):
         self.calls.append(values)
@@ -131,6 +132,9 @@ class Findings:
         )
         self.rows[key] = finding
         return finding
+
+    async def link_campaign(self, campaign_id, project_id, fingerprint):
+        self.links.append((campaign_id, project_id, fingerprint))
 
 
 class Specialist:
@@ -174,6 +178,7 @@ def test_finding_publication_invalidates_findings_after_the_durable_write(tmp_pa
     finding = run(service.process(observation()))
 
     assert repository.rows[(7, finding.fingerprint)] == finding
+    assert repository.links == [(11, 7, finding.fingerprint)]
     events.append.assert_awaited_once_with(7, "events", {"name": "findings"})
 
 

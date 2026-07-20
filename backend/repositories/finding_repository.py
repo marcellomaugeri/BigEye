@@ -136,6 +136,28 @@ class FindingRepository:
                     raise RuntimeError("finding database fields differ from selected artifact evidence")
                 return finding
 
+    async def link_campaign(self, campaign_id: int, project_id: int, fingerprint: str) -> None:
+        inserted = await self._pool.fetchval(
+            """INSERT INTO campaign_crash_groups (campaign_id, fingerprint)
+               SELECT c.id, f.fingerprint FROM campaigns AS c
+               JOIN findings AS f ON f.project_id = c.project_id AND f.fingerprint = $3
+               WHERE c.id = $1 AND c.project_id = $2
+               ON CONFLICT DO NOTHING RETURNING campaign_id""",
+            campaign_id, project_id, fingerprint,
+        )
+        if inserted not in {None, campaign_id}:
+            raise RuntimeError("campaign crash group link returned another campaign")
+
+    async def groups_for_campaign(self, campaign_id: int) -> tuple[str, ...]:
+        rows = await self._pool.fetch(
+            """SELECT fingerprint FROM campaign_crash_groups
+               WHERE campaign_id = $1 ORDER BY fingerprint LIMIT 10001""",
+            campaign_id,
+        )
+        if len(rows) > 10_000:
+            raise OverflowError("campaign crash groups exceed their bound")
+        return tuple(str(row["fingerprint"]) for row in rows)
+
     @staticmethod
     def _finding(row) -> Finding:
         return Finding(**dict(row))

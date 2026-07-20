@@ -41,12 +41,14 @@ class _BootstrapCoordinator:
 class ProjectBackboneService(CoordinatorRegistry):
     """Retain the public backbone name while enforcing one task per project."""
 
-    def __init__(self, projects, scheduler, advisory_lock=None):
+    def __init__(self, projects, scheduler, advisory_lock=None, coordinator_factory=None):
         self._scheduler = scheduler
         self._advisory_lock = advisory_lock
         super().__init__(
             projects,
-            lambda _project_id: _BootstrapCoordinator(scheduler, advisory_lock),
+            coordinator_factory or (
+                lambda _project_id: _BootstrapCoordinator(scheduler, advisory_lock)
+            ),
         )
 
     @property

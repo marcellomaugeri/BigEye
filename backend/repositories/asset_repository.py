@@ -28,6 +28,20 @@ class AssetRepository:
             raise RuntimeError("asset creation did not return a row")
         return self._asset(row)
 
+    async def find_validated(
+        self, project_id: int, kind: str, name: str, content_hash: str, parent_id: int | None,
+    ) -> CampaignAsset | None:
+        row = await self._pool.fetchrow(
+            """SELECT id, project_id, kind, name, content_hash, parent_id, created_at, validated_at, error
+               FROM assets
+               WHERE project_id = $1 AND kind = $2 AND name = $3 AND content_hash = $4
+                 AND parent_id IS NOT DISTINCT FROM $5
+                 AND validated_at IS NOT NULL AND error IS NULL
+               ORDER BY id LIMIT 1""",
+            project_id, kind, name, content_hash, parent_id,
+        )
+        return self._asset(row) if row else None
+
     async def mark_validated(self, asset_id: int) -> CampaignAsset:
         row = await self._pool.fetchrow(
             """UPDATE assets SET validated_at = CURRENT_TIMESTAMP, error = NULL

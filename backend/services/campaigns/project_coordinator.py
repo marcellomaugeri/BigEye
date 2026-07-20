@@ -4,12 +4,27 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
-from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from dataclasses import dataclass, replace
 import inspect
 
 from backend.fuzzing.coverage.overlap import RetirementCandidate
+from backend.agents.outputs.campaign_review import RetirementActionRecord
 from backend.services.campaigns.wake_rules import CampaignSnapshot, ReviewTrigger, WakeEvaluator
+
+
+MANAGER_RETRY_DELAY_SECONDS = 30
+MAX_MANAGER_REVIEW_ATTEMPTS = 2
+
+
+@dataclass(frozen=True)
+class _PendingReview:
+    trigger: ReviewTrigger
+    attempts: int
+    retry_after: datetime
+    context: object | None = None
+    evidence: tuple[dict, ...] = ()
+    prepared_actions: tuple[RetirementActionRecord, ...] = ()
 
 
 class PostgresProjectLock:
@@ -76,6 +91,7 @@ class ProjectCoordinator:
         self._wake_evaluator = wake_evaluator or WakeEvaluator()
         self._clock = clock or (lambda: datetime.now(UTC))
         self._previous: dict[int, CampaignSnapshot] = {}
+        self._pending_reviews: dict[int, _PendingReview] = {}
         self._signals: dict[int, asyncio.Event] = {}
         self._actions: dict[int, asyncio.Lock] = {}
 
@@ -121,21 +137,28 @@ class ProjectCoordinator:
                 self._previous[project_id] = snapshot
                 return None
 
-            retirement_candidates = await self._retirement_candidates(project, snapshot)
-            if any(candidate.project_id != project_id for candidate in retirement_candidates):
-                raise ValueError("retirement candidate belongs to another project")
-            retirement_evidence = tuple(
-                _retirement_evidence(candidate) for candidate in retirement_candidates
-            )
-            if retirement_evidence:
-                snapshot = replace(
-                    snapshot,
-                    overlap_candidate=True,
-                    evidence_ids=tuple(dict.fromkeys((
-                        *snapshot.evidence_ids,
-                        *(item["evidence_id"] for item in retirement_evidence),
-                    ))),
+            pending = self._pending_reviews.get(project_id)
+            retirement_evidence = ()
+            retirement_actions = pending.prepared_actions if pending is not None else ()
+            if pending is None:
+                retirement_candidates = await self._retirement_candidates(project, snapshot)
+                if any(candidate.project_id != project_id for candidate in retirement_candidates):
+                    raise ValueError("retirement candidate belongs to another project")
+                retirement_evidence = tuple(
+                    _retirement_evidence(candidate) for candidate in retirement_candidates
                 )
+                retirement_actions = tuple(
+                    _retirement_action(candidate) for candidate in retirement_candidates
+                )
+                if retirement_evidence:
+                    snapshot = replace(
+                        snapshot,
+                        overlap_candidate=True,
+                        evidence_ids=tuple(dict.fromkeys((
+                            *snapshot.evidence_ids,
+                            *(item["evidence_id"] for item in retirement_evidence),
+                        ))),
+                    )
 
             if snapshot.active_workers > project.worker_count:
                 await self._runtime.enforce_worker_count(
@@ -145,28 +168,57 @@ class ProjectCoordinator:
             if snapshot.free_slots != free_slots:
                 snapshot = replace(snapshot, free_slots=free_slots)
 
+            now = self._now()
+            if pending is not None and pending.retry_after > now:
+                return None
             previous = self._previous.get(project_id)
-            trigger = self._wake_evaluator.evaluate(previous, snapshot, self._now())
-            if trigger is not None and trigger.reason == "review window expired":
-                snapshot = replace(snapshot, review_due=True)
-            self._previous[project_id] = snapshot
+            trigger = pending.trigger if pending is not None else self._wake_evaluator.evaluate(
+                previous, snapshot, now,
+            )
             if trigger is None:
+                self._previous[project_id] = snapshot
                 return None
 
-            if trigger.stop_campaign:
+            if trigger.stop_campaign and pending is None:
                 await self._runtime.stop_campaigns(project, trigger.evidence_ids)
+            context = pending.context if pending is not None else None
+            evidence = [dict(item) for item in pending.evidence] if pending is not None else []
             try:
-                context = await _await(self._runtime.review_context(project, snapshot))
-                evidence = await _await(self._runtime.review_evidence(project, snapshot, trigger))
-                if not isinstance(evidence, list):
-                    raise TypeError("campaign review evidence must be a list")
-                evidence = [*evidence, *retirement_evidence]
-                decision = await self._manager.review(context, evidence, trigger.reason)
+                if context is None:
+                    context = await _await(self._runtime.review_context(project, snapshot))
+                if not evidence:
+                    evidence = await _await(self._runtime.review_evidence(project, snapshot, trigger))
+                    if not isinstance(evidence, list):
+                        raise TypeError("campaign review evidence must be a list")
+                    evidence = [*evidence, *retirement_evidence]
+                if retirement_actions:
+                    decision = await self._manager.review(
+                        context, evidence, trigger.reason,
+                        prepared_actions=retirement_actions,
+                    )
+                else:
+                    decision = await self._manager.review(context, evidence, trigger.reason)
                 await self.decision_executor.execute(project, decision)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
+                attempts = (pending.attempts if pending is not None else 0) + 1
+                if attempts < MAX_MANAGER_REVIEW_ATTEMPTS:
+                    self._pending_reviews[project_id] = _PendingReview(
+                        trigger,
+                        attempts,
+                        now + timedelta(seconds=MANAGER_RETRY_DELAY_SECONDS),
+                        context,
+                        tuple(dict(item) for item in evidence),
+                        retirement_actions,
+                    )
+                else:
+                    self._pending_reviews.pop(project_id, None)
+                    self._previous[project_id] = _consumed_snapshot(snapshot, trigger)
                 await self._record_manager_failure(project_id, trigger, error)
+            else:
+                self._pending_reviews.pop(project_id, None)
+                self._previous[project_id] = _consumed_snapshot(snapshot, trigger)
             return trigger
 
     def notify(self, project_id: int) -> None:
@@ -207,6 +259,9 @@ class ProjectCoordinator:
         now = self._now()
         if deadline is not None and deadline <= now:
             deadline = None
+        pending = self._pending_reviews.get(project_id)
+        if pending is not None and (deadline is None or pending.retry_after < deadline):
+            deadline = pending.retry_after
         waiter = getattr(self._runtime, "wait_for_change", None)
         try:
             if waiter is not None:
@@ -274,7 +329,7 @@ def _project_id(value: int) -> None:
 def _retirement_evidence(candidate: RetirementCandidate) -> dict:
     return {
         "evidence_id": (
-            f"retirement:{candidate.campaign_id}:{candidate.strategy_asset_id}:"
+            f"retirement:{candidate.project_id}:{candidate.campaign_id}:{candidate.strategy_asset_id}:"
             f"{candidate.retained_campaign_id}:{candidate.retained_strategy_asset_id}"
         ),
         "project_id": candidate.project_id,
@@ -287,3 +342,26 @@ def _retirement_evidence(candidate: RetirementCandidate) -> dict:
         "reversible": candidate.reversible,
         "preserved": ["assets", "corpus", "evidence", "reason"],
     }
+
+
+def _retirement_action(candidate: RetirementCandidate) -> RetirementActionRecord:
+    return RetirementActionRecord(
+        action_id=(
+            f"retirement:{candidate.project_id}:{candidate.campaign_id}:{candidate.strategy_asset_id}:"
+            f"{candidate.retained_campaign_id}:{candidate.retained_strategy_asset_id}"
+        ),
+        project_id=candidate.project_id,
+        campaign_id=candidate.campaign_id,
+        strategy_asset_id=candidate.strategy_asset_id,
+        retained_campaign_id=candidate.retained_campaign_id,
+        retained_strategy_asset_id=candidate.retained_strategy_asset_id,
+        evidence_ids=candidate.evidence_ids,
+        reason=candidate.reason,
+        reversible=candidate.reversible,
+    )
+
+
+def _consumed_snapshot(snapshot: CampaignSnapshot, trigger: ReviewTrigger) -> CampaignSnapshot:
+    if trigger.reason == "review window expired" and not snapshot.review_due:
+        return replace(snapshot, review_due=True)
+    return snapshot

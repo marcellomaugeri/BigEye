@@ -261,6 +261,67 @@ def test_agent_dockerfile_keeps_shell_and_json_braces_literal(tmp_path: Path) ->
     assert "${HOME} {\\\"mode\\\":\\\"safe\\\"}" in manifest.dockerfile.read_text()
 
 
+def test_dependency_changes_rebuild_project_and_dependents_but_harness_edits_reuse_project(tmp_path: Path) -> None:
+    from backend.fuzzing.layers.coverage_layer import CoverageLayerService
+    from backend.fuzzing.layers.project_layer import ProjectLayerService
+    from backend.fuzzing.layers.target_layer import TargetLayerService
+
+    project = SimpleNamespace(id=7, commit_sha="a" * 40)
+    repository = _manifest(tmp_path, "repository", "repository:tag")
+    builder = _Builder()
+    inspector = SimpleNamespace(inspect=lambda _tag: SimpleNamespace(
+        image_id="sha256:parent", os="linux", architecture="amd64",
+    ))
+    dependency_one = SimpleNamespace(id=1, kind="script", name="dependencies.sh")
+    dependency_two = SimpleNamespace(id=2, kind="script", name="dependencies.sh")
+    harness_one = SimpleNamespace(id=3, kind="harness", name="harness.cc")
+    harness_two = SimpleNamespace(id=4, kind="harness", name="harness.cc")
+    configuration = SimpleNamespace(id=5, kind="script", name="target.sh")
+    adapter = SimpleNamespace(id=6, kind="adapter", name="adapter.cc")
+    coverage_configuration = SimpleNamespace(id=7, kind="script", name="coverage.sh")
+    _asset(tmp_path, 7, dependency_one, "dependencies.sh", "#!/bin/sh\ntrue\n")
+    _asset(tmp_path, 7, dependency_two, "dependencies.sh", "#!/bin/sh\nprintf changed\n")
+    _asset(tmp_path, 7, harness_one, "harness.cc", "int first;\n")
+    _asset(tmp_path, 7, harness_two, "harness.cc", "int second;\n")
+    _asset(tmp_path, 7, configuration, "target.sh", "#!/bin/sh\ntrue\n")
+    _asset(tmp_path, 7, adapter, "adapter.cc", "int coverage;\n")
+    _asset(tmp_path, 7, coverage_configuration, "coverage.sh", "#!/bin/sh\ntrue\n")
+    projects = ProjectLayerService(tmp_path, builder, inspector)
+    targets = TargetLayerService(tmp_path, builder, inspector)
+    coverage = CoverageLayerService(tmp_path, builder, inspector)
+
+    first_project = projects.prepare(project, repository, dependency_one, lambda _text: None)
+    first_target = targets.prepare(
+        project, first_project, harness_one, configuration, lambda _text: None,
+    )
+    first_coverage = coverage.prepare(
+        project, first_project, adapter, coverage_configuration, lambda _text: None,
+        target_asset_id=3, configuration_asset_id=5, coverage_asset_id=6,
+    )
+    harness_only_project = projects.prepare(
+        project, repository, dependency_one, lambda _text: None,
+    )
+    harness_only_target = targets.prepare(
+        project, harness_only_project, harness_two, configuration, lambda _text: None,
+    )
+    changed_project = projects.prepare(
+        project, repository, dependency_two, lambda _text: None,
+    )
+    changed_target = targets.prepare(
+        project, changed_project, harness_two, configuration, lambda _text: None,
+    )
+    changed_coverage = coverage.prepare(
+        project, changed_project, adapter, coverage_configuration, lambda _text: None,
+        target_asset_id=4, configuration_asset_id=5, coverage_asset_id=6,
+    )
+
+    assert harness_only_project.tag == first_project.tag
+    assert harness_only_target.tag != first_target.tag
+    assert changed_project.tag != first_project.tag
+    assert changed_target.tag != harness_only_target.tag
+    assert changed_coverage.tag != first_coverage.tag
+
+
 class _Builder:
     def __init__(self):
         self.network_modes: list[str | None] = []

@@ -130,6 +130,7 @@ class PreparationPlan:
     asset_versions: tuple[AssetVersionRequest, ...]
     probe_invocations: tuple[ProbeInvocation, ...]
     existing_assets: Mapping[str, object] = field(default_factory=dict)
+    normal_build_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.asset_versions, tuple) or any(
@@ -138,6 +139,13 @@ class PreparationPlan:
             raise ValueError("preparation asset versions are invalid")
         if not isinstance(self.existing_assets, Mapping):
             raise ValueError("preparation existing assets are invalid")
+        if (
+            not isinstance(self.normal_build_paths, tuple)
+            or len(self.normal_build_paths) != len(set(self.normal_build_paths))
+        ):
+            raise ValueError("normal-build proposal paths are invalid")
+        for value in self.normal_build_paths:
+            AssetVersionRequest._validate_proposal_path(value)
         requested_roles = tuple(value.role for value in self.asset_versions)
         existing_roles = tuple(self.existing_assets)
         roles = (*requested_roles, *existing_roles)
@@ -376,7 +384,8 @@ class TargetPreparationService:
             intended_paths = tuple(intent.relative_path for intent in proposal.generated_asset_intents)
             if (
                 len(proposed_paths) != len(set(proposed_paths))
-                or set(proposed_paths) != set(intended_paths)
+                or set(proposed_paths).intersection(plan.normal_build_paths)
+                or set((*proposed_paths, *plan.normal_build_paths)) != set(intended_paths)
             ):
                 raise ValueError("asset versions do not match the proposal's proposed paths")
             assets = dict(plan.existing_assets)

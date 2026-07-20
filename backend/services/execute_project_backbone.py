@@ -8,12 +8,16 @@ from backend.services.stream_task_output import TaskLogLimitExceeded
 
 
 TASK_NAMES = ("repository clone", "LLVM toolchain preparation", "repository analysis")
+PRODUCTION_TASK_NAMES = ("repository clone", "LLVM toolchain preparation", "repository layer")
 
 
 class ExecuteProjectBackbone:
     """Keep task truth in one place while capabilities stay focused."""
 
-    def __init__(self, projects, tasks, clone, toolchain, analysis, logs, workspace: Path, events=None):
+    def __init__(
+        self, projects, tasks, clone, toolchain, analysis, logs, workspace: Path,
+        events=None, repository_layer=None,
+    ):
         self._projects = projects
         self._tasks = tasks
         self._clone = clone
@@ -22,24 +26,37 @@ class ExecuteProjectBackbone:
         self._logs = logs
         self._workspace = Path(workspace)
         self._events = events
+        self._repository_layer = repository_layer
 
     async def schedule(self, project_id: int) -> None:
         project = await self._projects.get(project_id)
         if project is None:
             return
         records = {task.name: task for task in await self._tasks.list_for_project(project_id)}
-        if set(records) != set(TASK_NAMES):
+        names = set(records)
+        if names != set(TASK_NAMES) and names != set(PRODUCTION_TASK_NAMES):
             raise RuntimeError("project initial tasks are incomplete")
-        clone_task, toolchain_task, analysis_task = (records[name] for name in TASK_NAMES)
+        clone_task = records["repository clone"]
+        toolchain_task = records["LLVM toolchain preparation"]
+        analysis_task = records.get("repository analysis")
+        repository_layer_task = records.get("repository layer")
         clone_job = asyncio.create_task(self._run_clone(project, clone_task))
         toolchain_job = asyncio.create_task(self._run_capability(toolchain_task, self._toolchain.prepare))
         try:
             clone_ok = await clone_job
-            if clone_ok:
+            if clone_ok and analysis_task is not None:
                 await self._run_analysis(project, analysis_task)
-            elif not self._terminal(analysis_task):
+            elif analysis_task is not None and not self._terminal(analysis_task):
                 await self._fail(analysis_task, "repository clone did not complete")
-            await toolchain_job
+            toolchain_ok = await toolchain_job
+            if repository_layer_task is not None:
+                if clone_ok and toolchain_ok and self._repository_layer is not None:
+                    await self._run_repository_layer(project, repository_layer_task)
+                elif not self._terminal(repository_layer_task):
+                    await self._fail(
+                        repository_layer_task,
+                        "repository clone and LLVM toolchain preparation did not complete",
+                    )
         except asyncio.CancelledError:
             clone_job.cancel()
             toolchain_job.cancel()
@@ -118,6 +135,15 @@ class ExecuteProjectBackbone:
             )
 
         return await self._run_capability(task, analyse)
+
+    async def _run_repository_layer(self, project, task) -> bool:
+        async def prepare(_):
+            resolved = await self._projects.get(project.id)
+            if resolved is None or resolved.commit_sha is None:
+                raise RuntimeError("repository commit is unresolved")
+            return await self._repository_layer.prepare(resolved, task)
+
+        return await self._run_capability(task, prepare)
 
     async def _fail(self, task, error: Exception | str) -> None:
         message = str(error) or type(error).__name__

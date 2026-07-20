@@ -52,6 +52,22 @@ CREATE TABLE campaigns (
     FOREIGN KEY (configuration_asset_id) REFERENCES assets (id)
 );
 
+CREATE TABLE campaign_contexts (
+    campaign_id BIGINT PRIMARY KEY,
+    configuration_purpose TEXT NOT NULL,
+    retirement_reason TEXT,
+    FOREIGN KEY (campaign_id) REFERENCES campaigns (id)
+);
+
+CREATE TABLE campaign_container_counters (
+    campaign_id BIGINT NOT NULL,
+    container_id TEXT NOT NULL,
+    base_cpu_seconds DOUBLE PRECISION NOT NULL,
+    last_raw_cpu_seconds DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (campaign_id, container_id),
+    FOREIGN KEY (campaign_id) REFERENCES campaigns (id)
+);
+
 CREATE TABLE coverage_evidence (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     project_id BIGINT NOT NULL,
@@ -67,6 +83,25 @@ CREATE TABLE coverage_evidence (
     FOREIGN KEY (project_id) REFERENCES projects (id),
     FOREIGN KEY (campaign_id) REFERENCES campaigns (id),
     FOREIGN KEY (asset_id) REFERENCES assets (id)
+);
+
+CREATE TABLE coverage_checkpoints (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    project_id BIGINT NOT NULL,
+    campaign_id BIGINT NOT NULL,
+    strategy_asset_id BIGINT NOT NULL,
+    commit_sha TEXT NOT NULL,
+    compatibility_group_id TEXT NOT NULL,
+    observed_cpu_seconds DOUBLE PRECISION NOT NULL,
+    reached_lines JSONB NOT NULL,
+    reached_functions JSONB NOT NULL,
+    recent_marginal_lines JSONB NOT NULL,
+    crash_group_ids JSONB NOT NULL,
+    crash_evidence_complete BOOLEAN NOT NULL,
+    configuration_purpose TEXT,
+    FOREIGN KEY (project_id) REFERENCES projects (id),
+    FOREIGN KEY (campaign_id) REFERENCES campaigns (id),
+    FOREIGN KEY (strategy_asset_id) REFERENCES assets (id)
 );
 
 CREATE TABLE findings (
@@ -86,8 +121,16 @@ CREATE TABLE findings (
     FOREIGN KEY (project_id) REFERENCES projects (id)
 );
 
+CREATE TABLE campaign_crash_groups (
+    campaign_id BIGINT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    PRIMARY KEY (campaign_id, fingerprint),
+    FOREIGN KEY (campaign_id) REFERENCES campaigns (id)
+);
+
 CREATE INDEX tasks_project_created_at_idx ON tasks (project_id, created_at, id);
 CREATE INDEX assets_project_created_at_idx ON assets (project_id, created_at, id);
 CREATE INDEX campaigns_project_started_at_idx ON campaigns (project_id, started_at, id);
 CREATE INDEX coverage_evidence_project_source_line_idx ON coverage_evidence (project_id, source_path, line_number);
+CREATE INDEX coverage_checkpoints_project_campaign_idx ON coverage_checkpoints (project_id, campaign_id, id);
 CREATE INDEX findings_project_created_at_idx ON findings (project_id, created_at, id);

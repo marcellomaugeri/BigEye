@@ -231,6 +231,31 @@ class CoverageRepository:
         )
         return [self._coverage(row) for row in rows]
 
+    async def reached_for_campaign(
+        self, project_id: int, commit_sha: str, campaign_id: int,
+    ) -> tuple[int, tuple]:
+        """Return one campaign's exact bounded clean reachable set and strategy identity."""
+        rows = await self._pool.fetch(
+            f"""SELECT {_COLUMNS} FROM coverage_evidence
+                WHERE project_id = $1 AND commit_sha = $2 AND campaign_id = $3
+                ORDER BY source_path, line_number, id LIMIT $4""",
+            project_id, commit_sha, campaign_id, 100_001,
+        )
+        if len(rows) > 100_000:
+            raise OverflowError("campaign clean coverage exceeds its bound")
+        evidence = tuple(self._coverage(row) for row in rows)
+        if not evidence:
+            raise KeyError("campaign clean coverage is unavailable")
+        strategy_ids = {item.asset_id for item in evidence}
+        if len(strategy_ids) != 1:
+            raise ValueError("campaign clean coverage spans multiple strategy identities")
+        from backend.fuzzing.coverage.exposure import ReachedLine
+        reached = tuple(sorted({
+            ReachedLine(item.source_path, item.line_number, item.function_name)
+            for item in evidence
+        }))
+        return next(iter(strategy_ids)), reached
+
     async def aggregate_project(
         self, project_id: int, commit_sha: str, limit: int = 1_000, offset: int = 0,
     ) -> CoveragePage:

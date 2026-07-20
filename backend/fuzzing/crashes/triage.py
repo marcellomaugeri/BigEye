@@ -95,6 +95,9 @@ class CrashPipeline:
                 reproducible=selected.reproducible,
                 candidate_selected=selected.candidate_selected,
             )
+            linker = getattr(self._findings, "link_campaign", None)
+            if linker is not None:
+                await linker(observation.campaign_id, observation.project_id, fingerprint)
         if self._events is not None:
             await self._events.append(observation.project_id, "events", {"name": "findings"})
         return finding

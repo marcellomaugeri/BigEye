@@ -180,6 +180,102 @@ def test_manager_failure_activity_does_not_persist_exception_secret_text() -> No
     assert "RuntimeError" in payload["motivation"]
 
 
+def test_failed_one_shot_review_is_retried_once_without_losing_its_edge() -> None:
+    manager = AsyncMock()
+    decision = object()
+    manager.review.side_effect = [RuntimeError("temporary"), decision]
+    current_time = [NOW]
+    subject = coordinator(manager=manager)
+    subject._clock = lambda: current_time[0]
+    observation = healthy_snapshot(corpus_opportunity=True)
+
+    first = run(subject.tick(7, observation))
+    current_time[0] += timedelta(seconds=30)
+    second = run(subject.tick(7, observation))
+    current_time[0] += timedelta(seconds=30)
+    third = run(subject.tick(7, observation))
+
+    assert first.reason == second.reason == "validated corpus opportunity"
+    assert third is None
+    assert manager.review.await_count == 2
+    subject.decision_executor.execute.assert_awaited_once_with(
+        subject.projects.get.return_value, decision,
+    )
+
+
+def test_failed_review_sets_one_time_deadline_instead_of_busy_polling() -> None:
+    manager = AsyncMock()
+    manager.review.side_effect = RuntimeError("temporary")
+    runtime = AsyncMock()
+    runtime.retirement_candidates.return_value = ()
+    runtime.review_context.return_value = SimpleNamespace(project_id=7)
+    runtime.review_evidence.return_value = [{"evidence_id": "campaign:3"}]
+    subject = coordinator(manager=manager, runtime=runtime)
+
+    run(subject.tick(7, healthy_snapshot(corpus_opportunity=True)))
+
+    seen = []
+
+    async def wait_for_change(project_id, received_signal, deadline):
+        seen.append((project_id, received_signal, deadline))
+
+    runtime.wait_for_change.side_effect = wait_for_change
+    run(subject._wait_for_change(7, healthy_snapshot(corpus_opportunity=True)))
+
+    assert len(seen) == 1
+    assert seen[0][0] == 7
+    assert isinstance(seen[0][1], asyncio.Event)
+    assert seen[0][2] == NOW + timedelta(seconds=30)
+    assert manager.review.await_count == 1
+
+
+def test_repeated_manager_failure_is_bounded_to_two_attempts() -> None:
+    manager = AsyncMock()
+    manager.review.side_effect = RuntimeError("unavailable")
+    current_time = [NOW]
+    subject = coordinator(manager=manager)
+    subject._clock = lambda: current_time[0]
+    observation = healthy_snapshot(corpus_opportunity=True)
+
+    run(subject.tick(7, observation))
+    current_time[0] += timedelta(seconds=30)
+    run(subject.tick(7, observation))
+    current_time[0] += timedelta(seconds=30)
+    assert run(subject.tick(7, observation)) is None
+
+    assert manager.review.await_count == 2
+
+
+def test_failed_retirement_review_retries_the_exact_original_action() -> None:
+    from backend.fuzzing.coverage.overlap import RetirementCandidate
+
+    candidate = RetirementCandidate(
+        project_id=7, campaign_id=9, strategy_asset_id=90,
+        retained_campaign_id=4, retained_strategy_asset_id=40,
+        evidence_ids=("candidate:1", "retained:1", "candidate:2", "retained:2"),
+        reason="clean subset at two checkpoints",
+    )
+    runtime = AsyncMock()
+    runtime.retirement_candidates.side_effect = [(candidate,), ()]
+    runtime.review_context.return_value = SimpleNamespace(project_id=7)
+    runtime.review_evidence.return_value = [{"evidence_id": "campaign:3"}]
+    manager = AsyncMock()
+    manager.review.side_effect = [RuntimeError("temporary"), object()]
+    current_time = [NOW]
+    subject = coordinator(runtime=runtime, manager=manager)
+    subject._clock = lambda: current_time[0]
+
+    run(subject.tick(7, healthy_snapshot()))
+    current_time[0] += timedelta(seconds=30)
+    run(subject.tick(7, healthy_snapshot()))
+
+    first = manager.review.await_args_list[0]
+    second = manager.review.await_args_list[1]
+    assert first.kwargs["prepared_actions"] == second.kwargs["prepared_actions"]
+    assert first.args[1] == second.args[1]
+    assert first.kwargs["prepared_actions"][0].action_id == "retirement:7:9:90:4:40"
+
+
 def test_worker_count_decrease_retires_only_excess_lowest_priority_workers() -> None:
     runtime = AsyncMock()
     subject = coordinator(value=project(workers=2), runtime=runtime)
