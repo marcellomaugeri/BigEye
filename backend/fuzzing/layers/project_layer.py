@@ -37,7 +37,7 @@ class _GeneratedLayerService:
 
     def _prepare(
         self, project, parent_manifest: LayerManifest, assets, dockerfile_template: str,
-        sink, network_mode: str | None, cancellation_signal=None,
+        sink, network_mode: str | None, cancellation_signal=None, extra_labels=None,
     ):
         if cancellation_signal is not None and cancellation_signal.is_set():
             raise ImageBuildCancelled(f"{self._kind} layer build cancelled")
@@ -47,9 +47,18 @@ class _GeneratedLayerService:
         commit_sha = self._commit(project)
         parent = self._verify_parent(parent_manifest, project_id, commit_sha)
         assets = tuple(assets)
+        extra_labels = self._validate_extra_labels(extra_labels)
         asset_digest = self._assets_digest(project_id, assets)
-        starter = dockerfile_template.format(parent=parent_manifest.tag, content_hash=_CONTENT_HASH_SENTINEL)
+        starter = dockerfile_template.format(
+            parent=parent_manifest.tag,
+            parent_image=parent.image_id,
+            content_hash=_CONTENT_HASH_SENTINEL,
+        )
         template = self._asset_dockerfile(project_id, assets, starter, parent.image_id, project_id, commit_sha)
+        if extra_labels:
+            template = template.rstrip() + "\nLABEL " + " ".join(
+                f'{key}="{value}"' for key, value in sorted(extra_labels.items())
+            ) + "\n"
         if template.count(_CONTENT_HASH_SENTINEL) != 1:
             raise ValueError("generated Dockerfile content hash sentinel is invalid")
         content_hash = self._digest(parent.image_id, commit_sha, template, asset_digest)
@@ -65,6 +74,7 @@ class _GeneratedLayerService:
             "bigeye.content-hash": content_hash,
             "bigeye.parent-image": parent.image_id,
         }
+        labels.update(extra_labels)
         root = self._workspace / "projects" / str(project_id) / "build-contexts" / f"{kind}-{tag_hash}"
         context_dir = root / "context"
         dockerfile = context_dir / "Dockerfile"
@@ -86,6 +96,30 @@ class _GeneratedLayerService:
                     build_arguments["cancellation_signal"] = cancellation_signal
                 self._image_builder.build(dockerfile, tag, **build_arguments)
             return manifest
+
+    @staticmethod
+    def _validate_extra_labels(labels):
+        if labels is None:
+            return {}
+        reserved = {
+            "bigeye.project", "bigeye.commit", "bigeye.layer",
+            "bigeye.content-hash", "bigeye.parent-image",
+        }
+        if (
+            not isinstance(labels, dict)
+            or any(
+                not isinstance(key, str)
+                or re.fullmatch(r"bigeye\.[a-z0-9-]+", key) is None
+                or key in reserved
+                or not isinstance(value, str)
+                or not value
+                or len(value) > 256
+                or any(character in value for character in "\"\\\r\n")
+                for key, value in labels.items()
+            )
+        ):
+            raise ValueError("generated layer labels are invalid")
+        return dict(labels)
 
     def _assets_digest(self, project_id: int, assets) -> str:
         digest = sha256()

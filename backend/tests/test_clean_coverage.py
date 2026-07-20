@@ -15,6 +15,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 
+CLEAN_IMAGE_ID = "sha256:" + "c" * 64
+PARENT_IMAGE_ID = "sha256:" + "d" * 64
+
+
 def run(awaitable):
     return asyncio.run(awaitable)
 
@@ -67,21 +71,21 @@ def _campaign(tmp_path: Path, **changes):
         "cpu_exposure_seconds": 8.5,
         "repository_root": tmp_path / "repository",
         "source_root": "/src",
-        "clean_image_id": "sha256:clean",
+        "clean_image_id": CLEAN_IMAGE_ID,
         "clean_content_hash": "c" * 64,
-        "clean_parent_image_id": "sha256:parent",
+        "clean_parent_image_id": PARENT_IMAGE_ID,
     }
     return SimpleNamespace(**(values | changes))
 
 
 def _client():
     return SimpleNamespace(api=SimpleNamespace(inspect_image=lambda _image: {
-        "Id": "sha256:clean",
+        "Id": CLEAN_IMAGE_ID,
         "Os": "linux",
         "Architecture": "amd64",
         "Config": {"Labels": {
             "bigeye.project": "7", "bigeye.commit": "a" * 40, "bigeye.layer": "coverage",
-            "bigeye.content-hash": "c" * 64, "bigeye.parent-image": "sha256:parent",
+            "bigeye.content-hash": "c" * 64, "bigeye.parent-image": PARENT_IMAGE_ID,
             "bigeye.target-asset-id": "31", "bigeye.configuration-asset-id": "32",
             "bigeye.coverage-asset-id": "34",
         }},
@@ -157,11 +161,57 @@ class _MemoryCoverageRepository:
     async def list_for_project(self, project_id, limit=1_000, offset=0):
         return [row for row in self.rows if row.project_id == project_id][offset:offset + limit]
 
+    async def aggregate_project(self, project_id, commit_sha, limit=1_000, offset=0):
+        grouped = {}
+        for row in self.rows:
+            if row.project_id == project_id and row.commit_sha == commit_sha:
+                group = grouped.setdefault(row.source_path, {"lines": set(), "cpu": 0.0})
+                group["lines"].add(row.line_number)
+                group["cpu"] += row.cpu_exposure_seconds
+        items = tuple({
+            "path": path,
+            "covered_lines": len(grouped[path]["lines"]),
+            "cpu_exposure_seconds": grouped[path]["cpu"],
+        } for path in sorted(grouped))
+        return SimpleNamespace(items=items[offset:offset + limit], total=len(items))
+
     async def list_for_source(self, project_id, commit_sha, source_path, limit=1_000, offset=0):
         rows = [row for row in self.rows if (
             row.project_id == project_id and row.commit_sha == commit_sha and row.source_path == source_path
         )]
         return rows[offset:offset + limit]
+
+    async def first_for_source(self, project_id, commit_sha, source_path):
+        rows = await self.list_for_source(project_id, commit_sha, source_path)
+        return rows[0] if rows else None
+
+    async def aggregate_source_range(self, project_id, commit_sha, source_path, start_line, end_line):
+        grouped = {}
+        for row in await self.list_for_source(project_id, commit_sha, source_path):
+            if start_line <= row.line_number <= end_line:
+                group = grouped.setdefault(row.line_number, {"assets": set(), "cpu": 0.0})
+                group["assets"].add(row.asset_id)
+                group["cpu"] += row.cpu_exposure_seconds
+        return tuple({
+            "line_number": line,
+            "strategy_count": len(grouped[line]["assets"]),
+            "cpu_exposure_seconds": grouped[line]["cpu"],
+        } for line in sorted(grouped))
+
+    async def aggregate_functions(self, project_id, commit_sha, source_path, limit=1_000, offset=0):
+        grouped = {}
+        for row in await self.list_for_source(project_id, commit_sha, source_path):
+            if row.function_name:
+                group = grouped.setdefault(row.function_name, {"lines": set(), "cpu": 0.0})
+                group["lines"].add(row.line_number)
+                group["cpu"] += row.cpu_exposure_seconds
+        items = tuple({
+            "name": name,
+            "path": source_path,
+            "covered_lines": len(grouped[name]["lines"]),
+            "cpu_exposure_seconds": grouped[name]["cpu"],
+        } for name in sorted(grouped))
+        return SimpleNamespace(items=items[offset:offset + limit], total=len(items))
 
     async def list_for_line(self, project_id, commit_sha, source_path, line_number, limit=500, offset=0):
         rows = [row for row in self.rows if (
@@ -170,14 +220,21 @@ class _MemoryCoverageRepository:
         )]
         return rows[offset:offset + limit]
 
+    async def page_for_line(self, project_id, commit_sha, source_path, line_number, limit=500, offset=0):
+        rows = [row for row in self.rows if (
+            row.project_id == project_id and row.commit_sha == commit_sha and row.source_path == source_path
+            and row.line_number == line_number
+        )]
+        return SimpleNamespace(items=tuple(rows[offset:offset + limit]), total=len(rows))
+
 
 def _snapshot(source_path="src/a.c", line=1, testcase=b"seed", build_kind="clean", source_hash=None):
     from backend.fuzzing.coverage.llvm_coverage import CoverageHit, CoverageLine, CoverageSnapshot
 
     return CoverageSnapshot(
         project_id=7, campaign_id=4, strategy_asset_id=33, commit_sha="a" * 40,
-        clean_image_id="sha256:clean", clean_content_hash="c" * 64,
-        clean_parent_image_id="sha256:parent", target_asset_id=31, configuration_asset_id=32,
+        clean_image_id=CLEAN_IMAGE_ID, clean_content_hash="c" * 64,
+        clean_parent_image_id=PARENT_IMAGE_ID, target_asset_id=31, configuration_asset_id=32,
         coverage_asset_id=34, replay_command=("/target", "{input}"), cpu_exposure_seconds=1.0,
         build_kind=build_kind, lines=(CoverageLine(source_path, line, "parse", source_hash),),
         hits=(CoverageHit(source_path, line, testcase, sha256(testcase).hexdigest()),),
@@ -279,7 +336,7 @@ def test_docker_executor_is_isolated_and_returns_stdout_only(tmp_path: Path):
     client = SimpleNamespace(containers=containers)
 
     result = DockerCoverageExecutor(client, timeout_seconds=30).run(
-        "sha256:clean", ("llvm-cov-18", "export"), {}, tmp_path
+        CLEAN_IMAGE_ID, ("llvm-cov-18", "export"), {}, tmp_path
     )
 
     assert result == b"result"
@@ -293,7 +350,7 @@ def test_docker_executor_is_isolated_and_returns_stdout_only(tmp_path: Path):
 
     with pytest.raises(ValueError, match="shell"):
         DockerCoverageExecutor(client, timeout_seconds=30).run(
-            "sha256:clean", ("/bin/sh", "-c", "id"), {}, tmp_path
+            CLEAN_IMAGE_ID, ("/bin/sh", "-c", "id"), {}, tmp_path
         )
 
 
@@ -610,6 +667,9 @@ def test_repository_claim_holds_transaction_advisory_lock_and_inserts_first_winn
     assert "pg_advisory_xact_lock" in connection.execute.await_args.args[0]
     assert "source_path = $3" in connection.fetchrow.await_args_list[0].args[0]
     assert "INSERT INTO coverage_evidence" in connection.fetchrow.await_args_list[1].args[0]
+    assert "ON CONFLICT (project_id, commit_sha, source_path, line_number, asset_id) DO NOTHING" in (
+        connection.fetchrow.await_args_list[1].args[0]
+    )
 
 
 def test_same_testcase_reaching_multiple_files_publishes_distinct_logical_hits(tmp_path: Path):
@@ -691,9 +751,9 @@ def test_checkout_drift_after_async_replay_rolls_back_artifact(tmp_path: Path):
     registry = _Registry(checkout)
 
     async def verifier(request):
-        assert request.clean_image_id == "sha256:clean"
+        assert request.clean_image_id == CLEAN_IMAGE_ID
         assert request.clean_content_hash == "c" * 64
-        assert request.clean_parent_image_id == "sha256:parent"
+        assert request.clean_parent_image_id == PARENT_IMAGE_ID
         assert (request.target_asset_id, request.configuration_asset_id, request.coverage_asset_id) == (31, 32, 34)
         await asyncio.sleep(0)
         registry.valid = False
@@ -765,3 +825,230 @@ def test_mixed_project_commits_fail_before_bounded_tree_query(tmp_path: Path):
         run(TraceabilityService(
             tmp_path, repository, lambda _request: True, _Registry(tmp_path)
         ).project_tree(7, limit=10, offset=0))
+
+
+def test_llvm_segments_reject_attacker_span_before_range_expansion(tmp_path: Path, monkeypatch):
+    import builtins
+
+    from backend.fuzzing.coverage.llvm_coverage import CoverageIntegrityError, LlvmCoverage
+
+    original_range = range
+
+    def guarded_range(start, stop=None, step=1):
+        actual_start, actual_stop = (0, start) if stop is None else (start, stop)
+        if actual_stop - actual_start > 2_000_000:
+            raise AssertionError("attacker-controlled range was expanded before validation")
+        return original_range(start, stop, step) if stop is not None else original_range(start)
+
+    monkeypatch.setattr(builtins, "range", guarded_range)
+    with pytest.raises(CoverageIntegrityError, match="segment|span"):
+        LlvmCoverage(_client(), _CoverageExecutor({}), tmp_path / "work")._segment_lines([
+            [1, 1, 1, True, True, False],
+            [10**12, 2, 0, True, True, False],
+        ])
+
+
+def test_checkout_registry_rejects_symbolic_branch_even_at_exact_commit(tmp_path: Path, monkeypatch):
+    from backend.fuzzing.coverage import traceability
+    from backend.fuzzing.coverage.llvm_coverage import CoverageIntegrityError
+
+    checkout = tmp_path / "projects/7/repository"
+    checkout.mkdir(parents=True)
+    project = SimpleNamespace(id=7, commit_sha="a" * 40)
+    projects = SimpleNamespace(get=AsyncMock(return_value=project))
+
+    async def command(argv, cwd=None):
+        del cwd
+        if argv[1:3] == ["rev-parse", "HEAD"]:
+            return project.commit_sha
+        if argv[1:4] == ["symbolic-ref", "-q", "HEAD"]:
+            return "refs/heads/main"
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(traceability, "run_command", command)
+    with pytest.raises(CoverageIntegrityError, match="detached"):
+        run(traceability.ProjectCheckoutRegistry(tmp_path, projects).resolve(7, project.commit_sha))
+
+
+def test_first_hit_replay_verifier_requires_exact_clean_replay_identity(tmp_path: Path):
+    from backend.fuzzing.coverage.llvm_coverage import CoverageHit, CoverageLine
+    from backend.fuzzing.coverage.replay_verifier import FirstHitReplayVerifier
+    from backend.fuzzing.coverage.traceability import ReplayVerification
+
+    testcase = tmp_path / "seed"
+    testcase.write_bytes(b"seed")
+    request = ReplayVerification(
+        7, "a" * 40, 4, 33, 31, 32, 34,
+        CLEAN_IMAGE_ID, "c" * 64, PARENT_IMAGE_ID,
+        "src/a.c", 12, testcase, sha256(b"seed").hexdigest(),
+        ("/src/build/clean-target", "{input}"),
+    )
+    target = _campaign(tmp_path)
+
+    class Resolver:
+        async def resolve(self, selected):
+            assert selected == request
+            return target
+
+    class Replay:
+        async def replay(self, selected, inputs):
+            assert selected is target
+            assert inputs == (testcase,)
+            snapshot = _snapshot(line=12, testcase=b"seed", source_hash=sha256(b"x\n").hexdigest())
+            return snapshot.__class__(
+                **{
+                    name: getattr(snapshot, name)
+                    for name in snapshot.__dataclass_fields__
+                    if name not in {"replay_command", "lines", "hits"}
+                },
+                replay_command=("/src/build/clean-target", "{input}"),
+                lines=(CoverageLine("src/a.c", 12, "parse", sha256(b"x\n").hexdigest()),),
+                hits=(CoverageHit("src/a.c", 12, b"seed", sha256(b"seed").hexdigest()),),
+            )
+
+    assert run(FirstHitReplayVerifier(Resolver(), Replay())(request)) is True
+
+
+def test_repository_conflict_returns_existing_first_winner():
+    from unittest.mock import MagicMock
+
+    from backend.repositories.coverage_repository import CoverageRepository
+
+    winner = {
+        "id": 9, "project_id": 7, "commit_sha": "a" * 40, "source_path": "src/a.c",
+        "line_number": 12, "function_name": "parse", "campaign_id": 4, "asset_id": 33,
+        "first_testcase_sha256": "c" * 64, "cpu_exposure_seconds": 2.0,
+    }
+    connection = AsyncMock()
+    connection.transaction = MagicMock(return_value=_Transaction())
+    connection.fetchrow.side_effect = [None, None, winner]
+    pool = SimpleNamespace(acquire=lambda: _Acquire(connection))
+
+    async def exercise():
+        async with CoverageRepository(pool).claim(
+            project_id=7, commit_sha="a" * 40, source_path="src/a.c", line_number=12, asset_id=33,
+        ) as claim:
+            evidence = await claim.create(
+                function_name="parse", campaign_id=4, first_testcase_sha256="b" * 64,
+                cpu_exposure_seconds=1.0,
+            )
+            return claim.created, evidence
+
+    inserted, evidence = run(exercise())
+
+    assert inserted is False
+    assert evidence.id == 9
+    assert evidence.first_testcase_sha256 == "c" * 64
+
+
+def test_repository_aggregates_before_pagination_and_filters_source_range():
+    from backend.repositories.coverage_repository import CoverageRepository
+
+    pool = AsyncMock()
+    pool.fetch.side_effect = [
+        [{"source_path": "src/a.c", "covered_lines": 8, "cpu_exposure_seconds": 12.0, "total": 3}],
+        [{"line_number": 12, "strategy_count": 2, "cpu_exposure_seconds": 4.0}],
+    ]
+    repository = CoverageRepository(pool)
+
+    page = run(repository.aggregate_project(7, "a" * 40, limit=1, offset=1))
+    lines = run(repository.aggregate_source_range(7, "a" * 40, "src/a.c", 10, 20))
+
+    aggregate_sql = pool.fetch.await_args_list[0].args[0]
+    source_sql = pool.fetch.await_args_list[1].args[0]
+    assert "GROUP BY source_path" in aggregate_sql
+    assert aggregate_sql.index("GROUP BY source_path") < aggregate_sql.index("LIMIT $3")
+    assert page.total == 3
+    assert page.items[0]["covered_lines"] == 8
+    assert "line_number BETWEEN $4 AND $5" in source_sql
+    assert pool.fetch.await_args_list[1].args[-2:] == (10, 20)
+    assert lines[0]["strategy_count"] == 2
+
+
+def test_production_first_hit_record_replays_through_bounded_docker_executor(tmp_path: Path):
+    from backend.fuzzing.coverage.replay_verifier import (
+        CleanCoverageTargetResolver,
+        DeferredLlvmCoverage,
+        FirstHitReplayVerifier,
+    )
+    from backend.fuzzing.coverage.traceability import TraceabilityService
+
+    checkout = tmp_path / "repository"
+    (checkout / "src").mkdir(parents=True)
+    (checkout / "src/a.c").write_text("x\n")
+
+    class Container:
+        def __init__(self, command, options):
+            self.command = command
+            self.options = options
+            self.removed = False
+
+        def start(self):
+            profiles = next(
+                Path(host) for host, mount in self.options["volumes"].items()
+                if mount["bind"] == "/coverage/profiles"
+            )
+            environment = self.options["environment"]
+            if "LLVM_PROFILE_FILE" in environment:
+                name = Path(environment["LLVM_PROFILE_FILE"].replace("%p", "123")).name
+                (profiles / name).write_bytes(b"raw")
+            elif self.command[0] == "llvm-profdata-18":
+                name = Path(self.command[self.command.index("-o") + 1]).name
+                (profiles / name).write_bytes(b"profile")
+
+        def wait(self, timeout):
+            assert timeout == 120
+            return {"StatusCode": 0}
+
+        def logs(self, **_options):
+            if self.command[0] == "llvm-cov-18":
+                return [json.dumps(_export(line=1)).encode()]
+            if self.command[0] == "cat":
+                return [b"x\n"]
+            return []
+
+        def remove(self, force):
+            assert force is True
+            self.removed = True
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+            self.closed = False
+            self.api = SimpleNamespace(inspect_image=lambda _image: _client().api.inspect_image(_image))
+            self.containers = SimpleNamespace(create=self.create)
+
+        def create(self, image, command, **options):
+            assert image == CLEAN_IMAGE_ID
+            self.calls.append((tuple(command), options))
+            return Container(command, options)
+
+        def close(self):
+            self.closed = True
+
+    client = Client()
+    docker_client = SimpleNamespace(connect=lambda: client)
+    registry = _Registry(checkout)
+    campaign = SimpleNamespace(
+        id=4, project_id=7, target_asset_id=31, configuration_asset_id=32,
+    )
+    campaigns = SimpleNamespace(get=AsyncMock(return_value=campaign))
+    assets = SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(
+        project_id=7, validated_at=object(), error=None,
+    )))
+    verifier = FirstHitReplayVerifier(
+        CleanCoverageTargetResolver(registry, campaigns, assets),
+        DeferredLlvmCoverage(tmp_path / "replay", docker_client=docker_client),
+    )
+    service = TraceabilityService(tmp_path, _MemoryCoverageRepository(), verifier, registry)
+
+    created = run(service.record(_snapshot(source_hash=sha256(b"x\n").hexdigest())))
+
+    assert len(created) == 1
+    assert client.closed is True
+    assert len(client.calls) >= 6
+    assert all(call[1]["network_mode"] == "none" and call[1]["read_only"] is True for call in client.calls)
+    assert any(
+        mount["bind"] == "/coverage/input" and mount["mode"] == "ro"
+        for _command, options in client.calls for mount in options["volumes"].values()
+    )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -320,10 +321,8 @@ class LlvmCoverage:
             raise ValueError("configuration asset ID must be a positive integer")
         _require_hex(campaign.commit_sha, {40, 64}, "coverage commit")
         _require_hex(campaign.clean_content_hash, {64}, "coverage content hash")
-        if not isinstance(campaign.clean_image_id, str) or not campaign.clean_image_id.startswith("sha256:"):
-            raise ValueError("clean image ID is invalid")
-        if not isinstance(campaign.clean_parent_image_id, str) or not campaign.clean_parent_image_id.startswith("sha256:"):
-            raise ValueError("clean parent image ID is invalid")
+        _require_image_id(campaign.clean_image_id, "clean image ID")
+        _require_image_id(campaign.clean_parent_image_id, "clean parent image ID")
         binary = _normalised_absolute(campaign.binary_path, "coverage binary")
         source_root = _normalised_absolute(campaign.source_root, "coverage source root")
         if source_root == "/":
@@ -449,24 +448,46 @@ class LlvmCoverage:
 
     @staticmethod
     def _segment_lines(segments):
-        if not isinstance(segments, list) or len(segments) > 2_000_000:
+        maximum_lines = 2_000_000
+        if not isinstance(segments, list) or len(segments) > maximum_lines:
             raise CoverageIntegrityError("llvm-cov segments are invalid or unbounded")
-        result = set()
+        spans = []
+        expanded = 0
         for index, segment in enumerate(segments):
             if not isinstance(segment, list) or len(segment) < 6:
-                continue
+                raise CoverageIntegrityError("llvm-cov segment is invalid")
             line, column, count, has_count, _entry, gap = segment[:6]
-            if type(line) is not int or type(column) is not int or line < 1 or column < 1:
-                continue
-            if has_count is not True or not isinstance(count, (int, float)) or count <= 0 or gap is True:
+            if (
+                type(line) is not int or type(column) is not int
+                or not 1 <= line <= maximum_lines or not 1 <= column <= maximum_lines
+                or isinstance(count, bool) or not isinstance(count, (int, float)) or not math.isfinite(count)
+                or type(has_count) is not bool or type(gap) is not bool
+            ):
+                raise CoverageIntegrityError("llvm-cov segment coordinates are invalid")
+            if has_count is not True or count <= 0 or gap is True:
                 continue
             end = line
             if index + 1 < len(segments):
                 following = segments[index + 1]
-                if isinstance(following, list) and len(following) >= 2 and type(following[0]) is int and type(following[1]) is int:
-                    end = following[0] if following[1] > 1 else following[0] - 1
+                if not isinstance(following, list) or len(following) < 2:
+                    raise CoverageIntegrityError("llvm-cov next segment is invalid")
+                next_line, next_column = following[:2]
+                if (
+                    type(next_line) is not int or type(next_column) is not int
+                    or not 1 <= next_line <= maximum_lines or not 1 <= next_column <= maximum_lines
+                    or next_line < line or (next_line == line and next_column < column)
+                ):
+                    raise CoverageIntegrityError("llvm-cov next segment coordinates are invalid")
+                end = next_line if next_column > 1 else next_line - 1
             if end >= line:
-                result.update(range(line, end + 1))
+                span = end - line + 1
+                if span > maximum_lines - expanded:
+                    raise CoverageIntegrityError("llvm-cov covered span exceeds its limit")
+                spans.append((line, end))
+                expanded += span
+        result = set()
+        for line, end in spans:
+            result.update(range(line, end + 1))
         return result
 
     def _collect_function(self, collected, function, campaign):
@@ -532,6 +553,14 @@ def _normalised_absolute(value, label):
 
 def _require_hex(value, lengths, label):
     if not isinstance(value, str) or len(value) not in lengths or any(char not in "0123456789abcdef" for char in value):
+        raise ValueError(f"{label} is invalid")
+
+
+def _require_image_id(value, label):
+    if (
+        not isinstance(value, str) or not value.startswith("sha256:") or len(value) != 71
+        or any(character not in "0123456789abcdef" for character in value[7:])
+    ):
         raise ValueError(f"{label} is invalid")
 
 

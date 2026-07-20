@@ -7,14 +7,13 @@ import json
 import math
 import os
 import stat
-from collections import defaultdict
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
 from backend.fuzzing.coverage.llvm_coverage import CoverageIntegrityError
-from backend.services.projects.clone_repository import run_command
+from backend.services.projects.clone_repository import GitCommandFailed, run_command
 
 
 @dataclass(frozen=True)
@@ -48,6 +47,12 @@ class ProjectCheckoutRegistry:
         head = await run_command(["git", "rev-parse", "HEAD"], cwd=root)
         if head != commit_sha:
             raise CoverageIntegrityError("checkout HEAD does not match the coverage commit")
+        try:
+            symbolic_head = await run_command(["git", "symbolic-ref", "-q", "HEAD"], cwd=root)
+        except GitCommandFailed:
+            symbolic_head = None
+        if symbolic_head is not None:
+            raise CoverageIntegrityError("coverage requires a detached project checkout")
         descriptor = _open_checkout(self._workspace, project_id)
         try:
             after = os.fstat(descriptor)
@@ -122,6 +127,8 @@ class TraceabilityService:
             if sha256(hit.testcase).hexdigest() != hit.testcase_sha256:
                 raise CoverageIntegrityError("testcase content does not match its SHA-256")
             retained = None
+            attempt_active = False
+            won = True
             try:
                 async with self._repository.claim(
                     project_id=snapshot.project_id,
@@ -133,6 +140,7 @@ class TraceabilityService:
                     if claim.existing is not None:
                         continue
                     retained = self._publish(snapshot, hit, source_hash)
+                    attempt_active = True
                     self._require_retained(retained)
                     verification = self._verification(snapshot, hit, retained)
                     if self._replay_verifier is None:
@@ -150,61 +158,57 @@ class TraceabilityService:
                         first_testcase_sha256=hit.testcase_sha256,
                         cpu_exposure_seconds=snapshot.cpu_exposure_seconds,
                     )
-                    await self._checkouts.verify(checkout)
-                    self._require_retained(retained)
+                    won = getattr(claim, "created", True) is True
+                    if won:
+                        await self._checkouts.verify(checkout)
+                        self._require_retained(retained)
+                    else:
+                        self._remove_attempt(retained)
+                        attempt_active = False
             except BaseException:
-                if retained is not None and retained.created:
+                if retained is not None and attempt_active:
                     self._remove_attempt(retained)
                 raise
             finally:
                 if retained is not None:
                     os.close(retained.final_descriptor)
                     os.close(retained.parent_descriptor)
+            if not won:
+                continue
             created.append(evidence)
         return created
 
     async def project_tree(self, project_id: int, limit: int = 1_000, offset: int = 0):
         commit = await self._project_commit(project_id)
-        evidence = await self._repository.list_for_project(project_id, limit=limit, offset=offset)
-        if not evidence:
+        page = await self._repository.aggregate_project(project_id, commit, limit=limit, offset=offset)
+        if page.total == 0:
             raise KeyError("coverage not found")
-        self._require_commit(evidence, commit)
         await self._checkouts.resolve(project_id, commit)
-        grouped = defaultdict(list)
-        for item in evidence:
-            grouped[item.source_path].append(item)
         return {
             "project_id": project_id,
             "commit_sha": commit,
-            "files": [
-                {
-                    "path": path,
-                    "covered_lines": len({item.line_number for item in items}),
-                    "cpu_exposure_seconds": sum(item.cpu_exposure_seconds for item in items),
-                }
-                for path, items in sorted(grouped.items())
-            ],
+            "files": list(page.items),
+            "pagination": {"limit": limit, "offset": offset, "total": page.total},
         }
 
     async def source_file(self, project_id: int, path: str, start_line: int, end_line: int):
         self._validate_range(start_line, end_line)
         commit = await self._project_commit(project_id)
         relative = self._safe_source_path(path)
-        evidence = await self._repository.list_for_source(project_id, commit, relative, limit=5_000, offset=0)
-        if not evidence:
+        identity = await self._repository.first_for_source(project_id, commit, relative)
+        if identity is None:
             raise KeyError("coverage not found")
-        self._require_commit(evidence, commit)
-        expected_hashes = {self._read_metadata(item)["source_sha256"] for item in evidence}
-        if len(expected_hashes) != 1:
-            raise CoverageIntegrityError("source evidence does not identify one clean source blob")
+        self._require_commit((identity,), commit)
+        expected_hash = self._read_metadata(identity)["source_sha256"]
+        aggregate = await self._repository.aggregate_source_range(
+            project_id, commit, relative, start_line, end_line,
+        )
         checkout = await self._checkouts.resolve(project_id, commit)
         source = _read_checkout_source(checkout, relative)
-        if sha256(source).hexdigest() != next(iter(expected_hashes)):
+        if sha256(source).hexdigest() != expected_hash:
             raise CoverageIntegrityError("checkout source does not match the exact clean image")
         lines = source.decode("utf-8", errors="replace").splitlines()
-        by_line = defaultdict(list)
-        for item in evidence:
-            by_line[item.line_number].append(item)
+        by_line = {item["line_number"]: item for item in aggregate}
         actual_end = min(end_line, len(lines))
         if actual_end < start_line:
             raise KeyError("coverage not found")
@@ -218,9 +222,9 @@ class TraceabilityService:
                 {
                     "number": number,
                     "text": lines[number - 1],
-                    "covered": bool(by_line[number]),
-                    "strategy_count": len({item.asset_id for item in by_line[number]}),
-                    "cpu_exposure_seconds": sum(item.cpu_exposure_seconds for item in by_line[number]),
+                    "covered": number in by_line,
+                    "strategy_count": by_line.get(number, {}).get("strategy_count", 0),
+                    "cpu_exposure_seconds": by_line.get(number, {}).get("cpu_exposure_seconds", 0.0),
                 }
                 for number in range(start_line, actual_end + 1)
             ],
@@ -229,26 +233,16 @@ class TraceabilityService:
     async def function_summaries(self, project_id: int, path: str, limit: int = 1_000, offset: int = 0):
         commit = await self._project_commit(project_id)
         relative = self._safe_source_path(path)
-        evidence = await self._repository.list_for_source(project_id, commit, relative, limit=limit, offset=offset)
-        if not evidence:
+        page = await self._repository.aggregate_functions(
+            project_id, commit, relative, limit=limit, offset=offset,
+        )
+        if page.total == 0:
             raise KeyError("coverage not found")
-        self._require_commit(evidence, commit)
         await self._checkouts.resolve(project_id, commit)
-        grouped = defaultdict(list)
-        for item in evidence:
-            if item.function_name:
-                grouped[item.function_name].append(item)
-        if not grouped:
-            raise KeyError("coverage not found")
-        return [
-            {
-                "name": name,
-                "path": relative,
-                "covered_lines": len({item.line_number for item in items}),
-                "cpu_exposure_seconds": sum(item.cpu_exposure_seconds for item in items),
-            }
-            for name, items in sorted(grouped.items())
-        ]
+        return {
+            "functions": list(page.items),
+            "pagination": {"limit": limit, "offset": offset, "total": page.total},
+        }
 
     async def line_evidence(
         self, project_id: int, path: str, line_number: int, limit: int = 500, offset: int = 0,
@@ -257,15 +251,15 @@ class TraceabilityService:
             raise ValueError("line number must be positive")
         commit = await self._project_commit(project_id)
         relative = self._safe_source_path(path)
-        evidence = await self._repository.list_for_line(
+        page = await self._repository.page_for_line(
             project_id, commit, relative, line_number, limit=limit, offset=offset
         )
-        if not evidence:
+        if page.total == 0:
             raise KeyError("coverage not found")
-        self._require_commit(evidence, commit)
+        self._require_commit(page.items, commit)
         await self._checkouts.resolve(project_id, commit)
         result = []
-        for item in evidence:
+        for item in page.items:
             metadata = self._read_metadata(item)
             result.append({
                 "campaign_id": item.campaign_id,
@@ -277,7 +271,10 @@ class TraceabilityService:
                 "clean_image_id": metadata["clean_image_id"],
                 "cpu_exposure_seconds": item.cpu_exposure_seconds,
             })
-        return result
+        return {
+            "evidence": result,
+            "pagination": {"limit": limit, "offset": offset, "total": page.total},
+        }
 
     async def _project_commit(self, project_id):
         _positive(project_id, "project ID")
@@ -488,9 +485,9 @@ class TraceabilityService:
             _digest(document.get(key), key.replace("_", " "))
         if (
             not isinstance(document.get("clean_image_id"), str)
-            or not document["clean_image_id"].startswith("sha256:")
+            or not _is_image_id(document["clean_image_id"])
             or not isinstance(document.get("clean_parent_image_id"), str)
-            or not document["clean_parent_image_id"].startswith("sha256:")
+            or not _is_image_id(document["clean_parent_image_id"])
             or type(document.get("target_asset_id")) is not int
             or document["target_asset_id"] <= 0
             or type(document.get("coverage_asset_id")) is not int
@@ -554,10 +551,8 @@ class TraceabilityService:
         _commit(snapshot.commit_sha)
         _digest(snapshot.clean_content_hash, "clean content hash")
         if (
-            not isinstance(snapshot.clean_image_id, str)
-            or not snapshot.clean_image_id.startswith("sha256:")
-            or not isinstance(snapshot.clean_parent_image_id, str)
-            or not snapshot.clean_parent_image_id.startswith("sha256:")
+            not _is_image_id(snapshot.clean_image_id)
+            or not _is_image_id(snapshot.clean_parent_image_id)
         ):
             raise CoverageIntegrityError("clean image provenance is invalid")
         if (
@@ -673,6 +668,15 @@ def _positive(value, label):
 def _commit(value):
     if not isinstance(value, str) or len(value) not in {40, 64} or any(char not in "0123456789abcdef" for char in value):
         raise CoverageIntegrityError("coverage commit is invalid")
+
+
+def _is_image_id(value):
+    return (
+        isinstance(value, str)
+        and value.startswith("sha256:")
+        and len(value) == 71
+        and all(character in "0123456789abcdef" for character in value[7:])
+    )
 
 
 def _digest(value, label):

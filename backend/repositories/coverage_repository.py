@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from hashlib import sha256
 
 from backend.models.coverage import CoverageEvidence
@@ -12,6 +13,14 @@ _COLUMNS = (
     "id, project_id, commit_sha, source_path, line_number, function_name, campaign_id, asset_id, "
     "first_testcase_sha256, cpu_exposure_seconds"
 )
+_COLUMN_NAMES = tuple(part.strip() for part in _COLUMNS.split(","))
+_PAGE_COLUMNS = ", ".join(f"page.{name}" for name in _COLUMN_NAMES)
+
+
+@dataclass(frozen=True)
+class CoveragePage:
+    items: tuple
+    total: int
 
 
 class CoverageClaim:
@@ -21,6 +30,7 @@ class CoverageClaim:
         self._connection = connection
         self._key = key
         self.existing = existing
+        self.created = False
 
     async def create(
         self, *, function_name: str | None, campaign_id: int,
@@ -34,12 +44,23 @@ class CoverageClaim:
                        (project_id, commit_sha, source_path, line_number, function_name, campaign_id, asset_id,
                         first_testcase_sha256, cpu_exposure_seconds)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (project_id, commit_sha, source_path, line_number, asset_id) DO NOTHING
                 RETURNING {_COLUMNS}""",
             project_id, commit_sha, source_path, line_number, function_name, campaign_id, asset_id,
             first_testcase_sha256, cpu_exposure_seconds,
         )
         if row is None:
-            raise RuntimeError("coverage evidence creation did not return a row")
+            row = await self._connection.fetchrow(
+                f"""SELECT {_COLUMNS} FROM coverage_evidence
+                    WHERE project_id = $1 AND commit_sha = $2 AND source_path = $3
+                      AND line_number = $4 AND asset_id = $5
+                    ORDER BY id LIMIT 1""",
+                *self._key,
+            )
+            if row is None:
+                raise RuntimeError("coverage evidence conflict did not return its winner")
+        else:
+            self.created = True
         self.existing = CoverageRepository._coverage(row)
         return self.existing
 
@@ -65,12 +86,21 @@ class CoverageRepository:
                        (project_id, commit_sha, source_path, line_number, function_name, campaign_id, asset_id,
                         first_testcase_sha256, cpu_exposure_seconds)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (project_id, commit_sha, source_path, line_number, asset_id) DO NOTHING
                 RETURNING {_COLUMNS}""",
             project_id, commit_sha, source_path, line_number, function_name, campaign_id, asset_id,
             first_testcase_sha256, cpu_exposure_seconds,
         )
         if row is None:
-            raise RuntimeError("coverage evidence creation did not return a row")
+            row = await self._pool.fetchrow(
+                f"""SELECT {_COLUMNS} FROM coverage_evidence
+                    WHERE project_id = $1 AND commit_sha = $2 AND source_path = $3
+                      AND line_number = $4 AND asset_id = $5
+                    ORDER BY id LIMIT 1""",
+                project_id, commit_sha, source_path, line_number, asset_id,
+            )
+            if row is None:
+                raise RuntimeError("coverage evidence conflict did not return its winner")
         return self._coverage(row)
 
     @asynccontextmanager
@@ -107,6 +137,97 @@ class CoverageRepository:
         )
         return [self._coverage(row) for row in rows]
 
+    async def aggregate_project(
+        self, project_id: int, commit_sha: str, limit: int = 1_000, offset: int = 0,
+    ) -> CoveragePage:
+        self._validate_page(limit, offset)
+        rows = await self._pool.fetch(
+            """WITH grouped AS (
+                   SELECT source_path, COUNT(DISTINCT line_number) AS covered_lines,
+                          SUM(cpu_exposure_seconds) AS cpu_exposure_seconds
+                   FROM coverage_evidence
+                   WHERE project_id = $1 AND commit_sha = $2
+                   GROUP BY source_path
+               ), page AS (
+                   SELECT source_path, covered_lines, cpu_exposure_seconds
+                   FROM grouped ORDER BY source_path LIMIT $3 OFFSET $4
+               )
+               SELECT page.source_path, page.covered_lines, page.cpu_exposure_seconds, total.total
+               FROM (SELECT COUNT(*) AS total FROM grouped) AS total
+               LEFT JOIN page ON TRUE ORDER BY page.source_path""",
+            project_id, commit_sha, limit, offset,
+        )
+        total = int(rows[0]["total"]) if rows else 0
+        return CoveragePage(tuple({
+            "path": str(row["source_path"]),
+            "covered_lines": int(row["covered_lines"]),
+            "cpu_exposure_seconds": float(row["cpu_exposure_seconds"]),
+        } for row in rows if row["source_path"] is not None), total)
+
+    async def aggregate_functions(
+        self, project_id: int, commit_sha: str, source_path: str,
+        limit: int = 1_000, offset: int = 0,
+    ) -> CoveragePage:
+        self._validate_page(limit, offset)
+        rows = await self._pool.fetch(
+            """WITH grouped AS (
+                   SELECT function_name, COUNT(DISTINCT line_number) AS covered_lines,
+                          SUM(cpu_exposure_seconds) AS cpu_exposure_seconds
+                   FROM coverage_evidence
+                   WHERE project_id = $1 AND commit_sha = $2 AND source_path = $3
+                     AND function_name IS NOT NULL
+                   GROUP BY function_name
+               ), page AS (
+                   SELECT function_name, covered_lines, cpu_exposure_seconds
+                   FROM grouped ORDER BY function_name LIMIT $4 OFFSET $5
+               )
+               SELECT page.function_name, page.covered_lines, page.cpu_exposure_seconds, total.total
+               FROM (SELECT COUNT(*) AS total FROM grouped) AS total
+               LEFT JOIN page ON TRUE ORDER BY page.function_name""",
+            project_id, commit_sha, source_path, limit, offset,
+        )
+        total = int(rows[0]["total"]) if rows else 0
+        return CoveragePage(tuple({
+            "name": str(row["function_name"]),
+            "path": source_path,
+            "covered_lines": int(row["covered_lines"]),
+            "cpu_exposure_seconds": float(row["cpu_exposure_seconds"]),
+        } for row in rows if row["function_name"] is not None), total)
+
+    async def aggregate_source_range(
+        self, project_id: int, commit_sha: str, source_path: str, start_line: int, end_line: int,
+    ) -> tuple[dict, ...]:
+        if (
+            type(start_line) is not int or type(end_line) is not int
+            or start_line < 1 or end_line < start_line or end_line - start_line + 1 > 500
+        ):
+            raise ValueError("coverage source range is outside its bounded range")
+        rows = await self._pool.fetch(
+            """SELECT line_number, COUNT(DISTINCT asset_id) AS strategy_count,
+                      SUM(cpu_exposure_seconds) AS cpu_exposure_seconds
+               FROM coverage_evidence
+               WHERE project_id = $1 AND commit_sha = $2 AND source_path = $3
+                 AND line_number BETWEEN $4 AND $5
+               GROUP BY line_number ORDER BY line_number""",
+            project_id, commit_sha, source_path, start_line, end_line,
+        )
+        return tuple({
+            "line_number": int(row["line_number"]),
+            "strategy_count": int(row["strategy_count"]),
+            "cpu_exposure_seconds": float(row["cpu_exposure_seconds"]),
+        } for row in rows)
+
+    async def first_for_source(
+        self, project_id: int, commit_sha: str, source_path: str,
+    ) -> CoverageEvidence | None:
+        row = await self._pool.fetchrow(
+            f"""SELECT {_COLUMNS} FROM coverage_evidence
+                WHERE project_id = $1 AND commit_sha = $2 AND source_path = $3
+                ORDER BY id LIMIT 1""",
+            project_id, commit_sha, source_path,
+        )
+        return self._coverage(row) if row else None
+
     async def list_for_source(
         self, project_id: int, commit_sha: str, source_path: str, limit: int = 1_000, offset: int = 0,
     ) -> list[CoverageEvidence]:
@@ -132,6 +253,26 @@ class CoverageRepository:
         )
         return [self._coverage(row) for row in rows]
 
+    async def page_for_line(
+        self, project_id: int, commit_sha: str, source_path: str, line_number: int,
+        limit: int = 500, offset: int = 0,
+    ) -> CoveragePage:
+        self._validate_page(limit, offset)
+        rows = await self._pool.fetch(
+            f"""WITH matching AS (
+                    SELECT {_COLUMNS} FROM coverage_evidence
+                    WHERE project_id = $1 AND commit_sha = $2 AND source_path = $3 AND line_number = $4
+                ), page AS (
+                    SELECT * FROM matching ORDER BY id LIMIT $5 OFFSET $6
+                )
+                SELECT {_PAGE_COLUMNS}, total.total
+                FROM (SELECT COUNT(*) AS total FROM matching) AS total
+                LEFT JOIN page ON TRUE ORDER BY page.id""",
+            project_id, commit_sha, source_path, line_number, limit, offset,
+        )
+        total = int(rows[0]["total"]) if rows else 0
+        return CoveragePage(tuple(self._coverage(row) for row in rows if row["id"] is not None), total)
+
     @staticmethod
     def _validate_page(limit, offset):
         if type(limit) is not int or not 1 <= limit <= 5_000 or type(offset) is not int or not 0 <= offset <= 10_000_000:
@@ -139,4 +280,4 @@ class CoverageRepository:
 
     @staticmethod
     def _coverage(row) -> CoverageEvidence:
-        return CoverageEvidence(**dict(row))
+        return CoverageEvidence(**{name: row[name] for name in _COLUMN_NAMES})

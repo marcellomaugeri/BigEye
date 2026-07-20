@@ -620,6 +620,7 @@ class TestRuntimeContracts:
     def test_production_graph_uses_real_executor_workflow_and_deferred_docker(self, tmp_path: Path) -> None:
         from backend.api.dependencies import build_services
         from backend.agents.workflow import RepositoryAnalysisWorkflow
+        from backend.fuzzing.coverage.replay_verifier import FirstHitReplayVerifier
         from backend.fuzzing.toolchain.deferred import DeferredToolchain
         from backend.services.execute_project_backbone import ExecuteProjectBackbone
 
@@ -628,6 +629,7 @@ class TestRuntimeContracts:
         assert isinstance(executor, ExecuteProjectBackbone)
         assert isinstance(executor._analysis, RepositoryAnalysisWorkflow)
         assert isinstance(executor._toolchain, DeferredToolchain)
+        assert isinstance(services.coverage._replay_verifier, FirstHitReplayVerifier)
         assert executor._analysis._manager._event_store is services.observability
 
     def test_production_analysis_wiring_persists_activity_and_debug(self, tmp_path: Path) -> None:

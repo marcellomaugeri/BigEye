@@ -3,6 +3,12 @@
 from pydantic import BaseModel
 
 
+class PaginationResponse(BaseModel):
+    limit: int
+    offset: int
+    total: int
+
+
 class CoverageFileResponse(BaseModel):
     path: str
     covered_lines: int
@@ -13,6 +19,7 @@ class CoverageTreeResponse(BaseModel):
     project_id: int
     commit_sha: str
     files: list[CoverageFileResponse]
+    pagination: PaginationResponse
 
 
 class SourceLineResponse(BaseModel):
@@ -39,6 +46,11 @@ class FunctionCoverageResponse(BaseModel):
     cpu_exposure_seconds: float
 
 
+class FunctionCoveragePageResponse(BaseModel):
+    functions: list[FunctionCoverageResponse]
+    pagination: PaginationResponse
+
+
 class LineEvidenceResponse(BaseModel):
     campaign_id: int
     strategy_asset_id: int
@@ -48,3 +60,8 @@ class LineEvidenceResponse(BaseModel):
     configuration_asset_id: int | None
     clean_image_id: str
     cpu_exposure_seconds: float
+
+
+class LineEvidencePageResponse(BaseModel):
+    evidence: list[LineEvidenceResponse]
+    pagination: PaginationResponse

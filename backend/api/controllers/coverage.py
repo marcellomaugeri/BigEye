@@ -4,8 +4,8 @@ from fastapi import APIRouter, HTTPException, Query, Request
 
 from backend.api.views.coverage import (
     CoverageTreeResponse,
-    FunctionCoverageResponse,
-    LineEvidenceResponse,
+    FunctionCoveragePageResponse,
+    LineEvidencePageResponse,
     SourceFileResponse,
 )
 from backend.fuzzing.coverage.llvm_coverage import CoverageIntegrityError
@@ -55,7 +55,7 @@ async def source_file(
         _translate(error)
 
 
-@router.get("/projects/{project_id}/coverage/functions", response_model=list[FunctionCoverageResponse])
+@router.get("/projects/{project_id}/coverage/functions", response_model=FunctionCoveragePageResponse)
 async def functions(
     project_id: int,
     request: Request,
@@ -69,7 +69,7 @@ async def functions(
         _translate(error)
 
 
-@router.get("/projects/{project_id}/coverage/lines/{line_number}", response_model=list[LineEvidenceResponse])
+@router.get("/projects/{project_id}/coverage/lines/{line_number}", response_model=LineEvidencePageResponse)
 async def line_evidence(
     project_id: int,
     line_number: int,

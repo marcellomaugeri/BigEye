@@ -12,7 +12,7 @@ class _Coverage:
     async def project_tree(self, project_id, limit=1_000, offset=0):
         return {"project_id": project_id, "commit_sha": "a" * 40, "files": [
             {"path": "src/a.c", "covered_lines": 2, "cpu_exposure_seconds": 4.0},
-        ]}
+        ], "pagination": {"limit": limit, "offset": offset, "total": 1}}
 
     async def source_file(self, project_id, path, start_line, end_line):
         return {
@@ -23,15 +23,21 @@ class _Coverage:
         }
 
     async def function_summaries(self, project_id, path, limit=1_000, offset=0):
-        return [{"name": "parse", "path": path, "covered_lines": 2, "cpu_exposure_seconds": 4.0}]
+        return {
+            "functions": [{"name": "parse", "path": path, "covered_lines": 2, "cpu_exposure_seconds": 4.0}],
+            "pagination": {"limit": limit, "offset": offset, "total": 1},
+        }
 
     async def line_evidence(self, project_id, path, line_number, limit=500, offset=0):
-        return [{
-            "campaign_id": 4, "strategy_asset_id": 33, "testcase_sha256": "b" * 64,
-            "replay_command": ["/target", "{input}"], "target_asset_id": 31,
-            "configuration_asset_id": None, "clean_image_id": "sha256:clean",
-            "cpu_exposure_seconds": 2.0,
-        }]
+        return {
+            "evidence": [{
+                "campaign_id": 4, "strategy_asset_id": 33, "testcase_sha256": "b" * 64,
+                "replay_command": ["/target", "{input}"], "target_asset_id": 31,
+                "configuration_asset_id": None, "clean_image_id": "sha256:clean",
+                "cpu_exposure_seconds": 2.0,
+            }],
+            "pagination": {"limit": limit, "offset": offset, "total": 1},
+        }
 
 
 def _client(coverage=None):
@@ -60,12 +66,15 @@ def test_coverage_routes_expose_tree_source_functions_and_first_hit_evidence():
 
     assert tree.status_code == 200
     assert tree.json()["files"][0]["path"] == "src/a.c"
+    assert tree.json()["pagination"] == {"limit": 1000, "offset": 0, "total": 1}
     assert source.status_code == 200
     assert source.json()["lines"][0]["covered"] is True
     assert functions.status_code == 200
-    assert functions.json()[0]["name"] == "parse"
+    assert functions.json()["functions"][0]["name"] == "parse"
+    assert functions.json()["pagination"]["total"] == 1
     assert evidence.status_code == 200
-    assert evidence.json()[0]["strategy_asset_id"] == 33
+    assert evidence.json()["evidence"][0]["strategy_asset_id"] == 33
+    assert evidence.json()["pagination"]["total"] == 1
 
 
 def test_source_route_enforces_bounded_ranges_before_service_call():

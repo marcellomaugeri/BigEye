@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from backend.repositories.project_repository import ProjectRepository
+from backend.repositories.asset_repository import AssetRepository
+from backend.repositories.campaign_repository import CampaignRepository
 from backend.repositories.coverage_repository import CoverageRepository
 from backend.repositories.finding_repository import FindingRepository
 from backend.repositories.task_repository import TaskRepository
@@ -21,6 +23,11 @@ from backend.services.execute_project_backbone import ExecuteProjectBackbone
 from backend.agents.workflow import RepositoryAnalysisWorkflow
 from backend.fuzzing.toolchain.deferred import DeferredToolchain
 from backend.fuzzing.coverage.traceability import ProjectCheckoutRegistry, TraceabilityService
+from backend.fuzzing.coverage.replay_verifier import (
+    CleanCoverageTargetResolver,
+    DeferredLlvmCoverage,
+    FirstHitReplayVerifier,
+)
 from backend.fuzzing.crashes.artifacts import FindingArtifactStore
 from backend.fuzzing.crashes.quarantine import CrashQuarantine
 
@@ -49,6 +56,8 @@ class Services:
 
 def build_services(pool, workspace: Path) -> Services:
     projects = ProjectRepository(pool)
+    assets = AssetRepository(pool)
+    campaigns = CampaignRepository(pool)
     coverage_repository = CoverageRepository(pool)
     findings = FindingRepository(pool)
     tasks = TaskRepository(pool)
@@ -59,11 +68,16 @@ def build_services(pool, workspace: Path) -> Services:
     analysis = RepositoryAnalysisWorkflow(workspace, event_store=observability)
     executor = ExecuteProjectBackbone(projects, tasks, clone, toolchain, analysis, logs, workspace, observability)
     backbone = ProjectBackboneService(projects, executor)
+    checkout_registry = ProjectCheckoutRegistry(workspace, projects)
+    replay_verifier = FirstHitReplayVerifier(
+        CleanCoverageTargetResolver(checkout_registry, campaigns, assets),
+        DeferredLlvmCoverage(workspace / "coverage-replay"),
+    )
     coverage = TraceabilityService(
         workspace,
         coverage_repository,
-        replay_verifier=None,
-        checkout_registry=ProjectCheckoutRegistry(workspace, projects),
+        replay_verifier=replay_verifier,
+        checkout_registry=checkout_registry,
     )
     finding_artifacts = FindingArtifactStore(CrashQuarantine(workspace))
     return Services(

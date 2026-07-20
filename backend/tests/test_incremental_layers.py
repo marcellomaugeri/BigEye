@@ -53,7 +53,10 @@ def test_project_dependency_build_is_the_only_layer_with_network_access(tmp_path
     _asset(tmp_path, 7, asset, "build.sh", "#!/bin/sh\nexit 0\n")
     project_manifest = ProjectLayerService(tmp_path, builder, inspector).prepare(project, repository, asset, lambda text: None)
     TargetLayerService(tmp_path, builder, inspector).prepare(project, project_manifest, asset, asset, lambda text: None)
-    CoverageLayerService(tmp_path, builder, inspector).prepare(project, project_manifest, asset, asset, lambda text: None)
+    CoverageLayerService(tmp_path, builder, inspector).prepare(
+        project, project_manifest, asset, asset, lambda text: None,
+        target_asset_id=1, configuration_asset_id=1, coverage_asset_id=1,
+    )
 
     assert builder.network_modes == [None, "none", "none"]
 
@@ -109,6 +112,11 @@ def test_layer_rejects_foreign_or_retagged_parent_before_context_or_build(tmp_pa
     with pytest.raises(ValueError, match="parent"):
         if service_name == "ProjectLayerService":
             service.prepare(project, parent, asset, lambda text: None)
+        elif service_name == "CoverageLayerService":
+            service.prepare(
+                project, parent, asset, asset, lambda text: None,
+                target_asset_id=1, configuration_asset_id=1, coverage_asset_id=1,
+            )
         else:
             service.prepare(project, parent, asset, asset, lambda text: None)
     assert builder.network_modes == []
@@ -139,6 +147,64 @@ def test_agent_dockerfile_is_validated_before_build_and_changes_only_its_layer(t
         service.prepare(project, parent, asset, lambda text: None)
     assert builder.network_modes == [None]
     assert "bigeye.layer=\"project\"" in first.dockerfile.read_text()
+
+
+def test_coverage_layer_binds_asset_provenance_into_manifest_and_reuse_check(tmp_path: Path) -> None:
+    from backend.fuzzing.layers.coverage_layer import CoverageLayerService
+
+    project = SimpleNamespace(id=7, commit_sha="a" * 40)
+    parent = _manifest(tmp_path, "project", "project:tag")
+    adapter = SimpleNamespace(id=34, content_hash="adapter", name="adapter.cc", kind="adapter")
+    configuration = SimpleNamespace(id=35, content_hash="coverage", name="coverage.sh", kind="script")
+    _asset(tmp_path, 7, adapter, "adapter.cc", "int adapter;\n")
+    _asset(tmp_path, 7, configuration, "coverage.sh", "#!/bin/sh\ntrue\n")
+
+    class Builder(_Builder):
+        def __init__(self):
+            super().__init__()
+            self.expected = []
+
+        def inspect_matching(self, tag, labels):
+            self.expected.append((tag, dict(labels)))
+            return "sha256:cached"
+
+    builder = Builder()
+    inspector = SimpleNamespace(inspect=lambda _tag: SimpleNamespace(
+        image_id="sha256:parent", os="linux", architecture="amd64",
+    ))
+    manifest = CoverageLayerService(tmp_path, builder, inspector).prepare(
+        project, parent, adapter, configuration, lambda _text: None,
+        target_asset_id=31, configuration_asset_id=32, coverage_asset_id=34,
+    )
+
+    expected = {
+        "bigeye.target-asset-id": "31",
+        "bigeye.configuration-asset-id": "32",
+        "bigeye.coverage-asset-id": "34",
+    }
+    assert expected.items() <= manifest.labels.items()
+    assert expected.items() <= builder.expected[0][1].items()
+    assert all(f'{key}="{value}"' in manifest.dockerfile.read_text() for key, value in expected.items())
+    assert builder.network_modes == []
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("target_asset_id", 0), ("configuration_asset_id", True), ("coverage_asset_id", -1),
+])
+def test_coverage_layer_rejects_invalid_provenance_ids(tmp_path: Path, field: str, value) -> None:
+    from backend.fuzzing.layers.coverage_layer import CoverageLayerService
+
+    project = SimpleNamespace(id=7, commit_sha="a" * 40)
+    parent = _manifest(tmp_path, "project", "project:tag")
+    asset = SimpleNamespace(id=1, content_hash="asset", name="coverage.sh", kind="script")
+    _asset(tmp_path, 7, asset, "coverage.sh", "#!/bin/sh\ntrue\n")
+    values = {"target_asset_id": 31, "configuration_asset_id": 32, "coverage_asset_id": 34}
+    values[field] = value
+
+    with pytest.raises(ValueError, match="asset ID"):
+        CoverageLayerService(tmp_path, _Builder(), SimpleNamespace()).prepare(
+            project, parent, asset, asset, lambda _text: None, **values,
+        )
 
 
 @pytest.mark.parametrize("text", [
