@@ -414,6 +414,7 @@ def test_first_testcase_is_stable_per_strategy_and_replayed_before_insert(tmp_pa
 
     assert observed == [(b"first", 0)]
     assert repository.create_count == 1
+    assert created[0].cpu_exposure_seconds == 0.0
     assert ignored == []
     metadata = json.loads(next((tmp_path / "projects/7/coverage/first-hits").rglob("evidence.json")).read_text())
     assert metadata["testcase_sha256"] == first_digest

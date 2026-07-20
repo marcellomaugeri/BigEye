@@ -46,13 +46,17 @@ class Lock:
         yield self.acquired
 
 
-def coordinator(*, value=None, snapshot=None, manager=None, runtime=None, bootstrap=None, discovery=None, lock=None, events=None):
+def coordinator(
+    *, value=None, snapshot=None, manager=None, runtime=None, bootstrap=None, discovery=None,
+    lock=None, events=None, retirement_candidates=(),
+):
     from backend.services.campaigns.project_coordinator import ProjectCoordinator
 
     value = value or project()
     projects = AsyncMock()
     projects.get.return_value = value
     runtime = runtime or AsyncMock()
+    runtime.retirement_candidates.return_value = retirement_candidates
     runtime.reconcile.return_value = snapshot or healthy_snapshot()
     runtime.review_context.return_value = SimpleNamespace(project_id=value.id)
     runtime.review_evidence.return_value = [{"evidence_id": "campaign:3"}]
@@ -76,6 +80,59 @@ def test_healthy_campaign_does_not_call_manager_between_conditions() -> None:
     run(subject.tick(project_id=7, snapshot=healthy_snapshot()))
 
     manager.review.assert_not_awaited()
+
+
+def test_every_campaign_observation_applies_cpu_exposure_before_wake_evaluation() -> None:
+    runtime = AsyncMock()
+    subject = coordinator(runtime=runtime)
+
+    run(subject.tick(project_id=7, snapshot=healthy_snapshot()))
+
+    runtime.apply_cpu_checkpoint.assert_awaited_once_with(
+        subject.projects.get.return_value, healthy_snapshot(),
+    )
+    assert runtime.method_calls[0][0] == "apply_cpu_checkpoint"
+
+
+def test_overlap_candidate_is_reviewed_without_preemptively_stopping_the_worker() -> None:
+    from backend.fuzzing.coverage.overlap import RetirementCandidate
+
+    runtime = AsyncMock()
+    runtime.review_context.return_value = SimpleNamespace(project_id=7)
+    runtime.review_evidence.return_value = [{"evidence_id": "campaign:3"}]
+    runtime.retirement_candidates.return_value = (
+        RetirementCandidate(
+            project_id=7,
+            campaign_id=9,
+            strategy_asset_id=90,
+            retained_campaign_id=4,
+            retained_strategy_asset_id=40,
+            evidence_ids=("candidate:1", "retained:1", "candidate:2", "retained:2"),
+            reason="clean coverage remained a subset for two consecutive checkpoints",
+        ),
+    )
+    manager = AsyncMock()
+    decision = object()
+    manager.review.return_value = decision
+    subject = coordinator(
+        runtime=runtime,
+        manager=manager,
+        retirement_candidates=runtime.retirement_candidates.return_value,
+    )
+
+    trigger = run(subject.tick(project_id=7, snapshot=healthy_snapshot()))
+
+    assert trigger.reason == "overlap retirement candidate"
+    runtime.stop_campaigns.assert_not_awaited()
+    evidence = manager.review.await_args.args[1]
+    retirement = next(item for item in evidence if item["evidence_id"].startswith("retirement:"))
+    assert retirement["campaign_id"] == 9
+    assert retirement["retained_campaign_id"] == 4
+    assert retirement["reversible"] is True
+    assert retirement["preserved"] == ["assets", "corpus", "evidence", "reason"]
+    subject.decision_executor.execute.assert_awaited_once_with(
+        subject.projects.get.return_value, decision,
+    )
 
 
 def test_triggered_tick_runs_manager_and_only_the_validated_decision_executor() -> None:

@@ -156,7 +156,7 @@ class TraceabilityService:
                         function_name=line.function_name,
                         campaign_id=snapshot.campaign_id,
                         first_testcase_sha256=hit.testcase_sha256,
-                        cpu_exposure_seconds=snapshot.cpu_exposure_seconds,
+                        cpu_exposure_seconds=0.0,
                     )
                     won = getattr(claim, "created", True) is True
                     if won:

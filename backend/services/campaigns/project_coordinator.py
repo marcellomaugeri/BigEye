@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from dataclasses import replace
 import inspect
 
+from backend.fuzzing.coverage.overlap import RetirementCandidate
 from backend.services.campaigns.wake_rules import CampaignSnapshot, ReviewTrigger, WakeEvaluator
 
 
@@ -114,10 +115,27 @@ class ProjectCoordinator:
             return None
         action_lock = self._actions.setdefault(project_id, asyncio.Lock())
         async with action_lock:
+            await self._apply_cpu_checkpoint(project, snapshot)
             if project.paused_at is not None:
                 await self._runtime.pause(project_id)
                 self._previous[project_id] = snapshot
                 return None
+
+            retirement_candidates = await self._retirement_candidates(project, snapshot)
+            if any(candidate.project_id != project_id for candidate in retirement_candidates):
+                raise ValueError("retirement candidate belongs to another project")
+            retirement_evidence = tuple(
+                _retirement_evidence(candidate) for candidate in retirement_candidates
+            )
+            if retirement_evidence:
+                snapshot = replace(
+                    snapshot,
+                    overlap_candidate=True,
+                    evidence_ids=tuple(dict.fromkeys((
+                        *snapshot.evidence_ids,
+                        *(item["evidence_id"] for item in retirement_evidence),
+                    ))),
+                )
 
             if snapshot.active_workers > project.worker_count:
                 await self._runtime.enforce_worker_count(
@@ -140,6 +158,9 @@ class ProjectCoordinator:
             try:
                 context = await _await(self._runtime.review_context(project, snapshot))
                 evidence = await _await(self._runtime.review_evidence(project, snapshot, trigger))
+                if not isinstance(evidence, list):
+                    raise TypeError("campaign review evidence must be a list")
+                evidence = [*evidence, *retirement_evidence]
                 decision = await self._manager.review(context, evidence, trigger.reason)
                 await self.decision_executor.execute(project, decision)
             except asyncio.CancelledError:
@@ -225,7 +246,14 @@ class ProjectCoordinator:
         candidates = getattr(self._runtime, "retirement_candidates", None)
         if candidates is None:
             return ()
-        return await _await(candidates(project, snapshot))
+        values = await _await(candidates(project, snapshot))
+        if (
+            not isinstance(values, (tuple, list))
+            or len(values) > 256
+            or any(not isinstance(value, RetirementCandidate) for value in values)
+        ):
+            raise TypeError("retirement candidates must be bounded validated evidence")
+        return tuple(values)
 
     def _now(self) -> datetime:
         now = self._clock()
@@ -241,3 +269,21 @@ async def _await(value):
 def _project_id(value: int) -> None:
     if type(value) is not int or value <= 0:
         raise ValueError("project ID must be a positive integer")
+
+
+def _retirement_evidence(candidate: RetirementCandidate) -> dict:
+    return {
+        "evidence_id": (
+            f"retirement:{candidate.campaign_id}:{candidate.strategy_asset_id}:"
+            f"{candidate.retained_campaign_id}:{candidate.retained_strategy_asset_id}"
+        ),
+        "project_id": candidate.project_id,
+        "campaign_id": candidate.campaign_id,
+        "strategy_asset_id": candidate.strategy_asset_id,
+        "retained_campaign_id": candidate.retained_campaign_id,
+        "retained_strategy_asset_id": candidate.retained_strategy_asset_id,
+        "supporting_evidence_ids": list(candidate.evidence_ids),
+        "reason": candidate.reason,
+        "reversible": candidate.reversible,
+        "preserved": ["assets", "corpus", "evidence", "reason"],
+    }

@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from hashlib import sha256
+import math
 
 from backend.models.coverage import CoverageEvidence
 
@@ -103,6 +104,99 @@ class CoverageRepository:
                 raise RuntimeError("coverage evidence conflict did not return its winner")
         return self._coverage(row)
 
+    async def apply_exposure_observation(
+        self, *, campaign_id: int, observed_cpu_seconds: float,
+        reached_lines: tuple[tuple[str, int], ...],
+    ) -> bool:
+        """Atomically advance a campaign CPU watermark and its exact reached lines."""
+        if type(campaign_id) is not int or campaign_id <= 0:
+            raise ValueError("campaign ID must be a positive integer")
+        if (
+            isinstance(observed_cpu_seconds, bool)
+            or not isinstance(observed_cpu_seconds, (int, float))
+            or not math.isfinite(observed_cpu_seconds)
+            or observed_cpu_seconds < 0
+        ):
+            raise ValueError("observed CPU seconds must be finite and non-negative")
+        if (
+            not isinstance(reached_lines, tuple)
+            or len(reached_lines) > 100_000
+            or len(set(reached_lines)) != len(reached_lines)
+            or any(
+                not isinstance(item, tuple) or len(item) != 2
+                or not isinstance(item[0], str) or not item[0]
+                or type(item[1]) is not int or item[1] <= 0
+                for item in reached_lines
+            )
+        ):
+            raise ValueError("reached lines are invalid or exceed their bound")
+
+        observed = float(observed_cpu_seconds)
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                campaign = await connection.fetchrow(
+                    """SELECT c.project_id, p.commit_sha, c.cpu_seconds AS previous_cpu_seconds
+                       FROM campaigns AS c
+                       JOIN projects AS p ON p.id = c.project_id
+                       WHERE c.id = $1
+                       FOR UPDATE OF c""",
+                    campaign_id,
+                )
+                if campaign is None:
+                    raise KeyError(campaign_id)
+                previous = float(campaign["previous_cpu_seconds"])
+                if not math.isfinite(previous) or previous < 0:
+                    raise ValueError("stored CPU seconds are invalid")
+                if observed < previous:
+                    raise ValueError("observed CPU seconds cannot decrease")
+                if observed == previous:
+                    return False
+                delta = observed - previous
+
+                if reached_lines:
+                    paths = [path for path, _line in reached_lines]
+                    line_numbers = [line for _path, line in reached_lines]
+                    identities = await connection.fetch(
+                        """SELECT DISTINCT ce.commit_sha, ce.asset_id
+                           FROM coverage_evidence AS ce
+                           JOIN assets AS a ON a.id = ce.asset_id AND a.project_id = ce.project_id
+                           WHERE ce.campaign_id = $1
+                             AND ce.project_id = $2
+                             AND (ce.source_path, ce.line_number) IN (
+                                 SELECT * FROM unnest($3::text[], $4::integer[])
+                             )""",
+                        campaign_id, campaign["project_id"], paths, line_numbers,
+                    )
+                    if len(identities) != 1 or identities[0]["commit_sha"] != campaign["commit_sha"]:
+                        raise ValueError("reached lines do not share the campaign's exact clean commit and strategy")
+                    strategy_asset_id = identities[0]["asset_id"]
+                    updated = await connection.fetchval(
+                        """WITH reached(source_path, line_number) AS (
+                               SELECT * FROM unnest($4::text[], $5::integer[])
+                           ), updated AS (
+                               UPDATE coverage_evidence AS ce
+                               SET cpu_exposure_seconds = ce.cpu_exposure_seconds + $6
+                               FROM reached
+                               WHERE ce.campaign_id = $1
+                                 AND ce.commit_sha = $2
+                                 AND ce.asset_id = $3
+                                 AND ce.source_path = reached.source_path
+                                 AND ce.line_number = reached.line_number
+                               RETURNING ce.id
+                           )
+                           SELECT COUNT(*) FROM updated""",
+                        campaign_id, campaign["commit_sha"], strategy_asset_id,
+                        paths, line_numbers, delta,
+                    )
+                    if int(updated) != len(reached_lines):
+                        raise ValueError("not every reached line has exact clean coverage evidence")
+
+                await connection.execute(
+                    "UPDATE campaigns SET cpu_seconds = $2 WHERE id = $1",
+                    campaign_id, observed,
+                )
+                return True
+
     @asynccontextmanager
     async def claim(self, *, project_id: int, commit_sha: str, source_path: str, line_number: int, asset_id: int):
         key = (project_id, commit_sha, source_path, line_number, asset_id)
@@ -170,13 +264,24 @@ class CoverageRepository:
     ) -> CoveragePage:
         self._validate_page(limit, offset)
         rows = await self._pool.fetch(
-            """WITH grouped AS (
-                   SELECT function_name, COUNT(DISTINCT line_number) AS covered_lines,
-                          SUM(cpu_exposure_seconds) AS cpu_exposure_seconds
+            """WITH per_campaign AS (
+                   SELECT function_name, campaign_id, MAX(cpu_exposure_seconds) AS cpu_exposure_seconds
+                   FROM coverage_evidence
+                   WHERE project_id = $1 AND commit_sha = $2 AND source_path = $3
+                     AND function_name IS NOT NULL
+                   GROUP BY function_name, campaign_id
+               ), line_counts AS (
+                   SELECT function_name, COUNT(DISTINCT line_number) AS covered_lines
                    FROM coverage_evidence
                    WHERE project_id = $1 AND commit_sha = $2 AND source_path = $3
                      AND function_name IS NOT NULL
                    GROUP BY function_name
+               ), grouped AS (
+                   SELECT per_campaign.function_name, line_counts.covered_lines,
+                          SUM(per_campaign.cpu_exposure_seconds) AS cpu_exposure_seconds
+                   FROM per_campaign
+                   JOIN line_counts USING (function_name)
+                   GROUP BY per_campaign.function_name, line_counts.covered_lines
                ), page AS (
                    SELECT function_name, covered_lines, cpu_exposure_seconds
                    FROM grouped ORDER BY function_name LIMIT $4 OFFSET $5
