@@ -70,6 +70,31 @@ def test_target_patch_changes_identity_but_corpus_and_dictionary_do_not(tmp_path
     )
 
 
+def test_target_layer_labels_exact_persisted_asset_lineage_for_crash_correction(tmp_path: Path) -> None:
+    from backend.fuzzing.layers.target_layer import TargetLayerService
+
+    project = SimpleNamespace(id=7, commit_sha="a" * 40)
+    parent = _manifest(tmp_path, "project", "project:tag")
+    target = SimpleNamespace(id=31, content_hash="", name="harness.cc", kind="target", parent_id=12)
+    configuration = SimpleNamespace(id=32, content_hash="", name="build.sh", kind="configuration")
+    _asset(tmp_path, 7, target, "harness.cc", "int target;\n")
+    _asset(tmp_path, 7, configuration, "build.sh", "#!/bin/sh\ntrue\n")
+    inspector = SimpleNamespace(
+        inspect=lambda _tag: SimpleNamespace(image_id="sha256:parent", os="linux", architecture="amd64")
+    )
+
+    manifest = TargetLayerService(tmp_path, _Builder(), inspector).prepare(
+        project, parent, target, configuration, lambda _text: None,
+    )
+    dockerfile = manifest.dockerfile.read_text()
+
+    assert 'bigeye.target-asset="31"' in dockerfile
+    assert f'bigeye.target-content-hash="{target.content_hash}"' in dockerfile
+    assert 'bigeye.parent-target-asset="12"' in dockerfile
+    assert manifest.labels["bigeye.target-asset"] == "31"
+    assert manifest.labels["bigeye.target-content-hash"] == target.content_hash
+
+
 def test_concurrent_layer_builds_do_not_cross_sink_output(tmp_path: Path) -> None:
     from backend.fuzzing.layers.project_layer import ProjectLayerService
 

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
 import errno
 import fcntl
 import json
@@ -26,6 +29,73 @@ from backend.models.finding import Finding
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _POINTER_MAX_BYTES = 2_048
 _EVIDENCE_MAX_BYTES = 512 * 1024
+_CLASSIFICATION_ORDER = {
+    "true vulnerability": 0,
+    "improper contract usage": 1,
+    "harness-induced false positive": 2,
+    "flaky or environmental": 3,
+    "unresolved": 4,
+}
+
+
+class FindingRecoveryRequired(RuntimeError):
+    """Publication could not prove which complete generation is selected."""
+
+
+@dataclass(frozen=True)
+class FindingGroupSelection:
+    candidate_selected: bool
+    classification: str
+    description: str
+    reproducible: bool
+    reproducer_sha256: str
+    reproducer_size: int
+
+
+@dataclass(frozen=True)
+class _PublishedGeneration:
+    name: str
+    created: bool
+    previous_pointer: bytes | None
+
+
+class _PointerSwitchFailure(RuntimeError):
+    def __init__(self, original: BaseException, switched: bool):
+        super().__init__(str(original))
+        self.original = original
+        self.switched = switched
+
+
+@dataclass
+class _LockRecord:
+    lock: asyncio.Lock
+    users: int = 0
+
+
+class _GroupLockPool:
+    """Serialize same-process groups before taking the cross-process file lock."""
+
+    def __init__(self) -> None:
+        self._guard = asyncio.Lock()
+        self._records: dict[tuple[int, str], _LockRecord] = {}
+
+    @asynccontextmanager
+    async def acquire(self, key: tuple[int, str]):
+        async with self._guard:
+            record = self._records.setdefault(key, _LockRecord(asyncio.Lock()))
+            record.users += 1
+        acquired = False
+        try:
+            await record.lock.acquire()
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                record.lock.release()
+            async with self._guard:
+                record.users -= 1
+                if record.users == 0:
+                    self._records.pop(key, None)
 
 
 class FindingArtifactStore:
@@ -33,6 +103,7 @@ class FindingArtifactStore:
 
     def __init__(self, quarantine: CrashQuarantine):
         self._quarantine = quarantine
+        self._group_locks = _GroupLockPool()
 
     def publish(
         self,
@@ -42,6 +113,34 @@ class FindingArtifactStore:
         evidence: CrashTriageEvidence,
         triage: TriageResult,
     ) -> None:
+        with self._coordinate_locked(fingerprint, quarantined, reproducer, evidence, triage):
+            pass
+
+    @asynccontextmanager
+    async def coordinate(
+        self,
+        fingerprint: str,
+        quarantined: QuarantinedCrash,
+        reproducer: bytes,
+        evidence: CrashTriageEvidence,
+        triage: TriageResult,
+    ):
+        """Hold one local and cross-process group lock through the database transaction."""
+        async with self._group_locks.acquire((quarantined.project_id, fingerprint)):
+            with self._coordinate_locked(
+                fingerprint, quarantined, reproducer, evidence, triage,
+            ) as selection:
+                yield selection
+
+    @contextmanager
+    def _coordinate_locked(
+        self,
+        fingerprint: str,
+        quarantined: QuarantinedCrash,
+        reproducer: bytes,
+        evidence: CrashTriageEvidence,
+        triage: TriageResult,
+    ):
         self._validate_digest(fingerprint, "finding fingerprint")
         if not isinstance(reproducer, bytes) or len(reproducer) > self._quarantine.max_input_bytes:
             raise ValueError("finding reproducer is invalid or exceeds its bound")
@@ -53,11 +152,42 @@ class FindingArtifactStore:
             )
             identity = os.fstat(directory)
             lock = self._lock(directory)
+            publication = None
             try:
                 self._record_occurrence(directory, quarantined)
-                current = self._current(directory, fingerprint, required=False)
-                if current is None or current["reproducer"]["size"] > len(reproducer):
-                    self._publish_generation(directory, fingerprint, reproducer, evidence, triage)
+                previous_pointer, current = self._current_with_bytes(
+                    directory, fingerprint, required=False,
+                )
+                candidate = self._representative(reproducer, evidence, triage)
+                selected = current is None or self._prefer(candidate, current["representative"])
+                if selected:
+                    publication = self._publish_generation(
+                        directory, fingerprint, reproducer, evidence, triage,
+                        candidate, previous_pointer,
+                    )
+                    representative = candidate
+                else:
+                    representative = current["representative"]
+                selection = FindingGroupSelection(
+                    candidate_selected=selected,
+                    classification=representative["classification"],
+                    description=representative["description"],
+                    reproducible=representative["reproducible"],
+                    reproducer_sha256=representative["reproducer_sha256"],
+                    reproducer_size=representative["reproducer_size"],
+                )
+                if not self._is_canonical(
+                    quarantined.project_id, fingerprint, (identity.st_dev, identity.st_ino),
+                ):
+                    if publication is not None:
+                        self._rollback_publication(directory, publication)
+                    raise ValueError("canonical finding directory changed before database publication")
+                try:
+                    yield selection
+                except BaseException:
+                    if publication is not None:
+                        self._rollback_publication(directory, publication)
+                    raise
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
                 os.close(lock)
@@ -79,6 +209,15 @@ class FindingArtifactStore:
                 raise ValueError("finding evidence fingerprint does not match the database group")
             if document.get("reproducer") != pointer["reproducer"]:
                 raise ValueError("finding evidence does not match its selected reproducer")
+            if document.get("representative") != pointer["representative"]:
+                raise ValueError("finding evidence does not match its selected representative")
+            representative = self._representative_mapping(document.get("representative"))
+            if (
+                representative["classification"] != finding.classification
+                or representative["description"] != finding.description
+                or representative["reproducible"] != finding.reproducible
+            ):
+                raise ValueError("finding database fields do not match selected evidence")
             return {
                 "uncertainty": self._required_text(document.get("uncertainty"), 2_000),
                 "evidence_ids": self._string_list(document.get("evidence_ids"), 64, 2_000),
@@ -145,10 +284,12 @@ class FindingArtifactStore:
     def _publish_generation(
         self, directory: int, fingerprint: str, reproducer: bytes,
         evidence: CrashTriageEvidence, triage: TriageResult,
-    ) -> None:
+        representative: dict[str, object], previous_pointer: bytes | None,
+    ) -> _PublishedGeneration:
         reproducer_metadata = {"sha256": sha256(reproducer).hexdigest(), "size": len(reproducer)}
         manifest = {
             "fingerprint": fingerprint,
+            "representative": representative,
             "uncertainty": triage.uncertainty[:2_000],
             "evidence_ids": list(evidence.evidence_ids),
             "reproducer": reproducer_metadata,
@@ -172,21 +313,52 @@ class FindingArtifactStore:
         generations = _open_component(directory, "generations", create=True)
         created = False
         try:
-            created = self._create_generation(generations, generation_name, reproducer, evidence_bytes)
             pointer = self._json({
                 "fingerprint": fingerprint,
                 "generation": generation_name,
                 "reproducer": reproducer_metadata,
+                "representative": representative,
             })
+            if len(pointer) > _POINTER_MAX_BYTES:
+                raise ValueError("finding generation pointer exceeds its reader bound")
+            created = self._create_generation(generations, generation_name, reproducer, evidence_bytes)
             try:
                 self._before_pointer_switch(directory, generation_name)
-                self._atomic_file(directory, "current.json", pointer, mode=0o400)
+                self._atomic_pointer(directory, pointer, "publication")
+            except _PointerSwitchFailure as error:
+                if error.switched:
+                    try:
+                        self._restore_pointer(directory, previous_pointer)
+                    except BaseException as rollback_error:
+                        raise FindingRecoveryRequired(
+                            "finding pointer durability is uncertain; retain complete generations for reconciliation"
+                        ) from rollback_error
+                if created:
+                    self._remove_generation(generations, generation_name)
+                raise error.original
             except BaseException:
                 if created:
                     self._remove_generation(generations, generation_name)
                 raise
+            return _PublishedGeneration(generation_name, created, previous_pointer)
         finally:
             os.close(generations)
+
+    def _rollback_publication(
+        self, directory: int, publication: _PublishedGeneration,
+    ) -> None:
+        try:
+            self._restore_pointer(directory, publication.previous_pointer)
+        except BaseException as rollback_error:
+            raise FindingRecoveryRequired(
+                "finding database failed and pointer rollback requires reconciliation"
+            ) from rollback_error
+        if publication.created:
+            generations = _open_component(directory, "generations", create=False)
+            try:
+                self._remove_generation(generations, publication.name)
+            finally:
+                os.close(generations)
 
     def _create_generation(
         self, generations: int, name: str, reproducer: bytes, evidence: bytes,
@@ -233,18 +405,33 @@ class FindingArtifactStore:
             raise ValueError("finding generation evidence content changed")
 
     def _current(self, directory: int, fingerprint: str, required: bool) -> dict[str, object] | None:
+        _content, pointer = self._current_with_bytes(directory, fingerprint, required)
+        return pointer
+
+    def _current_with_bytes(
+        self, directory: int, fingerprint: str, required: bool,
+    ) -> tuple[bytes | None, dict[str, object] | None]:
         try:
             value = self._read_file(directory, "current.json", _POINTER_MAX_BYTES, immutable=True)
         except FileNotFoundError:
             if required:
                 raise ValueError("finding has no selected evidence generation")
-            return None
+            return None, None
         pointer = self._json_object(value, "finding generation pointer")
-        if set(pointer) != {"fingerprint", "generation", "reproducer"} or pointer.get("fingerprint") != fingerprint:
+        if (
+            set(pointer) != {"fingerprint", "generation", "reproducer", "representative"}
+            or pointer.get("fingerprint") != fingerprint
+        ):
             raise ValueError("finding generation pointer is invalid")
         self._validate_digest(pointer.get("generation"), "finding generation")
         pointer["reproducer"] = self._reproducer_metadata(pointer.get("reproducer"))
-        return pointer
+        pointer["representative"] = self._representative_mapping(pointer.get("representative"))
+        if (
+            pointer["representative"]["reproducer_sha256"] != pointer["reproducer"]["sha256"]
+            or pointer["representative"]["reproducer_size"] != pointer["reproducer"]["size"]
+        ):
+            raise ValueError("finding representative does not match its reproducer")
+        return value, pointer
 
     def _open_selected(self, finding: Finding) -> tuple[int, int, int, dict[str, object]]:
         self._validate_digest(finding.fingerprint, "finding fingerprint")
@@ -360,19 +547,39 @@ class FindingArtifactStore:
         finally:
             os.close(descriptor)
 
-    @staticmethod
-    def _atomic_file(directory: int, name: str, content: bytes, mode: int) -> None:
-        temporary = f".{name}.{uuid4().hex}.tmp"
-        FindingArtifactStore._write_new_file(directory, temporary, content, mode)
+    def _atomic_pointer(self, directory: int, content: bytes, phase: str) -> None:
+        temporary = f".current.json.{uuid4().hex}.tmp"
+        self._write_new_file(directory, temporary, content, 0o400)
         try:
-            os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
-            os.fsync(directory)
-        except BaseException:
+            self._replace_pointer(directory, temporary, phase)
+        except BaseException as error:
             try:
                 os.unlink(temporary, dir_fd=directory)
             except FileNotFoundError:
                 pass
-            raise
+            raise _PointerSwitchFailure(error, False) from error
+        try:
+            self._sync_pointer_directory(directory, phase)
+        except BaseException as error:
+            raise _PointerSwitchFailure(error, True) from error
+
+    def _restore_pointer(self, directory: int, previous_pointer: bytes | None) -> None:
+        if previous_pointer is not None:
+            self._atomic_pointer(directory, previous_pointer, "rollback")
+            return
+        try:
+            os.unlink("current.json", dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        self._sync_pointer_directory(directory, "rollback")
+
+    @staticmethod
+    def _replace_pointer(directory: int, temporary: str, _phase: str) -> None:
+        os.replace(temporary, "current.json", src_dir_fd=directory, dst_dir_fd=directory)
+
+    @staticmethod
+    def _sync_pointer_directory(directory: int, _phase: str) -> None:
+        os.fsync(directory)
 
     @staticmethod
     def _remove_generation(parent: int, name: str) -> None:
@@ -446,6 +653,60 @@ class FindingArtifactStore:
     @staticmethod
     def _before_pointer_switch(_directory: int, _generation: str) -> None:
         """Test seam after a complete generation and before its atomic selection."""
+
+    @classmethod
+    def _representative(
+        cls, reproducer: bytes, evidence: CrashTriageEvidence, triage: TriageResult,
+    ) -> dict[str, object]:
+        return cls._representative_mapping({
+            "classification": triage.classification,
+            "description": triage.description,
+            "reproducible": evidence.reproducible,
+            "reproducer_sha256": sha256(reproducer).hexdigest(),
+            "reproducer_size": len(reproducer),
+        })
+
+    @staticmethod
+    def _representative_mapping(value: object) -> dict[str, object]:
+        if not isinstance(value, dict) or set(value) != {
+            "classification", "description", "reproducible",
+            "reproducer_sha256", "reproducer_size",
+        }:
+            raise ValueError("finding representative is invalid")
+        classification = value.get("classification")
+        description = value.get("description")
+        reproducible = value.get("reproducible")
+        digest = value.get("reproducer_sha256")
+        size = value.get("reproducer_size")
+        if classification not in _CLASSIFICATION_ORDER:
+            raise ValueError("finding representative classification is invalid")
+        if not isinstance(description, str) or not description or len(description) > 1_000 or "\x00" in description:
+            raise ValueError("finding representative description is invalid")
+        if not isinstance(reproducible, bool):
+            raise ValueError("finding representative reproducibility is invalid")
+        if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+            raise ValueError("finding representative reproducer hash is invalid")
+        if isinstance(size, bool) or not isinstance(size, int) or not 0 <= size <= DEFAULT_MAX_INPUT_BYTES:
+            raise ValueError("finding representative reproducer size is invalid")
+        return {
+            "classification": classification,
+            "description": description,
+            "reproducible": reproducible,
+            "reproducer_sha256": digest,
+            "reproducer_size": size,
+        }
+
+    @staticmethod
+    def _prefer(candidate: dict[str, object], current: dict[str, object]) -> bool:
+        if candidate["reproducible"] != current["reproducible"]:
+            return candidate["reproducible"] is True
+        candidate_order = _CLASSIFICATION_ORDER[candidate["classification"]]
+        current_order = _CLASSIFICATION_ORDER[current["classification"]]
+        if candidate_order != current_order:
+            return candidate_order < current_order
+        if candidate["reproducer_size"] != current["reproducer_size"]:
+            return candidate["reproducer_size"] < current["reproducer_size"]
+        return candidate["reproducer_sha256"] < current["reproducer_sha256"]
 
     @staticmethod
     def _json(value: object) -> bytes:

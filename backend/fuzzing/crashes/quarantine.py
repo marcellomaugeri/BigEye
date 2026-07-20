@@ -27,6 +27,37 @@ _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | 
 _FILE_READ_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 
 
+class _MetadataBudget:
+    """Count text and exact ensure-ASCII JSON bytes without building aggregate copies."""
+
+    def __init__(self) -> None:
+        self.characters = 0
+        self.utf8_bytes = 0
+        self.json_bytes = 4_096
+
+    def add(self, value: str, overhead: int = 16) -> None:
+        for character in value:
+            codepoint = ord(character)
+            if 0xD800 <= codepoint <= 0xDFFF:
+                raise ValueError("crash metadata contains an invalid Unicode surrogate")
+            self.characters += 1
+            self.utf8_bytes += (
+                1 if codepoint <= 0x7F else 2 if codepoint <= 0x7FF
+                else 3 if codepoint <= 0xFFFF else 4
+            )
+            self.json_bytes += (
+                2 if character in {'"', "\\"} else 6 if codepoint < 0x20
+                else 1 if codepoint <= 0x7F else 6 if codepoint <= 0xFFFF else 12
+            )
+            self._check()
+        self.json_bytes += overhead
+        self._check()
+
+    def _check(self) -> None:
+        if max(self.characters, self.utf8_bytes, self.json_bytes) > MAX_METADATA_BYTES:
+            raise ValueError("crash metadata exceeds the quarantine reader bound")
+
+
 def _positive_id(value: object, label: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{label} must be a positive integer")
@@ -73,6 +104,7 @@ class CrashObservation:
     harness_misuse_evidence: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        budget = _MetadataBudget()
         _positive_id(self.project_id, "project ID")
         _positive_id(self.campaign_id, "campaign ID")
         _positive_id(self.target_asset_id, "target asset ID")
@@ -80,29 +112,42 @@ class CrashObservation:
             _positive_id(self.configuration_asset_id, "configuration asset ID")
         if not isinstance(self.commit_sha, str) or not _COMMIT_PATTERN.fullmatch(self.commit_sha):
             raise ValueError("commit SHA must be one exact hexadecimal object ID")
+        budget.add(self.commit_sha)
         if self.engine not in {"afl", "libfuzzer"}:
             raise ValueError("crash engine must be afl or libfuzzer")
+        budget.add(self.engine)
         if not isinstance(self.image_id, str) or not _IMAGE_PATTERN.fullmatch(self.image_id):
             raise ValueError("crash image ID must be an exact sha256 image ID")
+        budget.add(self.image_id)
         if self.clean_image_id is not None and not _IMAGE_PATTERN.fullmatch(self.clean_image_id):
             raise ValueError("clean image ID must be an exact sha256 image ID")
+        if self.clean_image_id is not None:
+            budget.add(self.clean_image_id)
         _bounded_text(self.sanitizer, "sanitizer", 100, empty=False)
+        budget.add(self.sanitizer)
         _bounded_text(self.engine_output, "engine output", MAX_ENGINE_OUTPUT_CHARS)
+        budget.add(self.engine_output)
         _bounded_text(self.stack, "stack", MAX_STACK_CHARS)
+        budget.add(self.stack)
         _bounded_text(self.signal, "signal", 100)
+        budget.add(self.signal)
         if not isinstance(self.command, tuple) or not 1 <= len(self.command) <= MAX_COMMAND_ITEMS:
             raise ValueError("crash command is empty or exceeds its bound")
         for item in self.command:
             _bounded_text(item, "command item", MAX_COMMAND_ITEM_CHARS, empty=False)
             if "\n" in item or "\r" in item:
                 raise ValueError("crash command items must be single-line strings")
+            budget.add(item)
         if not isinstance(self.input_bytes, bytes):
             raise ValueError("crash input must be bytes")
         _source_reference(self.source_location, "source location")
+        if self.source_location is not None:
+            budget.add(self.source_location)
         if not isinstance(self.coverage, tuple) or len(self.coverage) > MAX_COVERAGE_ITEMS:
             raise ValueError("coverage evidence exceeds its bound")
         for value in self.coverage:
             _source_reference(value, "coverage location")
+            budget.add(value)
         if (
             not isinstance(self.compatible_sanitizer_variants, tuple)
             or len(self.compatible_sanitizer_variants) > MAX_COMPATIBLE_VARIANTS
@@ -117,6 +162,8 @@ class CrashObservation:
             if name in variant_names or not _IMAGE_PATTERN.fullmatch(image_id):
                 raise ValueError("sanitizer variant names and image IDs must be unique and exact")
             variant_names.add(name)
+            budget.add(name)
+            budget.add(image_id)
         if (
             not isinstance(self.harness_misuse_evidence, tuple)
             or len(self.harness_misuse_evidence) > MAX_HARNESS_EVIDENCE_IDS
@@ -126,6 +173,7 @@ class CrashObservation:
             _bounded_text(value, "harness evidence", 2_000, empty=False)
             if value.startswith("/") or ".." in value or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]*", value):
                 raise ValueError("harness evidence must be a bounded identifier, not a path or text payload")
+            budget.add(value)
 
     def provenance(self) -> dict[str, object]:
         """Return bounded JSON data; the input remains a separate binary artefact."""

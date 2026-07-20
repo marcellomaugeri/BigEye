@@ -5,16 +5,30 @@ from __future__ import annotations
 import json
 import re
 from hashlib import sha256
+from pathlib import PurePosixPath
 
 from backend.fuzzing.crashes.replay import ReplayResult
 
 
 _ADDRESS = re.compile(r"\b0x[0-9a-fA-F]+\b")
-_FRAME_PREFIX = re.compile(r"^\s*#\d+\s+")
 _WHITESPACE = re.compile(r"\s+")
 _PROJECT_SOURCE = re.compile(
     r"(?<![/A-Za-z0-9_.-])(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+"
     r"\.(?:c|cc|cpp|cxx|h|hh|hpp|hxx|rs|swift|m|mm):\d+(?::\d+)?"
+)
+_SYMBOL = re.compile(r"(?:\bin\s+|!)([^\s(]+)")
+_MODULE = re.compile(r"\(([^()\s]+)\)")
+_OFFSET = re.compile(r"\+0x[0-9a-fA-F]+\Z")
+_RUNTIME_FUNCTION = re.compile(
+    r"^(?:__libc_start_main|abort|raise|start_thread|pthread_[A-Za-z0-9_]+|"
+    r"__asan_[A-Za-z0-9_]+|__ubsan_[A-Za-z0-9_]+|__msan_[A-Za-z0-9_]+|"
+    r"__tsan_[A-Za-z0-9_]+)$",
+    re.IGNORECASE,
+)
+_RUNTIME_MODULE = re.compile(
+    r"^(?:libc(?:\.|-)|libpthread(?:\.|-)|libasan(?:\.|-)|libubsan(?:\.|-)|"
+    r"libmsan(?:\.|-)|libtsan(?:\.|-)|ld-linux|libsystem)",
+    re.IGNORECASE,
 )
 
 
@@ -26,11 +40,19 @@ def normalise_stack(stack: str) -> tuple[str, ...]:
     frames = []
     for raw in stack.splitlines()[:64]:
         source = _PROJECT_SOURCE.search(raw)
-        if source is None:
+        symbol_match = _SYMBOL.search(raw)
+        if symbol_match is None:
             continue
-        value = _FRAME_PREFIX.sub("", raw)
-        value = _ADDRESS.sub("<address>", value)
-        value = _text(value)
+        function = _OFFSET.sub("", symbol_match.group(1)).casefold()
+        module_match = _MODULE.search(raw)
+        module = ""
+        if module_match is not None:
+            module_value = _OFFSET.sub("", _ADDRESS.sub("", module_match.group(1)))
+            module = PurePosixPath(module_value).name.casefold()
+        if _RUNTIME_FUNCTION.fullmatch(function) or module and _RUNTIME_MODULE.match(module):
+            continue
+        location = source.group(0).casefold() if source is not None else module
+        value = f"{function}@{location}" if location else function
         if value and value not in frames:
             frames.append(value)
     return tuple(frames)

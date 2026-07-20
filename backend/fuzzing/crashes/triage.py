@@ -83,15 +83,17 @@ class CrashPipeline:
         if observation.harness_misuse_evidence and correction is None:
             classification = "unresolved"
         published_triage = self._publication_triage(classification, evidence, representative)
-        description = published_triage.description
-        self.artifacts.publish(fingerprint, quarantined, minimum.input_bytes, evidence, published_triage)
-        return await self._findings.create_or_increment(
-            project_id=observation.project_id,
-            fingerprint=fingerprint,
-            classification=classification,
-            description=description,
-            reproducible=replay.reproducible,
-        )
+        async with self.artifacts.coordinate(
+            fingerprint, quarantined, minimum.input_bytes, evidence, published_triage,
+        ) as selected:
+            return await self._findings.create_or_increment(
+                project_id=observation.project_id,
+                fingerprint=fingerprint,
+                classification=selected.classification,
+                description=selected.description,
+                reproducible=selected.reproducible,
+                candidate_selected=selected.candidate_selected,
+            )
 
     async def _correction_experiment(
         self, observation: CrashObservation, fingerprint: str,

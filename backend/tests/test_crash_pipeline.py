@@ -15,7 +15,7 @@ from backend.fuzzing.crashes.fingerprint import crash_fingerprint
 from backend.fuzzing.crashes.minimisation import CrashMinimiser
 from backend.fuzzing.crashes.quarantine import CrashObservation, CrashQuarantine
 from backend.fuzzing.crashes.replay import ReplayResult
-from backend.fuzzing.crashes.artifacts import FindingArtifactStore
+from backend.fuzzing.crashes.artifacts import FindingArtifactStore, FindingRecoveryRequired
 from backend.fuzzing.crashes.correction import (
     CorrectionCandidate,
     CorrectionImage,
@@ -99,23 +99,30 @@ class Findings:
 
     async def create_or_increment(self, **values):
         self.calls.append(values)
+        await asyncio.sleep(0)
         key = (values["project_id"], values["fingerprint"])
         existing = self.rows.get(key)
         count = 1 if existing is None else existing.occurrence_count + 1
+        selected_values = values if existing is None or values["candidate_selected"] else {
+            **values,
+            "classification": existing.classification,
+            "description": existing.description,
+            "reproducible": existing.reproducible,
+        }
         priority_reason = (
-            f"{values['classification']}; "
-            f"{'reproducible' if values['reproducible'] else 'not reproducible'}; "
+            f"{selected_values['classification']}; "
+            f"{'reproducible' if selected_values['reproducible'] else 'not reproducible'}; "
             f"observed {count} {'time' if count == 1 else 'times'}"
         )
         finding = Finding(
             id=len(self.rows) + 1 if existing is None else existing.id,
             project_id=values["project_id"],
             fingerprint=values["fingerprint"],
-            classification=values["classification"],
+            classification=selected_values["classification"],
             priority_rank=1,
             priority_reason=priority_reason,
-            description=values["description"],
-            reproducible=values["reproducible"],
+            description=selected_values["description"],
+            reproducible=selected_values["reproducible"],
             occurrence_count=count,
             created_at=datetime(2026, 7, 20, tzinfo=UTC),
             triaged_at=datetime(2026, 7, 20, tzinfo=UTC),
@@ -188,8 +195,97 @@ def test_duplicate_crashes_become_one_group_with_occurrence_count(tmp_path: Path
     assert len(repository.calls) == 2
     retained = service.artifacts.read_reproducer(second)
     metadata = service.artifacts.detail(second)["reproducer"]
-    assert retained == b"one"
+    expected = min((b"one", b"two"), key=lambda value: __import__("hashlib").sha256(value).hexdigest())
+    assert retained == expected
     assert metadata == {"sha256": __import__("hashlib").sha256(retained).hexdigest(), "size": len(retained)}
+
+
+def test_parallel_duplicates_keep_database_fields_and_selected_artifact_consistent(tmp_path: Path):
+    service, repository, _ = pipeline(tmp_path)
+
+    async def exercise():
+        return await asyncio.gather(
+            service.process(observation(input_bytes=b"one")),
+            service.process(observation(input_bytes=b"two")),
+        )
+
+    first, second = run(exercise())
+    finding = repository.rows[(7, first.fingerprint)]
+
+    assert first.id == second.id == finding.id
+    assert finding.occurrence_count == 2
+    assert service.artifacts.detail(finding)["reproducer"]["size"] == len(
+        service.artifacts.read_reproducer(finding)
+    )
+    assert all(call["classification"] == finding.classification for call in repository.calls)
+
+
+def test_representative_policy_updates_database_only_when_candidate_becomes_selected(tmp_path: Path):
+    class SequenceSpecialist(Specialist):
+        def __init__(self):
+            super().__init__()
+            self.classifications = iter(("unresolved", "true vulnerability", "unresolved"))
+
+        async def triage(self, evidence):
+            self.classification = next(self.classifications)
+            return await super().triage(evidence)
+
+    service, repository, _ = pipeline(tmp_path, specialist=SequenceSpecialist())
+
+    run(service.process(observation(input_bytes=b"first-long-input")))
+    run(service.process(observation(input_bytes=b"second-long-input")))
+    finding = run(service.process(observation(input_bytes=b"x")))
+
+    assert [call["candidate_selected"] for call in repository.calls] == [True, True, False]
+    assert finding.classification == "true vulnerability"
+    assert finding.occurrence_count == 3
+    assert service.artifacts.detail(finding)["reproducer"]["size"] == len(
+        service.artifacts.read_reproducer(finding)
+    )
+
+
+def test_database_failure_durably_rolls_back_a_new_selected_pointer(tmp_path: Path):
+    class FailingFindings:
+        async def create_or_increment(self, **_values):
+            raise RuntimeError("injected database failure")
+
+    service, _, _ = pipeline(tmp_path)
+    service._findings = FailingFindings()
+    with pytest.raises(RuntimeError, match="database failure"):
+        run(service.process(observation()))
+
+    roots = [path for path in (tmp_path / "projects/7/findings").iterdir() if path.is_dir()]
+    assert len(roots) == 1
+    root = roots[0]
+    assert not (root / "current.json").exists()
+    assert list((root / "generations").iterdir()) == []
+
+
+def test_database_failure_with_uncertain_pointer_rollback_requires_recovery(tmp_path: Path):
+    class RollbackFailingStore(FindingArtifactStore):
+        armed = False
+
+        def _sync_pointer_directory(self, directory, phase):
+            if self.armed and phase == "rollback":
+                raise OSError("injected database rollback fsync failure")
+            return super()._sync_pointer_directory(directory, phase)
+
+    class FailingFindings:
+        async def create_or_increment(self, **_values):
+            raise RuntimeError("injected database failure")
+
+    service, _, _ = pipeline(tmp_path)
+    store = RollbackFailingStore(service.quarantine)
+    service.artifacts = store
+    run(service.process(observation(input_bytes=b"first-long-input")))
+    service._findings = FailingFindings()
+    store.armed = True
+
+    with pytest.raises(FindingRecoveryRequired, match="requires reconciliation"):
+        run(service.process(observation(input_bytes=b"x")))
+
+    root = next((tmp_path / "projects/7/findings").iterdir())
+    assert len(list((root / "generations").iterdir())) == 2
 
 
 def test_raw_crash_is_quarantined_and_not_published_until_replay_completes(tmp_path: Path):
@@ -275,7 +371,15 @@ def test_validated_correction_uses_persisted_lineage_exact_images_and_runs_once_
 
     class Images:
         def inspect_exact(self, image_id):
-            labels = {"bigeye.project": "7", "bigeye.commit": "a" * 40, "bigeye.layer": "target"}
+            corrected = image_id == "sha256:" + "e" * 64
+            labels = {
+                "bigeye.project": "7", "bigeye.commit": "a" * 40, "bigeye.layer": "target",
+                "bigeye.content-hash": ("5" if corrected else "4") * 64,
+                "bigeye.target-asset": "99" if corrected else "31",
+                "bigeye.target-content-hash": ("2" if corrected else "1") * 64,
+            }
+            if corrected:
+                labels["bigeye.parent-target-asset"] = "31"
             return CorrectionImage(image_id, "linux", "amd64", labels)
 
     class Builder:
@@ -321,6 +425,10 @@ def test_correction_evidence_rejects_a_contradictory_disappearance_claim():
             project_id=7, target_asset_id=31, corrected_asset_id=99,
             base_image_id="sha256:" + "b" * 64,
             corrected_image_id="sha256:" + "e" * 64,
+            target_asset_content_hash="1" * 64,
+            corrected_asset_content_hash="2" * 64,
+            base_manifest_hash="4" * 64,
+            corrected_manifest_hash="5" * 64,
             commit_sha="a" * 40, base_signature="1" * 64,
             corrected_signature="2" * 64, signature_disappeared=True,
             evidence_id="correction:" + "3" * 64,
@@ -442,6 +550,23 @@ def test_fingerprint_keeps_distinct_project_crash_sites_separate():
     assert crash_fingerprint(first) == crash_fingerprint(incidental)
 
 
+def test_fingerprint_keeps_symbolized_no_extension_functions_and_removes_runtime_aslr_noise():
+    base = ReplayResult(
+        variant="original", crashed=True, signal="SIGSEGV",
+        stack="#0 0x1234 in parse_one (/opt/project/parser+0xab)\n#1 0x456 in __libc_start_main libc.so.6+0x99",
+        sanitizer="address", source_location=None, coverage=(), exit_code=-11,
+        image_id="sha256:" + "b" * 64,
+    )
+    same = replace(
+        base,
+        stack="#0 0xdeadbeef in parse_one (/different/root/parser+0xff)\n#1 0x999 in abort libc.so.6+0x12",
+    )
+    distinct = replace(base, stack="#0 0x777 in parse_two (/opt/project/parser+0x01)")
+
+    assert crash_fingerprint(base) == crash_fingerprint(same)
+    assert crash_fingerprint(base) != crash_fingerprint(distinct)
+
+
 def test_replay_result_rejects_unvalidated_signal_and_sanitizer_names():
     with pytest.raises(ValueError, match="signal"):
         ReplayResult(
@@ -470,12 +595,17 @@ def test_quarantine_rejects_oversized_inputs_and_symlinked_project_paths(tmp_pat
         CrashQuarantine(tmp_path).persist(observation())
 
 
-def test_quarantine_rejects_metadata_larger_than_its_reader_bound_before_publication(tmp_path: Path):
+def test_observation_rejects_aggregate_metadata_before_json_serialisation_or_publication(tmp_path: Path, monkeypatch):
+    import backend.fuzzing.crashes.quarantine as quarantine_module
+
     large_coverage = tuple(f"src/{'a' * 1000}{index}.c:1" for index in range(3_000))
-    crash = observation(coverage=large_coverage)
+    monkeypatch.setattr(
+        quarantine_module.json, "dumps",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("json.dumps must not run")),
+    )
 
     with pytest.raises(ValueError, match="metadata exceeds"):
-        CrashQuarantine(tmp_path).persist(crash)
+        observation(coverage=large_coverage)
 
     assert not (tmp_path / "projects").exists()
 
@@ -581,3 +711,66 @@ def test_failed_generation_update_keeps_the_previous_complete_generation(tmp_pat
         )
     )
     assert store.read_reproducer(finding) == b"larger"
+
+
+@pytest.mark.parametrize("failure", ["replace", "fsync"])
+def test_pointer_publication_failure_durably_restores_the_previous_generation(tmp_path: Path, failure: str):
+    quarantine = CrashQuarantine(tmp_path)
+    first = quarantine.persist(observation(input_bytes=b"first"))
+    second = quarantine.persist(observation(input_bytes=b"second"))
+    fingerprint = "b" * 64
+
+    class FailingStore(FindingArtifactStore):
+        armed = False
+
+        def _replace_pointer(self, directory, temporary, phase):
+            if self.armed and phase == "publication" and failure == "replace":
+                raise OSError("injected replace failure")
+            return super()._replace_pointer(directory, temporary, phase)
+
+        def _sync_pointer_directory(self, directory, phase):
+            if self.armed and phase == "publication" and failure == "fsync":
+                raise OSError("injected fsync failure")
+            return super()._sync_pointer_directory(directory, phase)
+
+    store = FailingStore(quarantine)
+    store.publish(fingerprint, first, b"larger", artifact_evidence(fingerprint), artifact_triage())
+    root = tmp_path / "projects/7/findings" / fingerprint
+    previous = (root / "current.json").read_bytes()
+    store.armed = True
+
+    with pytest.raises(OSError, match=failure):
+        store.publish(fingerprint, second, b"x", artifact_evidence(fingerprint), artifact_triage())
+
+    assert (root / "current.json").read_bytes() == previous
+    assert [path.name for path in (root / "generations").iterdir()] == [
+        json.loads(previous)["generation"]
+    ]
+
+
+def test_uncertain_pointer_rollback_retains_both_complete_generations_for_recovery(tmp_path: Path):
+    quarantine = CrashQuarantine(tmp_path)
+    first = quarantine.persist(observation(input_bytes=b"first"))
+    second = quarantine.persist(observation(input_bytes=b"second"))
+    fingerprint = "9" * 64
+
+    class UncertainStore(FindingArtifactStore):
+        armed = False
+
+        def _sync_pointer_directory(self, directory, phase):
+            if self.armed and phase in {"publication", "rollback"}:
+                raise OSError(f"injected {phase} fsync failure")
+            return super()._sync_pointer_directory(directory, phase)
+
+    store = UncertainStore(quarantine)
+    store.publish(fingerprint, first, b"larger", artifact_evidence(fingerprint), artifact_triage())
+    root = tmp_path / "projects/7/findings" / fingerprint
+    store.armed = True
+
+    with pytest.raises(FindingRecoveryRequired, match="reconciliation"):
+        store.publish(fingerprint, second, b"x", artifact_evidence(fingerprint), artifact_triage())
+
+    generations = list((root / "generations").iterdir())
+    assert len(generations) == 2
+    assert all({path.name for path in generation.iterdir()} == {"minimal.bin", "evidence.json"} for generation in generations)
+    assert all(generation.stat().st_mode & 0o222 == 0 for generation in generations)

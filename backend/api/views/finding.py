@@ -76,6 +76,10 @@ class CorrectionResponse(BaseModel):
     corrected_asset_id: int | None = Field(default=None, gt=0)
     base_image_id: str | None = Field(default=None, pattern=r"^sha256:[0-9a-f]{64}$")
     corrected_image_id: str | None = Field(default=None, pattern=r"^sha256:[0-9a-f]{64}$")
+    target_asset_content_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    corrected_asset_content_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    base_manifest_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    corrected_manifest_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     commit_sha: str | None = Field(default=None, pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
     base_signature: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     corrected_signature: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
@@ -88,6 +92,8 @@ class CorrectionResponse(BaseModel):
         evidence_fields = (
             self.project_id, self.target_asset_id, self.corrected_asset_id,
             self.base_image_id, self.corrected_image_id, self.commit_sha,
+            self.target_asset_content_hash, self.corrected_asset_content_hash,
+            self.base_manifest_hash, self.corrected_manifest_hash,
             self.base_signature, self.signature_disappeared, self.evidence_id,
         )
         if self.error is not None:
@@ -95,6 +101,12 @@ class CorrectionResponse(BaseModel):
                 raise ValueError("correction error cannot include unvalidated evidence")
         elif any(value is None for value in evidence_fields):
             raise ValueError("correction evidence is incomplete")
+        elif (
+            self.base_image_id == self.corrected_image_id
+            or self.target_asset_content_hash == self.corrected_asset_content_hash
+            or self.signature_disappeared != (self.corrected_signature is None)
+        ):
+            raise ValueError("correction evidence lineage or disappearance is contradictory")
         return self
 
 

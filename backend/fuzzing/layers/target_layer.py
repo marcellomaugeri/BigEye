@@ -32,6 +32,12 @@ class TargetLayerService(_GeneratedLayerService):
             patch_name = self._asset_entrypoint(fuzz_patch_asset)
             assets.append(("fuzz-patch", fuzz_patch_asset))
             patch_steps = f"COPY fuzz-patch/ /bigeye/fuzz-patch/\nRUN patch -p1 < /bigeye/fuzz-patch/{patch_name}\n"
+        target_lineage = {
+            "bigeye.target-asset": str(target_asset.id),
+            "bigeye.target-content-hash": target_asset.content_hash,
+        }
+        if getattr(target_asset, "parent_id", None) is not None:
+            target_lineage["bigeye.parent-target-asset"] = str(target_asset.parent_id)
         template = (
             "FROM {parent}\nWORKDIR /src\nCOPY target/ /bigeye/target/\n"
             "COPY configuration/ /bigeye/configuration/\n"
@@ -42,4 +48,5 @@ class TargetLayerService(_GeneratedLayerService):
         )
         return self._prepare(
             project, project_manifest, tuple(assets), template, sink, "none", cancellation_signal,
+            extra_labels=target_lineage,
         )

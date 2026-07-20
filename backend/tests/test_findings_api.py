@@ -197,7 +197,7 @@ def test_repository_creates_or_atomically_increments_one_project_fingerprint_gro
     pool = Pool()
     row = __import__("asyncio").run(FindingRepository(pool).create_or_increment(
         project_id=7, fingerprint="a" * 64, classification="true vulnerability",
-        description="description", reproducible=True,
+        description="description", reproducible=True, candidate_selected=True,
     ))
 
     assert row.occurrence_count == 2
@@ -205,7 +205,9 @@ def test_repository_creates_or_atomically_increments_one_project_fingerprint_gro
     assert "pg_advisory_xact_lock" in queries[0]
     assert "INSERT INTO findings" in queries[1]
     assert "ON CONFLICT (project_id, fingerprint)" in queries[1]
+    assert "CASE WHEN $6 THEN EXCLUDED.classification ELSE findings.classification END" in queries[1]
     assert "occurrence_count = findings.occurrence_count + 1" in queries[1]
+    assert pool.connection.calls[1][1][-1] is True
     assert "ROW_NUMBER() OVER" in queries[2]
     assert "priority_reason" in queries[2]
 
@@ -279,7 +281,7 @@ def test_repository_rejects_non_text_classification_without_querying():
     with pytest.raises(ValueError, match="classification"):
         asyncio.run(FindingRepository(Pool()).create_or_increment(
             project_id=7, fingerprint="a" * 64, classification=["unresolved"],
-            description="description", reproducible=False,
+            description="description", reproducible=False, candidate_selected=True,
         ))
 
 

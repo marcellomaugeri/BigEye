@@ -52,7 +52,7 @@ class FindingRepository:
 
     async def create_or_increment(
         self, *, project_id: int, fingerprint: str, classification: str,
-        description: str, reproducible: bool,
+        description: str, reproducible: bool, candidate_selected: bool,
     ) -> Finding:
         """Atomically publish one database-unique project/fingerprint crash group."""
         if isinstance(project_id, bool) or not isinstance(project_id, int) or project_id <= 0:
@@ -68,6 +68,8 @@ class FindingRepository:
             raise ValueError("finding description is invalid")
         if not isinstance(reproducible, bool):
             raise ValueError("finding reproducibility must be boolean")
+        if not isinstance(candidate_selected, bool):
+            raise ValueError("finding candidate selection must be boolean")
         async with self._pool.acquire() as connection:
             async with connection.transaction():
                 await connection.execute(
@@ -79,14 +81,14 @@ class FindingRepository:
                                description, reproducible, occurrence_count, triaged_at)
                        VALUES ($1, $2, $3, NULL, NULL, $4, $5, 1, CURRENT_TIMESTAMP)
                        ON CONFLICT (project_id, fingerprint) DO UPDATE
-                          SET classification = EXCLUDED.classification,
-                              description = EXCLUDED.description,
-                              reproducible = EXCLUDED.reproducible,
+                          SET classification = CASE WHEN $6 THEN EXCLUDED.classification ELSE findings.classification END,
+                              description = CASE WHEN $6 THEN EXCLUDED.description ELSE findings.description END,
+                              reproducible = CASE WHEN $6 THEN EXCLUDED.reproducible ELSE findings.reproducible END,
                               occurrence_count = findings.occurrence_count + 1,
                               triaged_at = CURRENT_TIMESTAMP,
                               error = NULL
                     RETURNING id""",
-                    project_id, fingerprint, classification, description, reproducible,
+                    project_id, fingerprint, classification, description, reproducible, candidate_selected,
                 )
                 if candidate is None:
                     raise RuntimeError("finding publication did not return a crash group")
@@ -125,7 +127,14 @@ class FindingRepository:
                 )
                 if row is None:
                     raise RuntimeError("ranked finding publication did not return its crash group")
-                return self._finding(row)
+                finding = self._finding(row)
+                if (
+                    finding.classification != classification
+                    or finding.description != description
+                    or finding.reproducible != reproducible
+                ):
+                    raise RuntimeError("finding database fields differ from selected artifact evidence")
+                return finding
 
     @staticmethod
     def _finding(row) -> Finding:
