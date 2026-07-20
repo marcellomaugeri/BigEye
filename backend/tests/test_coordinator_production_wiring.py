@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from hashlib import sha256
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -968,8 +969,9 @@ def test_missing_dependency_command_is_an_explicit_noop_not_fake_compilation(tmp
         SimpleNamespace(generated_asset_intents=[]),
     ))
 
-    source = store.create_reusable.await_args.args[3]["project-dependencies.sh"]
+    source, declared_hash = store.create_reusable.await_args.args[3]["project-dependencies.sh"]
     text = source.read_text()
+    assert declared_hash == sha256(source.read_bytes()).hexdigest()
     assert "intentionally has no project dependency command" in text
     assert "cmake" not in text and "make" not in text
 

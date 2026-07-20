@@ -215,7 +215,20 @@ def test_same_content_preparation_source_is_idempotent_during_concurrent_creatio
     ))) == 1
 
 
-def test_preparation_source_is_bound_before_asset_store_normalization(tmp_path) -> None:
+@pytest.mark.parametrize(
+    ("case", "source_name", "asset_name"),
+    (
+        ("dependency", "project-dependencies.sh", "project-dependencies.sh"),
+        ("empty probe", "probe/empty.txt", "target"),
+        ("minimum probe", "probe/minimum.txt", "target"),
+        ("coverage manifest", "coverage-build-manifest.txt", "coverage-build-manifest.txt"),
+        ("target build", "target-build.sh", "target-build.sh"),
+        ("coverage build", "coverage-build.sh", "coverage-build.sh"),
+    ),
+)
+def test_application_source_is_bound_before_asset_store_normalization(
+    tmp_path, case, source_name, asset_name,
+) -> None:
     from backend.agents.tools.generated_assets import read_asset_file, write_asset_file
     import backend.fuzzing.campaigns.production_factory as production_factory
     from backend.fuzzing.assets.store import AssetStore
@@ -227,53 +240,86 @@ def test_preparation_source_is_bound_before_asset_store_normalization(tmp_path) 
         repository_root=repository_root,
         generated_assets_root=repository_root.parent / "generated",
     )
-    source = production_factory._application_preparation_file(
-        context,
-        "target-build.sh",
-        "#!/bin/sh\nset -eu\nexit 0\n",
-    )
+    (repository_root / "seed").write_bytes(b"seed")
 
     class Assets:
         def __init__(self):
-            self.created = False
+            self.created = []
 
         async def create(self, project_id, kind, name, content_hash, parent_id):
-            self.created = True
-            return SimpleNamespace(
-                id=1, project_id=project_id, kind=kind, name=name,
+            asset = SimpleNamespace(
+                id=len(self.created) + 1, project_id=project_id, kind=kind, name=name,
                 content_hash=content_hash, parent_id=parent_id,
                 validated_at=None, error=None,
             )
+            self.created.append(asset)
+            return asset
 
         async def mark_validated(self, asset_id):
-            assert asset_id == 1
-            return SimpleNamespace(id=asset_id)
+            return next(asset for asset in self.created if asset.id == asset_id)
 
         async def record_error(self, _asset_id, _error):
             pass
 
     class ReplacingStore(AssetStore):
+        replaced = False
+
         def _normalise(self, project_id, kind, files):
-            selected = files["target-build.sh"]
-            path = selected[0] if isinstance(selected, tuple) else selected
-            relative_path = path.relative_to(context.generated_assets_root).as_posix()
-            existing = read_asset_file(context, relative_path)
-            write_asset_file(
-                context,
-                relative_path,
-                "#!/bin/sh\nset -eu\nexit 2\n",
-                existing["sha256"],
-            )
+            if source_name in files and not self.replaced:
+                self.replaced = True
+                selected = files[source_name]
+                path = selected[0] if isinstance(selected, tuple) else selected
+                relative_path = path.relative_to(context.generated_assets_root).as_posix()
+                existing = read_asset_file(context, relative_path)
+                replacement = (
+                    "#!/bin/sh\nset -eu\nexit 2\n"
+                    if path.suffix == ".sh"
+                    else "replaced\n"
+                )
+                write_asset_file(
+                    context, relative_path, replacement, existing["sha256"],
+                )
             return super()._normalise(project_id, kind, files)
 
     assets = Assets()
-    with pytest.raises(ValueError, match="declared hash"):
-        asyncio.run(ReplacingStore(workspace, assets).create(
-            7, "script", "target-build.sh", {"target-build.sh": source}, None,
-        ))
+    store = ReplacingStore(workspace, assets)
 
-    assert assets.created is False
-    assert not (workspace / "projects/7/assets").exists()
+    async def execute():
+        if case == "dependency":
+            normal = production_factory.NormalBuildPreparation(
+                discovery=SimpleNamespace(context=lambda _project_id: context),
+                asset_store=store,
+                repository_layers=SimpleNamespace(prepare=lambda *_args: "repository"),
+                project_layers=SimpleNamespace(prepare=lambda *_args: "project"),
+                toolchain_tag="toolchain",
+                sink=lambda _text: None,
+            )
+            return await normal.validate(
+                SimpleNamespace(id=7, commit_sha="a" * 40),
+                SimpleNamespace(generated_asset_intents=[]),
+            )
+        planner = ProposalPreparationPlanner(
+            discovery=SimpleNamespace(context=lambda _project_id: context),
+            asset_store=store,
+        )
+        return await planner.plan(
+            SimpleNamespace(id=7),
+            SimpleNamespace(
+                instance_type="system-level",
+                build_command=(
+                    "cmake -S /src -B /opt/bigeye/build && "
+                    "cmake --build /opt/bigeye/build --target fuzz-target"
+                ),
+                run_command="/opt/bigeye/fuzz-target",
+                seeds=(SimpleNamespace(path="seed"),),
+                generated_asset_intents=(),
+            ),
+        )
+
+    with pytest.raises(ValueError, match="declared hash"):
+        asyncio.run(execute())
+
+    assert all(asset.name != asset_name for asset in assets.created)
 
 
 @pytest.mark.parametrize("prompt", (SYSTEM_TARGET_PROMPT, COMPONENT_TARGET_PROMPT))

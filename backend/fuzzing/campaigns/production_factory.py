@@ -151,8 +151,8 @@ class ProposalPreparationPlanner:
 
     async def plan(self, project, proposal) -> PreparationPlan:
         context = self._discovery.context(project.id)
-        target_files: dict[str, Path] = {}
-        coverage_files: dict[str, Path] = {}
+        target_files: dict[str, Path | tuple[Path, str]] = {}
+        coverage_files: dict[str, Path | tuple[Path, str]] = {}
         patch_files: dict[str, Path] = {}
         target_paths: list[str] = []
         coverage_paths: list[str] = []
@@ -398,7 +398,8 @@ class ProductionTargetPreparationFactory:
         )
 
 
-def _application_file(context, relative_path: str, content: str) -> Path:
+def _application_file(context, relative_path: str, content: str) -> tuple[Path, str]:
+    digest = sha256(content.encode("utf-8")).hexdigest()
     try:
         existing = read_asset_file(context, relative_path)
     except GeneratedAssetError:
@@ -414,15 +415,14 @@ def _application_file(context, relative_path: str, content: str) -> Path:
     else:
         if existing["content"] != content:
             raise ValueError("application-owned generated preparation source changed")
-    return context.generated_assets_root / relative_path
+    return context.generated_assets_root / relative_path, digest
 
 
 def _application_preparation_file(context, name: str, content: str) -> tuple[Path, str]:
     digest = sha256(content.encode("utf-8")).hexdigest()
-    source = _application_file(
+    return _application_file(
         context, f"application/preparation/{digest}/{name}", content,
     )
-    return source, digest
 
 
 def _is_dependency_intent(intent) -> bool:
