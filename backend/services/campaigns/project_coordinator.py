@@ -221,8 +221,8 @@ class ProjectCoordinator:
                 manager_decision = getattr(decision, "decision", None)
                 if manager_decision is not None:
                     wake_at = now + timedelta(seconds=manager_decision.next_review_delay_seconds)
-                    await self.projects.schedule_manager_review(
-                        project_id, wake_at, manager_decision.next_review_reason,
+                    await self._schedule_manager_review(
+                        project, wake_at, manager_decision.next_review_reason,
                     )
             except asyncio.CancelledError:
                 raise
@@ -242,9 +242,7 @@ class ProjectCoordinator:
                     if attempts < MAX_MANAGER_REVIEW_ATTEMPTS
                     else f"Failure backoff after {type(error).__name__}: {trigger.reason}"
                 )
-                await self.projects.schedule_manager_review(
-                    project_id, retry_at, retry_reason,
-                )
+                await self._schedule_manager_review(project, retry_at, retry_reason)
                 if attempts < MAX_MANAGER_REVIEW_ATTEMPTS:
                     self._pending_reviews[project_id] = _PendingReview(
                         trigger, attempts, retry_at,
@@ -254,16 +252,12 @@ class ProjectCoordinator:
                     )
                 else:
                     self._pending_reviews.pop(project_id, None)
-                    self._previous[project_id] = replace(
-                        _consumed_snapshot(snapshot, trigger), manager_wake_at=retry_at,
-                    )
+                    self._previous[project_id] = _scheduled_snapshot(snapshot, trigger, retry_at)
                 await self._record_manager_failure(project_id, trigger, error)
             else:
                 self._pending_reviews.pop(project_id, None)
                 if manager_decision is not None:
-                    self._previous[project_id] = replace(
-                        _consumed_snapshot(snapshot, trigger), manager_wake_at=wake_at,
-                    )
+                    self._previous[project_id] = _scheduled_snapshot(snapshot, trigger, wake_at)
                 else:
                     self._previous[project_id] = _consumed_snapshot(snapshot, trigger)
             return trigger
@@ -315,6 +309,12 @@ class ProjectCoordinator:
             "evidence_ids": list(trigger.evidence_ids),
             "next_review_reason": trigger.reason,
         })
+
+    async def _schedule_manager_review(self, project, deadline: datetime, reason: str) -> None:
+        await self.projects.schedule_manager_review(project.id, deadline, reason)
+        schedule = getattr(self._runtime, "schedule_next_review", None)
+        if schedule is not None:
+            await _await(schedule(project, deadline, reason))
 
     async def _apply_cpu_checkpoint(self, project, snapshot: CampaignSnapshot) -> None:
         """Task 15 seam: persist one runtime checkpoint without choosing retirement here."""
@@ -420,3 +420,14 @@ def _consumed_snapshot(snapshot: CampaignSnapshot, trigger: ReviewTrigger) -> Ca
     if trigger.reason == "review window expired" and not snapshot.review_due:
         return replace(snapshot, manager_wake_at=None)
     return snapshot
+
+
+def _scheduled_snapshot(
+    snapshot: CampaignSnapshot, trigger: ReviewTrigger, deadline: datetime,
+) -> CampaignSnapshot:
+    return replace(
+        _consumed_snapshot(snapshot, trigger),
+        review_due=False,
+        next_review_after=deadline,
+        manager_wake_at=deadline,
+    )

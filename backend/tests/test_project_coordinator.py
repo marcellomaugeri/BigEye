@@ -4,7 +4,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
@@ -327,6 +327,54 @@ def test_successful_manager_review_persists_the_manager_selected_deadline() -> N
     )
 
 
+def test_expired_campaign_deadline_advances_with_the_manager_deadline() -> None:
+    project_value = project()
+    manager = AsyncMock()
+    manager.review.side_effect = [
+        SimpleNamespace(decision=SimpleNamespace(
+            next_review_delay_seconds=900,
+            next_review_reason="Recheck clean coverage slope.",
+        )),
+        SimpleNamespace(decision=SimpleNamespace(
+            next_review_delay_seconds=1_200,
+            next_review_reason="Recheck corpus growth.",
+        )),
+    ]
+    runtime = AsyncMock()
+    campaign_deadline = [NOW]
+    current_time = [NOW]
+    subject = coordinator(value=project_value, manager=manager, runtime=runtime)
+    subject._clock = lambda: current_time[0]
+    subject.decision_executor.execute.return_value = []
+
+    async def schedule_project(project_id, wake_at, reason):
+        assert project_id == 7
+        project_value.manager_wake_at = wake_at
+
+    async def schedule_campaign(project, wake_at, reason):
+        assert project is project_value
+        campaign_deadline[0] = wake_at
+
+    subject.projects.schedule_manager_review.side_effect = schedule_project
+    runtime.schedule_next_review.side_effect = schedule_campaign
+
+    run(subject.tick(7, healthy_snapshot(review_due=True, next_review_after=NOW)))
+
+    runtime.schedule_next_review.assert_awaited_once_with(
+        project_value,
+        NOW + timedelta(seconds=900),
+        "Recheck clean coverage slope.",
+    )
+    run(subject.tick(7, healthy_snapshot(next_review_after=campaign_deadline[0])))
+    assert manager.review.await_count == 1
+
+    current_time[0] += timedelta(seconds=900)
+    run(subject.tick(7, healthy_snapshot(
+        review_due=True, next_review_after=campaign_deadline[0],
+    )))
+    assert manager.review.await_count == 2
+
+
 def test_successive_manager_deadlines_wake_after_each_selected_delay() -> None:
     project_value = project(manager_wake_at=NOW)
     manager = AsyncMock()
@@ -381,6 +429,18 @@ def test_second_manager_failure_starts_a_durable_five_minute_backoff() -> None:
     assert manager.review.await_count == 2
     assert project_value.manager_wake_at == NOW + timedelta(seconds=330)
     assert subject._previous[7].manager_wake_at == NOW + timedelta(seconds=330)
+    assert subject._runtime.schedule_next_review.await_args_list[:2] == [
+        call(
+            project_value,
+            NOW + timedelta(seconds=30),
+            "Retry after RuntimeError: validated corpus opportunity",
+        ),
+        call(
+            project_value,
+            NOW + timedelta(seconds=330),
+            "Failure backoff after RuntimeError: validated corpus opportunity",
+        ),
+    ]
 
     current_time[0] += timedelta(seconds=30)
     assert run(subject.tick(7, observation)) is None
