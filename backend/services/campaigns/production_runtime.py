@@ -24,7 +24,10 @@ from backend.fuzzing.campaigns.monitor import (
     CampaignArtifactObservation,
     collect_campaign_sample,
 )
-from backend.fuzzing.campaigns.coverage_contract import CampaignCoverageContract
+from backend.fuzzing.campaigns.coverage_contract import (
+    CampaignCoverageContract,
+    valid_replay_environment,
+)
 from backend.fuzzing.campaigns.recovery import (
     CampaignRecovery,
     RecoverableCampaign,
@@ -1291,6 +1294,8 @@ class RepositoryCampaignRuntime:
         """Start one configuration-only sibling without rebuilding its exact target image."""
         if not isinstance(record, ProgressionActionRecord) or record.project_id != project.id:
             raise ValueError("progression action belongs to another project")
+        if not valid_replay_environment(record.environment):
+            raise ValueError("progression action replay environment is invalid")
         if self._invocations is None:
             raise ValueError("campaign invocation store is unavailable")
         if self._progression_assets is None:

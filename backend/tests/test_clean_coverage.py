@@ -471,6 +471,7 @@ def test_traceability_rejects_unbounded_or_secret_replay_environment(
     (("AUTHENTICATION", "Bearer bearer-secret"),),
     (("SIGNING_MATERIAL", "-----BEGIN PRIVATE KEY-----\nprivate-secret"),),
     (("REMOTE_ENDPOINT", "https://user:password@example.test/path"),),
+    (("DATABASE_URL", "postgresql://db/bigeye?user=admin&password=secret"),),
 ])
 def test_clean_coverage_contract_rejects_credential_shaped_replay_environment(
     replay_environment,
@@ -488,6 +489,7 @@ def test_clean_coverage_contract_preserves_benign_replay_configuration() -> None
         ("ASAN_OPTIONS", "abort_on_error=1:detect_leaks=1"),
         ("UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1"),
         ("DATABASE_URL", "postgresql://db/bigeye"),
+        ("REMOTE_ENDPOINT", "https://example.test/path?user=reader&mode=encrypted&ssl=true"),
     )) is True
 
 

@@ -17,6 +17,7 @@ from backend.fuzzing.campaigns.configuration import (
     ConfigurationHypothesis,
     ConfigurationPlanner,
 )
+from backend.fuzzing.campaigns.coverage_contract import valid_replay_environment
 from backend.fuzzing.campaigns.progression import (
     CampaignProgression,
     ProgressionAction,
@@ -41,6 +42,8 @@ class ProgressionAssetPublisher:
         self._asset_store = asset_store
 
     async def publish(self, context, base_campaign, record):
+        if not valid_replay_environment(getattr(record, "environment", None)):
+            raise ValueError("progression action replay environment is invalid")
         if (
             getattr(context, "project_id", None) != record.project_id
             or getattr(base_campaign, "project_id", None) != record.project_id

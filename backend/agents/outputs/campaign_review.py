@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from backend.agents.outputs.campaign_decision import CampaignDecision
 from backend.agents.outputs.target_proposal import TargetProposal
 from backend.agents.outputs.triage_result import TriageResult
+from backend.fuzzing.campaigns.coverage_contract import valid_replay_environment
 
 
 @dataclass(frozen=True)
@@ -151,11 +152,8 @@ class ProgressionActionRecord(BaseModel):
             or any(not value.strip() or len(value) > 2_000 for value in self.evidence_ids)
         ):
             raise ValueError("progression action evidence identifiers are invalid")
-        if any(
-            not key or not value or "\x00" in key or "\x00" in value
-            for key, value in self.environment
-        ):
-            raise ValueError("progression action environment is invalid")
+        if not valid_replay_environment(self.environment):
+            raise ValueError("progression action replay environment is invalid")
         if any(not value or "\x00" in value or "\n" in value for value in self.arguments):
             raise ValueError("progression action arguments are invalid")
         if self.action_name == "enable dictionary":

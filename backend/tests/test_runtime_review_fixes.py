@@ -126,6 +126,45 @@ def test_progression_variants_publish_distinct_reusable_validated_assets(tmp_pat
     assert target_parented.id != reused.id
 
 
+def test_progression_asset_publisher_rejects_secret_environment_without_writes(
+    tmp_path: Path,
+) -> None:
+    from backend.agents.outputs.campaign_review import ProgressionActionRecord
+    from backend.services.campaigns.production_progression import ProgressionAssetPublisher
+
+    repository = tmp_path / "workspace/projects/7/repository"
+    repository.mkdir(parents=True)
+    generated_assets_root = repository.parent / "assets"
+    context = SimpleNamespace(
+        project_id=7,
+        repository_root=repository,
+        generated_assets_root=generated_assets_root,
+    )
+    store = _ReusableAssetStore()
+    publisher = ProgressionAssetPublisher(store)
+    base = SimpleNamespace(
+        id=9, project_id=7, target_asset_id=31, configuration_asset_id=32,
+    )
+    record = ProgressionActionRecord.model_construct(
+        action_id="campaign-progression:7:9:secret",
+        project_id=7,
+        base_campaign_id=9,
+        target_asset_id=31,
+        action_name="try configuration",
+        evidence_ids=("evidence:source",),
+        arguments=("--protocol",),
+        environment=(("OPENAI_API_KEY", "must-not-be-persisted"),),
+        detail="auxiliary protocol",
+        dictionary_content=None,
+    )
+
+    with pytest.raises(ValueError, match="replay environment"):
+        run(publisher.publish(context, base, record))
+
+    assert store.assets == {}
+    assert not generated_assets_root.exists()
+
+
 def test_progression_retry_reuses_bound_campaign_and_strategy_after_partial_publication() -> None:
     from backend.fuzzing.engines.contracts import ContainerInvocation
     from backend.services.campaigns.production_runtime import RepositoryCampaignRuntime
@@ -201,6 +240,69 @@ def test_progression_retry_reuses_bound_campaign_and_strategy_after_partial_publ
     assert campaigns.clear_progression_error.await_count == 2
     assert containers.start_exact.await_count == 2
     containers.start_exact.assert_awaited_with(project, sibling)
+
+
+@pytest.mark.parametrize("environment", [
+    (("OPENAI_API_KEY", "must-not-be-persisted"),),
+    (("DATABASE_URL", "postgresql://db/bigeye?user=admin&password=secret"),),
+])
+def test_progression_rejects_secret_environment_before_asset_or_campaign_persistence(
+    environment,
+) -> None:
+    from backend.agents.outputs.campaign_review import ProgressionActionRecord
+    from backend.fuzzing.engines.contracts import ContainerInvocation
+    from backend.services.campaigns.production_runtime import RepositoryCampaignRuntime
+
+    project = SimpleNamespace(id=7, commit_sha="a" * 40, worker_count=2)
+    base = SimpleNamespace(
+        id=9, project_id=7, target_asset_id=31, configuration_asset_id=32,
+        engine="afl", stopped_at=None, error=None,
+    )
+    invocation = ContainerInvocation(
+        engine="afl", image_id="sha256:" + "b" * 64,
+        command=[
+            "afl-fuzz", "-i", "/campaign/corpus", "-o", "/campaign/output",
+            "-M", "main", "-t", "1000+", "-m", "0", "--",
+            "/opt/bigeye/parser", "@@",
+        ],
+        environment={"AFL_NO_UI": "1"}, campaign_labels={},
+        network_disabled=True, read_only_source=True,
+        timeout_ms=1_000, memory_limit_mb=1_024,
+    )
+    campaigns = AsyncMock()
+    campaigns.get.return_value = base
+    progression_assets = AsyncMock()
+    runtime = RepositoryCampaignRuntime(
+        tasks=AsyncMock(), assets=AsyncMock(), campaigns=campaigns,
+        discovery=SimpleNamespace(context=lambda _project_id: SimpleNamespace(project_id=7)),
+        containers=AsyncMock(),
+        invocations=SimpleNamespace(load=lambda *_args: invocation, clone_variant=AsyncMock()),
+        progression_assets=progression_assets,
+    )
+    record_fields = dict(
+        action_id="campaign-progression:7:9:secret",
+        project_id=7,
+        base_campaign_id=9,
+        target_asset_id=31,
+        action_name="try configuration",
+        evidence_ids=("evidence:source",),
+        arguments=("--protocol",),
+        environment=environment,
+        detail="auxiliary protocol",
+        dictionary_content=None,
+    )
+
+    with pytest.raises(ValueError, match="replay environment"):
+        ProgressionActionRecord(**record_fields)
+
+    record = ProgressionActionRecord.model_construct(**record_fields)
+
+    with pytest.raises(ValueError, match="replay environment"):
+        run(runtime.progress(project, record))
+
+    campaigns.get.assert_not_awaited()
+    campaigns.create_progression.assert_not_awaited()
+    progression_assets.publish.assert_not_awaited()
 
 
 def test_reconciliation_skips_an_incomplete_errored_progression_invocation(

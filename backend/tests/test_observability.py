@@ -148,6 +148,7 @@ def test_redaction_removes_credential_shaped_names_and_values() -> None:
         "GITHUB_PAT": "github-secret",
         "AWS_ACCESS_KEY_ID": "aws-secret",
         "DATABASE_URL": "postgresql://user:password@db/bigeye",
+        "DATABASE_QUERY_URL": "postgresql://db/bigeye?user=admin&password=secret",
         "authentication": "Bearer bearer-secret",
         "signing_material": "-----BEGIN PRIVATE KEY-----\nprivate-secret",
         "BIGEYE_MODE": "encrypted",
@@ -158,11 +159,20 @@ def test_redaction_removes_credential_shaped_names_and_values() -> None:
         "GITHUB_PAT": "[REDACTED]",
         "AWS_ACCESS_KEY_ID": "[REDACTED]",
         "DATABASE_URL": "[REDACTED]",
+        "DATABASE_QUERY_URL": "[REDACTED]",
         "authentication": "[REDACTED]",
         "signing_material": "[REDACTED]",
         "BIGEYE_MODE": "encrypted",
         "ASAN_OPTIONS": "abort_on_error=1:detect_leaks=1",
     }
+
+
+def test_redaction_preserves_benign_url_query_configuration() -> None:
+    from backend.services.observability.redaction import redact
+
+    value = "https://example.test/path?user=reader&mode=encrypted&ssl=true"
+
+    assert redact({"REMOTE_ENDPOINT": value}) == {"REMOTE_ENDPOINT": value}
 
 
 def test_activity_and_debug_are_separate_from_internal_events_stream(tmp_path: Path) -> None:

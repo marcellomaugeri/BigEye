@@ -2,7 +2,7 @@
 
 from collections.abc import Mapping
 import re
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 
 REDACTED = "[REDACTED]"
@@ -40,7 +40,12 @@ def is_secret_value(value: object) -> bool:
         parsed = urlsplit(candidate)
         if not parsed.scheme or not parsed.netloc:
             return False
-        return parsed.username is not None or parsed.password is not None
+        if parsed.username is not None or parsed.password is not None:
+            return True
+        return any(
+            bool(item) and is_secret_key(key)
+            for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+        )
     except ValueError:
         return "://" in candidate and "@" in candidate
 
