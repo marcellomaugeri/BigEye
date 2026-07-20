@@ -213,9 +213,30 @@ def test_setup_verifies_tools_platform_and_frozen_dependencies_without_system_in
     assert "npm ci" in setup
     assert "up -d --wait postgres" in setup
     assert "schema.sql" in setup
+    assert "schema_contract.sql" in setup
+    assert 'node -e' in setup
+    assert "^20.19.0 || >=22.12.0" in setup
+    assert '. "$env_file"' not in setup
+    assert "SELECT COUNT(*) FROM pg_tables" not in setup
     for forbidden in ("apt-get", "brew install", "dnf install", "yum install", "sudo "):
         assert forbidden not in setup
     assert not any("pip freeze" in line and ">" in line for line in setup.splitlines())
+
+
+def test_setup_uses_a_fail_closed_exact_schema_catalog_contract() -> None:
+    contract = (ROOT / "backend/database/schema_contract.sql").read_text(encoding="utf-8")
+
+    for relation in (
+        "projects", "tasks", "assets", "campaigns", "campaign_contexts",
+        "campaign_container_counters", "coverage_evidence", "coverage_checkpoints",
+        "findings", "campaign_crash_groups", "campaign_artifacts",
+    ):
+        assert relation in contract
+    assert "information_schema.columns" in contract
+    assert "pg_constraint" in contract
+    assert "pg_indexes" in contract
+    assert "schema catalog does not match" in contract
+    assert "COUNT(*) = 11" not in contract
 
 
 def test_start_loads_env_without_echoing_secrets_and_execs_one_host_backend() -> None:
@@ -227,6 +248,10 @@ def test_start_loads_env_without_echoing_secrets_and_execs_one_host_backend() ->
     assert "up -d --wait postgres" in start
     assert "exec" in start and "-m backend.run" in start
     assert "--reload" not in start
+    build = start.index("npm run build")
+    compose = start.index("up -d --wait postgres")
+    source = start.index('. "$env_file"')
+    assert build < compose < source < start.index("-m backend.run")
     for unsafe in ("set -x", "printenv", "env |", "echo $OPENAI_API_KEY", "echo ${OPENAI_API_KEY"):
         assert unsafe not in start
 
@@ -252,6 +277,7 @@ def test_readme_uses_the_intended_environment_template_and_one_command_entrypoin
     assert "scripts/start.sh" in readme
     assert "scripts/start.sh --no-browser" in readme
     assert "scripts/check.sh" in readme
+    assert "Node.js `^20.19.0 || >=22.12.0`" in readme
     assert "Windows" not in readme
 
 

@@ -25,12 +25,12 @@ if [ ! -x "$python" ]; then
     exit 1
 fi
 
+(cd "$project_dir/frontend" && npm run build)
+docker compose --env-file "$env_file" -f "$compose_file" up -d --wait postgres
+
 set -a
 . "$env_file"
 set +a
-
-(cd "$project_dir/frontend" && npm run build)
-docker compose --env-file "$env_file" -f "$compose_file" up -d --wait postgres
 
 cd "$project_dir"
 exec "$python" -m backend.run "$@"

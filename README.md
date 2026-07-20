@@ -16,7 +16,7 @@ BigEye supports macOS with Docker Desktop and Linux with Docker Engine plus
 Docker Compose v2. Install these prerequisites yourself before setup:
 
 - Python 3.14 as `python3.14`;
-- Node.js with npm;
+- Node.js `^20.19.0 || >=22.12.0` with npm, as required by Vite 8;
 - Git;
 - Docker with Compose v2 and a builder that supports `linux/amd64`.
 

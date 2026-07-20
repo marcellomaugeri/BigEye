@@ -17,6 +17,7 @@ env_file="$project_dir/.env"
 compose_file="$project_dir/compose.yaml"
 python="$project_dir/backend/.venv/bin/python"
 requirements="$project_dir/backend/requirements.txt"
+schema_contract="$project_dir/backend/database/schema_contract.sql"
 
 fail() {
     printf 'BigEye setup: %s\n' "$1" >&2
@@ -35,11 +36,18 @@ compose() {
     fi
 }
 
+database() {
+    compose exec -T postgres sh -c \
+        'exec psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" "$@"' sh "$@"
+}
+
 for command_name in python3.14 node npm git docker; do
     require_command "$command_name"
 done
 python3.14 -c 'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 14) else 1)' \
     || fail "python3.14 must run Python 3.14."
+node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit((major === 20 && minor >= 19) || major > 22 || (major === 22 && minor >= 12) ? 0 : 1)' \
+    || fail "Node.js ^20.19.0 || >=22.12.0 is required by Vite 8."
 docker compose version >/dev/null 2>&1 \
     || fail "Docker Compose v2 is required. Start Docker Desktop or the Docker Engine."
 docker info >/dev/null 2>&1 \
@@ -50,12 +58,6 @@ case "$platforms" in
     *linux/amd64*) ;;
     *) fail "The active Docker builder does not support linux/amd64." ;;
 esac
-
-if [ -f "$env_file" ]; then
-    set -a
-    . "$env_file"
-    set +a
-fi
 
 if [ ! -x "$python" ]; then
     python3.14 -m venv "$project_dir/backend/.venv"
@@ -69,17 +71,12 @@ fi
 (cd "$project_dir/frontend" && npm ci)
 
 compose up -d --wait postgres
-database_user=${POSTGRES_USER:-bigeye}
-database_name=${POSTGRES_DB:-bigeye}
-schema_present=$(compose exec -T postgres psql -U "$database_user" -d "$database_name" \
+schema_present=$(database \
     --tuples-only --no-align --command "SELECT to_regclass('public.projects') IS NOT NULL")
 if [ "$schema_present" != "t" ]; then
-    compose exec -T postgres psql -U "$database_user" -d "$database_name" \
-        --set ON_ERROR_STOP=1 --file /docker-entrypoint-initdb.d/schema.sql
+    database --set ON_ERROR_STOP=1 --file /docker-entrypoint-initdb.d/schema.sql
 fi
-table_count=$(compose exec -T postgres psql -U "$database_user" -d "$database_name" \
-    --tuples-only --no-align --command "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public' AND tablename IN ('projects','tasks','assets','campaigns','campaign_contexts','campaign_container_counters','coverage_evidence','coverage_checkpoints','findings','campaign_crash_groups')")
-[ "$table_count" = "10" ] \
-    || fail "The development database schema is incomplete; back up workspace and run backend/database/reset.sh."
+database --set ON_ERROR_STOP=1 --file - < "$schema_contract" \
+    || fail "The development database schema catalog does not match this release; back up workspace and explicitly run backend/database/reset.sh."
 
 printf '%s\n' 'BigEye setup is ready. Copy .env_example to .env if needed, add OPENAI_API_KEY, then run scripts/start.sh.'
