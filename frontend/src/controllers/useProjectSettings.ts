@@ -103,14 +103,24 @@ export function useProjectSettings(api: BigEyeApi, project: Project | null, enab
 
   const setPaused = useCallback(async (paused: boolean) => {
     if (!project) return;
+    const projectId = project.id;
+    const generation = ++requestGeneration.current;
     setSaving(true);
     setError(null);
     try {
-      onProjectChange(paused ? await api.pauseProject(project.id) : await api.resumeProject(project.id));
+      const updated = paused ? await api.pauseProject(projectId) : await api.resumeProject(projectId);
+      if (generation !== requestGeneration.current || selectedProjectIdRef.current !== projectId) return;
+      onProjectChange(updated);
     } catch (requestError) {
-      setError(friendlyApiError(requestError, paused ? 'Could not pause the project.' : 'Could not resume the project.'));
+      if (generation === requestGeneration.current && selectedProjectIdRef.current === projectId) {
+        setError(friendlyApiError(
+          requestError, paused ? 'Could not pause the project.' : 'Could not resume the project.',
+        ));
+      }
     } finally {
-      setSaving(false);
+      if (generation === requestGeneration.current && selectedProjectIdRef.current === projectId) {
+        setSaving(false);
+      }
     }
   }, [api, onProjectChange, project]);
 

@@ -9,7 +9,12 @@ from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Path, Query, Request, Response
 
-from backend.api.views.finding import FindingDetailResponse, FindingPageResponse, FindingResponse
+from backend.api.views.finding import (
+    FindingDetailResponse,
+    FindingEvidenceEventResponse,
+    FindingPageResponse,
+    FindingResponse,
+)
 
 
 router = APIRouter()
@@ -81,7 +86,20 @@ async def get_finding(project_id: PositiveId, finding_id: PositiveId, request: R
     finding = await _finding(project_id, finding_id, request)
     try:
         evidence = request.app.state.services.finding_artifacts.detail(finding)
-        return FindingDetailResponse.from_model_and_evidence(finding, evidence)
+        detail = FindingDetailResponse.from_model_and_evidence(finding, evidence)
+        located = await request.app.state.services.observability.locate_evidence(
+            project_id, detail.evidence_ids,
+        )
+        evidence_events = [
+            FindingEvidenceEventResponse(
+                evidence_id=evidence_id, stream=located[evidence_id].stream,
+                event_id=located[evidence_id].id,
+            )
+            for evidence_id in detail.evidence_ids if evidence_id in located
+        ]
+        response = detail.model_dump()
+        response["evidence_events"] = evidence_events
+        return FindingDetailResponse(**response)
     except (OSError, ValueError) as error:
         raise HTTPException(status_code=409, detail="finding evidence is unavailable") from error
 

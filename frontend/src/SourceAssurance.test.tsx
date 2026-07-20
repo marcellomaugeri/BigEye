@@ -70,7 +70,7 @@ function apiDouble(overrides: Partial<BigEyeApi> = {}): BigEyeApi {
     getCoverageTree: vi.fn().mockResolvedValue(tree), getSourceFile: vi.fn().mockResolvedValue(source),
     getLineEvidence: vi.fn().mockResolvedValue(lineEvidence),
     retainedTestcaseUrl: vi.fn().mockReturnValue('/retained/testcase'),
-    getFinding: vi.fn(), findingReproducerUrl: vi.fn(), getProjectLog: vi.fn(),
+    getFinding: vi.fn(), findingReproducerUrl: vi.fn(), getProjectLog: vi.fn(), getProjectEvent: vi.fn(),
     listFindings: vi.fn().mockResolvedValue({ items: [], next_cursor: null }), ...overrides
   } as BigEyeApi;
 }

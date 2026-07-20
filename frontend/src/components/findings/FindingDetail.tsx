@@ -4,8 +4,9 @@ function title(value: string): string {
   return value.length === 0 ? 'Unresolved' : value[0].toUpperCase() + value.slice(1);
 }
 
-function evidenceHref(evidenceId: string): string {
-  return `#activity?evidence=${encodeURIComponent(evidenceId)}`;
+function evidenceHref(evidenceId: string, stream: 'activity' | 'debug', eventId: number): string {
+  const query = new URLSearchParams({ stream, event: String(eventId), evidence: evidenceId });
+  return `#activity?${query}`;
 }
 
 function sourceHref(sourceLocation: string): string | null {
@@ -25,6 +26,7 @@ export function FindingDetail({ finding, reproducerUrl }: {
     ...finding.replay.compatible_variants,
     ...(finding.replay.clean_variant ? [finding.replay.clean_variant] : []),
   ];
+  const evidenceEvents = new Map(finding.evidence_events.map((event) => [event.evidence_id, event]));
   return <article className="finding-detail">
     <header>
       <div><p className="eyebrow">Priority {finding.priority_rank ?? 'pending'}</p><h2>{title(finding.classification)}</h2></div>
@@ -43,9 +45,13 @@ export function FindingDetail({ finding, reproducerUrl }: {
     {reproducerUrl && <a className="finding-download" download href={reproducerUrl}>Download minimal reproducer</a>}
     <section>
       <h3>Evidence</h3>
-      <ul className="evidence-links">{finding.evidence_ids.map((evidenceId) => <li key={evidenceId}>
-        <a href={evidenceHref(evidenceId)}>{evidenceId}</a>
-      </li>)}</ul>
+      <ul className="evidence-links">{finding.evidence_ids.map((evidenceId) => {
+        const event = evidenceEvents.get(evidenceId);
+        return <li key={evidenceId}>{event
+          ? <a href={evidenceHref(evidenceId, event.stream, event.event_id)}>{evidenceId}</a>
+          : <code>{evidenceId}</code>}
+        </li>;
+      })}</ul>
     </section>
     <details>
       <summary>Technical evidence</summary>

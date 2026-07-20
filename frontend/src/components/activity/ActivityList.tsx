@@ -1,23 +1,24 @@
-import { eventHasEvidence, type ProjectEvent } from '../../models/event';
+import type { ProjectEvent } from '../../models/event';
 
 function text(payload: Record<string, unknown>, key: string, fallback: string): string {
   return typeof payload[key] === 'string' && payload[key].length > 0 ? payload[key] as string : fallback;
 }
 
-function evidenceHref(evidenceId: string): string {
-  return `#activity?evidence=${encodeURIComponent(evidenceId)}`;
+function evidenceHref(eventId: number, evidenceId: string): string {
+  const query = new URLSearchParams({ stream: 'activity', event: String(eventId), evidence: evidenceId });
+  return `#activity?${query}`;
 }
 
-export function ActivityList({ events, focusedEvidenceId = null }: {
+export function ActivityList({ events, focusedEventId = null }: {
   events: ProjectEvent[];
-  focusedEvidenceId?: string | null;
+  focusedEventId?: number | null;
 }) {
   if (events.length === 0) return <p className="muted-copy">No campaign decisions have been recorded yet.</p>;
   return <ol className="activity-list">
     {events.map((event) => {
       const evidence = Array.isArray(event.payload.evidence_ids)
         ? event.payload.evidence_ids.filter((item): item is string => typeof item === 'string') : [];
-      const focused = focusedEvidenceId !== null && eventHasEvidence(event, focusedEvidenceId);
+      const focused = focusedEventId === event.id;
       return <li key={event.id}>
         <article data-evidence-focus={focused ? 'true' : undefined} tabIndex={focused ? -1 : undefined}>
           <time dateTime={event.created_at}>{new Date(event.created_at).toLocaleString()}</time>
@@ -26,7 +27,7 @@ export function ActivityList({ events, focusedEvidenceId = null }: {
           <section><h3>What changed</h3><p>{text(event.payload, 'change', 'No campaign change was recorded.')}</p></section>
           <section><h3>Next review</h3><p>{text(event.payload, 'next_review_condition', 'Review when new campaign evidence arrives.')}</p></section>
           {evidence.length > 0 && <ul className="evidence-links">{evidence.map((evidenceId) => <li key={evidenceId}>
-            <a href={evidenceHref(evidenceId)}>{evidenceId}</a>
+            <a href={evidenceHref(event.id, evidenceId)}>{evidenceId}</a>
           </li>)}</ul>}
           {(event.payload.task_id !== undefined || event.payload.state !== undefined) && <details>
             <summary>Internal task</summary>

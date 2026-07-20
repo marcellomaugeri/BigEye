@@ -3,7 +3,7 @@ import type { ProjectSettings, Settings, UpdateProjectSettingsRequest } from '..
 import type { Task, TaskLog } from '../models/task';
 import type { CampaignList } from '../models/campaign';
 import type { CoverageTree, LineEvidencePage, SourceFile } from '../models/coverage';
-import type { ProjectEventPage } from '../models/event';
+import type { ProjectEvent, ProjectEventPage } from '../models/event';
 import type { FindingDetail, FindingPage } from '../models/finding';
 
 export interface BigEyeApi {
@@ -31,6 +31,7 @@ export interface BigEyeApi {
   getProjectLog(
     projectId: string, stream: 'activity' | 'debug', before?: number, limit?: number,
   ): Promise<ProjectEventPage>;
+  getProjectEvent(projectId: string, stream: 'activity' | 'debug', eventId: number): Promise<ProjectEvent>;
 }
 
 export class ApiClient implements BigEyeApi {
@@ -133,6 +134,12 @@ export class ApiClient implements BigEyeApi {
     const query = new URLSearchParams({ before: String(before), limit: String(limit) });
     return this.request(
       `/api/projects/${encodeURIComponent(projectId)}/logs/${stream}?${query}`,
+    );
+  }
+
+  getProjectEvent(projectId: string, stream: 'activity' | 'debug', eventId: number): Promise<ProjectEvent> {
+    return this.request(
+      `/api/projects/${encodeURIComponent(projectId)}/logs/${stream}/${eventId}`,
     );
   }
 

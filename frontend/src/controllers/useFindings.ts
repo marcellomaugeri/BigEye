@@ -90,15 +90,24 @@ export function useFindings(
       try {
         const page = await api.listFindings(projectId, cursor);
         if (!isCurrent()) return;
+        const retainedSelection = !append && refreshSelected ? selectedIdRef.current : null;
         setFindings((current) => {
-          const combined = append ? [...current, ...page.items] : page.items;
+          const retainedSummary = retainedSelection === null
+            ? undefined : current.find((item) => item.id === retainedSelection);
+          const combined = append ? [...current, ...page.items] : [
+            ...page.items,
+            ...(retainedSummary && !page.items.some((item) => item.id === retainedSummary.id)
+              ? [retainedSummary] : []),
+          ];
           return [...new Map(combined.map((item) => [item.id, item])).values()];
         });
         cursorRef.current = page.next_cursor;
         setNextCursor(page.next_cursor);
         if (!append) {
-          const retained = selectedIdRef.current && page.items.some((item) => item.id === selectedIdRef.current)
-            ? selectedIdRef.current : page.items[0]?.id ?? null;
+          const retained = refreshSelected && selectedIdRef.current !== null
+            ? selectedIdRef.current
+            : selectedIdRef.current && page.items.some((item) => item.id === selectedIdRef.current)
+              ? selectedIdRef.current : page.items[0]?.id ?? null;
           selectedIdRef.current = retained;
           setSelectedFindingId(retained);
           if (retained === null) setSelectedFinding(null);
@@ -122,9 +131,8 @@ export function useFindings(
     setLiveError(null);
     void load();
     const unsubscribe = events.subscribe(projectId, (name) => {
-      setLiveError(null);
       if (name === 'findings') void load(false, true);
-    }, setLiveError);
+    }, setLiveError, () => setLiveError(null));
     return () => unsubscribe();
   }, [api, enabled, events, project, reportError]);
 
@@ -149,7 +157,11 @@ export function useFindings(
       setFindings((current) => [...new Map([...current, ...page.items].map((item) => [item.id, item])).values()]);
       cursorRef.current = page.next_cursor;
       setNextCursor(page.next_cursor);
-    }).catch(reportError).finally(() => {
+    }).catch((requestError) => {
+      if (generation === projectGeneration.current && currentProjectId.current === projectId) {
+        reportError(requestError);
+      }
+    }).finally(() => {
       if (generation === projectGeneration.current && currentProjectId.current === projectId) setLoading(false);
     });
   }, [api, loading, project, reportError]);

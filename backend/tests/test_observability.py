@@ -27,6 +27,83 @@ def test_event_id_is_the_durable_jsonl_byte_offset(tmp_path: Path) -> None:
     assert [event.payload["message"] for event in run(store.read(7, "activity", first.id, 20))] == ["two"]
 
 
+def test_exact_public_event_read_uses_the_durable_record_offset(tmp_path: Path) -> None:
+    from backend.services.observability.event_store import ProjectEventStore
+
+    store = ProjectEventStore(tmp_path)
+    run(store.append(7, "debug", {"evidence_id": "replay:old"}))
+    retained = run(store.append(7, "debug", {"evidence_id": "replay:clean"}))
+
+    exact = run(store.read_exact(7, "debug", retained.id))
+
+    assert exact == retained
+
+
+def test_exact_event_read_rejects_non_boundary_wrong_stream_and_missing_offsets(tmp_path: Path) -> None:
+    from backend.services.observability.event_store import InvalidEventCursor, ProjectEventStore
+
+    store = ProjectEventStore(tmp_path)
+    retained = run(store.append(7, "activity", {"evidence_id": "coverage:parser:42"}))
+
+    with pytest.raises(InvalidEventCursor):
+        run(store.read_exact(7, "activity", retained.id + 1))
+    with pytest.raises(ValueError, match="public"):
+        run(store.read_exact(7, "events", retained.id))
+    with pytest.raises(KeyError):
+        run(store.read_exact(8, "activity", retained.id))
+
+
+def test_evidence_lookup_returns_only_exact_retained_public_records(tmp_path: Path) -> None:
+    from backend.services.observability.event_store import ProjectEventStore
+
+    store = ProjectEventStore(tmp_path)
+    activity = run(store.append(7, "activity", {
+        "evidence_ids": ["coverage:parser:42", "shared:evidence"],
+    }))
+    debug = run(store.append(7, "debug", {
+        "outcomes": [{"evidence_id": "replay:clean"}, {"evidence_id": "shared:evidence"}],
+    }))
+
+    located = run(store.locate_evidence(7, [
+        "coverage:parser:42", "replay:clean", "shared:evidence", "not-retained",
+    ]))
+
+    assert located["coverage:parser:42"] == activity
+    assert located["replay:clean"] == debug
+    assert located["shared:evidence"] == debug
+    assert "not-retained" not in located
+
+
+def test_evidence_lookup_pages_to_an_old_retained_record_without_a_total_scan_cutoff(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from backend.services.observability import event_store
+    from backend.services.observability.event_store import ProjectEventStore
+
+    monkeypatch.setattr(event_store.os, "fsync", lambda _descriptor: None)
+    store = ProjectEventStore(tmp_path)
+    retained = store.append_sync(7, "activity", {"evidence_id": "old:retained"})
+    for index in range(1_001):
+        store.append_sync(7, "activity", {"evidence_id": f"newer:{index}"})
+
+    located = run(store.locate_evidence(7, ["old:retained"]))
+
+    assert located["old:retained"] == retained
+
+
+def test_evidence_lookup_prefers_the_scalar_owner_over_a_newer_reference(tmp_path: Path) -> None:
+    from backend.services.observability.event_store import ProjectEventStore
+
+    store = ProjectEventStore(tmp_path)
+    owner = run(store.append(7, "debug", {"evidence_id": "replay:owned"}))
+    run(store.append(7, "activity", {"evidence_ids": ["replay:owned"]}))
+    run(store.append(7, "debug", {"outcomes": [{"evidence_id": "replay:owned"}]}))
+
+    located = run(store.locate_evidence(7, ["replay:owned"]))
+
+    assert located["replay:owned"] == owner
+
+
 def test_redaction_removes_tokens_and_authorization_headers() -> None:
     from backend.services.observability.redaction import redact
 
@@ -378,6 +455,23 @@ def test_activity_and_debug_query_routes_exclude_internal_events(tmp_path: Path)
     assert activity.events[0].payload["repository_token"] == "[REDACTED]"
     assert activity.has_more is False
     assert error.value.status_code == 422
+
+
+def test_exact_public_event_route_returns_the_requested_retained_record(tmp_path: Path) -> None:
+    from backend.api.controllers.events import get_project_event
+    from backend.services.observability.event_store import ProjectEventStore
+
+    store = ProjectEventStore(tmp_path)
+    retained = run(store.append(7, "debug", {"evidence_id": "replay:clean"}))
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(services=SimpleNamespace(
+        projects=SimpleNamespace(get=AsyncMock(return_value=object())), observability=store,
+    ))))
+
+    response = run(get_project_event(7, "debug", retained.id, request))
+
+    assert response.id == retained.id
+    assert response.stream == "debug"
+    assert response.payload == {"evidence_id": "replay:clean"}
 
 
 def test_sse_rejects_an_invalid_last_event_id() -> None:

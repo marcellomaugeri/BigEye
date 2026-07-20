@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -110,6 +111,12 @@ class CorrectionResponse(BaseModel):
         return self
 
 
+class FindingEvidenceEventResponse(BaseModel):
+    evidence_id: str = Field(min_length=1, max_length=2_000)
+    stream: Literal["activity", "debug"]
+    event_id: int = Field(ge=0)
+
+
 class FindingDetailResponse(FindingResponse):
     uncertainty: str = Field(min_length=1, max_length=2_000)
     evidence_ids: list[str] = Field(min_length=1, max_length=64)
@@ -118,6 +125,7 @@ class FindingDetailResponse(FindingResponse):
     minimisation: MinimisationResponse | None = None
     correction: CorrectionResponse | None = None
     repair_intent: str | None = Field(default=None, max_length=2_000)
+    evidence_events: list[FindingEvidenceEventResponse] = Field(default_factory=list, max_length=64)
 
     @classmethod
     def from_model_and_evidence(cls, finding, evidence: dict[str, object]):

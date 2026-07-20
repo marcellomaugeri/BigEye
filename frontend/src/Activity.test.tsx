@@ -6,7 +6,7 @@ import { useActivity, type ActivityModel } from './controllers/useActivity';
 import type { ProjectEvent } from './models/event';
 import type { Project } from './models/project';
 import type { BigEyeApi } from './services/apiClient';
-import type { ProjectEventStream, ProjectInvalidation } from './services/eventStream';
+import { EventStream, type ProjectEventStream, type ProjectInvalidation } from './services/eventStream';
 import { ActivityView } from './views/ActivityView';
 
 const project: Project = {
@@ -54,7 +54,7 @@ function model(overrides: Partial<ActivityModel> = {}): ActivityModel {
     project, activityEvents: [activity], debugEvents: [modelDebug, toolDebug],
     activeTab: 'activity', debugFilter: 'all', loading: false,
     activityError: null, debugError: null, liveError: null,
-    focusedEvidenceId: null,
+    focusedEvidenceId: null, focusedEventId: null,
     activityHasMore: false, debugHasMore: false,
     onTabChange: vi.fn(), onDebugFilter: vi.fn(), onLoadMoreActivity: vi.fn(), onLoadMoreDebug: vi.fn(),
     ...overrides,
@@ -74,6 +74,7 @@ function apiDouble(overrides: Partial<BigEyeApi> = {}): BigEyeApi {
     getProjectLog: vi.fn((_projectId: string, stream: 'activity' | 'debug') => Promise.resolve(
       stream === 'activity' ? { events: [activity], next_offset: 10, has_more: false } : { events: [modelDebug, toolDebug], next_offset: 21, has_more: false },
     )),
+    getProjectEvent: vi.fn(),
     ...overrides,
   } as BigEyeApi;
 }
@@ -82,6 +83,28 @@ const idleEvents: ProjectEventStream = { subscribe: vi.fn().mockReturnValue(() =
 
 describe('Activity and Debug', () => {
   afterEach(() => { window.history.replaceState(null, '', '/'); });
+
+  it('reports EventSource recovery only after the connection reopens', () => {
+    class FakeEventSource {
+      static latest: FakeEventSource;
+      onerror: (() => void) | null = null;
+      onopen: (() => void) | null = null;
+      constructor(readonly url: string) { FakeEventSource.latest = this; }
+      addEventListener() { /* invalidations are irrelevant to this connection test */ }
+      close() { /* no-op */ }
+    }
+    vi.stubGlobal('EventSource', FakeEventSource);
+    const onError = vi.fn();
+    const onOpen = vi.fn();
+
+    new EventStream().subscribe(project.id, vi.fn(), onError, onOpen);
+    FakeEventSource.latest.onerror?.();
+    FakeEventSource.latest.onopen?.();
+
+    expect(onError).toHaveBeenCalledWith('Live updates are temporarily unavailable.');
+    expect(onOpen).toHaveBeenCalledOnce();
+    vi.unstubAllGlobals();
+  });
 
   it('shows structured motivation and next review without claiming hidden chain of thought', () => {
     render(<ActivityView model={model()} />);
@@ -162,25 +185,33 @@ describe('Activity and Debug', () => {
       ...modelDebug,
       payload: { ...modelDebug.payload, evidence_ids: ['replay:clean'] },
     };
-    window.history.replaceState(null, '', '/#activity?evidence=replay%3Aclean');
+    const duplicateEvidence = { ...debugEvidence, id: 19 };
+    window.history.replaceState(null, '', '/#activity?stream=debug&event=20&evidence=replay%3Aclean');
+    const getProjectEvent = vi.fn().mockResolvedValue(debugEvidence);
     const api = apiDouble({
       getProjectLog: vi.fn((_projectId: string, stream: 'activity' | 'debug') => Promise.resolve(
         stream === 'activity'
           ? { events: [activity], next_offset: 0, has_more: false }
-          : { events: [debugEvidence], next_offset: 0, has_more: false },
+          : { events: [duplicateEvidence], next_offset: 0, has_more: false },
       )),
+      getProjectEvent,
     });
     const { result } = renderHook(() => useActivity(api, idleEvents, project, true));
 
     await waitFor(() => expect(result.current.activeTab).toBe('debug'));
     expect(result.current.focusedEvidenceId).toBe('replay:clean');
+    expect(result.current.focusedEventId).toBe(20);
+    expect(getProjectEvent).toHaveBeenCalledWith(project.id, 'debug', 20);
+    expect(result.current.debugEvents.map((event) => event.id)).toEqual([debugEvidence.id, duplicateEvidence.id]);
 
     render(<ActivityView model={model({
-      activeTab: 'debug', debugEvents: [debugEvidence], focusedEvidenceId: 'replay:clean',
+      activeTab: 'debug', debugEvents: [duplicateEvidence, debugEvidence],
+      focusedEvidenceId: 'replay:clean', focusedEventId: 20,
     })} />);
-    const focused = screen.getByText('model.end').closest('article');
-    expect(focused).toHaveAttribute('data-evidence-focus', 'true');
-    expect(focused).toHaveFocus();
+    const records = screen.getAllByText('model.end').map((node) => node.closest('article'));
+    expect(records[0]).not.toHaveAttribute('data-evidence-focus');
+    expect(records[1]).toHaveAttribute('data-evidence-focus', 'true');
+    expect(records[1]).toHaveFocus();
   });
 
   it('keeps the Activity route reachable without a selected project', async () => {
@@ -202,9 +233,11 @@ describe('Activity and Debug', () => {
 
   it('keeps stream failures independent and surfaces live update failures', async () => {
     let reportLiveError!: (message: string) => void;
+    let reportLiveRecovery!: () => void;
     const events: ProjectEventStream = {
-      subscribe: vi.fn((_projectId, _onEvent, onError) => {
+      subscribe: vi.fn((_projectId, _onEvent, onError, onOpen) => {
         reportLiveError = onError!;
+        reportLiveRecovery = onOpen!;
         return () => undefined;
       }),
     };
@@ -220,6 +253,8 @@ describe('Activity and Debug', () => {
     expect(result.current.debugEvents).toEqual([modelDebug]);
     act(() => reportLiveError('Live updates are temporarily unavailable.'));
     expect(result.current.liveError).toBe('Live updates are temporarily unavailable.');
+    act(() => reportLiveRecovery());
+    expect(result.current.liveError).toBeNull();
   });
 
   it('uses the truthful server cursor and has-more flag when loading older records', async () => {
@@ -238,6 +273,33 @@ describe('Activity and Debug', () => {
     await waitFor(() => expect(result.current.activityEvents).toEqual([activity, older]));
     expect(getProjectLog).toHaveBeenCalledWith('7', 'activity', 10, 100);
     expect(result.current.activityHasMore).toBe(false);
+  });
+
+  it('ignores a stale older-log rejection after switching projects', async () => {
+    let rejectOlder!: (reason: unknown) => void;
+    const olderPage = new Promise<never>((_resolve, reject) => { rejectOlder = reject; });
+    const secondProject = { ...project, id: '8', repository_url: 'https://example.test/second.git' };
+    const getProjectLog = vi.fn((projectId: string, stream: 'activity' | 'debug', before: number) => {
+      if (projectId === project.id && stream === 'activity' && before === 10) return olderPage;
+      const isInitialActivity = projectId === project.id && stream === 'activity' && before === -1;
+      return Promise.resolve({
+        events: isInitialActivity ? [activity] : [],
+        next_offset: isInitialActivity ? 10 : 0,
+        has_more: isInitialActivity,
+      });
+    });
+    const api = apiDouble({ getProjectLog });
+    const { result, rerender } = renderHook(
+      ({ selected }) => useActivity(api, idleEvents, selected, true),
+      { initialProps: { selected: project } },
+    );
+    await waitFor(() => expect(result.current.activityHasMore).toBe(true));
+    act(() => result.current.onLoadMoreActivity());
+    rerender({ selected: secondProject });
+    rejectOlder(new Error('stale project failure'));
+    await act(async () => { await Promise.resolve(); });
+
+    expect(result.current.activityError).toBeNull();
   });
 
   it('refetches only the named activity or debug resource', async () => {

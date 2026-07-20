@@ -111,6 +111,59 @@ class ProjectEventStore:
         finally:
             os.close(descriptor)
 
+    async def read_exact(self, project_id: int, stream: str, event_id: int) -> StoredEvent:
+        """Read one public event addressed by its durable JSONL byte offset."""
+        self._validate_project_id(project_id)
+        self._validate_public_stream(stream)
+        if not isinstance(event_id, int) or isinstance(event_id, bool) or event_id < 0:
+            raise ValueError("event ID is invalid")
+        descriptor = self._open_file(project_id, stream, create=False, write=False)
+        if descriptor is None:
+            raise KeyError(event_id)
+        try:
+            size = os.fstat(descriptor).st_size
+            if event_id >= size:
+                raise KeyError(event_id)
+            if event_id > 0 and os.pread(descriptor, 1, event_id - 1) != b"\n":
+                raise InvalidEventCursor("event ID is not a record boundary")
+            raw = os.pread(descriptor, EVENT_RECORD_MAX_BYTES + 1, event_id)
+            newline = raw.find(b"\n")
+            if newline < 0 or newline >= EVENT_RECORD_MAX_BYTES:
+                raise CorruptEventLog("project event log is corrupt")
+            return self._decode_exact_record(raw[:newline + 1], stream, event_id)
+        finally:
+            os.close(descriptor)
+
+    async def locate_evidence(
+        self, project_id: int, evidence_ids: list[str],
+    ) -> dict[str, StoredEvent]:
+        """Resolve evidence identifiers to their newest retained public event."""
+        self._validate_project_id(project_id)
+        if (
+            not isinstance(evidence_ids, list) or len(evidence_ids) > 64
+            or any(not isinstance(value, str) or not value.strip() or len(value) > 2_000 for value in evidence_ids)
+        ):
+            raise ValueError("evidence identifiers are invalid")
+        wanted = set(evidence_ids)
+        located: dict[str, StoredEvent] = {}
+        precedence: dict[str, tuple[bool, datetime, int, str]] = {}
+        for stream in ("activity", "debug"):
+            before = -1
+            while True:
+                page = await self.read_latest(project_id, stream, before, 100)
+                for event in page:
+                    for evidence_id, owns_evidence in self._evidence_matches(event.payload).items():
+                        if evidence_id not in wanted:
+                            continue
+                        candidate = (owns_evidence, event.created_at, event.id, event.stream)
+                        if evidence_id not in precedence or candidate > precedence[evidence_id]:
+                            located[evidence_id] = event
+                            precedence[evidence_id] = candidate
+                if not page.has_more or page.next_offset == before:
+                    break
+                before = page.next_offset
+        return located
+
     def _append(self, project_id: int, stream: str, payload) -> StoredEvent:
         created_at = datetime.now(UTC)
         descriptor = self._open_file(project_id, stream, create=True, write=True)
@@ -241,6 +294,35 @@ class ProjectEventStore:
             raise CorruptEventLog("project event log is corrupt")
         return raw
 
+    @staticmethod
+    def _decode_exact_record(raw: bytes, stream: str, event_id: int) -> StoredEvent:
+        try:
+            value = json.loads(raw.decode("utf-8"))
+            created_at = datetime.fromisoformat(value["created_at"])
+            if value["id"] != event_id or value["stream"] != stream:
+                raise ValueError
+            return StoredEvent(event_id, created_at, stream, value["payload"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise CorruptEventLog("project event log is corrupt") from error
+
+    @staticmethod
+    def _evidence_matches(payload: object) -> dict[str, bool]:
+        if not isinstance(payload, Mapping):
+            return {}
+        found: dict[str, bool] = {}
+        values = payload.get("evidence_ids")
+        if isinstance(values, list):
+            found.update((value, False) for value in values if isinstance(value, str))
+        outcomes = payload.get("outcomes")
+        if isinstance(outcomes, list):
+            found.update(
+                (outcome["evidence_id"], False) for outcome in outcomes
+                if isinstance(outcome, Mapping) and isinstance(outcome.get("evidence_id"), str)
+            )
+        if isinstance(payload.get("evidence_id"), str):
+            found[payload["evidence_id"]] = True
+        return found
+
     def _open_file(self, project_id: int, stream: str, create: bool, write: bool) -> int | None:
         try:
             directory = self._log_directory(project_id, create)
@@ -312,6 +394,11 @@ class ProjectEventStore:
     def _validate_stream(stream: str) -> None:
         if stream not in STREAMS:
             raise ValueError("event stream is invalid")
+
+    @staticmethod
+    def _validate_public_stream(stream: str) -> None:
+        if stream not in PUBLIC_STREAMS:
+            raise ValueError("public event stream is invalid")
 
     @staticmethod
     def _invalidation_payload(payload) -> dict[str, str]:

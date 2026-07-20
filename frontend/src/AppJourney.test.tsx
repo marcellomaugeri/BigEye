@@ -45,7 +45,7 @@ function apiDouble(overrides: Record<string, unknown> = {}) {
     getLineEvidence: vi.fn(),
     retainedTestcaseUrl: vi.fn(),
     listFindings: vi.fn().mockResolvedValue({ items: [], next_cursor: null }),
-    getFinding: vi.fn(), findingReproducerUrl: vi.fn(), getProjectLog: vi.fn(),
+    getFinding: vi.fn(), findingReproducerUrl: vi.fn(), getProjectLog: vi.fn(), getProjectEvent: vi.fn(),
     ...overrides
   } as BigEyeApi & Record<string, ReturnType<typeof vi.fn>>;
 }
@@ -247,5 +247,26 @@ describe('App journey', () => {
 
     secondSettings.resolve({ requested_revision: secondProject.requested_revision, commit_sha: secondProject.commit_sha, worker_count: 3, token_present: false });
     await waitFor(() => expect(result.current.workerCount).toBe('3'));
+  });
+
+  it('ignores delayed pause failure and completion after the selected project changes', async () => {
+    const pauseA = deferred<typeof activeProject>();
+    const secondProject = { ...activeProject, id: '8', repository_url: 'https://example.test/second.git' };
+    const api = apiDouble({ pauseProject: vi.fn().mockReturnValue(pauseA.promise) });
+    const onProjectChange = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ selected }) => useProjectSettings(api, selected, true, onProjectChange),
+      { initialProps: { selected: activeProject } },
+    );
+    await waitFor(() => expect(result.current.settings).not.toBeNull());
+    act(() => { void result.current.setPaused(true); });
+    expect(result.current.saving).toBe(true);
+    rerender({ selected: secondProject });
+    await waitFor(() => expect(api.getProjectSettings).toHaveBeenCalledWith(secondProject.id));
+    pauseA.reject(new Error('stale pause failure'));
+    await act(async () => { await Promise.resolve(); });
+
+    expect(result.current.error).toBeNull();
+    expect(onProjectChange).not.toHaveBeenCalled();
   });
 });

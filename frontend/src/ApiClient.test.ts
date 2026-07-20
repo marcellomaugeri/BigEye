@@ -62,4 +62,16 @@ describe('ApiClient source assurance boundaries', () => {
       'http://127.0.0.1:8000/api/projects/project%2F7/findings/finding%2F9/reproducer',
     );
   });
+
+  it('reads one exact retained event by stream and durable offset', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({ id: 812, stream: 'debug', payload: {} }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await new ApiClient('http://127.0.0.1:8000').getProjectEvent('project/7', 'debug', 812);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:8000/api/projects/project%2F7/logs/debug/812',
+      undefined,
+    );
+  });
 });

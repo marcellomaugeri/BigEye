@@ -7,11 +7,27 @@ import type { ProjectEventStream } from '../services/eventStream';
 const UNAVAILABLE = 'Campaign activity is temporarily unavailable.';
 const PAGE_SIZE = 100;
 
-function evidenceFromLocation(): string | null {
+interface EvidenceTarget {
+  evidenceId: string;
+  stream: ActivityTab;
+  eventId: number;
+}
+
+function evidenceTargetFromLocation(): EvidenceTarget | null {
   const [page, query = ''] = window.location.hash.slice(1).split('?', 2);
   if (page !== 'activity') return null;
-  const value = new URLSearchParams(query).get('evidence');
-  return value && value.length <= 2_000 ? value : null;
+  const params = new URLSearchParams(query);
+  const evidenceId = params.get('evidence');
+  const stream = params.get('stream');
+  const eventValue = params.get('event');
+  if (
+    !evidenceId || evidenceId.length > 2_000
+    || (stream !== 'activity' && stream !== 'debug')
+    || eventValue === null || !/^\d+$/.test(eventValue)
+  ) return null;
+  const eventId = Number(eventValue);
+  if (!Number.isSafeInteger(eventId)) return null;
+  return { evidenceId, stream, eventId };
 }
 
 export interface ActivityModel {
@@ -25,6 +41,7 @@ export interface ActivityModel {
   debugError: string | null;
   liveError: string | null;
   focusedEvidenceId: string | null;
+  focusedEventId: number | null;
   activityHasMore: boolean;
   debugHasMore: boolean;
   onTabChange: (tab: ActivityTab) => void;
@@ -46,30 +63,23 @@ export function useActivity(
   const [activityError, setActivityError] = useState<string | null>(null);
   const [debugError, setDebugError] = useState<string | null>(null);
   const [liveError, setLiveError] = useState<string | null>(null);
-  const [focusedEvidenceId, setFocusedEvidenceId] = useState<string | null>(evidenceFromLocation);
+  const [evidenceTarget, setEvidenceTarget] = useState<EvidenceTarget | null>(evidenceTargetFromLocation);
+  const [focusedTarget, setFocusedTarget] = useState<EvidenceTarget | null>(null);
   const generation = useRef(0);
   const currentProjectId = useRef<string | null>(project?.id ?? null);
+  const focusedTargetRef = useRef<EvidenceTarget | null>(null);
   const cursors = useRef({ activity: -1, debug: -1 });
 
   useEffect(() => {
-    const update = () => setFocusedEvidenceId(evidenceFromLocation());
+    const update = () => setEvidenceTarget(evidenceTargetFromLocation());
     update();
     window.addEventListener('hashchange', update);
     return () => window.removeEventListener('hashchange', update);
   }, []);
 
   useEffect(() => {
-    setFocusedEvidenceId(evidenceFromLocation());
+    setEvidenceTarget(evidenceTargetFromLocation());
   }, [enabled]);
-
-  useEffect(() => {
-    if (focusedEvidenceId === null) return;
-    if (activityEvents.some((event) => eventHasEvidence(event, focusedEvidenceId))) {
-      setActiveTab('activity');
-    } else if (debugEvents.some((event) => eventHasEvidence(event, focusedEvidenceId))) {
-      setActiveTab('debug');
-    }
-  }, [activityEvents, debugEvents, focusedEvidenceId]);
 
   const reportError = useCallback((stream: ActivityTab, requestError: unknown) => {
     const message = friendlyApiError(requestError, UNAVAILABLE);
@@ -90,6 +100,8 @@ export function useActivity(
       setActivityError(null);
       setDebugError(null);
       setLiveError(null);
+      focusedTargetRef.current = null;
+      setFocusedTarget(null);
       return;
     }
     const projectId = project.id;
@@ -100,16 +112,52 @@ export function useActivity(
         if (!isCurrent()) return;
         cursors.current[stream] = page.next_offset;
         if (stream === 'activity') {
-          setActivityEvents(page.events);
+          setActivityEvents((current) => {
+            const focused = focusedTargetRef.current?.stream === stream
+              ? current.find((event) => event.id === focusedTargetRef.current?.eventId) : undefined;
+            return focused && !page.events.some((event) => event.id === focused.id)
+              ? [focused, ...page.events] : page.events;
+          });
           setActivityHasMore(page.has_more);
           setActivityError(null);
         } else {
-          setDebugEvents(page.events);
+          setDebugEvents((current) => {
+            const focused = focusedTargetRef.current?.stream === stream
+              ? current.find((event) => event.id === focusedTargetRef.current?.eventId) : undefined;
+            return focused && !page.events.some((event) => event.id === focused.id)
+              ? [focused, ...page.events] : page.events;
+          });
           setDebugHasMore(page.has_more);
           setDebugError(null);
         }
       } catch (requestError) {
         if (isCurrent()) reportError(stream, requestError);
+      }
+    };
+    const loadExact = async () => {
+      if (evidenceTarget === null) return;
+      try {
+        const event = await api.getProjectEvent(
+          projectId, evidenceTarget.stream, evidenceTarget.eventId,
+        );
+        if (!isCurrent()) return;
+        if (
+          event.id !== evidenceTarget.eventId || event.stream !== evidenceTarget.stream
+          || !eventHasEvidence(event, evidenceTarget.evidenceId)
+        ) return;
+        focusedTargetRef.current = evidenceTarget;
+        setFocusedTarget(evidenceTarget);
+        const merge = (current: ProjectEvent[]) => [
+          event, ...current.filter((item) => item.id !== event.id),
+        ];
+        if (evidenceTarget.stream === 'activity') setActivityEvents(merge);
+        else {
+          setDebugEvents(merge);
+          setDebugFilter('all');
+        }
+        setActiveTab(evidenceTarget.stream);
+      } catch (requestError) {
+        if (isCurrent()) reportError(evidenceTarget.stream, requestError);
       }
     };
 
@@ -121,17 +169,19 @@ export function useActivity(
     setActivityError(null);
     setDebugError(null);
     setLiveError(null);
+    focusedTargetRef.current = null;
+    setFocusedTarget(null);
     setLoading(true);
-    void Promise.allSettled([load('activity'), load('debug')]).finally(() => {
-      if (isCurrent()) setLoading(false);
-    });
+    void (async () => {
+      await Promise.allSettled([load('activity'), load('debug')]);
+      await loadExact();
+    })().finally(() => { if (isCurrent()) setLoading(false); });
     const unsubscribe = events.subscribe(projectId, (name) => {
-      setLiveError(null);
       if (name === 'activity') void load('activity');
       if (name === 'debug') void load('debug');
-    }, setLiveError);
+    }, setLiveError, () => setLiveError(null));
     return () => unsubscribe();
-  }, [api, enabled, events, project, reportError]);
+  }, [api, enabled, events, evidenceTarget, project, reportError]);
 
   const loadMore = useCallback((stream: ActivityTab) => {
     if (!project || loading) return;
@@ -150,14 +200,20 @@ export function useActivity(
         setDebugHasMore(page.has_more);
         setDebugError(null);
       }
-    }).catch((requestError) => reportError(stream, requestError)).finally(() => {
+    }).catch((requestError) => {
+      if (generation.current === currentGeneration && currentProjectId.current === projectId) {
+        reportError(stream, requestError);
+      }
+    }).finally(() => {
       if (generation.current === currentGeneration && currentProjectId.current === projectId) setLoading(false);
     });
   }, [api, loading, project, reportError]);
 
   return {
     project, activityEvents, debugEvents, activeTab, debugFilter, loading,
-    activityError, debugError, liveError, focusedEvidenceId,
+    activityError, debugError, liveError,
+    focusedEvidenceId: focusedTarget?.evidenceId ?? null,
+    focusedEventId: focusedTarget?.eventId ?? null,
     activityHasMore, debugHasMore, onTabChange: setActiveTab, onDebugFilter: setDebugFilter,
     onLoadMoreActivity: () => loadMore('activity'), onLoadMoreDebug: () => loadMore('debug'),
   };

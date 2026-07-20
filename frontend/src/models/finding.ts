@@ -34,6 +34,11 @@ export interface FindingDetail extends FindingSummary {
   minimisation: { accepted: boolean; original_size: number; minimal_size: number } | null;
   correction: Record<string, unknown> | null;
   repair_intent: string | null;
+  evidence_events: Array<{
+    evidence_id: string;
+    stream: 'activity' | 'debug';
+    event_id: number;
+  }>;
 }
 
 export interface FindingPage {

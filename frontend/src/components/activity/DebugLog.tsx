@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { eventHasEvidence, type DebugFilter, type ProjectEvent } from '../../models/event';
+import type { DebugFilter, ProjectEvent } from '../../models/event';
 
 const filters: Array<{ value: DebugFilter; label: string }> = [
   { value: 'all', label: 'All debug evidence' }, { value: 'agent', label: 'Agent calls' },
@@ -51,10 +51,10 @@ function RawJson({ payload }: { payload: Record<string, unknown> }) {
   </details>;
 }
 
-export function DebugLog({ events, filter, focusedEvidenceId = null, onFilter }: {
+export function DebugLog({ events, filter, focusedEventId = null, onFilter }: {
   events: ProjectEvent[];
   filter: DebugFilter;
-  focusedEvidenceId?: string | null;
+  focusedEventId?: number | null;
   onFilter: (filter: DebugFilter) => void;
 }) {
   const visible = events.filter((event) => filter === 'all' || category(event) === filter);
@@ -75,8 +75,8 @@ export function DebugLog({ events, filter, focusedEvidenceId = null, onFilter }:
         const summaries = stringList(payload.reasoning_summaries);
         return <li key={event.id}>
           <article
-            data-evidence-focus={focusedEvidenceId !== null && eventHasEvidence(event, focusedEvidenceId) ? 'true' : undefined}
-            tabIndex={focusedEvidenceId !== null && eventHasEvidence(event, focusedEvidenceId) ? -1 : undefined}
+            data-evidence-focus={focusedEventId === event.id ? 'true' : undefined}
+            tabIndex={focusedEventId === event.id ? -1 : undefined}
           >
             <header><h3>{eventName(event)}</h3><time dateTime={event.created_at}>{new Date(event.created_at).toLocaleString()}</time></header>
             {usageText(payload.usage).length > 0 && <p className="debug-usage">{usageText(payload.usage).map((item) => <span key={item}>{item}</span>)}</p>}

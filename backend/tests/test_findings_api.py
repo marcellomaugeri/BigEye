@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -51,13 +52,14 @@ class FindingArtifacts:
         return b"crash"
 
 
-def client(rows=None, artifacts=None):
+def client(rows=None, artifacts=None, observability=None):
     from backend.api.app import create_app
 
     services = SimpleNamespace(
         recovery=SimpleNamespace(recover=lambda: None),
         findings=rows or FindingRows(),
         finding_artifacts=artifacts or FindingArtifacts(),
+        observability=observability or SimpleNamespace(locate_evidence=AsyncMock(return_value={})),
         close=lambda: None,
     )
     app = create_app(services=services)
@@ -98,6 +100,26 @@ def test_detail_is_project_scoped_and_exposes_bounded_evidence_not_logs_or_paths
     assert "path" not in str(body).casefold()
     assert "log" not in str(body).casefold()
     assert wrong_project.status_code == 404
+
+
+def test_detail_links_only_evidence_resolved_to_an_exact_retained_event():
+    from backend.models.event import StoredEvent
+
+    retained = StoredEvent(
+        id=812, created_at=NOW, stream="activity",
+        payload={"evidence_ids": ["replay:original:1"]},
+    )
+    observability = SimpleNamespace(locate_evidence=AsyncMock(return_value={
+        "replay:original:1": retained,
+    }))
+    with client(observability=observability) as api:
+        response = api.get("/api/projects/7/findings/5")
+
+    assert response.status_code == 200
+    assert response.json()["evidence_events"] == [{
+        "evidence_id": "replay:original:1", "stream": "activity", "event_id": 812,
+    }]
+    observability.locate_evidence.assert_awaited_once_with(7, ["replay:original:1"])
 
 
 def test_reproducer_download_has_fixed_safe_headers_and_no_host_path():

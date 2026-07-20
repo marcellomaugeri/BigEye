@@ -13,7 +13,7 @@ export function ActivityView({ model }: { model: ActivityModel }) {
     const focused = document.querySelector<HTMLElement>('[data-evidence-focus="true"]');
     focused?.focus({ preventScroll: true });
     focused?.scrollIntoView?.({ block: 'nearest' });
-  }, [model.activeTab, model.activityEvents, model.debugEvents, model.focusedEvidenceId]);
+  }, [model.activeTab, model.activityEvents, model.debugEvents, model.focusedEventId]);
   if (model.project === null) {
     return <EmptyState title="Activity">Select or create a project to review campaign activity.</EmptyState>;
   }
@@ -28,12 +28,12 @@ export function ActivityView({ model }: { model: ActivityModel }) {
       </Tabs.List>
       <Tabs.Content className="activity-panel" value="activity">
         {model.activityError && <StatusText tone="error">{model.activityError}</StatusText>}
-        {(model.activityError === null || model.activityEvents.length > 0) && <ActivityList events={model.activityEvents} focusedEvidenceId={model.focusedEvidenceId} />}
+        {(model.activityError === null || model.activityEvents.length > 0) && <ActivityList events={model.activityEvents} focusedEventId={model.focusedEventId} />}
         {model.activityHasMore && <Button disabled={model.loading} onClick={model.onLoadMoreActivity} variant="secondary">Load older activity</Button>}
       </Tabs.Content>
       <Tabs.Content className="activity-panel" value="debug">
         {model.debugError && <StatusText tone="error">{model.debugError}</StatusText>}
-        {(model.debugError === null || model.debugEvents.length > 0) && <DebugLog events={model.debugEvents} filter={model.debugFilter} focusedEvidenceId={model.focusedEvidenceId} onFilter={model.onDebugFilter} />}
+        {(model.debugError === null || model.debugEvents.length > 0) && <DebugLog events={model.debugEvents} filter={model.debugFilter} focusedEventId={model.focusedEventId} onFilter={model.onDebugFilter} />}
         {model.debugHasMore && <Button disabled={model.loading} onClick={model.onLoadMoreDebug} variant="secondary">Load older debug records</Button>}
       </Tabs.Content>
     </Tabs.Root>

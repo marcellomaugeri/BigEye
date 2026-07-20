@@ -11,6 +11,26 @@ from backend.services.projects.clone_repository import UnsafeWorkspacePath
 router = APIRouter()
 
 
+@router.get("/projects/{project_id}/logs/{stream}/{event_id}", response_model=StoredEventResponse)
+async def get_project_event(
+    project_id: int,
+    stream: Literal["activity", "debug"],
+    event_id: int,
+    request: Request,
+):
+    if stream not in {"activity", "debug"} or event_id < 0:
+        raise HTTPException(status_code=422, detail="invalid project event")
+    if await request.app.state.services.projects.get(project_id) is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        event = await request.app.state.services.observability.read_exact(project_id, stream, event_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="project event not found") from error
+    except (ValueError, UnsafeWorkspacePath) as error:
+        raise HTTPException(status_code=422, detail="invalid project event") from error
+    return StoredEventResponse.from_model(event)
+
+
 @router.get("/projects/{project_id}/logs/{stream}", response_model=EventLogResponse)
 async def get_project_log(
     project_id: int,
