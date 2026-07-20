@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from hashlib import sha256
 import os
 from pathlib import Path
 import re
@@ -180,18 +181,18 @@ class ProposalPreparationPlanner:
         empty = _application_file(context, "application/probe-empty.txt", "")
         minimum = _application_file(context, "application/probe-minimum.txt", "0")
         target_files.update({"probe/empty.txt": empty, "probe/minimum.txt": minimum})
-        target_script = _application_file(
+        target_script = _application_preparation_file(
             context,
-            "application/target-build.sh",
+            "target-build.sh",
             _build_script(
                 proposal.build_command,
                 instance_type=proposal.instance_type,
                 coverage=False,
             ),
         )
-        coverage_script = _application_file(
+        coverage_script = _application_preparation_file(
             context,
-            "application/coverage-build.sh",
+            "coverage-build.sh",
             _build_script(
                 proposal.build_command,
                 instance_type=proposal.instance_type,
@@ -399,11 +400,28 @@ def _application_file(context, relative_path: str, content: str) -> Path:
     try:
         existing = read_asset_file(context, relative_path)
     except GeneratedAssetError:
-        write_asset_file(context, relative_path, content, None)
+        try:
+            write_asset_file(context, relative_path, content, None)
+        except GeneratedAssetError as error:
+            try:
+                concurrent = read_asset_file(context, relative_path)
+            except GeneratedAssetError:
+                raise error
+            if concurrent["content"] != content:
+                raise error
     else:
         if existing["content"] != content:
-            write_asset_file(context, relative_path, content, existing["sha256"])
+            raise ValueError("application-owned generated preparation source changed")
     return context.generated_assets_root / relative_path
+
+
+def _application_preparation_file(context, name: str, content: str) -> Path:
+    digest = sha256(content.encode("utf-8")).hexdigest()
+    return _application_file(
+        context,
+        f"application/preparation/{digest}/{name}",
+        content,
+    )
 
 
 def _is_dependency_intent(intent) -> bool:

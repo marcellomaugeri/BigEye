@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -58,16 +62,22 @@ def _generated_scripts(
 
     asyncio.run(planner.plan(SimpleNamespace(id=7), proposal))
 
+    target, = generated.glob("application/preparation/*/target-build.sh")
+    coverage, = generated.glob("application/preparation/*/coverage-build.sh")
     return (
-        (generated / "application" / "target-build.sh").read_text(),
-        (generated / "application" / "coverage-build.sh").read_text(),
+        target.read_text(),
+        coverage.read_text(),
     )
 
 
-def test_retry_replaces_application_build_drafts_but_keeps_published_versions_immutable(
+def test_concurrent_proposals_publish_from_distinct_immutable_preparation_sources(
     tmp_path,
 ) -> None:
-    project_root = tmp_path / "projects" / "7"
+    from backend.fuzzing.assets.store import AssetStore
+    from backend.models.asset import CampaignAsset
+
+    workspace = tmp_path / "workspace"
+    project_root = workspace / "projects" / "7"
     repository = project_root / "repository"
     repository.mkdir(parents=True)
     (repository / "seed").write_bytes(b"seed")
@@ -77,27 +87,43 @@ def test_retry_replaces_application_build_drafts_but_keeps_published_versions_im
         generated_assets_root=generated,
     )
 
-    class AssetStore:
+    class Assets:
         def __init__(self):
             self.next_id = 1
-            self.published = []
+            self.assets = {}
+            self.first_creates = 0
+            self.first_create_gate = asyncio.Event()
 
-        async def create(self, _project_id, kind, name, files, _parent_id):
-            contents = {
-                path: source.read_text()
-                for path, source in files.items()
-            }
-            asset = SimpleNamespace(
-                id=self.next_id, kind=kind, name=name, contents=contents,
+        async def create(self, project_id, kind, name, content_hash, parent_id):
+            asset = CampaignAsset(
+                id=self.next_id, project_id=project_id, kind=kind, name=name,
+                content_hash=content_hash, parent_id=parent_id,
+                created_at=datetime.now(UTC), validated_at=None, error=None,
             )
             self.next_id += 1
-            self.published.append(asset)
+            self.assets[asset.id] = asset
+            self.first_creates += 1
+            if self.first_creates <= 2:
+                if self.first_creates == 2:
+                    self.first_create_gate.set()
+                await self.first_create_gate.wait()
             return asset
 
-    store = AssetStore()
+        async def get(self, asset_id):
+            return self.assets.get(asset_id)
+
+        async def mark_validated(self, asset_id):
+            asset = replace(self.assets[asset_id], validated_at=datetime.now(UTC))
+            self.assets[asset_id] = asset
+            return asset
+
+        async def record_error(self, asset_id, error):
+            self.assets[asset_id] = replace(self.assets[asset_id], error=error)
+
+    assets = Assets()
     planner = ProposalPreparationPlanner(
         discovery=SimpleNamespace(context=lambda _project_id: context),
-        asset_store=store,
+        asset_store=AssetStore(workspace, assets),
     )
 
     def selected(command: str):
@@ -109,32 +135,81 @@ def test_retry_replaces_application_build_drafts_but_keeps_published_versions_im
             generated_asset_intents=(),
         )
 
-    first = asyncio.run(planner.plan(
-        SimpleNamespace(id=7),
-        selected(
-            "cmake -S /src -B /opt/bigeye/build -DFEATURE=OFF && "
-            "cmake --build /opt/bigeye/build --target fuzz-target"
-        ),
-    ))
+    async def plan_both():
+        return await asyncio.gather(
+            planner.plan(SimpleNamespace(id=7), selected(
+                "cmake -S /src -B /opt/bigeye/build -DFEATURE=OFF && "
+                "cmake --build /opt/bigeye/build --target fuzz-target"
+            )),
+            planner.plan(SimpleNamespace(id=7), selected(
+                "cmake -S /src -B /opt/bigeye/build -DFEATURE=ON && "
+                "cmake --build /opt/bigeye/build --target fuzz-target"
+            )),
+        )
+
+    first, second = asyncio.run(plan_both())
     first_target = first.existing_assets["configuration"]
+    second_target = second.existing_assets["configuration"]
     first_coverage = first.existing_assets["coverage_configuration"]
+    second_coverage = second.existing_assets["coverage_configuration"]
 
-    second = asyncio.run(planner.plan(
-        SimpleNamespace(id=7),
-        selected(
-            "cmake -S /src -B /opt/bigeye/build -DFEATURE=ON && "
-            "cmake --build /opt/bigeye/build --target fuzz-target"
-        ),
-    ))
+    assert "-DFEATURE=OFF" in (
+        workspace / f"projects/7/assets/{first_target.id}/target-build.sh"
+    ).read_text()
+    assert "-DFEATURE=ON" in (
+        workspace / f"projects/7/assets/{second_target.id}/target-build.sh"
+    ).read_text()
+    assert "-DFEATURE=OFF" in (
+        workspace / f"projects/7/assets/{first_coverage.id}/coverage-build.sh"
+    ).read_text()
+    assert "-DFEATURE=ON" in (
+        workspace / f"projects/7/assets/{second_coverage.id}/coverage-build.sh"
+    ).read_text()
+    target_sources = sorted(generated.glob("application/preparation/*/target-build.sh"))
+    coverage_sources = sorted(generated.glob("application/preparation/*/coverage-build.sh"))
+    assert len(target_sources) == 2
+    assert len(coverage_sources) == 2
+    assert all(len(path.parent.name) == 64 for path in (*target_sources, *coverage_sources))
 
-    assert "-DFEATURE=OFF" in first_target.contents["target-build.sh"]
-    assert "-DFEATURE=OFF" in first_coverage.contents["coverage-build.sh"]
-    assert "-DFEATURE=ON" in second.existing_assets["configuration"].contents["target-build.sh"]
-    assert "-DFEATURE=ON" in second.existing_assets["coverage_configuration"].contents["coverage-build.sh"]
-    assert first_target.id != second.existing_assets["configuration"].id
-    assert first_coverage.id != second.existing_assets["coverage_configuration"].id
-    assert "-DFEATURE=ON" in (generated / "application" / "target-build.sh").read_text()
-    assert "-DFEATURE=ON" in (generated / "application" / "coverage-build.sh").read_text()
+
+def test_same_content_preparation_source_is_idempotent_during_concurrent_creation(
+    tmp_path, monkeypatch,
+) -> None:
+    import backend.fuzzing.campaigns.production_factory as production_factory
+    from backend.agents.tools.generated_assets import GeneratedAssetError
+
+    repository = tmp_path / "projects/7/repository"
+    repository.mkdir(parents=True)
+    context = SimpleNamespace(
+        repository_root=repository,
+        generated_assets_root=repository.parent / "generated",
+    )
+    content = "#!/bin/sh\nset -eu\nexit 0\n"
+    barrier = threading.Barrier(2)
+    real_read = production_factory.read_asset_file
+
+    def read_together(selected_context, relative_path):
+        try:
+            return real_read(selected_context, relative_path)
+        except GeneratedAssetError:
+            barrier.wait(timeout=5)
+            raise
+
+    monkeypatch.setattr(production_factory, "read_asset_file", read_together)
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        paths = tuple(workers.map(
+            lambda _index: production_factory._application_preparation_file(
+                context, "target-build.sh", content,
+            ),
+            range(2),
+        ))
+
+    assert paths[0] == paths[1]
+    assert paths[0].read_text() == content
+    assert len(tuple(context.generated_assets_root.glob(
+        "application/preparation/*/target-build.sh"
+    ))) == 1
 
 
 @pytest.mark.parametrize("prompt", (SYSTEM_TARGET_PROMPT, COMPONENT_TARGET_PROMPT))
