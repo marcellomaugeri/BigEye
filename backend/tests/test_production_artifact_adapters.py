@@ -1307,7 +1307,16 @@ def _triage_result(output, citation: str | None = None):
             }],
         }]),)
     return SimpleNamespace(
-        final_output=output, raw_responses=raw_responses, new_items=(),
+        final_output={
+            "summary": "Triaged the bounded crash group.",
+            "evidence_ids": list(output["evidence_ids"]),
+            "target_proposals": [],
+            "triage_results": [output],
+            "operation_request_ids": [],
+            "recommendations": [],
+            "uncertainty": output["uncertainty"],
+        },
+        raw_responses=raw_responses, new_items=(),
     )
 
 
@@ -1326,7 +1335,7 @@ async def _retrieve_for_triage(agent, context, question: str, limit: int):
 def test_crash_triage_luna_registers_repository_evidence_returned_by_its_tool(
     tmp_path: Path,
 ) -> None:
-    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageSpecialist
+    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageWorker
 
     context = _triage_context(tmp_path)
     calls = []
@@ -1338,7 +1347,7 @@ def test_crash_triage_luna_registers_repository_evidence_returned_by_its_tool(
             excerpts[0]["evidence_id"], "replay:original:1",
         ]))
 
-    result = asyncio.run(ProductionCrashTriageSpecialist(
+    result = asyncio.run(ProductionCrashTriageWorker(
         SimpleNamespace(context=lambda _project_id: context), runner=runner,
     ).triage(_triage_evidence()))
 
@@ -1350,7 +1359,7 @@ def test_crash_triage_luna_registers_repository_evidence_returned_by_its_tool(
 def test_crash_triage_terra_registers_only_its_own_retry_retrieval(
     tmp_path: Path,
 ) -> None:
-    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageSpecialist
+    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageWorker
 
     context = _triage_context(
         tmp_path,
@@ -1369,7 +1378,7 @@ def test_crash_triage_terra_registers_only_its_own_retry_retrieval(
             cited.append("replay:original:1")
         return _triage_result(_triage_output(cited))
 
-    result = asyncio.run(ProductionCrashTriageSpecialist(
+    result = asyncio.run(ProductionCrashTriageWorker(
         SimpleNamespace(context=lambda _project_id: context), runner=runner,
     ).triage(_triage_evidence()))
 
@@ -1382,8 +1391,8 @@ def test_crash_triage_terra_registers_only_its_own_retry_retrieval(
 def test_crash_triage_fails_after_two_attempts_invent_evidence_and_traces_raw_results(
     tmp_path: Path,
 ) -> None:
-    from backend.agents.tools.agent_dispatch import SpecialistValidationError
-    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageSpecialist
+    from backend.agents.tools.agent_dispatch import WorkerValidationError
+    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageWorker
     from backend.services.observability.event_store import ProjectEventStore
 
     context = _triage_context(tmp_path)
@@ -1395,9 +1404,9 @@ def test_crash_triage_fails_after_two_attempts_invent_evidence_and_traces_raw_re
         return _triage_result(_triage_output(["invented:" + agent.model]))
 
     with pytest.raises(
-        SpecialistValidationError, match="failed deterministic validation twice",
+        WorkerValidationError, match="failed deterministic validation twice",
     ):
-        asyncio.run(ProductionCrashTriageSpecialist(
+        asyncio.run(ProductionCrashTriageWorker(
             SimpleNamespace(context=lambda _project_id: context), events=store, runner=runner,
         ).triage(_triage_evidence()))
 
@@ -1409,13 +1418,16 @@ def test_crash_triage_fails_after_two_attempts_invent_evidence_and_traces_raw_re
     assert [event["event"] for event in debug] == [
         "workflow.result", "specialist.retry", "workflow.result", "workflow.error",
     ]
-    assert [event["output"]["evidence_ids"] for event in debug if event["event"] == "workflow.result"] == [
+    assert [
+        event["output"]["triage_results"][0]["evidence_ids"]
+        for event in debug if event["event"] == "workflow.result"
+    ] == [
         ["invented:gpt-5.6-luna"], ["invented:gpt-5.6-terra"],
     ]
 
 
 def test_crash_triage_accepts_an_exact_official_citation_id(tmp_path: Path) -> None:
-    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageSpecialist
+    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageWorker
 
     context = _triage_context(tmp_path)
     citation = "https://llvm.org/docs/LibFuzzer.html"
@@ -1427,7 +1439,7 @@ def test_crash_triage_accepts_an_exact_official_citation_id(tmp_path: Path) -> N
             _triage_output([citation, "replay:original:1"]), citation,
         )
 
-    result = asyncio.run(ProductionCrashTriageSpecialist(
+    result = asyncio.run(ProductionCrashTriageWorker(
         SimpleNamespace(context=lambda _project_id: context), runner=runner,
     ).triage(_triage_evidence()))
 
@@ -1438,7 +1450,7 @@ def test_crash_triage_accepts_an_exact_official_citation_id(tmp_path: Path) -> N
 def test_crash_triage_retries_a_nonofficial_citation_then_accepts_terra_official_source(
     tmp_path: Path,
 ) -> None:
-    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageSpecialist
+    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageWorker
 
     context = _triage_context(tmp_path)
     rejected = "https://example.org/fuzzing"
@@ -1452,7 +1464,7 @@ def test_crash_triage_retries_a_nonofficial_citation_then_accepts_terra_official
             _triage_output([citation, "replay:original:1"]), citation,
         )
 
-    result = asyncio.run(ProductionCrashTriageSpecialist(
+    result = asyncio.run(ProductionCrashTriageWorker(
         SimpleNamespace(context=lambda _project_id: context), runner=runner,
     ).triage(_triage_evidence()))
 
@@ -1464,7 +1476,7 @@ def test_crash_triage_retrieval_bounds_requests_and_caps_dynamic_evidence_at_64(
     tmp_path: Path,
 ) -> None:
     from backend.agents.tools.evidence_retrieval import evidence_request_error
-    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageSpecialist
+    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageWorker
 
     source = "".join(
         f"int group{group}_parser_{index}(const char *input);\n"
@@ -1488,7 +1500,7 @@ def test_crash_triage_retrieval_bounds_requests_and_caps_dynamic_evidence_at_64(
             retained[-1]["evidence_id"], "replay:original:1",
         ]))
 
-    result = asyncio.run(ProductionCrashTriageSpecialist(
+    result = asyncio.run(ProductionCrashTriageWorker(
         SimpleNamespace(context=lambda _project_id: context), runner=runner,
     ).triage(_triage_evidence()))
 
@@ -1504,7 +1516,7 @@ def test_crash_triage_retrieval_bounds_requests_and_caps_dynamic_evidence_at_64(
 
 def test_crash_triage_retries_invalid_luna_output_once_with_terra_and_same_evidence() -> None:
     from backend.fuzzing.crashes.triage import CrashTriageEvidence
-    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageSpecialist
+    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageWorker
 
     evidence = CrashTriageEvidence(
         project_id=7, campaign_id=9, fingerprint="f" * 64, reproducible=True,
@@ -1524,10 +1536,10 @@ def test_crash_triage_retries_invalid_luna_output_once_with_terra_and_same_evide
     async def runner(agent, prompt, **kwargs):
         calls.append((agent.model, prompt, kwargs["context"]))
         output = {**valid, "classification": "invented"} if len(calls) == 1 else valid
-        return SimpleNamespace(final_output=output, raw_responses=(), new_items=())
+        return _triage_result(output)
 
     context = SimpleNamespace(evidence=SimpleNamespace(inventory=SimpleNamespace(build_files=())))
-    specialist = ProductionCrashTriageSpecialist(
+    specialist = ProductionCrashTriageWorker(
         SimpleNamespace(context=lambda project_id: context), runner=runner,
     )
     result = asyncio.run(specialist.triage(evidence))
@@ -1541,7 +1553,7 @@ def test_crash_triage_retries_invalid_luna_output_once_with_terra_and_same_evide
 
 def test_crash_triage_does_not_escalate_a_transport_failure_to_terra() -> None:
     from backend.fuzzing.crashes.triage import CrashTriageEvidence
-    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageSpecialist
+    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageWorker
 
     evidence = CrashTriageEvidence(
         project_id=7, campaign_id=9, fingerprint="f" * 64, reproducible=True,
@@ -1558,7 +1570,7 @@ def test_crash_triage_does_not_escalate_a_transport_failure_to_terra() -> None:
         raise ConnectionError("transport unavailable")
 
     context = SimpleNamespace(evidence=SimpleNamespace(inventory=SimpleNamespace(build_files=())))
-    specialist = ProductionCrashTriageSpecialist(
+    specialist = ProductionCrashTriageWorker(
         SimpleNamespace(context=lambda project_id: context), runner=runner,
     )
 

@@ -1,1 +1,1 @@
-"""Short-lived specialist roles invoked by the manager as tools."""
+"""Legacy package retained for import compatibility; fixed specialist roles were removed."""

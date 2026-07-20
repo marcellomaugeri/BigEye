@@ -10,10 +10,9 @@ from uuid import uuid4
 from agents import Runner
 
 from backend.agents.context import AgentContext
+from backend.agents.fuzzing_worker import build_fuzzing_worker
 from backend.agents.prompts.target_repair import TARGET_REPAIR_ASSIGNMENT
-from backend.agents.specialists.component_target import build_component_target_agent
-from backend.agents.specialists.system_target import build_system_target_agent
-from backend.agents.tools.agent_dispatch import _validate_target
+from backend.agents.tools.agent_dispatch import _validate_worker_result
 from backend.agents.tools.generated_assets import (
     list_asset_files,
     read_asset_file,
@@ -26,7 +25,7 @@ from backend.fuzzing.campaigns.target_preparation import TargetRepair
 
 
 class TargetRepairAgent:
-    """Use the same specialist capability in an isolated draft root for one Terra correction."""
+    """Use the general worker in an isolated draft root for one Terra correction."""
 
     def __init__(self, discovery, event_store=None, runner=Runner.run):
         self._discovery = discovery
@@ -61,9 +60,7 @@ class TargetRepairAgent:
                 record = read_asset_file(original, path)
                 originals[path] = record
                 write_asset_file(context, path, str(record["content"]), None)
-            expected_type = "system-level" if proposal.instance_type == "system-level" else "component-level"
-            builder = build_system_target_agent if expected_type == "system-level" else build_component_target_agent
-            agent = builder(model, official_documentation_domains(context))
+            agent = build_fuzzing_worker(model, official_documentation_domains(context))
             trace = LocalTrace(self._events, project.id)
             prompt = TARGET_REPAIR_ASSIGNMENT + "\n" + json.dumps({
                 "proposal": proposal.model_dump(mode="json"),
@@ -76,10 +73,17 @@ class TargetRepairAgent:
                 run_config=trace.run_config("BigEye target repair"),
             )
             trace.record_result(agent, prompt, result)
-            repaired = _validate_target(
+            worker_result = _validate_worker_result(
                 getattr(result, "final_output", None),
-                frozenset(proposal.evidence_ids), expected_type,
+                frozenset(proposal.evidence_ids), frozenset(),
             )
+            if (
+                len(worker_result.target_proposals) != 1
+                or worker_result.triage_results
+                or worker_result.operation_request_ids
+            ):
+                raise ValueError("Terra repair returned outcomes outside its bounded assignment")
+            repaired = worker_result.target_proposals[0]
             if (
                 (repaired.target_name, repaired.instance_type, repaired.configuration)
                 != (proposal.target_name, proposal.instance_type, proposal.configuration)

@@ -1,4 +1,4 @@
-"""Structured target proposal returned by system and component specialists."""
+"""Structured target proposal returned by a dynamically assigned fuzzing worker."""
 
 from pydantic import BaseModel, ConfigDict, Field
 

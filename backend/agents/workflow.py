@@ -18,7 +18,7 @@ _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | 
 
 
 class CampaignWorkflow(CampaignManager):
-    """Named application boundary for ongoing campaign reviews."""
+    """Named application boundary for dynamic-worker campaign reviews."""
 
 
 def _publish_initial_decision(workspace: Path, context: AgentContext, content: str) -> Path:

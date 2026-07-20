@@ -1,4 +1,4 @@
-"""Terra campaign manager with typed specialist tools and deterministic boundaries."""
+"""Terra campaign manager with one dynamic worker tool and deterministic boundaries."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from backend.agents.outputs.campaign_review import (
 )
 from backend.agents.prompts.manager import MANAGER_PROMPT
 from backend.agents.tools.agent_dispatch import (
-    SpecialistValidationError,
+    WorkerValidationError,
     _reject_operation_request_evidence_ids,
     dispatch_tools,
 )
@@ -30,11 +30,11 @@ MAX_MANAGER_EVIDENCE_BYTES = 64_000
 MAX_MANAGER_REASON_CHARS = 4_000
 
 
-def build_manager_agent(specialist_tools) -> Agent:
+def build_manager_agent(worker_tools) -> Agent:
     """Construct the Terra manager without repository, shell, or Docker access."""
     return Agent(
         name="Campaign manager", instructions=MANAGER_PROMPT, model="gpt-5.6-terra",
-        model_settings=ModelSettings(parallel_tool_calls=True), tools=list(specialist_tools),
+        model_settings=ModelSettings(parallel_tool_calls=True), tools=list(worker_tools),
         output_type=CampaignDecision,
     )
 
@@ -72,32 +72,32 @@ def _validated_decision(
     try:
         decision = value if isinstance(value, CampaignDecision) else CampaignDecision.model_validate(value)
     except (ValidationError, TypeError) as error:
-        raise SpecialistValidationError("manager returned an invalid campaign decision") from error
+        raise WorkerValidationError("manager returned an invalid campaign decision") from error
     if len(decision.bounded_actions) != len(set(decision.bounded_actions)):
-        raise SpecialistValidationError("manager returned duplicate bounded actions")
+        raise WorkerValidationError("manager returned duplicate bounded actions")
     if any(not action.strip() or len(action) > 500 for action in decision.bounded_actions):
-        raise SpecialistValidationError("manager returned an invalid bounded action")
+        raise WorkerValidationError("manager returned an invalid bounded action")
     if set(decision.bounded_actions) - actionable_ids:
-        raise SpecialistValidationError("manager selected an action outside this review")
+        raise WorkerValidationError("manager selected an action outside this review")
     values = decision.evidence_ids
     if len(values) != len(set(values)):
-        raise SpecialistValidationError("manager returned duplicate evidence identifiers")
+        raise WorkerValidationError("manager returned duplicate evidence identifiers")
     if any(not isinstance(value, str) or not value or len(value) > 2_000 for value in values):
-        raise SpecialistValidationError("manager returned an invalid evidence identifier")
+        raise WorkerValidationError("manager returned an invalid evidence identifier")
     try:
         _reject_operation_request_evidence_ids(values)
-    except SpecialistValidationError as error:
-        raise SpecialistValidationError(
+    except WorkerValidationError as error:
+        raise WorkerValidationError(
             "manager returned an operation-request ID as evidence"
         ) from error
     selected_ids = frozenset(decision.bounded_actions)
     action_evidence_ids = set(values) & actionable_ids
     if action_evidence_ids - selected_ids:
-        raise SpecialistValidationError("manager cited an unselected action as evidence")
+        raise WorkerValidationError("manager cited an unselected action as evidence")
     removable_ids = action_evidence_ids & selected_ids
     factual_values = [value for value in values if value not in removable_ids]
     if set(factual_values) - evidence_ids:
-        raise SpecialistValidationError("manager cited evidence outside this review")
+        raise WorkerValidationError("manager cited evidence outside this review")
     removed_ids = tuple(value for value in values if value in removable_ids)
     if not removed_ids:
         return decision, ()

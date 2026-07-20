@@ -192,7 +192,7 @@ def test_dynamic_repository_evidence_does_not_escape_the_specialist_boundary(
     from backend.agents.context import AgentContext
     from backend.fuzzing.discovery.retrieval import EvidenceRetriever
     from backend.services.campaigns.production_evidence_factory import (
-        ProductionCrashTriageSpecialist,
+        ProductionCrashTriageWorker,
     )
     from backend.services.observability.event_store import ProjectEventStore
 
@@ -222,17 +222,25 @@ def test_dynamic_repository_evidence_does_not_escape_the_specialist_boundary(
         observed.update(dynamic_id=dynamic_id, deterministic_ids=deterministic_ids)
         return SimpleNamespace(
             final_output={
-                "classification": "true vulnerability",
-                "description": "stable fault",
+                "summary": "Triaged the bounded crash group.",
                 "evidence_ids": [dynamic_id, deterministic_ids[0]],
+                "target_proposals": [],
+                "triage_results": [{
+                    "classification": "true vulnerability",
+                    "description": "stable fault",
+                    "evidence_ids": [dynamic_id, deterministic_ids[0]],
+                    "uncertainty": "impact unknown",
+                    "priority_rationale": "stable",
+                    "repair_intent": "inspect parser",
+                }],
+                "operation_request_ids": [],
+                "recommendations": [],
                 "uncertainty": "impact unknown",
-                "priority_rationale": "stable",
-                "repair_intent": "inspect parser",
             },
             raw_responses=(), new_items=(),
         )
 
-    specialist = ProductionCrashTriageSpecialist(
+    specialist = ProductionCrashTriageWorker(
         SimpleNamespace(context=lambda _project_id: context),
         events=events,
         runner=runner,
@@ -251,7 +259,7 @@ def test_dynamic_repository_evidence_does_not_escape_the_specialist_boundary(
     assert dynamic_id not in service.artifacts.detail(finding)["evidence_ids"]
     debug = [event.payload for event in run(events.read(7, "debug", -1, 100))]
     workflow_result = next(event for event in debug if event["event"] == "workflow.result")
-    assert workflow_result["output"]["evidence_ids"] == [
+    assert workflow_result["output"]["triage_results"][0]["evidence_ids"] == [
         dynamic_id, deterministic_ids[0],
     ]
 

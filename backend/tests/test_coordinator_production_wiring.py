@@ -81,9 +81,16 @@ def test_manager_selects_target_result_while_operation_requests_remain_audit_onl
         new_items = []
         raw_responses = []
         input = "nested"
-        final_output = proposal
-
-        def __init__(self, outer_context):
+        def __init__(self, outer_context, operation_request_id):
+            self.final_output = {
+                "summary": "Prepared parser target.",
+                "evidence_ids": ["source:parser"],
+                "target_proposals": [proposal.model_dump(mode="json")],
+                "triage_results": [],
+                "operation_request_ids": [operation_request_id],
+                "recommendations": [],
+                "uncertainty": "Not probed.",
+            }
             self.agent_tool_invocation = SimpleNamespace(
                 tool_name=outer_context.tool_name,
                 tool_call_id=outer_context.tool_call_id,
@@ -98,26 +105,27 @@ def test_manager_selects_target_result_while_operation_requests_remain_audit_onl
             tool for tool in starting_agent.tools if tool.name == "request_contained_operation"
         )
         arguments = '{"operation":"probe","asset_paths":[],"assertions":["seed reaches parser"]}'
-        await operation.on_invoke_tool(ToolContext(
+        operation_output = await operation.on_invoke_tool(ToolContext(
             context.context, tool_name=operation.name, tool_call_id="operation-1",
             tool_arguments=arguments, run_config=RunConfig(), agent=starting_agent,
+            tool_input=context.tool_input,
         ), arguments)
-        return NestedResult(context)
+        return NestedResult(context, operation_output["request_id"])
 
     monkeypatch.setattr(Runner, "run", nested_runner)
 
     async def manager_runner(agent, _prompt, **_kwargs):
-        target_tool = next(tool for tool in agent.tools if tool.name == "prepare_system_target")
+        target_tool = next(tool for tool in agent.tools if tool.name == "run_fuzzing_worker")
         arguments = '{"assignment":"prepare parser","evidence_ids":["source:parser"]}'
         output = await target_tool.on_invoke_tool(ToolContext(
             context, tool_name=target_tool.name, tool_call_id="target-1",
             tool_arguments=arguments, run_config=RunConfig(),
         ), arguments)
-        assert set(output) == {"result_id", "result"}
+        assert output["target_result_ids"]
         return SimpleNamespace(
             final_output=CampaignDecision(
                 decision="prepare parser", motivation="validated target proposal",
-                evidence_ids=["source:parser"], bounded_actions=[output["result_id"]],
+                evidence_ids=["source:parser"], bounded_actions=output["target_result_ids"],
                 next_review_delay_seconds=900,
                 next_review_reason="Recheck after the deterministic probe", uncertainty="not probed",
             ), raw_responses=[], new_items=[],
@@ -156,7 +164,7 @@ def test_validated_prepared_target_is_published_and_started(tmp_path) -> None:
         evidence_ids=["source:parser"], uncertainty="probe required",
     )
     record = TargetProposalRecord(
-        result_id="target_1", specialist="system", tool_call_id="call_1",
+        result_id="target_1", worker_assignment="system", tool_call_id="call_1",
         attempt=1, model="gpt-5.6-luna", proposal=proposal,
     )
     prepared = SimpleNamespace(
@@ -217,7 +225,7 @@ def test_target_preparation_promotes_its_compilation_lease_only_after_exact_star
         evidence_ids=["source:parser"], uncertainty="probe required",
     )
     record = TargetProposalRecord(
-        result_id="target_1", specialist="system", tool_call_id="call_1",
+        result_id="target_1", worker_assignment="system", tool_call_id="call_1",
         attempt=1, model="gpt-5.6-luna", proposal=proposal,
     )
     prepared = SimpleNamespace(
@@ -267,7 +275,7 @@ def test_system_campaign_uses_file_mode_only_for_an_explicit_input_placeholder()
             evidence_ids=["source:parser"], uncertainty="probe required",
         )
         return TargetProposalRecord(
-            result_id="target_1", specialist="system", tool_call_id="call_1",
+            result_id="target_1", worker_assignment="system", tool_call_id="call_1",
             attempt=1, model="gpt-5.6-luna", proposal=proposal,
         )
 
@@ -307,7 +315,7 @@ def test_campaign_run_command_rejects_noncontained_or_shell_argv() -> None:
             evidence_ids=["source:parser"], uncertainty="probe required",
         )
         return TargetProposalRecord(
-            result_id="target_1", specialist="system", tool_call_id="call_1",
+            result_id="target_1", worker_assignment="system", tool_call_id="call_1",
             attempt=1, model="gpt-5.6-luna", proposal=proposal,
         )
 
@@ -1148,7 +1156,15 @@ def test_terra_repair_edits_exactly_one_isolated_existing_draft(tmp_path) -> Non
     async def runner(_agent, _prompt, *, context, **_kwargs):
         record = read_asset_file(context, "harness.cc")
         write_asset_file(context, "harness.cc", "int repaired;\n", record["sha256"])
-        return SimpleNamespace(final_output=proposal)
+        return SimpleNamespace(final_output={
+            "summary": "Repaired one generated harness.",
+            "evidence_ids": ["source:parser"],
+            "target_proposals": [proposal.model_dump(mode="json")],
+            "triage_results": [],
+            "operation_request_ids": [],
+            "recommendations": [],
+            "uncertainty": "Probe still required.",
+        })
 
     repairer = TargetRepairAgent(
         SimpleNamespace(context=lambda _project_id: context), runner=runner,

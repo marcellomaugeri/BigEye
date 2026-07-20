@@ -11,7 +11,7 @@ from backend.services.observability.event_store import ProjectEventStore
 
 
 @pytest.mark.skipif(os.getenv("BIGEYE_LIVE_OPENAI") != "1", reason="live OpenAI smoke is opt-in")
-def test_live_manager_delegates_to_one_bounded_specialist_and_records_debug(tmp_path: Path) -> None:
+def test_live_manager_delegates_to_one_bounded_worker_and_records_debug(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     repository.mkdir()
     (repository / "CMakeLists.txt").write_text("add_executable(parser main.c)\n")
@@ -25,7 +25,7 @@ def test_live_manager_delegates_to_one_bounded_specialist_and_records_debug(tmp_
 
     review = asyncio.run(CampaignManager(store).review(
         context, evidence=[excerpt.as_dict()],
-        reason="Call prepare_system_target once, then choose the smallest deterministic parser probe.",
+        reason="Call run_fuzzing_worker once, then choose the smallest deterministic parser probe.",
     ))
 
     assert review.decision.decision

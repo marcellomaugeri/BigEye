@@ -1236,7 +1236,7 @@ def test_retained_target_identity_includes_instance_type() -> None:
 def _record(result_id: str = "target_known") -> TargetProposalRecord:
     return TargetProposalRecord(
         result_id=result_id,
-        specialist="prepare_component_target",
+        worker_assignment="prepare a component target",
         tool_call_id="call-1",
         attempt=1,
         model="gpt-5.6-luna",

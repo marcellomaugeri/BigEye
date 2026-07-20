@@ -17,27 +17,31 @@ from backend.fuzzing.campaigns.coverage_contract import valid_replay_environment
 
 
 @dataclass(frozen=True)
-class SpecialistInvocation:
-    """Exact outer agent-tool invocation and model attempt that produced a record."""
+class WorkerInvocation:
+    """Exact dynamic assignment, agent-tool call, and model attempt for one worker run."""
 
-    specialist: str
+    worker_assignment: str
     tool_call_id: str
     attempt: int
     model: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.specialist, str) or not self.specialist or len(self.specialist) > 100:
-            raise ValueError("specialist invocation name is invalid")
+        if (
+            not isinstance(self.worker_assignment, str)
+            or not self.worker_assignment
+            or len(self.worker_assignment) > 4_000
+        ):
+            raise ValueError("worker assignment is invalid")
         if not isinstance(self.tool_call_id, str) or not self.tool_call_id or len(self.tool_call_id) > 500:
-            raise ValueError("specialist tool call ID is invalid")
+            raise ValueError("worker tool call ID is invalid")
         if not isinstance(self.attempt, int) or isinstance(self.attempt, bool) or self.attempt < 1:
-            raise ValueError("specialist attempt is invalid")
+            raise ValueError("worker attempt is invalid")
         if not isinstance(self.model, str) or not self.model or len(self.model) > 100:
-            raise ValueError("specialist model is invalid")
+            raise ValueError("worker model is invalid")
 
     @property
     def key(self) -> tuple[str, str, int, str]:
-        return self.specialist, self.tool_call_id, self.attempt, self.model
+        return self.worker_assignment, self.tool_call_id, self.attempt, self.model
 
 
 class TargetProposalRecord(BaseModel):
@@ -46,7 +50,7 @@ class TargetProposalRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     result_id: str = Field(min_length=1, max_length=100)
-    specialist: str = Field(min_length=1, max_length=100)
+    worker_assignment: str = Field(min_length=1, max_length=4_000)
     tool_call_id: str = Field(min_length=1, max_length=500)
     attempt: int = Field(ge=1)
     model: str = Field(min_length=1, max_length=100)
@@ -59,7 +63,7 @@ class TriageResultRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     result_id: str = Field(min_length=1, max_length=100)
-    specialist: str = Field(min_length=1, max_length=100)
+    worker_assignment: str = Field(min_length=1, max_length=4_000)
     tool_call_id: str = Field(min_length=1, max_length=500)
     attempt: int = Field(ge=1)
     model: str = Field(min_length=1, max_length=100)
@@ -67,12 +71,12 @@ class TriageResultRecord(BaseModel):
 
 
 class ContainedOperationRequestRecord(BaseModel):
-    """A typed specialist planning record retained for audit, not execution."""
+    """A typed worker planning record retained for audit, not execution."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     request_id: str = Field(min_length=1, max_length=100)
-    specialist: str = Field(min_length=1, max_length=100)
+    worker_assignment: str = Field(min_length=1, max_length=4_000)
     tool_call_id: str = Field(min_length=1, max_length=500)
     attempt: int = Field(ge=1)
     model: str = Field(min_length=1, max_length=100)
@@ -241,8 +245,8 @@ class CampaignReviewCollection:
         ] = {}
         self._quarantined_operations: dict[str, ContainedOperationRequestRecord] = {}
 
-    def record_specialist(
-        self, invocation: SpecialistInvocation, result: TargetProposal | TriageResult,
+    def record_worker_outcome(
+        self, invocation: WorkerInvocation, result: TargetProposal | TriageResult,
     ) -> TargetProposalRecord | TriageResultRecord:
         if isinstance(result, TargetProposal):
             payload = {**invocation.__dict__, "proposal": result.model_dump(mode="json")}
@@ -262,8 +266,17 @@ class CampaignReviewCollection:
                 return self._triage[record.result_id]
         raise TypeError("campaign review result type is unsupported")
 
+    def record_worker(
+        self, invocation: WorkerInvocation, targets: list[TargetProposal], triage: list[TriageResult],
+    ) -> tuple[tuple[TargetProposalRecord, ...], tuple[TriageResultRecord, ...]]:
+        """Retain every validated concrete outcome from one accepted worker result."""
+        return (
+            tuple(self.record_worker_outcome(invocation, result) for result in targets),
+            tuple(self.record_worker_outcome(invocation, result) for result in triage),
+        )
+
     def record_operation(
-        self, invocation: SpecialistInvocation, request: dict,
+        self, invocation: WorkerInvocation, request: dict,
     ) -> ContainedOperationRequestRecord:
         payload = {**invocation.__dict__, **request}
         record = ContainedOperationRequestRecord(
@@ -275,8 +288,13 @@ class CampaignReviewCollection:
             pending.setdefault(record.request_id, record)
             return pending[record.request_id]
 
-    def complete_attempt(self, invocation: SpecialistInvocation, *, accepted: bool) -> None:
-        """Retain audit records only from the exact accepted specialist attempt."""
+    def pending_operation_ids(self, invocation: WorkerInvocation) -> frozenset[str]:
+        """Return only operation requests created by this exact in-flight worker attempt."""
+        with self._lock:
+            return frozenset(self._pending_operations.get(invocation.key, ()))
+
+    def complete_attempt(self, invocation: WorkerInvocation, *, accepted: bool) -> None:
+        """Retain audit records only from the exact accepted worker attempt."""
         with self._lock:
             pending = self._pending_operations.pop(invocation.key, {})
             for request_id, record in pending.items():

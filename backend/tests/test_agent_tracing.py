@@ -194,7 +194,7 @@ def test_result_trace_records_agent_tool_invocation_metadata(tmp_path: Path) -> 
     result = SimpleNamespace(
         final_output={"ok": True}, raw_responses=[], new_items=[],
         agent_tool_invocation=SimpleNamespace(
-            tool_name="prepare_system_target", tool_call_id="call-parent",
+            tool_name="run_fuzzing_worker", tool_call_id="call-parent",
             tool_arguments='{"assignment":"parser","evidence_ids":["known"]}',
         ),
     )
@@ -202,7 +202,7 @@ def test_result_trace_records_agent_tool_invocation_metadata(tmp_path: Path) -> 
     trace.record_result(agent, "nested input", result)
 
     record = read_payloads(store, "debug")[-1]
-    assert record["parent_tool"] == "prepare_system_target"
+    assert record["parent_tool"] == "run_fuzzing_worker"
     assert record["parent_tool_call_id"] == "call-parent"
     assert record["parent_tool_arguments"] == {
         "assignment": "parser", "evidence_ids": ["known"],
@@ -258,9 +258,7 @@ def test_campaign_manager_returns_structured_decision_and_writes_plain_activity(
     assert isinstance(result, CampaignReviewResult)
     assert result.decision == decision
     assert calls[0][0].model == "gpt-5.6-terra"
-    assert {tool.name for tool in calls[0][0].tools} == {
-        "prepare_system_target", "prepare_component_target", "triage_crash_group"
-    }
+    assert [tool.name for tool in calls[0][0].tools] == ["run_fuzzing_worker"]
     assert calls[0][2]["run_config"].trace_include_sensitive_data is False
     activity = read_payloads(store, "activity")
     assert activity[-1] == {
@@ -275,7 +273,7 @@ def test_campaign_manager_accepts_source_evidence_registered_inside_a_specialist
     context = context_for(tmp_path)
 
     async def runner(agent, prompt, **kwargs):
-        system_tool = next(tool for tool in agent.tools if tool.name == "prepare_system_target")
+        system_tool = next(tool for tool in agent.tools if tool.name == "run_fuzzing_worker")
         retrieval = next(tool for tool in system_tool._agent_instance.tools if tool.name == "retrieve_repository_evidence")
         tool_context = ToolContext(
             context, tool_name=retrieval.name, tool_call_id="retrieve-1",
@@ -323,11 +321,21 @@ def test_campaign_manager_returns_selectable_specialist_result_and_audit_operati
         new_items = []
         raw_responses = []
         input = "nested"
-        final_output = proposal
         agent_tool_invocation = SimpleNamespace(
-            tool_name="prepare_system_target", tool_call_id="call-specialist",
+            tool_name="run_fuzzing_worker", tool_call_id="call-specialist",
             tool_arguments='{"assignment":"parser","evidence_ids":["known"]}',
         )
+
+        def __init__(self, operation_request_id):
+            self.final_output = {
+                "summary": "Prepared parser target.",
+                "evidence_ids": ["known"],
+                "target_proposals": [proposal],
+                "triage_results": [],
+                "operation_request_ids": [operation_request_id],
+                "recommendations": [],
+                "uncertainty": "Not probed.",
+            }
 
         def to_input_list(self):
             return []
@@ -344,12 +352,12 @@ def test_campaign_manager_returns_selectable_specialist_result_and_audit_operati
             tool_arguments=(
                 '{"operation":"probe","asset_paths":["system/parser/config.sh"],'
                 '"assertions":["reaches parser"]}'
-            ), run_config=RunConfig(), agent=starting_agent,
+            ), run_config=RunConfig(), agent=starting_agent, tool_input=context.tool_input,
         )
         operation_outputs[context.tool_call_id] = await operation_tool.on_invoke_tool(
             operation_context, operation_context.tool_arguments,
         )
-        return NestedResult()
+        return NestedResult(operation_outputs[context.tool_call_id]["request_id"])
 
     monkeypatch.setattr(Runner, "run", nested_runner)
 
@@ -358,18 +366,19 @@ def test_campaign_manager_returns_selectable_specialist_result_and_audit_operati
     async def manager_runner(agent, prompt, **kwargs):
         nonlocal manager_calls
         manager_calls += 1
-        target_tool = next(tool for tool in agent.tools if tool.name == "prepare_system_target")
+        target_tool = next(tool for tool in agent.tools if tool.name == "run_fuzzing_worker")
         target_context = ToolContext(
             context, tool_name=target_tool.name, tool_call_id="call-specialist",
             tool_arguments='{"assignment":"parser","evidence_ids":["known"]}',
             run_config=RunConfig(),
         )
-        specialist = await target_tool.on_invoke_tool(target_context, target_context.tool_arguments)
+        worker = await target_tool.on_invoke_tool(target_context, target_context.tool_arguments)
+        target_id = worker["target_result_ids"][0]
         return SimpleNamespace(
             final_output=CampaignDecision(
                 decision="probe", motivation="proposal ready",
-                evidence_ids=["known", specialist["result_id"]],
-                bounded_actions=[specialist["result_id"]],
+                evidence_ids=["known", target_id],
+                bounded_actions=[target_id],
                 next_review_delay_seconds=900,
                 next_review_reason="Recheck after the probe", uncertainty="not probed",
             ), raw_responses=[], new_items=[],

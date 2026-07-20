@@ -1,1 +1,1 @@
-"""Instructions for the campaign manager and temporary specialists."""
+"""Instructions for the campaign manager and dynamically assigned worker."""

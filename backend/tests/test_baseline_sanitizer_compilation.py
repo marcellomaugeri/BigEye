@@ -18,8 +18,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from backend.agents.prompts.component_target import COMPONENT_TARGET_PROMPT
-from backend.agents.prompts.system_target import SYSTEM_TARGET_PROMPT
+from backend.agents.prompts.fuzzing_worker import FUZZING_WORKER_PROMPT
 from backend.fuzzing.campaigns.production_factory import ProposalPreparationPlanner
 
 
@@ -322,8 +321,8 @@ def test_application_source_is_bound_before_asset_store_normalization(
     assert all(asset.name != asset_name for asset in assets.created)
 
 
-@pytest.mark.parametrize("prompt", (SYSTEM_TARGET_PROMPT, COMPONENT_TARGET_PROMPT))
-def test_target_specialists_receive_the_supported_explicit_cmake_form(prompt: str) -> None:
+def test_dynamic_worker_receives_the_supported_explicit_cmake_form() -> None:
+    prompt = FUZZING_WORKER_PROMPT
     assert "cmake -S" in prompt
     assert "-B" in prompt
     assert "project -D options" in prompt

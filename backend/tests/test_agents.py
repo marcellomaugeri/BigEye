@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,20 +12,19 @@ from agents.tool_context import ToolContext
 from backend.agents.context import AgentContext
 from backend.agents.manager import build_manager_agent
 from backend.agents.outputs.campaign_decision import CampaignDecision
+from backend.agents.outputs.fuzzing_worker_result import FuzzingWorkerResult
 from backend.agents.outputs.target_proposal import TargetProposal
 from backend.agents.outputs.triage_result import TriageResult
-from backend.agents.prompts.component_target import COMPONENT_TARGET_PROMPT
-from backend.agents.prompts.crash_triage import CRASH_TRIAGE_PROMPT
+from backend.agents.prompts.fuzzing_worker import FUZZING_WORKER_PROMPT
 from backend.agents.prompts.manager import MANAGER_PROMPT
-from backend.agents.prompts.system_target import SYSTEM_TARGET_PROMPT
 from backend.agents.prompts.target_repair import TARGET_REPAIR_ASSIGNMENT
 from backend.agents.outputs.campaign_review import (
     CampaignReviewCollection,
     ContainedOperationRequestRecord,
-    SpecialistInvocation,
+    WorkerInvocation,
 )
 from backend.agents.tools.agent_dispatch import (
-    SpecialistValidationError,
+    WorkerValidationError,
     _validate_evidence_ids,
     _validate_target,
     _validate_triage,
@@ -222,23 +222,92 @@ def test_git_metadata_uses_bounded_argv_and_repository_root(tmp_path: Path) -> N
     ]
 
 
-def test_manager_has_specialists_as_tools_and_no_direct_repository_tools(tmp_path: Path) -> None:
+def test_manager_has_one_dynamic_worker_tool_and_no_direct_repository_tools(tmp_path: Path) -> None:
     tools = dispatch_tools(agent_context(tmp_path), evidence_ids={"evidence-1"})
     manager = build_manager_agent(tools)
 
     assert isinstance(manager, Agent)
     assert manager.model == "gpt-5.6-terra"
-    assert {tool.name for tool in manager.tools} == {
-        "prepare_system_target",
-        "prepare_component_target",
-        "triage_crash_group",
-    }
+    assert [tool.name for tool in manager.tools] == ["run_fuzzing_worker"]
     assert manager.handoffs == []
     for tool in tools:
         assert tool._is_agent_tool is True
         assert tool._agent_instance.model == "gpt-5.6-luna"
         assert set(tool.params_json_schema["properties"]) == {"assignment", "evidence_ids"}
         assert tool.params_json_schema["additionalProperties"] is False
+
+
+def test_one_dynamic_worker_tool_supports_overlapping_distinct_assignments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agents import Runner
+
+    context = agent_context(tmp_path)
+    tool = dispatch_tools(context, evidence_ids={"evidence-1"})[0]
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+    assignments: list[tuple[str, str]] = []
+
+    class Result:
+        interruptions = []
+        new_items = []
+        raw_responses = []
+        input = "nested"
+
+        def __init__(self, outer_context):
+            request = outer_context.tool_input
+            assignments.append((outer_context.tool_call_id, request["assignment"]))
+            self.final_output = FuzzingWorkerResult(
+                summary="Completed " + request["assignment"],
+                evidence_ids=["evidence-1"], target_proposals=[], triage_results=[],
+                operation_request_ids=[], recommendations=[], uncertainty="No unresolved issue.",
+            )
+            self.agent_tool_invocation = SimpleNamespace(
+                tool_name=outer_context.tool_name,
+                tool_call_id=outer_context.tool_call_id,
+                tool_arguments=outer_context.tool_arguments,
+            )
+
+        def to_input_list(self):
+            return []
+
+    async def runner(starting_agent=None, context=None, **kwargs):
+        if len(assignments) == 1:
+            both_started.set()
+        if len(assignments) == 0:
+            # Result construction records the structured request after both calls enter.
+            pass
+        await asyncio.sleep(0)
+        assignments.append((context.tool_call_id, context.tool_input["assignment"]))
+        if len(assignments) == 2:
+            both_started.set()
+        await both_started.wait()
+        release.set()
+        await release.wait()
+        assignments.pop()
+        return Result(context)
+
+    monkeypatch.setattr(Runner, "run", runner)
+
+    async def invoke(call_id: str, assignment: str):
+        arguments = (
+            '{"assignment":"' + assignment + '","evidence_ids":["evidence-1"]}'
+        )
+        return await tool.on_invoke_tool(ToolContext(
+            context, tool_name=tool.name, tool_call_id=call_id,
+            tool_arguments=arguments, run_config=RunConfig(),
+        ), arguments)
+
+    async def scenario():
+        return await asyncio.gather(
+            invoke("call-system", "prepare a system target"),
+            invoke("call-triage", "triage replay evidence"),
+        )
+
+    first, second = asyncio.run(scenario())
+
+    assert first["result"]["summary"] == "Completed prepare a system target"
+    assert second["result"]["summary"] == "Completed triage replay evidence"
 
 
 def test_specialist_receives_requested_evidence_records_not_manager_conversation(
@@ -257,9 +326,9 @@ def test_specialist_receives_requested_evidence_records_not_manager_conversation
         new_items = []
         raw_responses = []
         input = "nested"
-        final_output = _target_proposal("evidence-1")
+        final_output = _worker_result(targets=[_target_proposal("evidence-1")])
         agent_tool_invocation = SimpleNamespace(
-            tool_name="prepare_system_target", tool_call_id="call-1",
+            tool_name="run_fuzzing_worker", tool_call_id="call-1",
             tool_arguments='{"assignment":"prepare parser","evidence_ids":["evidence-1"]}',
         )
 
@@ -275,7 +344,7 @@ def test_specialist_receives_requested_evidence_records_not_manager_conversation
     monkeypatch.setattr(Runner, "run", runner)
     tool = next(item for item in dispatch_tools(
         context, evidence_ids={"evidence-1"}, evidence_records={"evidence-1": record},
-    ) if item.name == "prepare_system_target")
+    ) if item.name == "run_fuzzing_worker")
     tool_context = ToolContext(
         context, tool_name=tool.name, tool_call_id="call-1",
         tool_arguments='{"assignment":"prepare parser","evidence_ids":["evidence-1"]}',
@@ -294,7 +363,7 @@ def test_specialist_receives_requested_evidence_records_not_manager_conversation
     assert "outer-secret-message" not in nested.casefold()
 
 
-def test_specialists_have_narrow_tools_structured_outputs_and_no_handoffs(tmp_path: Path) -> None:
+def test_dynamic_worker_has_complete_bounded_tools_structured_output_and_no_handoffs(tmp_path: Path) -> None:
     workers = {tool.name: tool._agent_instance for tool in dispatch_tools(agent_context(tmp_path), evidence_ids=set())}
     shared = {
         "list_project_files", "read_source_lines", "search_source_text", "inspect_git_metadata",
@@ -303,12 +372,8 @@ def test_specialists_have_narrow_tools_structured_outputs_and_no_handoffs(tmp_pa
         "request_contained_operation",
     }
 
-    assert {tool.name for tool in workers["prepare_system_target"].tools} == shared
-    assert {tool.name for tool in workers["prepare_component_target"].tools} == shared
-    assert {tool.name for tool in workers["triage_crash_group"].tools} == shared
-    assert workers["prepare_system_target"].output_type is TargetProposal
-    assert workers["prepare_component_target"].output_type is TargetProposal
-    assert workers["triage_crash_group"].output_type is TriageResult
+    assert {tool.name for tool in workers["run_fuzzing_worker"].tools} == shared
+    assert workers["run_fuzzing_worker"].output_type is FuzzingWorkerResult
     assert all(worker.handoffs == [] for worker in workers.values())
     assert {tool.name for tool in evidence_retrieval_tools()} == {"inspect_build_evidence", "retrieve_repository_evidence"}
 
@@ -329,9 +394,9 @@ def test_agent_prompts_keep_operation_requests_out_of_decision_and_evidence_ids(
     assert "belong only in bounded actions" in MANAGER_PROMPT
     assert "return application-owned result or operation-request IDs" not in MANAGER_PROMPT
     assert CampaignDecision.model_fields["bounded_actions"].description is None
-    for prompt in (SYSTEM_TARGET_PROMPT, COMPONENT_TARGET_PROMPT, CRASH_TRIAGE_PROMPT):
-        assert "exactly build, probe, replay, or coverage" in prompt
-        assert "evidence_ids must never contain operation-request IDs" in prompt
+    assert "exactly build, probe, replay, or coverage" in FUZZING_WORKER_PROMPT
+    assert "evidence_ids" in FUZZING_WORKER_PROMPT
+    assert "must never contain operation-request IDs" in FUZZING_WORKER_PROMPT
 
 
 def test_retrieval_tool_schema_is_bounded_and_overlong_queries_return_correction(tmp_path: Path) -> None:
@@ -354,7 +419,7 @@ def test_retrieval_tool_schema_is_bounded_and_overlong_queries_return_correction
     assert "1 to 12" in output
 
 
-@pytest.mark.parametrize("prompt", [SYSTEM_TARGET_PROMPT, COMPONENT_TARGET_PROMPT, CRASH_TRIAGE_PROMPT])
+@pytest.mark.parametrize("prompt", [FUZZING_WORKER_PROMPT])
 def test_specialists_treat_repository_and_web_content_as_untrusted_evidence(prompt: str) -> None:
     lowered = prompt.casefold()
 
@@ -378,13 +443,13 @@ def test_structured_outputs_reject_missing_fields_and_extra_assumptions() -> Non
     )
     decision = CampaignDecision(
         decision="prepare target", motivation="The parser has a supported byte entry path.",
-        evidence_ids=["evidence-1"], bounded_actions=["prepare_component_target"],
+        evidence_ids=["evidence-1"], bounded_actions=["run_fuzzing_worker"],
         next_review_delay_seconds=900, next_review_reason="Recheck after the deterministic probe",
         uncertainty="build not yet run",
     )
 
     assert proposal.instance_type == "component-level"
-    assert decision.bounded_actions == ["prepare_component_target"]
+    assert decision.bounded_actions == ["run_fuzzing_worker"]
     with pytest.raises(ValidationError):
         CampaignDecision(
             decision="wait", motivation="No action", evidence_ids=[], bounded_actions=[],
@@ -443,6 +508,31 @@ def _target_proposal(evidence_id: str) -> TargetProposal:
     )
 
 
+def _worker_result(
+    *,
+    targets: list[TargetProposal] | None = None,
+    triage: list[TriageResult] | None = None,
+    evidence_ids: list[str] | None = None,
+    operation_request_ids: list[str] | None = None,
+    uncertainty: str = "No additional uncertainty.",
+) -> FuzzingWorkerResult:
+    targets = targets or []
+    triage = triage or []
+    if evidence_ids is None:
+        evidence_ids = list(dict.fromkeys(
+            value for result in [*targets, *triage] for value in result.evidence_ids
+        ))
+    return FuzzingWorkerResult(
+        summary="Completed the bounded worker assignment.",
+        evidence_ids=evidence_ids,
+        target_proposals=targets,
+        triage_results=triage,
+        operation_request_ids=operation_request_ids or [],
+        recommendations=[],
+        uncertainty=uncertainty,
+    )
+
+
 def test_target_validator_normalizes_a_descriptive_suffix_to_the_authoritative_tool_type() -> None:
     proposal = _target_proposal("known").model_copy(update={"instance_type": "system-level executable"})
 
@@ -467,7 +557,7 @@ def test_target_validator_normalizes_a_descriptive_suffix_to_the_authoritative_t
 def test_target_validator_rejects_shell_syntax_before_action_selection(run_command: str) -> None:
     proposal = _target_proposal("known").model_copy(update={"run_command": run_command})
 
-    with pytest.raises(SpecialistValidationError, match="shell-free argv"):
+    with pytest.raises(WorkerValidationError, match="shell-free argv"):
         _validate_target(proposal, frozenset({"known"}), "system-level")
 
 
@@ -504,7 +594,7 @@ def test_system_target_validator_rejects_invalid_input_placeholder_contract(
 ) -> None:
     proposal = _target_proposal("known").model_copy(update={"run_command": run_command})
 
-    with pytest.raises(SpecialistValidationError, match="input placeholder"):
+    with pytest.raises(WorkerValidationError, match="input placeholder"):
         _validate_target(proposal, frozenset({"known"}), "system-level")
 
 
@@ -517,7 +607,7 @@ def test_target_validator_rejects_application_owned_stdin_marker(
         "run_command": "/opt/bigeye/parser {stdin}",
     })
 
-    with pytest.raises(SpecialistValidationError, match="application-owned"):
+    with pytest.raises(WorkerValidationError, match="application-owned"):
         _validate_target(proposal, frozenset({"known"}), instance_type)
 
 
@@ -528,7 +618,7 @@ def test_component_target_validator_rejects_input_placeholders(placeholder: str)
         "run_command": f"/opt/bigeye/parser {placeholder}",
     })
 
-    with pytest.raises(SpecialistValidationError, match="component-level.*placeholder"):
+    with pytest.raises(WorkerValidationError, match="component-level.*placeholder"):
         _validate_target(proposal, frozenset({"known"}), "component-level")
 
 
@@ -540,25 +630,25 @@ def test_target_validator_rejects_control_characters(control: str) -> None:
         "run_command": f"/opt/bigeye/parser --value a{control}b",
     })
 
-    with pytest.raises(SpecialistValidationError, match="control characters"):
+    with pytest.raises(WorkerValidationError, match="control characters"):
         _validate_target(proposal, frozenset({"known"}), "system-level")
 
 
 def test_target_prompts_require_shell_free_run_commands_and_afl_input_modes() -> None:
-    for prompt in (SYSTEM_TARGET_PROMPT, COMPONENT_TARGET_PROMPT, TARGET_REPAIR_ASSIGNMENT):
+    for prompt in (FUZZING_WORKER_PROMPT, TARGET_REPAIR_ASSIGNMENT):
         lowered = prompt.casefold()
         assert "shell-free argv" in lowered
         assert "redirection" in lowered
         assert "command substitution" in lowered
 
-    system = SYSTEM_TARGET_PROMPT.casefold()
+    system = FUZZING_WORKER_PROMPT.casefold()
     assert "stdin" in system
     assert "omit" in system
     assert "literal @@" in system
     assert "do not use {input}" in system
     assert "do not use {stdin}" in system
     assert "application-owned" in system
-    component = COMPONENT_TARGET_PROMPT.casefold()
+    component = FUZZING_WORKER_PROMPT.casefold()
     assert "must not include @@ or {input}" in component
 
 
@@ -588,7 +678,7 @@ def test_luna_specialist_retries_once_with_terra_only_after_validation_failure(
             self.final_output = output
             self.input = "prepare parser"
             self.agent_tool_invocation = SimpleNamespace(
-                tool_name="prepare_system_target", tool_call_id="call-1",
+                tool_name="run_fuzzing_worker", tool_call_id="call-1",
                 tool_arguments='{"assignment":"prepare parser","evidence_ids":["known"]}',
             )
 
@@ -599,10 +689,11 @@ def test_luna_specialist_retries_once_with_terra_only_after_validation_failure(
         agent = starting_agent
         calls.append((agent.model, kwargs.get("max_turns")))
         proposal = _target_proposal("known")
-        return Result(
+        selected = (
             proposal.model_copy(update=luna_update)
             if agent.model == "gpt-5.6-luna" else proposal
         )
+        return Result(_worker_result(targets=[selected]))
 
     from agents import Runner
 
@@ -610,7 +701,7 @@ def test_luna_specialist_retries_once_with_terra_only_after_validation_failure(
     collection = CampaignReviewCollection()
     tool = next(item for item in dispatch_tools(
         context, evidence_ids={"known"}, trace=trace, collection=collection,
-    ) if item.name == "prepare_system_target")
+    ) if item.name == "run_fuzzing_worker")
     tool_context = ToolContext(
         context, tool_name=tool.name, tool_call_id="call-1",
         tool_arguments='{"assignment":"prepare parser","evidence_ids":["known"]}', run_config=RunConfig(),
@@ -620,11 +711,15 @@ def test_luna_specialist_retries_once_with_terra_only_after_validation_failure(
     ))
 
     assert calls == [("gpt-5.6-luna", 14), ("gpt-5.6-terra", 14)]
-    assert set(output) == {"result_id", "result"}
-    assert output["result"] == _target_proposal("known").model_dump(mode="json")
+    assert set(output) == {
+        "result", "target_result_ids", "triage_result_ids", "operation_request_ids",
+    }
+    assert output["result"]["target_proposals"] == [
+        _target_proposal("known").model_dump(mode="json")
+    ]
     review = collection.result(CampaignDecision(
         decision="prepare", motivation="validated retry", evidence_ids=["known"],
-        bounded_actions=[output["result_id"]], next_review_delay_seconds=900,
+        bounded_actions=output["target_result_ids"], next_review_delay_seconds=900,
         next_review_reason="Recheck after the probe",
         uncertainty="not probed",
     ))
@@ -635,9 +730,58 @@ def test_luna_specialist_retries_once_with_terra_only_after_validation_failure(
     debug = [event.payload for event in asyncio.run(store.read(context.project_id, "debug", -1, 100))]
     nested = [event for event in debug if event["event"] in {"workflow.result", "specialist.retry"}]
     assert {event.get("model") for event in nested} == {"gpt-5.6-luna", "gpt-5.6-terra"}
-    assert all(event["parent_tool"] == "prepare_system_target" for event in nested)
+    assert all(event["parent_tool"] == "run_fuzzing_worker" for event in nested)
     assert all(event["parent_tool_call_id"] == "call-1" for event in nested)
     assert all(event["parent_tool_arguments"]["assignment"] == "prepare parser" for event in nested)
+
+
+def test_luna_explicit_bounded_difficulty_gets_one_terra_correction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agents import Runner
+
+    context = agent_context(tmp_path)
+    calls = []
+
+    class Result:
+        interruptions = []
+        new_items = []
+        raw_responses = []
+        input = "nested"
+
+        def __init__(self, agent, outer_context):
+            self.final_output = _worker_result(
+                evidence_ids=["known"],
+                uncertainty=(
+                    "BOUNDED_ASSIGNMENT_EXCEEDS_LUNA_CAPABILITY: source shape is ambiguous."
+                    if agent.model == "gpt-5.6-luna"
+                    else "Terra resolved the bounded source ambiguity."
+                ),
+            )
+            self.agent_tool_invocation = SimpleNamespace(
+                tool_name=outer_context.tool_name,
+                tool_call_id=outer_context.tool_call_id,
+                tool_arguments=outer_context.tool_arguments,
+            )
+
+        def to_input_list(self):
+            return []
+
+    async def runner(starting_agent=None, context=None, **_kwargs):
+        calls.append(starting_agent.model)
+        return Result(starting_agent, context)
+
+    monkeypatch.setattr(Runner, "run", runner)
+    tool = dispatch_tools(context, evidence_ids={"known"})[0]
+    arguments = '{"assignment":"inspect a plateau","evidence_ids":["known"]}'
+
+    output = asyncio.run(tool.on_invoke_tool(ToolContext(
+        context, tool_name=tool.name, tool_call_id="call-difficulty",
+        tool_arguments=arguments, run_config=RunConfig(),
+    ), arguments))
+
+    assert calls == ["gpt-5.6-luna", "gpt-5.6-terra"]
+    assert output["result"]["uncertainty"] == "Terra resolved the bounded source ambiguity."
 
 
 def test_retry_quarantines_luna_requests_and_returns_only_terra_invocation_ids(
@@ -660,12 +804,15 @@ def test_retry_quarantines_luna_requests_and_returns_only_terra_invocation_ids(
             proposal = _target_proposal(
                 "unknown" if agent.model == "gpt-5.6-luna" else "known"
             )
-            self.final_output = proposal.model_copy(update={
-                "target_name": (
-                    "failed-luna-target" if agent.model == "gpt-5.6-luna"
-                    else "validated-terra-target"
-                ),
-            })
+            self.final_output = _worker_result(
+                targets=[proposal.model_copy(update={
+                    "target_name": (
+                        "failed-luna-target" if agent.model == "gpt-5.6-luna"
+                        else "validated-terra-target"
+                    ),
+                })],
+                operation_request_ids=[operations_by_model[agent.model]],
+            )
             self.agent_tool_invocation = (
                 SimpleNamespace(
                     tool_name=outer_context.tool_name,
@@ -691,6 +838,7 @@ def test_retry_quarantines_luna_requests_and_returns_only_terra_invocation_ids(
             context.context if isinstance(context, ToolContext) else context,
             tool_name=operation.name, tool_call_id="operation-" + outer_id,
             tool_arguments=arguments, run_config=RunConfig(), agent=starting_agent,
+            tool_input=context.tool_input,
         ), arguments)
         operations_by_model[starting_agent.model] = operation_output["request_id"]
         return Result(starting_agent, context)
@@ -698,7 +846,7 @@ def test_retry_quarantines_luna_requests_and_returns_only_terra_invocation_ids(
     monkeypatch.setattr(Runner, "run", runner)
     tool = next(item for item in dispatch_tools(
         context, evidence_ids={"known"}, collection=collection,
-    ) if item.name == "prepare_system_target")
+    ) if item.name == "run_fuzzing_worker")
     arguments = '{"assignment":"parser","evidence_ids":["known"]}'
     output = asyncio.run(tool.on_invoke_tool(ToolContext(
         context, tool_name=tool.name, tool_call_id="call-retry",
@@ -706,12 +854,14 @@ def test_retry_quarantines_luna_requests_and_returns_only_terra_invocation_ids(
     ), arguments))
 
     assert calls == ["gpt-5.6-luna", "gpt-5.6-terra"]
-    assert output["result"]["target_name"] == "validated-terra-target"
+    assert output["result"]["target_proposals"][0]["target_name"] == "validated-terra-target"
     assert "failed-luna-target" not in str(output)
-    assert set(output) == {"result_id", "result"}
+    assert set(output) == {
+        "result", "target_result_ids", "triage_result_ids", "operation_request_ids",
+    }
     review = collection.result(CampaignDecision(
         decision="select retry", motivation="Terra corrected evidence", evidence_ids=["known"],
-        bounded_actions=[output["result_id"]],
+        bounded_actions=output["target_result_ids"],
         next_review_delay_seconds=900, next_review_reason="Recheck after the probe", uncertainty="not probed",
     ))
     assert {record.model for record in review.known_operation_requests} == {"gpt-5.6-terra"}
@@ -748,9 +898,9 @@ def test_failed_terra_validation_returns_fixed_manager_correction(
         new_items = []
         raw_responses = []
         input = "nested"
-        final_output = _target_proposal("unknown")
+        final_output = _worker_result(targets=[_target_proposal("unknown")])
         agent_tool_invocation = SimpleNamespace(
-            tool_name="prepare_system_target", tool_call_id="call-correct",
+            tool_name="run_fuzzing_worker", tool_call_id="call-correct",
             tool_arguments='{"assignment":"parser","evidence_ids":["known"]}',
         )
 
@@ -764,7 +914,7 @@ def test_failed_terra_validation_returns_fixed_manager_correction(
     monkeypatch.setattr(Runner, "run", runner)
     tool = next(item for item in dispatch_tools(
         context, evidence_ids={"known"},
-    ) if item.name == "prepare_system_target")
+    ) if item.name == "run_fuzzing_worker")
     arguments = '{"assignment":"parser","evidence_ids":["known"]}'
 
     output = asyncio.run(tool.on_invoke_tool(ToolContext(
@@ -774,8 +924,8 @@ def test_failed_terra_validation_returns_fixed_manager_correction(
 
     assert calls == ["gpt-5.6-luna", "gpt-5.6-terra"]
     assert output == (
-        "Specialist request rejected. Provide one bounded assignment and only evidence IDs supplied "
-        "by this review, then call the specialist again."
+        "Worker request rejected. Provide one bounded assignment and only evidence IDs supplied "
+        "by this review, then call the worker again."
     )
 
 
@@ -784,34 +934,35 @@ def test_specialist_accepts_only_source_evidence_returned_by_its_retrieval_tool(
 ) -> None:
     context = agent_context(tmp_path)
     calls = []
-    tool = next(item for item in dispatch_tools(context, evidence_ids=set()) if item.name == "prepare_system_target")
+    tool = next(item for item in dispatch_tools(context, evidence_ids=set()) if item.name == "run_fuzzing_worker")
     retrieval = next(item for item in tool._agent_instance.tools if item.name == "retrieve_repository_evidence")
-    retrieval_context = ToolContext(
-        context, tool_name=retrieval.name, tool_call_id="retrieve-1",
-        tool_arguments='{"question":"println","limit":2}', run_config=RunConfig(),
-    )
-    excerpts = asyncio.run(retrieval.on_invoke_tool(
-        retrieval_context, '{"question":"println","limit":2}'
-    ))
-    evidence_id = excerpts[0]["evidence_id"]
 
     class Result:
         interruptions = []
         new_items = []
         raw_responses = []
         input = "prepare parser"
-        final_output = _target_proposal(evidence_id)
-        agent_tool_invocation = SimpleNamespace(
-            tool_name="prepare_system_target", tool_call_id="call-1",
-            tool_arguments='{"assignment":"prepare parser","evidence_ids":[]}',
-        )
+
+        def __init__(self, evidence_id, outer_context):
+            self.final_output = _worker_result(targets=[_target_proposal(evidence_id)])
+            self.agent_tool_invocation = SimpleNamespace(
+                tool_name=outer_context.tool_name,
+                tool_call_id=outer_context.tool_call_id,
+                tool_arguments=outer_context.tool_arguments,
+            )
 
         def to_input_list(self):
             return []
 
-    async def runner(starting_agent=None, input=None, **kwargs):
+    async def runner(starting_agent=None, input=None, context=None, **kwargs):
         calls.append(starting_agent.model)
-        return Result()
+        arguments = '{"question":"println","limit":2}'
+        excerpts = await retrieval.on_invoke_tool(ToolContext(
+            context.context, tool_name=retrieval.name, tool_call_id="retrieve-1",
+            tool_arguments=arguments, run_config=RunConfig(), agent=starting_agent,
+            tool_input=context.tool_input,
+        ), arguments)
+        return Result(excerpts[0]["evidence_id"], context)
 
     from agents import Runner
 
@@ -825,7 +976,7 @@ def test_specialist_accepts_only_source_evidence_returned_by_its_retrieval_tool(
     ))
 
     assert calls == ["gpt-5.6-luna"]
-    assert set(output) == {"result_id", "result"}
+    assert output["target_result_ids"]
 
 
 def test_specialist_accepts_only_web_citation_returned_by_its_model_response(
@@ -838,14 +989,14 @@ def test_specialist_accepts_only_web_citation_returned_by_its_model_response(
         interruptions = []
         new_items = []
         input = "prepare parser"
-        final_output = _target_proposal(citation)
+        final_output = _worker_result(targets=[_target_proposal(citation)])
         raw_responses = [SimpleNamespace(output=[{
             "type": "message", "content": [{"type": "output_text", "text": "docs", "annotations": [{
                 "type": "url_citation", "url": citation,
             }]}],
         }])]
         agent_tool_invocation = SimpleNamespace(
-            tool_name="prepare_system_target", tool_call_id="call-1",
+            tool_name="run_fuzzing_worker", tool_call_id="call-1",
             tool_arguments='{"assignment":"prepare parser","evidence_ids":[]}',
         )
 
@@ -861,7 +1012,7 @@ def test_specialist_accepts_only_web_citation_returned_by_its_model_response(
     from agents import Runner
 
     monkeypatch.setattr(Runner, "run", runner)
-    tool = next(item for item in dispatch_tools(context, evidence_ids=set()) if item.name == "prepare_system_target")
+    tool = next(item for item in dispatch_tools(context, evidence_ids=set()) if item.name == "run_fuzzing_worker")
     parent_context = ToolContext(
         context, tool_name=tool.name, tool_call_id="call-1",
         tool_arguments='{"assignment":"prepare parser","evidence_ids":[]}', run_config=RunConfig(),
@@ -872,7 +1023,7 @@ def test_specialist_accepts_only_web_citation_returned_by_its_model_response(
     ))
 
     assert calls == ["gpt-5.6-luna"]
-    assert set(output) == {"result_id", "result"}
+    assert output["target_result_ids"]
 
 
 def test_nonofficial_web_citation_triggers_one_terra_validation_retry(
@@ -889,14 +1040,14 @@ def test_nonofficial_web_citation_triggers_one_terra_validation_retry(
 
         def __init__(self, model: str):
             citation = rejected if model == "gpt-5.6-luna" else accepted
-            self.final_output = _target_proposal(citation)
+            self.final_output = _worker_result(targets=[_target_proposal(citation)])
             self.raw_responses = [SimpleNamespace(output=[{
                 "type": "message", "content": [{"type": "output_text", "text": "docs", "annotations": [{
                     "type": "url_citation", "url": citation,
                 }]}],
             }])]
             self.agent_tool_invocation = SimpleNamespace(
-                tool_name="prepare_system_target", tool_call_id="call-web",
+                tool_name="run_fuzzing_worker", tool_call_id="call-web",
                 tool_arguments='{"assignment":"prepare parser","evidence_ids":[]}',
             )
 
@@ -912,7 +1063,7 @@ def test_nonofficial_web_citation_triggers_one_terra_validation_retry(
     from agents import Runner
 
     monkeypatch.setattr(Runner, "run", runner)
-    tool = next(item for item in dispatch_tools(context, evidence_ids=set()) if item.name == "prepare_system_target")
+    tool = next(item for item in dispatch_tools(context, evidence_ids=set()) if item.name == "run_fuzzing_worker")
     parent_context = ToolContext(
         context, tool_name=tool.name, tool_call_id="call-web",
         tool_arguments='{"assignment":"prepare parser","evidence_ids":[]}', run_config=RunConfig(),
@@ -923,7 +1074,7 @@ def test_nonofficial_web_citation_triggers_one_terra_validation_retry(
     ))
 
     assert calls == ["gpt-5.6-luna", "gpt-5.6-terra"]
-    assert set(output) == {"result_id", "result"}
+    assert output["target_result_ids"]
     web = next(item for item in tool._agent_instance.tools if item.name == "web_search")
     assert "llvm.org" in web.filters.allowed_domains
     assert "aflplus.plus" in web.filters.allowed_domains
@@ -946,7 +1097,7 @@ def test_specialist_transport_failure_is_not_retried(tmp_path: Path, monkeypatch
     monkeypatch.setattr(Runner, "run", runner)
     tool = next(item for item in dispatch_tools(
         context, evidence_ids=set(), trace=trace,
-    ) if item.name == "prepare_system_target")
+    ) if item.name == "run_fuzzing_worker")
     tool_context = ToolContext(
         context, tool_name=tool.name, tool_call_id="call-1",
         tool_arguments='{"assignment":"prepare parser","evidence_ids":[]}', run_config=RunConfig(),
@@ -961,7 +1112,7 @@ def test_specialist_transport_failure_is_not_retried(tmp_path: Path, monkeypatch
         event.payload for event in asyncio.run(store.read(context.project_id, "debug", -1, 100))
         if event.payload.get("event") == "workflow.error"
     ]
-    assert errors[-1]["parent_tool"] == "prepare_system_target"
+    assert errors[-1]["parent_tool"] == "run_fuzzing_worker"
     assert errors[-1]["parent_tool_call_id"] == "call-1"
     assert errors[-1]["parent_tool_arguments"]["assignment"] == "prepare parser"
 
@@ -975,7 +1126,7 @@ def test_max_turns_isolated_to_one_parallel_specialist_and_its_requests_are_audi
     collection = CampaignReviewCollection()
     tool = next(item for item in dispatch_tools(
         context, evidence_ids={"known"}, collection=collection,
-    ) if item.name == "prepare_system_target")
+    ) if item.name == "run_fuzzing_worker")
 
     class Result:
         interruptions = []
@@ -984,7 +1135,7 @@ def test_max_turns_isolated_to_one_parallel_specialist_and_its_requests_are_audi
         input = "nested"
 
         def __init__(self, outer_context):
-            self.final_output = _target_proposal("known")
+            self.final_output = _worker_result(targets=[_target_proposal("known")])
             self.agent_tool_invocation = SimpleNamespace(
                 tool_name=outer_context.tool_name,
                 tool_call_id=outer_context.tool_call_id,
@@ -1004,6 +1155,7 @@ def test_max_turns_isolated_to_one_parallel_specialist_and_its_requests_are_audi
             await operation.on_invoke_tool(ToolContext(
                 context.context, tool_name=operation.name, tool_call_id="operation-budget",
                 tool_arguments=arguments, run_config=RunConfig(), agent=starting_agent,
+                tool_input=context.tool_input,
             ), arguments)
             raise MaxTurnsExceeded("specialist exceeded 14 turns")
         return Result(context)
@@ -1024,10 +1176,10 @@ def test_max_turns_isolated_to_one_parallel_specialist_and_its_requests_are_audi
 
     assert "turn budget exhausted" in exhausted
     assert "result or action IDs" in exhausted
-    assert set(valid) == {"result_id", "result"}
+    assert valid["target_result_ids"]
     review = collection.result(CampaignDecision(
         decision="prepare valid sibling", motivation="validated target", evidence_ids=["known"],
-        bounded_actions=[valid["result_id"]], next_review_delay_seconds=900,
+        bounded_actions=valid["target_result_ids"], next_review_delay_seconds=900,
         next_review_reason="Recheck after the probe",
         uncertainty="other specialist exhausted its budget",
     ))
@@ -1054,7 +1206,7 @@ def test_agent_tool_returns_fixed_correction_for_unassigned_evidence_without_run
         context, evidence_ids={"known"}, evidence_records={
             "known": {"evidence_id": "known", "summary": "parser"},
         },
-    ) if item.name == "prepare_system_target")
+    ) if item.name == "run_fuzzing_worker")
     tool_context = ToolContext(
         context, tool_name=tool.name, tool_call_id="call-invalid",
         tool_arguments='{"assignment":"parser","evidence_ids":["stale"]}', run_config=RunConfig(),
@@ -1064,8 +1216,8 @@ def test_agent_tool_returns_fixed_correction_for_unassigned_evidence_without_run
 
     assert calls == 0
     assert output == (
-        "Specialist request rejected. Provide one bounded assignment and only evidence IDs supplied "
-        "by this review, then call the specialist again."
+        "Worker request rejected. Provide one bounded assignment and only evidence IDs supplied "
+        "by this review, then call the worker again."
     )
     assert "stale" not in output
 
@@ -1080,8 +1232,8 @@ def test_parallel_agent_tool_results_and_requests_never_cross_invocations(
     tools = dispatch_tools(
         context, evidence_ids={"known"}, collection=collection,
     )
-    target_tool = next(item for item in tools if item.name == "prepare_system_target")
-    triage_tool = next(item for item in tools if item.name == "triage_crash_group")
+    target_tool = next(item for item in tools if item.name == "run_fuzzing_worker")
+    triage_tool = next(item for item in tools if item.name == "run_fuzzing_worker")
 
     class Result:
         interruptions = []
@@ -1089,20 +1241,26 @@ def test_parallel_agent_tool_results_and_requests_never_cross_invocations(
         raw_responses = []
         input = "nested"
 
-        def __init__(self, agent, invocation):
-            if agent.output_type is TriageResult:
-                self.final_output = TriageResult(
+        def __init__(self, invocation, operation_request_id):
+            if invocation.tool_call_id == "call-triage":
+                triage = TriageResult(
                     classification="true vulnerability",
                     description="replay reaches a bounds violation in parser.c",
                     evidence_ids=["known"], uncertainty="exploitability not assessed",
                     priority_rationale="reproducible memory-safety failure",
                     repair_intent="preserve testcase and report the source location",
                 )
+                self.final_output = _worker_result(
+                    triage=[triage], operation_request_ids=[operation_request_id],
+                )
             else:
-                self.final_output = _target_proposal("known").model_copy(update={
-                    "target_name": "parser-" + invocation.tool_call_id,
-                    "byte_path": "stdin -> parser -> " + invocation.tool_call_id,
-                })
+                self.final_output = _worker_result(
+                    targets=[_target_proposal("known").model_copy(update={
+                        "target_name": "parser-" + invocation.tool_call_id,
+                        "byte_path": "stdin -> parser -> " + invocation.tool_call_id,
+                    })],
+                    operation_request_ids=[operation_request_id],
+                )
             self.agent_tool_invocation = SimpleNamespace(
                 tool_name=invocation.tool_name, tool_call_id=invocation.tool_call_id,
                 tool_arguments=invocation.tool_arguments,
@@ -1120,10 +1278,10 @@ def test_parallel_agent_tool_results_and_requests_never_cross_invocations(
             tool_arguments=(
                 '{"operation":"probe","asset_paths":[],"assertions":["probe '
                 + context.tool_call_id + '"]}'
-            ), run_config=RunConfig(), agent=starting_agent,
+            ), run_config=RunConfig(), agent=starting_agent, tool_input=context.tool_input,
         )
-        await operation.on_invoke_tool(inner, inner.tool_arguments)
-        return Result(starting_agent, context)
+        operation_output = await operation.on_invoke_tool(inner, inner.tool_arguments)
+        return Result(context, operation_output["request_id"])
 
     monkeypatch.setattr(Runner, "run", runner)
 
@@ -1142,19 +1300,22 @@ def test_parallel_agent_tool_results_and_requests_never_cross_invocations(
 
     first, second, triage = asyncio.run(scenario())
 
-    assert first["result_id"] != second["result_id"]
-    assert first["result"]["target_name"] == "parser-call-a"
-    assert second["result"]["target_name"] == "parser-call-b"
-    assert first["result"]["byte_path"] != second["result"]["byte_path"]
-    assert triage["result"]["classification"] == "true vulnerability"
-    assert triage["result"]["description"] == "replay reaches a bounds violation in parser.c"
-    assert triage["result"]["priority_rationale"] == "reproducible memory-safety failure"
-    assert triage["result"]["evidence_ids"] == ["known"]
-    assert set(triage["result"]) == set(TriageResult.model_fields)
-    assert all(set(output) == {"result_id", "result"} for output in (first, second, triage))
+    assert first["target_result_ids"] != second["target_result_ids"]
+    assert first["result"]["target_proposals"][0]["target_name"] == "parser-call-a"
+    assert second["result"]["target_proposals"][0]["target_name"] == "parser-call-b"
+    assert (
+        first["result"]["target_proposals"][0]["byte_path"]
+        != second["result"]["target_proposals"][0]["byte_path"]
+    )
+    triage_result = triage["result"]["triage_results"][0]
+    assert triage_result["classification"] == "true vulnerability"
+    assert triage_result["description"] == "replay reaches a bounds violation in parser.c"
+    assert triage_result["priority_rationale"] == "reproducible memory-safety failure"
+    assert triage_result["evidence_ids"] == ["known"]
+    assert set(triage_result) == set(TriageResult.model_fields)
     decision = CampaignDecision(
         decision="select first", motivation="first proposal", evidence_ids=["known"],
-        bounded_actions=[first["result_id"]],
+        bounded_actions=first["target_result_ids"],
         next_review_delay_seconds=900, next_review_reason="Recheck after the probe", uncertainty="not probed",
     )
     review = collection.result(decision)
@@ -1165,8 +1326,86 @@ def test_parallel_agent_tool_results_and_requests_never_cross_invocations(
     }
     assert len({record.request_id for record in review.known_operation_requests}) == 3
     assert {record.actionable for record in review.known_operation_requests} == {False}
-    assert {record.result_id for record in review.selected_target_proposals} == {first["result_id"]}
+    assert {record.result_id for record in review.selected_target_proposals} == {
+        first["target_result_ids"][0]
+    }
     assert review.selected_operation_requests == ()
+
+
+def test_parallel_worker_calls_cannot_cite_evidence_retrieved_by_a_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agents import Runner
+
+    context = agent_context(tmp_path)
+    tool = dispatch_tools(context, evidence_ids={"known-a", "known-b"})[0]
+    retrieved = asyncio.Event()
+    dynamic_id = ""
+
+    class Result:
+        interruptions = []
+        new_items = []
+        raw_responses = []
+        input = "nested"
+
+        def __init__(self, outer_context, evidence_id):
+            self.final_output = _worker_result(evidence_ids=[evidence_id])
+            self.agent_tool_invocation = SimpleNamespace(
+                tool_name=outer_context.tool_name,
+                tool_call_id=outer_context.tool_call_id,
+                tool_arguments=outer_context.tool_arguments,
+            )
+
+        def to_input_list(self):
+            return []
+
+    async def runner(starting_agent=None, context=None, **_kwargs):
+        nonlocal dynamic_id
+        if context.tool_call_id == "call-a":
+            retrieval = next(
+                item for item in starting_agent.tools
+                if item.name == "retrieve_repository_evidence"
+            )
+            arguments = '{"question":"println","limit":1}'
+            excerpts = await retrieval.on_invoke_tool(ToolContext(
+                context.context,
+                tool_name=retrieval.name,
+                tool_call_id="retrieve-a",
+                tool_arguments=arguments,
+                tool_input=context.tool_input,
+                run_config=RunConfig(),
+                agent=starting_agent,
+            ), arguments)
+            dynamic_id = excerpts[0]["evidence_id"]
+            retrieved.set()
+            return Result(context, dynamic_id)
+        await retrieved.wait()
+        return Result(context, dynamic_id)
+
+    monkeypatch.setattr(Runner, "run", runner)
+
+    async def invoke(call_id: str, evidence_id: str):
+        arguments = json.dumps({
+            "assignment": "assignment " + call_id,
+            "evidence_ids": [evidence_id],
+        })
+        return await tool.on_invoke_tool(ToolContext(
+            context, tool_name=tool.name, tool_call_id=call_id,
+            tool_arguments=arguments, run_config=RunConfig(),
+        ), arguments)
+
+    async def scenario():
+        return await asyncio.gather(
+            invoke("call-a", "known-a"), invoke("call-b", "known-b"),
+        )
+
+    first, second = asyncio.run(scenario())
+
+    assert first["result"]["evidence_ids"] == [dynamic_id]
+    assert second == (
+        "Worker request rejected. Provide one bounded assignment and only evidence IDs supplied "
+        "by this review, then call the worker again."
+    )
 
 
 def test_generated_asset_writes_only_inside_draft_root_with_compare_and_swap(tmp_path: Path) -> None:
@@ -1300,14 +1539,14 @@ def test_contained_operation_is_a_bounded_request_not_host_execution(tmp_path: P
     with pytest.raises(ValidationError):
         ContainedOperationRequestRecord(
             request_id="operation_" + "a" * 24,
-            specialist="prepare_system_target", tool_call_id="call-1", attempt=1,
+            worker_assignment="prepare a system target", tool_call_id="call-1", attempt=1,
             model="gpt-5.6-luna", operation="probe", asset_paths=(),
             assertions=("seed reaches parser",), executed=False,
             provenance="agent_request", trusted_instructions=False, actionable=True,
         )
 
 
-def test_review_collection_retains_typed_specialist_results_and_operation_requests(tmp_path: Path) -> None:
+def test_review_collection_retains_typed_worker_results_and_operation_requests(tmp_path: Path) -> None:
     from backend.agents.manager import _decision
 
     context = agent_context(tmp_path)
@@ -1318,11 +1557,11 @@ def test_review_collection_retains_typed_specialist_results_and_operation_reques
         context, "probe", ["system/parser/config.sh"], ["reaches project code"],
     )
 
-    invocation = SpecialistInvocation(
-        specialist="prepare_system_target", tool_call_id="call-review", attempt=1,
+    invocation = WorkerInvocation(
+        worker_assignment="prepare a system target", tool_call_id="call-review", attempt=1,
         model="gpt-5.6-luna",
     )
-    target_record = collection.record_specialist(invocation, proposal)
+    target_record = collection.record_worker_outcome(invocation, proposal)
     operation_record = collection.record_operation(invocation, request)
     collection.complete_attempt(invocation, accepted=True)
     review = collection.result(CampaignDecision(
@@ -1346,7 +1585,7 @@ def test_review_collection_retains_typed_specialist_results_and_operation_reques
             next_review_reason="Recheck the selected evidence",
             uncertainty="no deterministic executor",
         ))
-    with pytest.raises(SpecialistValidationError, match="outside this review"):
+    with pytest.raises(WorkerValidationError, match="outside this review"):
         _decision(
             CampaignDecision(
                 decision="select hidden request", motivation="malicious runner",
@@ -1400,7 +1639,7 @@ def test_manager_evidence_normalization_fails_closed(
 ) -> None:
     from backend.agents.manager import _decision
 
-    with pytest.raises(SpecialistValidationError, match=message):
+    with pytest.raises(WorkerValidationError, match=message):
         _decision(CampaignDecision(
             decision="prepare target", motivation="invalid decision boundary",
             evidence_ids=evidence_ids, bounded_actions=bounded_actions,
@@ -1411,7 +1650,7 @@ def test_manager_evidence_normalization_fails_closed(
 def test_target_proposal_rejects_operation_request_ids_as_evidence() -> None:
     request_id = "operation_" + "a" * 24
 
-    with pytest.raises(SpecialistValidationError, match="operation-request IDs cannot be evidence"):
+    with pytest.raises(WorkerValidationError, match="operation-request IDs cannot be evidence"):
         _validate_target(_target_proposal(request_id), frozenset({request_id}), "system-level")
 
 
@@ -1425,17 +1664,17 @@ def test_operation_request_ids_are_rejected_across_every_agent_evidence_boundary
         repair_intent="replay the testcase",
     )
 
-    with pytest.raises(SpecialistValidationError, match="operation-request IDs cannot be evidence"):
+    with pytest.raises(WorkerValidationError, match="operation-request IDs cannot be evidence"):
         _validate_evidence_ids([request_id], frozenset({request_id}))
-    with pytest.raises(SpecialistValidationError, match="operation-request IDs cannot be evidence"):
+    with pytest.raises(WorkerValidationError, match="operation-request IDs cannot be evidence"):
         _validate_triage(triage, frozenset({request_id}))
-    with pytest.raises(SpecialistValidationError, match="manager returned an operation-request ID as evidence"):
+    with pytest.raises(WorkerValidationError, match="manager returned an operation-request ID as evidence"):
         _decision(CampaignDecision(
             decision="wait", motivation="malicious evidence", evidence_ids=[request_id],
             bounded_actions=[], next_review_delay_seconds=900,
             next_review_reason="Recheck when new evidence arrives", uncertainty="unknown",
         ), frozenset({request_id}), frozenset())
-    with pytest.raises(SpecialistValidationError, match="operation-request IDs cannot be evidence"):
+    with pytest.raises(WorkerValidationError, match="operation-request IDs cannot be evidence"):
         _bounded_evidence([{"evidence_id": request_id}])
 
     legitimate = "repository:src/operation_parser.c:24"
@@ -1460,7 +1699,7 @@ def test_prepared_campaign_actions_reject_operation_request_evidence_before_runn
     async def runner(*_args, **_kwargs):
         raise AssertionError("runner must not receive invalid prepared evidence")
 
-    with pytest.raises(SpecialistValidationError, match="operation-request IDs cannot be evidence"):
+    with pytest.raises(WorkerValidationError, match="operation-request IDs cannot be evidence"):
         asyncio.run(CampaignManager(runner=runner).review(
             agent_context(tmp_path),
             [{"evidence_id": action.action_id}], "campaign progression",

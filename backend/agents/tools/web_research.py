@@ -1,4 +1,4 @@
-"""Deterministic official-documentation boundaries for specialist web research."""
+"""Deterministic official-documentation boundaries for fuzzing-worker research."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ def official_documentation_domains(context: AgentContext) -> frozenset[str]:
 
 
 def official_web_search_tool(domains: frozenset[str]) -> WebSearchTool:
-    """Restrict hosted web search before any result reaches the specialist."""
+    """Restrict hosted web search before any result reaches the worker."""
     return WebSearchTool(
         search_context_size="low", filters=Filters(allowed_domains=sorted(domains)),
     )
@@ -58,12 +58,12 @@ def validate_official_citations(citations: list[str], domains: frozenset[str]) -
             parsed = urlsplit(citation)
             hostname = (parsed.hostname or "").casefold().rstrip(".")
         except ValueError as error:
-            raise UnofficialWebCitation("specialist returned a malformed web citation") from error
+            raise UnofficialWebCitation("worker returned a malformed web citation") from error
         if (
             parsed.scheme != "https" or parsed.username is not None or parsed.password is not None
             or not hostname
             or not any(hostname == domain or hostname.endswith("." + domain) for domain in domains)
         ):
-            raise UnofficialWebCitation("specialist cited a nonofficial web source")
+            raise UnofficialWebCitation("worker cited a nonofficial web source")
         accepted.append(citation)
     return list(dict.fromkeys(accepted))
