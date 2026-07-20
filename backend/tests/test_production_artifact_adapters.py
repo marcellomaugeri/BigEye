@@ -1356,6 +1356,46 @@ def test_crash_triage_luna_registers_repository_evidence_returned_by_its_tool(
     assert calls == [("gpt-5.6-luna", 14)]
 
 
+def test_crash_triage_retries_when_luna_requests_a_replay_operation(
+    tmp_path: Path,
+) -> None:
+    from agents import RunConfig
+    from agents.tool_context import ToolContext
+    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageWorker
+
+    context = _triage_context(tmp_path)
+    calls = []
+    operation_outputs = []
+
+    async def runner(agent, _prompt, **kwargs):
+        calls.append((agent.model, kwargs["max_turns"]))
+        if agent.model == "gpt-5.6-luna":
+            operation = next(
+                item for item in agent.tools
+                if item.name == "request_contained_operation"
+            )
+            arguments = json.dumps({
+                "operation": "replay",
+                "asset_paths": [],
+                "assertions": ["replay the quarantined crash"],
+            })
+            operation_outputs.append(await operation.on_invoke_tool(ToolContext(
+                context, tool_name=operation.name, tool_call_id="operation-replay",
+                tool_arguments=arguments, run_config=RunConfig(), agent=agent,
+            ), arguments))
+        return _triage_result(_triage_output(["replay:original:1"]))
+
+    result = asyncio.run(ProductionCrashTriageWorker(
+        SimpleNamespace(context=lambda _project_id: context), runner=runner,
+    ).triage(_triage_evidence()))
+
+    assert result.classification == "true vulnerability"
+    assert calls == [("gpt-5.6-luna", 14), ("gpt-5.6-terra", 14)]
+    assert len(operation_outputs) == 1
+    assert isinstance(operation_outputs[0], str)
+    assert "not available" in operation_outputs[0]
+
+
 def test_crash_triage_terra_registers_only_its_own_retry_retrieval(
     tmp_path: Path,
 ) -> None:
@@ -1416,7 +1456,7 @@ def test_crash_triage_fails_after_two_attempts_invent_evidence_and_traces_raw_re
     ]
     assert calls == [("gpt-5.6-luna", 14), ("gpt-5.6-terra", 14)]
     assert [event["event"] for event in debug] == [
-        "workflow.result", "specialist.retry", "workflow.result", "workflow.error",
+        "workflow.result", "worker.retry", "workflow.result", "workflow.error",
     ]
     assert [
         event["output"]["triage_results"][0]["evidence_ids"]

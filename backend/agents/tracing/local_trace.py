@@ -277,7 +277,7 @@ class LocalTrace:
 
     def retry(self, agent, error: Exception, invocation=None) -> None:
         self.debug(
-            "specialist.retry", agent=getattr(agent, "name", None), model=getattr(agent, "model", None),
+            "worker.retry", agent=getattr(agent, "name", None), model=getattr(agent, "model", None),
             retry_count=1, error={"type": type(error).__name__, "message": str(error)},
             **self._invocation_fields(invocation),
         )

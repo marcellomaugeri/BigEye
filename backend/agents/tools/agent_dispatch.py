@@ -256,7 +256,8 @@ def _tool(
     description: str, evidence_records: dict[str, dict],
     collection: CampaignReviewCollection, web_domains: frozenset[str], hooks=None, trace=None,
 ):
-    validated_ids = evidence_ids
+    manager_envelope_ids = frozenset(evidence_ids)
+    accepted_review_ids = evidence_ids
     worker_hooks = hooks or RunHooks()
     assignment_evidence: dict[tuple[str, str, int, str], set[str]] = {}
     assignment_lock = threading.Lock()
@@ -299,8 +300,6 @@ def _tool(
             evidence_id = value.get("evidence_id")
             if isinstance(evidence_id, str):
                 returned_ids.append(evidence_id)
-                validated_ids.add(evidence_id)
-                evidence_records[evidence_id] = {**value, "trusted_instructions": False}
         if _CURRENT_WORKER_INVOCATION.get() is not None:
             add_assignment_evidence(active_worker(tool_context), returned_ids)
         return results
@@ -332,7 +331,7 @@ def _tool(
         params = options.get("params") or {}
         requested = params.get("evidence_ids", []) if isinstance(params, dict) else []
         try:
-            _validate_evidence_ids(requested, frozenset(validated_ids))
+            _validate_evidence_ids(requested, manager_envelope_ids)
         except WorkerValidationError as error:
             raise ManagerEnvelopeValidationError("manager worker envelope is invalid") from error
         records = []
@@ -392,13 +391,7 @@ def _tool(
             citations = validate_official_citations(
                 web_citations(getattr(result, "raw_responses", ())), web_domains,
             )
-            validated_ids.update(citations)
             add_assignment_evidence(luna_invocation, citations)
-            for citation in citations:
-                evidence_records[citation] = {
-                    "evidence_id": citation, "source": "official_web_citation",
-                    "trusted_instructions": False,
-                }
             output = _validate_worker_result(
                 getattr(result, "final_output", None),
                 exact_assignment_evidence(luna_invocation),
@@ -463,18 +456,13 @@ def _tool(
                 citations = validate_official_citations(
                     web_citations(getattr(retry_result, "raw_responses", ())), web_domains,
                 )
-                validated_ids.update(citations)
                 add_assignment_evidence(terra_invocation, citations)
-                for citation in citations:
-                    evidence_records[citation] = {
-                        "evidence_id": citation, "source": "official_web_citation",
-                        "trusted_instructions": False,
-                    }
                 output = _validate_worker_result(
                     getattr(retry_result, "final_output", None),
                     exact_assignment_evidence(terra_invocation),
                     collection.pending_operation_ids(terra_invocation),
                 )
+                successful_evidence_ids = exact_assignment_evidence(terra_invocation)
             except (WorkerValidationError, UnofficialWebCitation) as retry_error:
                 collection.complete_attempt(terra_invocation, accepted=False)
                 validation_error = WorkerValidationError(str(retry_error))
@@ -492,10 +480,12 @@ def _tool(
             successful_invocation = terra_invocation
         else:
             successful_invocation = luna_invocation
+            successful_evidence_ids = exact_assignment_evidence(luna_invocation)
         target_records, triage_records = collection.record_worker(
             successful_invocation, output.target_proposals, output.triage_results,
         )
         collection.complete_attempt(successful_invocation, accepted=True)
+        accepted_review_ids.update(successful_evidence_ids)
         return {
             "result": output.model_dump(mode="json"),
             "target_result_ids": [record.result_id for record in target_records],

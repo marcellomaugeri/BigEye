@@ -728,7 +728,7 @@ def test_luna_specialist_retries_once_with_terra_only_after_validation_failure(
     assert review.known_target_proposals[0].attempt == 2
     assert review.known_target_proposals[0].model == "gpt-5.6-terra"
     debug = [event.payload for event in asyncio.run(store.read(context.project_id, "debug", -1, 100))]
-    nested = [event for event in debug if event["event"] in {"workflow.result", "specialist.retry"}]
+    nested = [event for event in debug if event["event"] in {"workflow.result", "worker.retry"}]
     assert {event.get("model") for event in nested} == {"gpt-5.6-luna", "gpt-5.6-terra"}
     assert all(event["parent_tool"] == "run_fuzzing_worker" for event in nested)
     assert all(event["parent_tool_call_id"] == "call-1" for event in nested)
@@ -1406,6 +1406,88 @@ def test_parallel_worker_calls_cannot_cite_evidence_retrieved_by_a_sibling(
         "Worker request rejected. Provide one bounded assignment and only evidence IDs supplied "
         "by this review, then call the worker again."
     )
+
+
+def test_parallel_worker_envelope_cannot_claim_evidence_from_an_inflight_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agents import Runner
+
+    context = agent_context(tmp_path)
+    tool = dispatch_tools(context, evidence_ids={"known-a", "known-b"})[0]
+    retrieved = asyncio.Event()
+    release_first = asyncio.Event()
+    dynamic_id = ""
+    entered = []
+
+    class Result:
+        interruptions = []
+        new_items = []
+        raw_responses = []
+        input = "nested"
+
+        def __init__(self, outer_context, evidence_id):
+            self.final_output = _worker_result(evidence_ids=[evidence_id])
+            self.agent_tool_invocation = SimpleNamespace(
+                tool_name=outer_context.tool_name,
+                tool_call_id=outer_context.tool_call_id,
+                tool_arguments=outer_context.tool_arguments,
+            )
+
+        def to_input_list(self):
+            return []
+
+    async def runner(starting_agent=None, context=None, **_kwargs):
+        nonlocal dynamic_id
+        entered.append(context.tool_call_id)
+        if context.tool_call_id == "call-a":
+            retrieval = next(
+                item for item in starting_agent.tools
+                if item.name == "retrieve_repository_evidence"
+            )
+            arguments = '{"question":"println","limit":1}'
+            excerpts = await retrieval.on_invoke_tool(ToolContext(
+                context.context,
+                tool_name=retrieval.name,
+                tool_call_id="retrieve-a",
+                tool_arguments=arguments,
+                tool_input=context.tool_input,
+                run_config=RunConfig(),
+                agent=starting_agent,
+            ), arguments)
+            dynamic_id = excerpts[0]["evidence_id"]
+            retrieved.set()
+            await release_first.wait()
+            return Result(context, dynamic_id)
+        return Result(context, dynamic_id)
+
+    monkeypatch.setattr(Runner, "run", runner)
+
+    async def invoke(call_id: str, evidence_id: str):
+        arguments = json.dumps({
+            "assignment": "assignment " + call_id,
+            "evidence_ids": [evidence_id],
+        })
+        return await tool.on_invoke_tool(ToolContext(
+            context, tool_name=tool.name, tool_call_id=call_id,
+            tool_arguments=arguments, run_config=RunConfig(),
+        ), arguments)
+
+    async def scenario():
+        first_task = asyncio.create_task(invoke("call-a", "known-a"))
+        await retrieved.wait()
+        second = await invoke("call-b", dynamic_id)
+        release_first.set()
+        return await first_task, second
+
+    first, second = asyncio.run(scenario())
+
+    assert first["result"]["evidence_ids"] == [dynamic_id]
+    assert second == (
+        "Worker request rejected. Provide one bounded assignment and only evidence IDs supplied "
+        "by this review, then call the worker again."
+    )
+    assert entered == ["call-a"]
 
 
 def test_generated_asset_writes_only_inside_draft_root_with_compare_and_swap(tmp_path: Path) -> None:

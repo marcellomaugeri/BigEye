@@ -30,6 +30,7 @@ from backend.agents.tools.agent_dispatch import (
     _DIFFICULTY_MARKER,
     _validate_worker_result,
 )
+from backend.agents.tools.contained_operations import ContainedOperation
 from backend.agents.tools.evidence_retrieval import (
     EvidenceLimit,
     EvidenceQuestion,
@@ -651,7 +652,7 @@ class ProductionCrashTriageWorker:
         )
         last_error = None
         for attempt, model in enumerate(("gpt-5.6-luna", "gpt-5.6-terra")):
-            agent, allowed_ids = _crash_worker_attempt_agent(
+            agent, allowed_ids, operation_requested = _crash_worker_attempt_agent(
                 model, domains, evidence.evidence_ids,
             )
             try:
@@ -663,6 +664,10 @@ class ProductionCrashTriageWorker:
                     ),
                 )
                 trace.record_result(agent, prompt, result, retry_count=attempt)
+                if operation_requested():
+                    raise WorkerValidationError(
+                        "crash triage requested a deterministic pipeline operation"
+                    )
                 citations = validate_official_citations(
                     web_citations(getattr(result, "raw_responses", ())), domains,
                 )
@@ -711,6 +716,7 @@ def _crash_worker_attempt_agent(
 ):
     allowed_ids = set(deterministic_ids)
     dynamic_ids: set[str] = set()
+    operation_attempted = False
 
     @function_tool(
         name_override="retrieve_repository_evidence",
@@ -738,13 +744,43 @@ def _crash_worker_attempt_agent(
         allowed_ids.update(additions)
         return results
 
+    def unavailable_operation_error(_context, error: Exception) -> str:
+        if not isinstance(error, WorkerValidationError):
+            raise error
+        return (
+            "Contained operation requests are not available during crash triage. "
+            "Use only the supplied deterministic replay evidence."
+        )
+
+    @function_tool(
+        name_override="request_contained_operation",
+        failure_error_function=unavailable_operation_error,
+    )
+    async def rejected_operation(
+        context: RunContextWrapper[AgentContext], operation: ContainedOperation,
+        asset_paths: list[str], assertions: list[str],
+    ) -> dict[str, object]:
+        """Reject pipeline operations because deterministic crash services already ran them."""
+        raise WorkerValidationError(
+            "contained operation is unavailable during crash triage"
+        )
+
+    invoke_rejected_operation = rejected_operation.on_invoke_tool
+
+    async def record_rejected_operation(tool_context, input_json: str):
+        nonlocal operation_attempted
+        operation_attempted = True
+        return await invoke_rejected_operation(tool_context, input_json)
+
+    rejected_operation.on_invoke_tool = record_rejected_operation
+
     agent = build_fuzzing_worker(model, domains)
-    tools = [
-        registered_retrieval
-        if getattr(tool, "name", None) == "retrieve_repository_evidence" else tool
-        for tool in agent.tools
-    ]
-    return agent.clone(tools=tools), allowed_ids
+    replacements = {
+        "retrieve_repository_evidence": registered_retrieval,
+        "request_contained_operation": rejected_operation,
+    }
+    tools = [replacements.get(getattr(tool, "name", None), tool) for tool in agent.tools]
+    return agent.clone(tools=tools), allowed_ids, lambda: operation_attempted
 
 
 def _regular_inputs(root: Path, maximum: int) -> tuple[Path, ...]:

@@ -268,19 +268,63 @@ def test_campaign_manager_returns_structured_decision_and_writes_plain_activity(
     assert "reasoning" not in json.dumps(activity).casefold()
 
 
-def test_campaign_manager_accepts_source_evidence_registered_inside_a_specialist(tmp_path: Path) -> None:
+def test_campaign_manager_accepts_source_evidence_from_an_accepted_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agents import Runner
+
     store = ProjectEventStore(tmp_path)
     context = context_for(tmp_path)
 
-    async def runner(agent, prompt, **kwargs):
-        system_tool = next(tool for tool in agent.tools if tool.name == "run_fuzzing_worker")
-        retrieval = next(tool for tool in system_tool._agent_instance.tools if tool.name == "retrieve_repository_evidence")
-        tool_context = ToolContext(
-            context, tool_name=retrieval.name, tool_call_id="retrieve-1",
-            tool_arguments='{"question":"main","limit":1}', run_config=RunConfig(),
+    class NestedResult:
+        interruptions = []
+        new_items = []
+        raw_responses = []
+        input = "nested"
+
+        def __init__(self, outer_context, evidence_id):
+            self.final_output = {
+                "summary": "Located the source entry point.",
+                "evidence_ids": [evidence_id],
+                "target_proposals": [],
+                "triage_results": [],
+                "operation_request_ids": [],
+                "recommendations": [],
+                "uncertainty": "Input path not measured.",
+            }
+            self.agent_tool_invocation = SimpleNamespace(
+                tool_name=outer_context.tool_name,
+                tool_call_id=outer_context.tool_call_id,
+                tool_arguments=outer_context.tool_arguments,
+            )
+
+        def to_input_list(self):
+            return []
+
+    async def nested_runner(starting_agent=None, context=None, **kwargs):
+        retrieval = next(
+            tool for tool in starting_agent.tools
+            if tool.name == "retrieve_repository_evidence"
         )
-        excerpts = await retrieval.on_invoke_tool(tool_context, '{"question":"main","limit":1}')
-        evidence_id = excerpts[0]["evidence_id"]
+        arguments = '{"question":"main","limit":1}'
+        excerpts = await retrieval.on_invoke_tool(ToolContext(
+            context.context, tool_name=retrieval.name, tool_call_id="retrieve-1",
+            tool_arguments=arguments, tool_input=context.tool_input,
+            run_config=RunConfig(), agent=starting_agent,
+        ), arguments)
+        return NestedResult(context, excerpts[0]["evidence_id"])
+
+    monkeypatch.setattr(Runner, "run", nested_runner)
+
+    async def runner(agent, prompt, **kwargs):
+        worker_tool = next(tool for tool in agent.tools if tool.name == "run_fuzzing_worker")
+        arguments = '{"assignment":"locate source entry point","evidence_ids":[]}'
+        tool_context = ToolContext(
+            context, tool_name=worker_tool.name, tool_call_id="worker-1",
+            tool_arguments=arguments, run_config=RunConfig(),
+        )
+        worker = await worker_tool.on_invoke_tool(tool_context, arguments)
+        evidence_id = worker["result"]["evidence_ids"][0]
         return SimpleNamespace(
             final_output=CampaignDecision(
                 decision="prepare target", motivation="The executable has a source entry point.",
