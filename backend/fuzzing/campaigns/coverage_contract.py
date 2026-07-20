@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 import re
 
-from backend.services.observability.redaction import is_secret_key
+from backend.services.observability.redaction import is_secret_key, is_secret_value
 
 
 _OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
@@ -67,6 +67,7 @@ def valid_replay_environment(values) -> bool:
             or key.startswith(("LD_", "DYLD_"))
             or is_secret_key(key)
             or not isinstance(value, str) or not value or "\x00" in value or len(value) > 4_096
+            or is_secret_value(value)
         ):
             return False
         total_bytes += len(key.encode("utf-8")) + len(value.encode("utf-8"))

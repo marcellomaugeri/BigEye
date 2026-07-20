@@ -96,6 +96,32 @@ def test_coverage_routes_expose_tree_source_functions_and_first_hit_evidence():
     assert testcase.headers["content-disposition"].startswith("attachment;")
 
 
+def test_line_evidence_response_redacts_credential_shaped_environment_defensively():
+    class UnsafeCoverage(_Coverage):
+        async def line_evidence(self, project_id, path, line_number, limit=500, offset=0):
+            result = await super().line_evidence(project_id, path, line_number, limit, offset)
+            result["evidence"][0]["replay_environment"] = {
+                "BIGEYE_MODE": "encrypted",
+                "GITHUB_PAT": "github-secret",
+                "DATABASE_URL": "postgresql://user:password@db/bigeye",
+                "authentication": "Bearer bearer-secret",
+            }
+            return result
+
+    with _client(UnsafeCoverage()) as client:
+        response = client.get(
+            "/api/projects/7/coverage/lines/12", params={"path": "src/a.c"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["evidence"][0]["replay_environment"] == {
+        "BIGEYE_MODE": "encrypted",
+        "GITHUB_PAT": "[REDACTED]",
+        "DATABASE_URL": "[REDACTED]",
+        "authentication": "[REDACTED]",
+    }
+
+
 def test_retained_testcase_route_rejects_untrusted_identity_without_leaking_paths():
     class RejectingCoverage(_Coverage):
         async def retained_testcase(self, *_args):

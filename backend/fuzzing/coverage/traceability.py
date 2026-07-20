@@ -531,7 +531,11 @@ class TraceabilityService:
             raise CoverageIntegrityError("first-hit metadata identity does not match its evidence")
         for key in ("source_sha256", "clean_content_hash"):
             _digest(document.get(key), key.replace("_", " "))
-        replay_environment = _stored_replay_environment(document.get("replay_environment"))
+        replay_environment = (
+            _stored_replay_environment(document["replay_environment"])
+            if isinstance(document, dict) and "replay_environment" in document
+            else ()
+        )
         if (
             not isinstance(document.get("clean_image_id"), str)
             or not _is_image_id(document["clean_image_id"])

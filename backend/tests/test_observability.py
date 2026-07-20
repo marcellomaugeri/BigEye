@@ -131,13 +131,37 @@ def test_redaction_normalizes_nested_key_separators_and_case() -> None:
         "OPENAI_API_KEY": "openai", "X-Api-Key": "header", "AWS_SECRET_ACCESS_KEY": "aws",
         "nested": [{"Authorization": "Bearer secret", "repository_token": "token"}],
         "credentials": {"password": "password", "credential": "credential"},
-        "safe_key": "visible", "monkey": "visible", "secretary": "visible",
+        "safe_key": "credential-shaped", "monkey": "visible", "secretary": "visible",
     })
 
     assert value == {
         "OPENAI_API_KEY": "[REDACTED]", "X-Api-Key": "[REDACTED]", "AWS_SECRET_ACCESS_KEY": "[REDACTED]",
         "nested": [{"Authorization": "[REDACTED]", "repository_token": "[REDACTED]"}],
-        "credentials": "[REDACTED]", "safe_key": "visible", "monkey": "visible", "secretary": "visible",
+        "credentials": "[REDACTED]", "safe_key": "[REDACTED]", "monkey": "visible", "secretary": "visible",
+    }
+
+
+def test_redaction_removes_credential_shaped_names_and_values() -> None:
+    from backend.services.observability.redaction import redact
+
+    value = redact({
+        "GITHUB_PAT": "github-secret",
+        "AWS_ACCESS_KEY_ID": "aws-secret",
+        "DATABASE_URL": "postgresql://user:password@db/bigeye",
+        "authentication": "Bearer bearer-secret",
+        "signing_material": "-----BEGIN PRIVATE KEY-----\nprivate-secret",
+        "BIGEYE_MODE": "encrypted",
+        "ASAN_OPTIONS": "abort_on_error=1:detect_leaks=1",
+    })
+
+    assert value == {
+        "GITHUB_PAT": "[REDACTED]",
+        "AWS_ACCESS_KEY_ID": "[REDACTED]",
+        "DATABASE_URL": "[REDACTED]",
+        "authentication": "[REDACTED]",
+        "signing_material": "[REDACTED]",
+        "BIGEYE_MODE": "encrypted",
+        "ASAN_OPTIONS": "abort_on_error=1:detect_leaks=1",
     }
 
 

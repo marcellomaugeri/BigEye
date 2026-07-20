@@ -1,6 +1,8 @@
 """HTTP views for clean source coverage and first-hit evidence."""
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+
+from backend.services.observability.redaction import redact_environment
 
 
 class PaginationResponse(BaseModel):
@@ -62,6 +64,11 @@ class LineEvidenceResponse(BaseModel):
     configuration_asset_id: int | None
     clean_image_id: str
     cpu_exposure_seconds: float
+
+    @field_validator("replay_environment", mode="before")
+    @classmethod
+    def redact_replay_environment(cls, value):
+        return redact_environment(value)
 
 
 class LineEvidencePageResponse(BaseModel):

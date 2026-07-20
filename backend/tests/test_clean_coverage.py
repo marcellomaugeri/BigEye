@@ -459,6 +459,37 @@ def test_traceability_rejects_unbounded_or_secret_replay_environment(
     assert list((tmp_path / "projects/7/coverage/first-hits").rglob("evidence.json")) == []
 
 
+@pytest.mark.parametrize("replay_environment", [
+    (("GITHUB_PAT", "github-secret"),),
+    (("AWS_ACCESS_KEY_ID", "aws-secret"),),
+    (("SERVICE_TOKEN", "service-secret"),),
+    (("SERVICE_SECRET", "service-secret"),),
+    (("SERVICE_PASSWORD", "service-secret"),),
+    (("SERVICE_KEY", "service-secret"),),
+    (("DATABASE_URL", "postgresql://user:password@db/bigeye"),),
+    (("AUTHENTICATION", "Bearer bearer-secret"),),
+    (("SIGNING_MATERIAL", "-----BEGIN PRIVATE KEY-----\nprivate-secret"),),
+    (("REMOTE_ENDPOINT", "https://user:password@example.test/path"),),
+])
+def test_clean_coverage_contract_rejects_credential_shaped_replay_environment(
+    replay_environment,
+) -> None:
+    from backend.fuzzing.campaigns.coverage_contract import valid_replay_environment
+
+    assert valid_replay_environment(replay_environment) is False
+
+
+def test_clean_coverage_contract_preserves_benign_replay_configuration() -> None:
+    from backend.fuzzing.campaigns.coverage_contract import valid_replay_environment
+
+    assert valid_replay_environment((
+        ("BIGEYE_MODE", "encrypted"),
+        ("ASAN_OPTIONS", "abort_on_error=1:detect_leaks=1"),
+        ("UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1"),
+        ("DATABASE_URL", "postgresql://db/bigeye"),
+    )) is True
+
+
 def test_new_first_hit_invalidates_coverage_only_after_durable_publication(tmp_path: Path):
     from backend.fuzzing.coverage.traceability import TraceabilityService
 
@@ -663,6 +694,30 @@ def test_line_query_rejects_invalid_persisted_replay_environment(tmp_path: Path)
 
     with pytest.raises(CoverageIntegrityError, match="metadata is invalid"):
         run(service.line_evidence(7, "src/a.c", 1))
+
+
+def test_line_query_treats_missing_legacy_replay_environment_as_empty(tmp_path: Path):
+    from backend.fuzzing.coverage.traceability import TraceabilityService
+
+    checkout = tmp_path / "repository"
+    (checkout / "src").mkdir(parents=True)
+    (checkout / "src/a.c").write_text("x\n")
+    repository = _MemoryCoverageRepository()
+    service = TraceabilityService(tmp_path, repository, lambda _request: True, _Registry(checkout))
+    run(service.record(_snapshot(source_hash=sha256(b"x\n").hexdigest())))
+    metadata = next((tmp_path / "projects/7/coverage/first-hits").rglob("evidence.json"))
+    directory = metadata.parent
+    directory.chmod(0o700)
+    metadata.chmod(0o600)
+    document = json.loads(metadata.read_text())
+    del document["replay_environment"]
+    metadata.write_text(json.dumps(document))
+    metadata.chmod(0o400)
+    directory.chmod(0o500)
+
+    line = run(service.line_evidence(7, "src/a.c", 1))["evidence"][0]
+
+    assert line["replay_environment"] == {}
 
 
 def test_coverage_repository_inserts_existing_minimal_row_contract():
