@@ -147,6 +147,155 @@ class FuzzContainerService:
     def recover(self, campaign: FuzzCampaign, invocation: ContainerInvocation) -> ContainerIdentity | None:
         return self._find(campaign, invocation, running_only=True)
 
+    def inspect_owned(self, identity: ContainerIdentity) -> ContainerIdentity:
+        """Inspect a previously verified runtime while its corpus path is quiesced."""
+        contract = self._known_contract(identity)
+        container = self._client.containers.get(identity.container_id)
+        container.reload()
+        verify_runtime(container, contract)
+        return ContainerIdentity(
+            identity.container_id,
+            contract.campaign_id,
+            contract.project_id,
+            _container_state(container),
+        )
+
+    def replace_owned(
+        self,
+        identity: ContainerIdentity,
+        campaign: FuzzCampaign,
+        invocation: ContainerInvocation,
+        committed_corpus_identity: tuple[int, int],
+    ) -> ContainerIdentity:
+        """Replace one verified writer after its canonical corpus inode changed."""
+        contract = self._known_contract(identity)
+        self._validate_campaign(campaign)
+        if (
+            campaign.id != contract.campaign_id
+            or campaign.project_id != contract.project_id
+            or campaign.commit_sha != contract.commit_sha
+        ):
+            raise ContainerOwnershipMismatch(
+                "replacement campaign does not match service-owned evidence"
+            )
+        _validate_filesystem_identity(committed_corpus_identity)
+        container = self._client.containers.get(identity.container_id)
+        container.reload()
+        verify_runtime(container, contract)
+
+        with self._workspace.open_campaign(
+            contract.project_id, contract.campaign_id, create=False,
+        ) as directory:
+            if (directory.device, directory.inode) != (contract.device, contract.inode):
+                raise ContainerOwnershipMismatch(
+                    "canonical campaign workspace changed before writer replacement"
+                )
+            self._workspace.validate_log_destination(directory)
+            mounts = self._workspace.existing_mounts(directory)
+            current_identities = dict(
+                (name, (device, inode)) for name, device, inode in mounts.identities
+            )
+            previous_identities = dict(
+                (name, (device, inode)) for name, device, inode in contract.mount_identities
+            )
+            if (
+                current_identities.get("corpus") != committed_corpus_identity
+                or current_identities.get("corpus") == previous_identities.get("corpus")
+                or current_identities.get("output") != previous_identities.get("output")
+                or current_identities.get("config") != previous_identities.get("config")
+            ):
+                raise ContainerOwnershipMismatch(
+                    "only the committed canonical corpus may change during writer replacement"
+                )
+            user_id, group_id = _unprivileged_user()
+            replacement_contract = build_runtime_contract(
+                self._client,
+                campaign,
+                invocation,
+                mounts.volumes,
+                mounts.identities,
+                f"{user_id}:{group_id}",
+                (directory.device, directory.inode),
+                directory.path,
+            )
+            _require_same_campaign_contract(contract, replacement_contract)
+
+            primary_error = None
+            state = _container_state(container)
+            if state == "paused":
+                try:
+                    container.unpause()
+                    container.reload()
+                    state = _container_state(container)
+                except Exception as error:
+                    primary_error = error
+            if state in ACTIVE_STATES:
+                try:
+                    container.stop(timeout=self._stop_timeout_seconds)
+                except Exception as error:
+                    if primary_error is not None:
+                        primary_error.add_note(f"graceful stop also failed: {error}")
+                    else:
+                        primary_error = error
+                try:
+                    container.reload()
+                except Exception as error:
+                    if primary_error is not None:
+                        primary_error.add_note(
+                            f"state reload after graceful stop also failed: {error}"
+                        )
+                        raise primary_error
+                    raise
+                state = _container_state(container)
+                if state in ACTIVE_STATES:
+                    try:
+                        container.kill()
+                    except Exception as error:
+                        if primary_error is not None:
+                            primary_error.add_note(f"forced kill also failed: {error}")
+                        else:
+                            primary_error = error
+                    container.reload()
+                    state = _container_state(container)
+            if state in ACTIVE_STATES:
+                still_running = ContainerStillRunning(
+                    f"container {identity.container_id} did not stop for replacement"
+                )
+                if primary_error is not None:
+                    primary_error.add_note(str(still_running))
+                    raise primary_error
+                raise still_running
+
+            log_descriptor = self._workspace.open_log(directory)
+            try:
+                persist_bounded_logs(
+                    container,
+                    log_descriptor,
+                    self._final_log_max_bytes,
+                    self._final_log_timeout_seconds,
+                )
+            finally:
+                os.close(log_descriptor)
+            container.remove(force=False)
+            del self._owned[identity.container_id]
+            if primary_error is not None:
+                raise primary_error
+
+        replacement = self.start(campaign, invocation)
+        observed = self.inspect_owned(replacement)
+        replacement_contract = self._known_contract(replacement)
+        if (
+            observed.state != "running"
+            or dict(
+                (name, (device, inode))
+                for name, device, inode in replacement_contract.mount_identities
+            ).get("corpus") != committed_corpus_identity
+        ):
+            raise ContainerContractMismatch(
+                "replacement writer does not own the committed corpus"
+            )
+        return observed
+
     def stream_logs(self, identity: ContainerIdentity, sink, follow: bool = True) -> None:
         contract = self._known_contract(identity)
         with self._open_owned_campaign(contract) as directory:
@@ -370,3 +519,36 @@ def _text(chunk) -> str:
 def _unprivileged_user() -> tuple[int, int]:
     user_id, group_id = os.getuid(), os.getgid()
     return (65534, 65534) if user_id == 0 else (user_id, group_id)
+
+
+def _validate_filesystem_identity(identity: tuple[int, int]) -> None:
+    if (
+        not isinstance(identity, tuple)
+        or len(identity) != 2
+        or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in identity)
+    ):
+        raise ValueError("committed corpus identity must contain two positive integers")
+
+
+def _require_same_campaign_contract(
+    previous: RuntimeContract,
+    replacement: RuntimeContract,
+) -> None:
+    stable_fields = (
+        "campaign_id", "project_id", "commit_sha", "image_id", "engine",
+        "command", "environment", "mounts", "user", "memory_bytes",
+        "device", "inode", "campaign_path", "name",
+    )
+    if any(getattr(previous, field) != getattr(replacement, field) for field in stable_fields):
+        raise ContainerOwnershipMismatch(
+            "replacement invocation changed the verified campaign contract"
+        )
+    corpus_label = "com.bigeye.mount.corpus"
+    previous_labels = previous.labels_dict()
+    replacement_labels = replacement.labels_dict()
+    previous_labels.pop(corpus_label, None)
+    replacement_labels.pop(corpus_label, None)
+    if previous_labels != replacement_labels:
+        raise ContainerOwnershipMismatch(
+            "replacement invocation changed campaign ownership labels"
+        )

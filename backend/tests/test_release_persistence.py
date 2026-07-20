@@ -143,6 +143,30 @@ class TestProjectRepository:
         assert "paused_at = CURRENT_TIMESTAMP" in pool.execute.await_args_list[0].args[0]
         assert "paused_at = NULL" in pool.execute.await_args_list[1].args[0]
 
+    def test_settings_resume_validates_and_restarts_before_clearing_pause(self):
+        from backend.services.projects.project_settings import ProjectSettingsService
+
+        paused = project_row(paused_at=NOW)
+        resumed = project_row(paused_at=None)
+        projects = AsyncMock()
+        projects.get.side_effect = [
+            SimpleNamespace(**paused), SimpleNamespace(**resumed),
+        ]
+        registry = AsyncMock()
+        order = []
+        registry.resume.side_effect = lambda _identifier: order.append("validate-and-restart")
+        projects.resume.side_effect = lambda _identifier: order.append("clear-pause")
+        registry.settings_changed.side_effect = lambda _identifier: order.append("start-coordinator")
+        service = ProjectSettingsService(projects, registry)
+
+        result = run(service.resume(7))
+
+        assert registry.resume.await_args.args == (7,)
+        assert projects.resume.await_args.args == (7,)
+        assert registry.settings_changed.await_args.args == (7,)
+        assert order == ["validate-and-restart", "clear-pause", "start-coordinator"]
+        assert result.paused_at is None
+
     def test_get_repository_token_returns_secret_only_to_the_clone_boundary(self):
         from backend.repositories.project_repository import ProjectRepository
 

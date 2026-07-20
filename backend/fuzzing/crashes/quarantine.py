@@ -93,6 +93,7 @@ class CrashObservation:
     sanitizer: str
     command: tuple[str, ...]
     input_bytes: bytes
+    input_mode: str | None = None
     configuration_asset_id: int | None = None
     engine_output: str = ""
     stack: str = ""
@@ -101,6 +102,7 @@ class CrashObservation:
     coverage: tuple[str, ...] = ()
     compatible_sanitizer_variants: tuple[tuple[str, str], ...] = ()
     clean_image_id: str | None = None
+    clean_command: tuple[str, ...] = ()
     harness_misuse_evidence: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -116,6 +118,14 @@ class CrashObservation:
         if self.engine not in {"afl", "libfuzzer"}:
             raise ValueError("crash engine must be afl or libfuzzer")
         budget.add(self.engine)
+        input_mode = self.input_mode
+        if input_mode is None:
+            input_mode = "inprocess" if self.engine == "libfuzzer" else "file"
+            object.__setattr__(self, "input_mode", input_mode)
+        allowed_modes = {"file", "stdin"} if self.engine == "afl" else {"inprocess"}
+        if input_mode not in allowed_modes:
+            raise ValueError("crash input mode does not match its engine")
+        budget.add(input_mode)
         if not isinstance(self.image_id, str) or not _IMAGE_PATTERN.fullmatch(self.image_id):
             raise ValueError("crash image ID must be an exact sha256 image ID")
         budget.add(self.image_id)
@@ -123,6 +133,8 @@ class CrashObservation:
             raise ValueError("clean image ID must be an exact sha256 image ID")
         if self.clean_image_id is not None:
             budget.add(self.clean_image_id)
+            if not self.clean_command:
+                object.__setattr__(self, "clean_command", self.command)
         _bounded_text(self.sanitizer, "sanitizer", 100, empty=False)
         budget.add(self.sanitizer)
         _bounded_text(self.engine_output, "engine output", MAX_ENGINE_OUTPUT_CHARS)
@@ -138,6 +150,16 @@ class CrashObservation:
             if "\n" in item or "\r" in item:
                 raise ValueError("crash command items must be single-line strings")
             budget.add(item)
+        if self.clean_image_id is None and self.clean_command:
+            raise ValueError("clean crash command requires an exact clean image")
+        if self.clean_command:
+            if len(self.clean_command) > MAX_COMMAND_ITEMS:
+                raise ValueError("clean crash command exceeds its bound")
+            for item in self.clean_command:
+                _bounded_text(item, "clean command item", MAX_COMMAND_ITEM_CHARS, empty=False)
+                if "\n" in item or "\r" in item:
+                    raise ValueError("clean crash command items must be single-line strings")
+                budget.add(item)
         if not isinstance(self.input_bytes, bytes):
             raise ValueError("crash input must be bytes")
         _source_reference(self.source_location, "source location")
@@ -182,8 +204,10 @@ class CrashObservation:
             "campaign_id": self.campaign_id,
             "commit_sha": self.commit_sha,
             "engine": self.engine,
+            "input_mode": self.input_mode,
             "image_id": self.image_id,
             "clean_image_id": self.clean_image_id,
+            "clean_command": list(self.clean_command),
             "target_asset_id": self.target_asset_id,
             "configuration_asset_id": self.configuration_asset_id,
             "sanitizer": self.sanitizer,

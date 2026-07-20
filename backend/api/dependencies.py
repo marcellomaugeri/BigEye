@@ -6,6 +6,7 @@ from pathlib import Path
 from backend.repositories.project_repository import ProjectRepository
 from backend.repositories.asset_repository import AssetRepository
 from backend.repositories.campaign_repository import CampaignRepository
+from backend.repositories.campaign_artifact_repository import CampaignArtifactRepository
 from backend.repositories.coverage_repository import CoverageRepository
 from backend.repositories.coverage_checkpoint_repository import CoverageCheckpointRepository
 from backend.repositories.finding_repository import FindingRepository
@@ -32,6 +33,10 @@ from backend.services.campaigns.production_runtime import (
     ProjectDiscovery,
     RepositoryCampaignRuntime,
 )
+from backend.services.campaigns.production_evidence_factory import (
+    DeferredCampaignEvidenceProcessor,
+    ProductionCampaignEvidenceFactory,
+)
 from backend.services.campaigns.project_coordinator import PostgresProjectLock, ProjectCoordinator
 from backend.services.campaigns.read_campaigns import CampaignReadService
 from backend.agents.workflow import CampaignWorkflow, RepositoryAnalysisWorkflow
@@ -50,6 +55,7 @@ from backend.fuzzing.campaigns.production_factory import (
 )
 from backend.services.initial_tasks import InitialTaskService
 from backend.fuzzing.coverage.exposure import ExposureAccountant
+from backend.fuzzing.docker.client import DockerClient
 
 
 @dataclass
@@ -85,6 +91,7 @@ def build_services(pool, workspace: Path) -> Services:
     projects = ProjectRepository(pool)
     assets = AssetRepository(pool)
     campaigns = CampaignRepository(pool)
+    campaign_artifacts = CampaignArtifactRepository(pool)
     coverage_repository = CoverageRepository(pool)
     coverage_history = CoverageCheckpointRepository(pool, coverage_repository)
     findings = FindingRepository(pool)
@@ -107,6 +114,31 @@ def build_services(pool, workspace: Path) -> Services:
     campaign_containers = DeferredCampaignContainers(
         workspace, invocation_store=invocation_store,
     )
+    checkout_registry = ProjectCheckoutRegistry(workspace, projects)
+    replay_verifier = FirstHitReplayVerifier(
+        CleanCoverageTargetResolver(checkout_registry, campaigns, assets),
+        DeferredLlvmCoverage(workspace / "coverage-replay"),
+    )
+    coverage = TraceabilityService(
+        workspace,
+        coverage_repository,
+        replay_verifier=replay_verifier,
+        checkout_registry=checkout_registry,
+        events=observability,
+    )
+    evidence_processor = DeferredCampaignEvidenceProcessor(
+        ProductionCampaignEvidenceFactory(
+            workspace=workspace,
+            contracts=invocation_store,
+            assets=assets,
+            artifacts=campaign_artifacts,
+            traceability=coverage,
+            findings=findings,
+            discovery=discovery,
+            events=observability,
+        ),
+        DockerClient(),
+    )
     campaign_runtime = RepositoryCampaignRuntime(
         tasks=tasks,
         assets=assets,
@@ -120,6 +152,8 @@ def build_services(pool, workspace: Path) -> Services:
         cpu_counters=campaigns,
         crash_groups=findings,
         campaign_contexts=campaigns,
+        evidence_processor=evidence_processor,
+        artifact_state=campaign_artifacts,
     )
     campaign_manager = CampaignWorkflow(observability)
     preparation_graph = DeferredTargetPreparationGraph(
@@ -156,18 +190,6 @@ def build_services(pool, workspace: Path) -> Services:
             advisory_lock=advisory_lock,
             events=observability,
         ),
-    )
-    checkout_registry = ProjectCheckoutRegistry(workspace, projects)
-    replay_verifier = FirstHitReplayVerifier(
-        CleanCoverageTargetResolver(checkout_registry, campaigns, assets),
-        DeferredLlvmCoverage(workspace / "coverage-replay"),
-    )
-    coverage = TraceabilityService(
-        workspace,
-        coverage_repository,
-        replay_verifier=replay_verifier,
-        checkout_registry=checkout_registry,
-        events=observability,
     )
     finding_artifacts = FindingArtifactStore(CrashQuarantine(workspace))
     return Services(

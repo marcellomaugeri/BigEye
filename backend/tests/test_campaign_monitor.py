@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -51,14 +52,16 @@ def _observe(root: Path, engine: str, logs: bytes = b""):
     )
 
 
-def _observe_with_monitor(monitor, root: Path, engine: str, logs: bytes = b""):
+def _observe_with_monitor(
+    monitor, root: Path, engine: str, logs: bytes = b"", artifact_cursors=None,
+):
     client = SimpleNamespace(containers=_Containers(_Container(logs)))
     project = SimpleNamespace(id=7)
     campaign = SimpleNamespace(id=9)
     identity = SimpleNamespace(container_id="container-9")
     invocation = SimpleNamespace(engine=engine)
     return monitor.observe(
-        client, project, campaign, identity, invocation,
+        client, project, campaign, identity, invocation, artifact_cursors or {},
     )
 
 
@@ -124,16 +127,66 @@ def test_monitor_cursor_eventually_visits_more_than_one_bounded_artifact_page(
     queue = campaign / "output" / "main" / "queue"
     for index in range(520):
         (queue / f"id:{index:06d}").write_bytes(str(index).encode())
-    monitor = DockerCampaignMonitor(tmp_path, clock=lambda: NOW)
-
-    first = _observe_with_monitor(monitor, tmp_path, "afl")
-    second = _observe_with_monitor(monitor, tmp_path, "afl")
+    first = _observe_with_monitor(DockerCampaignMonitor(tmp_path, clock=lambda: NOW), tmp_path, "afl")
+    cursors = {
+        kind: (observed_ns, name)
+        for kind, observed_ns, name in first.next_artifact_cursors
+    }
+    second = _observe_with_monitor(
+        DockerCampaignMonitor(tmp_path, clock=lambda: NOW), tmp_path, "afl",
+        artifact_cursors=cursors,
+    )
+    third = _observe_with_monitor(
+        DockerCampaignMonitor(tmp_path, clock=lambda: NOW), tmp_path, "afl",
+        artifact_cursors={
+            kind: (observed_ns, name)
+            for kind, observed_ns, name in second.next_artifact_cursors
+        },
+    )
 
     visited = {item.relative_path for item in (*first.artifacts, *second.artifacts)}
     assert first.queue_files == second.queue_files == 520
     assert len(first.artifacts) == 512
     assert len(second.artifacts) == 8
     assert len(visited) == 520
+    assert third.artifacts == ()
+    assert third.next_artifact_cursors == second.next_artifact_cursors
+
+
+def test_libfuzzer_durable_cursor_observes_a_later_low_hash_name_after_restart(
+    tmp_path: Path,
+) -> None:
+    from backend.services.campaigns.production_runtime import DockerCampaignMonitor
+
+    campaign = _campaign_workspace(tmp_path, "libfuzzer")
+    high = campaign / "corpus" / ("f" * 64)
+    high.write_bytes(b"first")
+    os.utime(high, ns=(1_000_000_000, 1_000_000_000))
+    first = _observe_with_monitor(
+        DockerCampaignMonitor(tmp_path, clock=lambda: NOW), tmp_path, "libfuzzer",
+    )
+    low = campaign / "corpus" / ("0" * 64)
+    low.write_bytes(b"later")
+    os.utime(low, ns=(2_000_000_000, 2_000_000_000))
+
+    second = _observe_with_monitor(
+        DockerCampaignMonitor(tmp_path, clock=lambda: NOW), tmp_path, "libfuzzer",
+        artifact_cursors={
+            kind: (observed_ns, name)
+            for kind, observed_ns, name in first.next_artifact_cursors
+        },
+    )
+    third = _observe_with_monitor(
+        DockerCampaignMonitor(tmp_path, clock=lambda: NOW), tmp_path, "libfuzzer",
+        artifact_cursors={
+            kind: (observed_ns, name)
+            for kind, observed_ns, name in second.next_artifact_cursors
+        },
+    )
+
+    assert [item.relative_path for item in first.artifacts] == ["corpus/" + "f" * 64]
+    assert [item.relative_path for item in second.artifacts] == ["corpus/" + "0" * 64]
+    assert third.artifacts == ()
 
 
 def test_oversized_libfuzzer_log_sample_is_truncated_to_its_bounded_tail(
@@ -257,7 +310,7 @@ def test_runtime_passes_monitor_artifacts_to_processor_and_exposes_only_validate
     project = SimpleNamespace(id=7, commit_sha="a" * 40, worker_count=1)
     campaign = SimpleNamespace(
         id=9, project_id=7, target_asset_id=31, configuration_asset_id=32,
-        stopped_at=None, next_review_after=None, error=None,
+        engine="libfuzzer", stopped_at=None, next_review_after=None, error=None,
     )
     tasks, assets, campaigns = AsyncMock(), AsyncMock(), AsyncMock()
     tasks.list_for_project.return_value = []
@@ -291,3 +344,52 @@ def test_runtime_passes_monitor_artifacts_to_processor_and_exposes_only_validate
     assert snapshot.corpus_opportunity is False
     assert "finding:abc" in snapshot.evidence_ids
     processor.process.assert_awaited_once()
+
+
+def test_runtime_advances_durable_artifact_cursors_only_after_the_complete_page_succeeds() -> None:
+    from unittest.mock import AsyncMock
+
+    from backend.services.campaigns.production_evidence import CampaignProcessingResult
+    from backend.services.campaigns.production_runtime import (
+        CampaignProgressObservation,
+        ContainerObservation,
+        RepositoryCampaignRuntime,
+    )
+
+    project = SimpleNamespace(id=7, commit_sha="a" * 40, worker_count=1)
+    campaign = SimpleNamespace(
+        id=9, project_id=7, target_asset_id=31, configuration_asset_id=32,
+        engine="afl", stopped_at=None, next_review_after=None, error=None,
+    )
+    tasks, assets, campaigns = AsyncMock(), AsyncMock(), AsyncMock()
+    tasks.list_for_project.return_value = []
+    assets.list_for_project.return_value = []
+    campaigns.list_for_project.return_value = [campaign]
+    campaigns.record_heartbeat.return_value = False
+    progress = CampaignProgressObservation(
+        9, 2.0, NOW, 520, 0, "progress:9", "container-9",
+        next_artifact_cursors=(("queue", 20, "id:000519"),),
+    )
+    containers = AsyncMock()
+    containers.reconcile.return_value = ContainerObservation((9,), (), (), (progress,))
+    processor = AsyncMock()
+    processor.process.side_effect = [RuntimeError("retry page"), CampaignProcessingResult(False, False, ())]
+    artifact_state = AsyncMock()
+    artifact_state.cursors.return_value = {"queue": (10, "id:000511")}
+    runtime = RepositoryCampaignRuntime(
+        tasks=tasks, assets=assets, campaigns=campaigns,
+        discovery=SimpleNamespace(evidence=lambda _project_id: ()), containers=containers,
+        invocations=SimpleNamespace(load=lambda *_args: SimpleNamespace(engine="afl")),
+        evidence_processor=processor, artifact_state=artifact_state,
+    )
+
+    asyncio.run(runtime.reconcile(project))
+    artifact_state.advance_cursors.assert_not_awaited()
+    asyncio.run(runtime.reconcile(project))
+
+    assert containers.reconcile.await_args_list[0].args[3] == {
+        9: {"queue": (10, "id:000511")},
+    }
+    artifact_state.advance_cursors.assert_awaited_once_with(
+        7, 9, (("queue", 20, "id:000519"),),
+    )

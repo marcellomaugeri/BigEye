@@ -246,6 +246,95 @@ def test_repeated_manager_failure_is_bounded_to_two_attempts() -> None:
     assert manager.review.await_count == 2
 
 
+def test_failed_selected_action_is_retried_once_with_sanitized_failure_evidence() -> None:
+    from backend.services.campaigns.decision_executor import ActionError, ActionResult
+
+    manager = AsyncMock()
+    manager.review.return_value = object()
+    current_time = [NOW]
+    subject = coordinator(manager=manager)
+    subject.decision_executor.execute.return_value = [
+        ActionResult("target_1", None, ActionError("RuntimeError", "build failed")),
+    ]
+    subject._clock = lambda: current_time[0]
+    observation = healthy_snapshot(corpus_opportunity=True)
+
+    for _ in range(3):
+        run(subject.tick(7, observation))
+        current_time[0] += timedelta(seconds=30)
+
+    assert manager.review.await_count == 2
+    assert subject.decision_executor.execute.await_count == 2
+    retry_evidence = manager.review.await_args_list[1].args[1]
+    failure = next(
+        item for item in retry_evidence
+        if item.get("kind") == "action_execution_failure"
+    )
+    assert failure["action_ids"] == ["target_1"]
+    assert failure["error_types"] == ["RuntimeError"]
+    assert "build failed" not in repr(failure)
+    assert 7 not in subject._pending_reviews
+
+
+def test_successful_time_slot_review_persists_the_next_review_deadline() -> None:
+    manager = AsyncMock()
+    manager.review.return_value = object()
+    runtime = AsyncMock()
+    runtime.retirement_candidates.return_value = ()
+    runtime.review_context.return_value = SimpleNamespace(project_id=7)
+    runtime.review_evidence.return_value = [{"evidence_id": "campaign:3"}]
+    subject = coordinator(manager=manager, runtime=runtime)
+    subject.decision_executor.execute.return_value = []
+
+    run(subject.tick(7, healthy_snapshot(review_due=True, next_review_after=NOW)))
+
+    runtime.schedule_next_review.assert_awaited_once()
+    call = runtime.schedule_next_review.await_args
+    assert call.args[0] is subject.projects.get.return_value
+    assert call.args[1] > NOW
+    assert call.args[2] == "periodic campaign supervision"
+
+
+def test_current_deterministic_progression_is_a_prepared_manager_action() -> None:
+    from backend.agents.outputs.campaign_review import ProgressionActionRecord
+    from backend.services.campaigns.production_runtime import RepositoryCampaignRuntime
+    from backend.services.campaigns.project_coordinator import ProjectCoordinator
+
+    action = ProgressionActionRecord(
+        action_id="campaign-progression:7:9:abcd1234abcd1234",
+        project_id=7, base_campaign_id=9, target_asset_id=31,
+        action_name="enable dictionary", evidence_ids=("source:parser.c:8",),
+        dictionary_content='token_000="MAGIC"\n',
+    )
+    context = SimpleNamespace(project_id=7, commit_sha="a" * 40)
+    campaigns = AsyncMock()
+    campaigns.schedule_next_reviews.return_value = True
+    runtime = RepositoryCampaignRuntime(
+        tasks=AsyncMock(), assets=AsyncMock(), campaigns=campaigns,
+        discovery=SimpleNamespace(context=lambda _project_id: context),
+        containers=AsyncMock(),
+    )
+    runtime._progression_records[7] = (action,)
+    runtime._review_evidence[7] = ({
+        "evidence_id": action.action_id, "trusted_instructions": False,
+    },)
+    manager = AsyncMock()
+    manager.review.return_value = object()
+    projects = AsyncMock()
+    projects.get.return_value = project()
+    decision_executor = AsyncMock()
+    decision_executor.execute.return_value = []
+    subject = ProjectCoordinator(
+        projects=projects, bootstrap=AsyncMock(), discovery=AsyncMock(),
+        manager=manager, decision_executor=decision_executor,
+        runtime=runtime, advisory_lock=Lock(), clock=lambda: NOW,
+    )
+
+    run(subject.tick(7, healthy_snapshot(corpus_opportunity=True)))
+
+    assert manager.review.await_args.kwargs["prepared_actions"] == (action,)
+
+
 def test_failed_retirement_review_retries_the_exact_original_action() -> None:
     from backend.fuzzing.coverage.overlap import RetirementCandidate
 
@@ -441,6 +530,47 @@ def test_registry_starts_one_task_per_project_signals_changes_and_closes_every_t
     coordinators[1].resumed.assert_awaited_once_with(1)
 
 
+def test_registry_starts_a_resumed_coordinator_only_after_settings_are_committed() -> None:
+    from backend.services.campaigns.coordinator_registry import CoordinatorRegistry
+
+    started = asyncio.Event()
+
+    class Coordinator:
+        def __init__(self):
+            self.resumed = AsyncMock()
+            self.changed = Mock()
+
+        async def run(self, identifier):
+            assert identifier == 7
+            started.set()
+            await asyncio.Future()
+
+        async def resume(self, identifier):
+            await self.resumed(identifier)
+
+        def notify(self, identifier):
+            assert identifier == 7
+            self.changed()
+
+    coordinator_value = Coordinator()
+    registry = CoordinatorRegistry(AsyncMock(), lambda _identifier: coordinator_value)
+
+    async def scenario():
+        await registry.resume(7)
+        await asyncio.sleep(0)
+        assert not started.is_set()
+        assert 7 not in registry.tasks
+
+        await registry.settings_changed(7)
+        await asyncio.wait_for(started.wait(), 1)
+        await registry.close()
+
+    run(scenario())
+
+    coordinator_value.resumed.assert_awaited_once_with(7)
+    coordinator_value.changed.assert_called_once_with()
+
+
 def test_registry_keeps_concurrent_projects_independent_when_one_fails() -> None:
     from backend.services.campaigns.coordinator_registry import CoordinatorRegistry
 
@@ -469,6 +599,37 @@ def test_registry_keeps_concurrent_projects_independent_when_one_fails() -> None
         await registry.close()
 
     run(scenario())
+
+
+def test_registry_restarts_one_crashed_coordinator_then_persists_the_second_failure() -> None:
+    from backend.services.campaigns.coordinator_registry import CoordinatorRegistry
+
+    attempts = []
+
+    class Failing:
+        async def run(self, identifier):
+            attempts.append(identifier)
+            raise RuntimeError("coordinator crashed")
+        def notify(self, _identifier): pass
+
+    projects = AsyncMock()
+    projects.get.return_value = project(identifier=7)
+    registry = CoordinatorRegistry(projects, lambda _identifier: Failing())
+
+    async def scenario():
+        registry.start(7)
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if projects.finish.await_count:
+                break
+        await registry.close()
+
+    run(scenario())
+
+    assert attempts == [7, 7]
+    projects.finish.assert_awaited_once()
+    assert projects.finish.await_args.args[0] == 7
+    assert "RuntimeError" in projects.finish.await_args.args[1]
 
 
 def test_backbone_compatibility_service_uses_registry_lifecycle_for_legacy_bootstrap() -> None:

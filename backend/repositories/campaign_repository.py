@@ -239,6 +239,43 @@ class CampaignRepository:
         )
         return stopped_id == campaign_id
 
+    async def stop_for_worker_limit(
+        self, project_id: int, campaign_id: int, retirement_reason: str,
+    ) -> bool:
+        if not isinstance(retirement_reason, str) or not retirement_reason.strip() or len(retirement_reason) > 1_024:
+            raise ValueError("worker-limit retirement reason is invalid")
+        stopped_id = await self._pool.fetchval(
+            """WITH stopped AS (
+                   UPDATE campaigns SET stopped_at = CURRENT_TIMESTAMP,
+                       next_review_after = NULL, next_review_reason = NULL
+                   WHERE id = $2 AND project_id = $1 AND stopped_at IS NULL
+                   RETURNING id
+               ), recorded AS (
+                   UPDATE campaign_contexts SET retirement_reason = $3
+                   WHERE campaign_id = (SELECT id FROM stopped)
+                   RETURNING campaign_id
+               )
+               SELECT campaign_id FROM recorded""",
+            project_id, campaign_id, retirement_reason.strip(),
+        )
+        return stopped_id == campaign_id
+
+    async def schedule_next_reviews(self, project_id: int, deadline, reason: str) -> bool:
+        if (
+            getattr(deadline, "tzinfo", None) is None
+            or not isinstance(reason, str) or not reason.strip() or len(reason) > 1_000
+        ):
+            raise ValueError("campaign review schedule is invalid")
+        value = await self._pool.fetchval(
+            """WITH updated AS (
+                   UPDATE campaigns SET next_review_after = $2, next_review_reason = $3
+                   WHERE project_id = $1 AND stopped_at IS NULL
+                   RETURNING id
+               ) SELECT COUNT(*) FROM updated""",
+            project_id, deadline, reason.strip(),
+        )
+        return int(value) > 0
+
     @staticmethod
     def _campaign(row) -> Campaign:
         return Campaign(**dict(row))

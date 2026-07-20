@@ -149,7 +149,7 @@ class CampaignRecovery:
                 continue
             if (
                 campaign.healthy
-                and (container is None or container.state in {"created", "exited", "dead"})
+                and (container is None or container.state in {"created", "paused", "exited", "dead"})
                 and self._has_durable_corpus(campaign)
             ):
                 self._control.restart(campaign, container)

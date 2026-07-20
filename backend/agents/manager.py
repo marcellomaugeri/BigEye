@@ -12,6 +12,7 @@ from backend.agents.outputs.campaign_decision import CampaignDecision
 from backend.agents.outputs.campaign_review import (
     CampaignReviewCollection,
     CampaignReviewResult,
+    ProgressionActionRecord,
     RetirementActionRecord,
 )
 from backend.agents.prompts.manager import MANAGER_PROMPT
@@ -91,7 +92,7 @@ class CampaignManager:
         evidence,
         reason: str,
         *,
-        prepared_actions: tuple[RetirementActionRecord, ...] = (),
+        prepared_actions: tuple[RetirementActionRecord | ProgressionActionRecord, ...] = (),
     ) -> CampaignReviewResult:
         if not isinstance(reason, str) or not reason.strip() or len(reason) > MAX_MANAGER_REASON_CHARS:
             raise ValueError("campaign review reason is invalid")
@@ -107,7 +108,7 @@ class CampaignManager:
             not isinstance(prepared_actions, tuple)
             or len(prepared_actions) > MAX_MANAGER_EVIDENCE_ITEMS
             or any(
-                not isinstance(record, RetirementActionRecord)
+                not isinstance(record, (RetirementActionRecord, ProgressionActionRecord))
                 or record.project_id != context.project_id
                 or record.action_id not in evidence_ids
                 for record in prepared_actions
@@ -115,7 +116,10 @@ class CampaignManager:
         ):
             raise ValueError("prepared campaign actions are invalid for this review")
         for record in prepared_actions:
-            collection.record_retirement(record)
+            if isinstance(record, RetirementActionRecord):
+                collection.record_retirement(record)
+            else:
+                collection.record_progression(record)
         tools = dispatch_tools(
             context, evidence_ids=evidence_ids, hooks=hooks, trace=trace,
             evidence_registry=evidence_registry, evidence_records=evidence_records,

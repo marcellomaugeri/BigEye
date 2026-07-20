@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 import inspect
+import json
 import shlex
 
 from backend.agents.outputs.campaign_review import TargetProposalRecord
@@ -70,6 +71,7 @@ class CampaignTargetPreparation:
         target_asset_id, configuration_asset_id, _coverage_asset_id = self._identity(
             project, prepared,
         )
+        configuration_files = self._configuration_files(record)
         engine, invocation = self._invocation(record, prepared)
         campaign = await self._campaigns.create(
             project_id=project.id,
@@ -83,7 +85,11 @@ class CampaignTargetPreparation:
         try:
             await self._invocations.publish(
                 project.id, campaign.id, invocation, prepared.probe_invocations,
+                configuration_files=configuration_files,
             )
+            publish_coverage = getattr(self._invocations, "publish_coverage", None)
+            if publish_coverage is not None:
+                await publish_coverage(project.id, campaign.id, project.commit_sha, prepared)
             await self._containers.start_exact(project, campaign)
         except BaseException as error:
             if isinstance(error, asyncio.CancelledError):
@@ -163,6 +169,18 @@ class CampaignTargetPreparation:
             )
             return "libfuzzer", LibFuzzerCommand.build(spec)
         raise ValueError("target proposal has an unsupported instance type")
+
+    @staticmethod
+    def _configuration_files(record: TargetProposalRecord) -> dict[str, bytes]:
+        proposal = record.proposal
+        return {
+            "sanitizer-intent.json": json.dumps({
+                "proposal_intent": proposal.sanitizer_plan,
+                "applied_primary": ["address", "undefined"],
+                "supporting_evidence_ids": list(proposal.evidence_ids),
+                "trusted_instructions": False,
+            }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        }
 
     async def _invalidate(self, project_id: int) -> None:
         if self._events is not None:

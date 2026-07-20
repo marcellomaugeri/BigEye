@@ -121,6 +121,67 @@ class RetirementActionRecord(BaseModel):
         return self
 
 
+class ProgressionActionRecord(BaseModel):
+    """Application-owned incremental variant of one exact healthy campaign."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    action_id: str = Field(min_length=1, max_length=200)
+    project_id: int = Field(ge=1)
+    base_campaign_id: int = Field(ge=1)
+    target_asset_id: int = Field(ge=1)
+    action_name: str = Field(min_length=1, max_length=100)
+    evidence_ids: tuple[str, ...] = Field(min_length=1, max_length=32)
+    arguments: tuple[str, ...] = Field(default=(), max_length=32)
+    environment: tuple[tuple[str, str], ...] = Field(default=(), max_length=32)
+    detail: str | None = Field(default=None, max_length=500)
+    dictionary_content: str | None = Field(default=None, max_length=64_000)
+
+    @property
+    def key(self) -> str:
+        return f"{self.action_name}:{self.detail}" if self.detail else self.action_name
+
+    @model_validator(mode="after")
+    def validate_identity_and_mechanics(self):
+        prefix = f"campaign-progression:{self.project_id}:{self.base_campaign_id}:"
+        if not self.action_id.startswith(prefix):
+            raise ValueError("progression action identity does not match its base campaign")
+        if (
+            len(self.evidence_ids) != len(set(self.evidence_ids))
+            or any(not value.strip() or len(value) > 2_000 for value in self.evidence_ids)
+        ):
+            raise ValueError("progression action evidence identifiers are invalid")
+        if any(
+            not key or not value or "\x00" in key or "\x00" in value
+            for key, value in self.environment
+        ):
+            raise ValueError("progression action environment is invalid")
+        if any(not value or "\x00" in value or "\n" in value for value in self.arguments):
+            raise ValueError("progression action arguments are invalid")
+        if self.action_name == "enable dictionary":
+            if (
+                not self.dictionary_content
+                or "\x00" in self.dictionary_content
+                or self.arguments or self.environment or self.detail is not None
+            ):
+                raise ValueError("dictionary progression mechanics are invalid")
+        elif self.action_name == "try configuration":
+            if not self.arguments or self.dictionary_content is not None or not self.detail:
+                raise ValueError("configuration progression mechanics are invalid")
+        elif self.action_name == "enable grammar mutator":
+            if (
+                self.arguments or self.dictionary_content is not None or self.detail is not None
+                or self.environment != ((
+                    "AFL_CUSTOM_MUTATOR_LIBRARY",
+                    "/usr/local/lib/afl/libgrammarmutator-json.so",
+                ),)
+            ):
+                raise ValueError("grammar progression mechanics are invalid")
+        else:
+            raise ValueError("progression action does not have application-owned mechanics")
+        return self
+
+
 class CampaignReviewResult(BaseModel):
     """The decision plus every validated typed result produced while reaching it."""
 
@@ -138,6 +199,8 @@ class CampaignReviewResult(BaseModel):
     quarantined_operation_requests: tuple[ContainedOperationRequestRecord, ...]
     known_retirement_actions: tuple[RetirementActionRecord, ...] = ()
     selected_retirement_actions: tuple[RetirementActionRecord, ...] = ()
+    known_progression_actions: tuple[ProgressionActionRecord, ...] = ()
+    selected_progression_actions: tuple[ProgressionActionRecord, ...] = ()
 
     @property
     def target_proposals(self) -> tuple[TargetProposalRecord, ...]:
@@ -173,6 +236,7 @@ class CampaignReviewCollection:
         self._triage: dict[str, TriageResultRecord] = {}
         self._operations: dict[str, ContainedOperationRequestRecord] = {}
         self._retirements: dict[str, RetirementActionRecord] = {}
+        self._progressions: dict[str, ProgressionActionRecord] = {}
         self._pending_operations: dict[
             tuple[str, str, int, str], dict[str, ContainedOperationRequestRecord]
         ] = {}
@@ -234,7 +298,10 @@ class CampaignReviewCollection:
 
     def actionable_ids(self) -> frozenset[str]:
         with self._lock:
-            return frozenset((*self._targets, *self._triage, *self._operations, *self._retirements))
+            return frozenset((
+                *self._targets, *self._triage, *self._operations,
+                *self._retirements, *self._progressions,
+            ))
 
     def record_retirement(self, record: RetirementActionRecord) -> RetirementActionRecord:
         if not isinstance(record, RetirementActionRecord) or record.reversible is not True:
@@ -249,9 +316,21 @@ class CampaignReviewCollection:
                 raise ValueError("retirement action identifier is not unique")
             return self._retirements[record.action_id]
 
+    def record_progression(self, record: ProgressionActionRecord) -> ProgressionActionRecord:
+        if not isinstance(record, ProgressionActionRecord):
+            raise TypeError("progression action must be application-validated")
+        with self._lock:
+            self._progressions.setdefault(record.action_id, record)
+            if self._progressions[record.action_id] != record:
+                raise ValueError("progression action identifier is not unique")
+            return self._progressions[record.action_id]
+
     def result(self, decision: CampaignDecision) -> CampaignReviewResult:
         with self._lock:
-            known_ids = frozenset((*self._targets, *self._triage, *self._operations, *self._retirements))
+            known_ids = frozenset((
+                *self._targets, *self._triage, *self._operations,
+                *self._retirements, *self._progressions,
+            ))
             selected_ids = tuple(decision.bounded_actions)
             if len(selected_ids) != len(set(selected_ids)):
                 raise ValueError("campaign decision contains duplicate action IDs")
@@ -261,6 +340,7 @@ class CampaignReviewCollection:
             triage_values = tuple(self._triage[key] for key in sorted(self._triage))
             operation_values = tuple(self._operations[key] for key in sorted(self._operations))
             retirement_values = tuple(self._retirements[key] for key in sorted(self._retirements))
+            progression_values = tuple(self._progressions[key] for key in sorted(self._progressions))
             return CampaignReviewResult(
                 decision=decision,
                 known_action_ids=tuple(sorted(known_ids)), selected_action_ids=selected_ids,
@@ -282,5 +362,9 @@ class CampaignReviewCollection:
                 known_retirement_actions=retirement_values,
                 selected_retirement_actions=tuple(
                     record for record in retirement_values if record.action_id in selected_ids
+                ),
+                known_progression_actions=progression_values,
+                selected_progression_actions=tuple(
+                    record for record in progression_values if record.action_id in selected_ids
                 ),
             )

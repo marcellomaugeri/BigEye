@@ -21,6 +21,10 @@ class CoverageIntegrityError(ValueError):
     """Raised when coverage cannot be bound to clean, immutable project source."""
 
 
+_ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_FORBIDDEN_REPLAY_ENVIRONMENT = frozenset({"PATH", "PYTHONPATH"})
+
+
 @dataclass(frozen=True)
 class CoverageLine:
     source_path: str
@@ -54,6 +58,7 @@ class CoverageSnapshot:
     build_kind: str
     lines: tuple[CoverageLine, ...]
     hits: tuple[CoverageHit, ...]
+    replay_environment: tuple[tuple[str, str], ...] = ()
 
 
 class CoverageExecutor(Protocol):
@@ -88,9 +93,7 @@ class DockerCoverageExecutor:
             raise ValueError("coverage command arguments exceed their byte limit")
         if Path(command[0]).name.lower() in {"sh", "bash", "dash", "zsh", "fish"}:
             raise ValueError("coverage command cannot use a shell")
-        if not isinstance(environment, dict) or set(environment) - {"LLVM_PROFILE_FILE"} or any(
-            not isinstance(value, str) or len(value) > 4096 for value in environment.values()
-        ):
+        if not _valid_coverage_environment(environment):
             raise ValueError("coverage environment is invalid")
         profile_directory = Path(os.path.abspath(profile_directory))
         if profile_directory.is_symlink() or not profile_directory.is_dir():
@@ -178,7 +181,11 @@ class LlvmCoverage:
                 stem = f"input-{index:06d}"
                 command = tuple("/coverage/input" if value == "{input}" else value for value in campaign.replay_command)
                 profile_pattern = f"/coverage/profiles/{stem}-%p.profraw"
-                self._executor.run(image["id"], command, {"LLVM_PROFILE_FILE": profile_pattern}, profile_dir, input_path)
+                replay_environment = dict(getattr(campaign, "replay_environment", ()))
+                replay_environment["LLVM_PROFILE_FILE"] = profile_pattern
+                self._executor.run(
+                    image["id"], command, replay_environment, profile_dir, input_path,
+                )
                 self._require_file(input_path, input_identity, digest)
                 raw_names = self._profile_names(profile_dir, stem)
                 raw_manifest = self._profile_manifest(profile_dir, raw_names)
@@ -262,6 +269,7 @@ class LlvmCoverage:
                 build_kind="clean",
                 lines=merged_lines,
                 hits=tuple(first_hits[key] for key in sorted(first_hits) if key in merged_keys),
+                replay_environment=tuple(getattr(campaign, "replay_environment", ())),
             )
         finally:
             shutil.rmtree(work)
@@ -340,6 +348,12 @@ class LlvmCoverage:
             raise ValueError("coverage replay binary must exactly match the clean binary")
         if command.count("{input}") != 1:
             raise ValueError("coverage replay command must contain one input placeholder")
+        replay_environment = dict(getattr(campaign, "replay_environment", ()))
+        if (
+            "LLVM_PROFILE_FILE" in replay_environment
+            or not _valid_coverage_environment(replay_environment)
+        ):
+            raise ValueError("coverage replay environment is invalid")
 
     @staticmethod
     def _stage_input(source, replay_root):
@@ -537,6 +551,24 @@ class LlvmCoverage:
     @staticmethod
     def _read_project_source(root, source_path):
         return _read_regular(Path(os.path.abspath(root)).joinpath(*PurePosixPath(source_path).parts), 2 * 1024 * 1024)[0]
+
+
+def _valid_coverage_environment(environment) -> bool:
+    return (
+        isinstance(environment, dict)
+        and len(environment) <= 33
+        and all(
+            isinstance(key, str)
+            and _ENVIRONMENT_NAME.fullmatch(key) is not None
+            and key not in _FORBIDDEN_REPLAY_ENVIRONMENT
+            and not key.startswith(("LD_", "DYLD_"))
+            and isinstance(value, str)
+            and bool(value)
+            and "\x00" not in value
+            and len(value) <= 4_096
+            for key, value in environment.items()
+        )
+    )
 
 
 def _normalised_absolute(value, label):

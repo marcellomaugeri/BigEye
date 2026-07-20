@@ -231,13 +231,16 @@ class _NativeRunner:
     def __init__(self):
         self.commands: list[tuple[str, ...]] = []
 
-    def run(self, campaign, command: tuple[str, ...], output: Path) -> None:
+    def run(
+        self, campaign, command: tuple[str, ...], output: Path, source: Path | None = None,
+    ) -> None:
         self.commands.append(command)
         if command[0] in {"afl-cmin", campaign.target_command[0]}:
             output.mkdir(parents=True, exist_ok=True)
-            source = campaign.corpus_dir / "keep"
-            (output / "keep").write_bytes(source.read_bytes())
+            selected = campaign.corpus_dir / "keep"
+            (output / "keep").write_bytes(selected.read_bytes())
         elif command[0] == "afl-tmin":
+            assert source is not None and source.is_file()
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_bytes(b"k")
 
@@ -255,6 +258,7 @@ class _FakeContainerController:
         quiesce_error=None,
         inspect_after_quiesce_error=None,
         resume_error=None,
+        replacement_error=None,
     ):
         from backend.fuzzing.corpus.quiescence import CampaignWriterIdentity
 
@@ -270,6 +274,7 @@ class _FakeContainerController:
         self.quiesce_error = quiesce_error
         self.inspect_after_quiesce_error = inspect_after_quiesce_error
         self.resume_error = resume_error
+        self.replacement_error = replacement_error
         self.calls = []
         self.writer_gate = threading.Lock()
         self._gate_held = False
@@ -310,12 +315,24 @@ class _FakeContainerController:
             self._gate_held = False
             self.writer_gate.release()
 
-    def _refresh_identity(self):
+    def replace(self, identity, prior_state):
+        self.calls.append(("replace", identity, prior_state))
+        if self.replacement_error is not None:
+            raise self.replacement_error
+        self._refresh_identity(container_id="container-7-replacement")
+        self.active = prior_state.active
+        self.state = prior_state.state
+        if self._gate_held:
+            self._gate_held = False
+            self.writer_gate.release()
+        return self.identity
+
+    def _refresh_identity(self, container_id="container-7"):
         identity_stat = os.stat(self._identity_path, follow_symlinks=False)
         self.identity = self._identity_type(
             self._campaign_id,
             self._project_id,
-            "container-7",
+            container_id,
             self._identity_path,
             identity_stat.st_dev,
             identity_stat.st_ino,
@@ -349,7 +366,11 @@ def test_afl_minimisation_uses_native_tools_and_replaces_only_after_coverage_pre
     (corpus / "drop").write_bytes(b"drop")
     campaign = _owned_campaign("afl++", corpus, ("/opt/bigeye/target", "@@"))
     runner = _NativeRunner()
-    minimiser = _quiesced_minimiser(runner, lambda _campaign, _corpus: frozenset({"parser.c:12"}), corpus)
+    controller = _FakeContainerController(corpus)
+    original_identity = controller.identity
+    minimiser = _quiesced_minimiser(
+        runner, lambda _campaign, _corpus: frozenset({"parser.c:12"}), corpus, controller,
+    )
 
     result = minimiser.minimise(campaign)
 
@@ -359,6 +380,12 @@ def test_afl_minimisation_uses_native_tools_and_replaces_only_after_coverage_pre
     assert [command[0] for command in runner.commands] == ["afl-cmin", "afl-tmin"]
     assert (corpus / "keep").read_bytes() == b"k"
     assert not (corpus / "drop").exists()
+    assert controller.identity.container_id != original_identity.container_id
+    assert controller.identity.corpus_inode == corpus.stat().st_ino
+    assert controller.identity.corpus_inode != original_identity.corpus_inode
+    assert [call[0] for call in controller.calls].count("replace") == 1
+    assert [call[0] for call in controller.calls].count("resume") == 0
+    assert not tuple(corpus.parent.glob(".corpus.retired-*"))
 
 
 def test_minimisation_keeps_original_corpus_when_clean_coverage_is_lost(tmp_path: Path) -> None:
@@ -456,6 +483,7 @@ def test_minimisation_restores_original_when_candidate_publication_fails(tmp_pat
     (corpus / "keep").write_bytes(b"original")
     campaign = _owned_campaign("libfuzzer", corpus, ("/target",))
     controller = _FakeContainerController(corpus)
+    original_identity = controller.identity
     real_replace = module.os.replace
     failed = False
 
@@ -475,7 +503,9 @@ def test_minimisation_restores_original_when_candidate_publication_fails(tmp_pat
         ).minimise(campaign)
 
     assert (corpus / "keep").read_bytes() == b"original"
+    assert controller.identity == original_identity
     assert [call[0] for call in controller.calls].count("resume") == 1
+    assert [call[0] for call in controller.calls].count("replace") == 0
 
 
 def test_minimisation_recovers_original_after_interrupted_post_publish_cleanup(tmp_path: Path) -> None:
@@ -917,15 +947,16 @@ def test_rollback_failure_marks_recovery_required_and_leaves_writer_stopped(
     assert [call[0] for call in controller.calls].count("resume") == 0
 
 
-def test_resume_failure_is_surfaced_after_durably_verified_commit(tmp_path: Path) -> None:
+def test_replacement_failure_after_commit_requires_recovery_without_rolling_back(tmp_path: Path) -> None:
     from backend.fuzzing.corpus.minimisation import CorpusMinimiser
     from backend.fuzzing.corpus.quiescence import CampaignQuiescenceRecoveryError, CampaignQuiescenceService
 
     corpus = tmp_path / "campaign/corpus"
     corpus.mkdir(parents=True)
     (corpus / "keep").write_bytes(b"original")
-    resume = RuntimeError("resume failed")
-    controller = _FakeContainerController(corpus, resume_error=resume)
+    original_identity = (corpus.stat().st_dev, corpus.stat().st_ino)
+    replacement = RuntimeError("replacement failed")
+    controller = _FakeContainerController(corpus, replacement_error=replacement)
 
     with pytest.raises(CampaignQuiescenceRecoveryError) as caught:
         CorpusMinimiser(
@@ -935,14 +966,22 @@ def test_resume_failure_is_surfaced_after_durably_verified_commit(tmp_path: Path
         ).minimise(_owned_campaign("libfuzzer", corpus, ("/target",)))
 
     assert caught.value.primary_error is None
-    assert caught.value.resume_error is resume
-    assert caught.value.recovery_required is False
+    assert caught.value.resume_error is replacement
+    assert caught.value.recovery_required is True
     assert controller.active is False
-    assert [call[0] for call in controller.calls].count("resume") == 1
+    assert (corpus / "keep").read_bytes() == b"original"
+    assert (corpus.stat().st_dev, corpus.stat().st_ino) != original_identity
+    assert tuple(corpus.parent.glob(".corpus.retired-*"))
+    assert [call[0] for call in controller.calls].count("replace") == 1
+    assert [call[0] for call in controller.calls].count("resume") == 0
 
 
 def test_quiescence_service_serialises_publication_transitions_per_campaign(tmp_path: Path) -> None:
-    from backend.fuzzing.corpus.quiescence import CampaignCorpusOwnership, CampaignQuiescenceService
+    from backend.fuzzing.corpus.quiescence import (
+        CampaignCorpusOwnership,
+        CampaignOwnershipMismatch,
+        CampaignQuiescenceService,
+    )
 
     corpus = tmp_path / "corpus"
     corpus.mkdir()
@@ -970,6 +1009,11 @@ def test_quiescence_service_serialises_publication_transitions_per_campaign(tmp_
             nonlocal active_operations
             with state_lock:
                 active_operations -= 1
+            replacement = corpus.with_name(f"corpus-new-{id(self)}")
+            retired = corpus.with_name(f"corpus-retired-{id(self)}")
+            replacement.mkdir()
+            corpus.rename(retired)
+            replacement.rename(corpus)
 
         def rollback(self):
             nonlocal active_operations
@@ -990,11 +1034,13 @@ def test_quiescence_service_serialises_publication_transitions_per_campaign(tmp_
         assert maximum_active == 1
         release.set()
         assert first.result() == "published"
-        assert second.result() == "published"
+        with pytest.raises(CampaignOwnershipMismatch, match="no longer canonical"):
+            second.result()
 
     assert maximum_active == 1
-    assert [call[0] for call in controller.calls].count("quiesce") == 2
-    assert [call[0] for call in controller.calls].count("resume") == 2
+    assert [call[0] for call in controller.calls].count("quiesce") == 1
+    assert [call[0] for call in controller.calls].count("replace") == 1
+    assert [call[0] for call in controller.calls].count("resume") == 0
 
 
 def test_quiescence_blocks_late_writer_until_publication_is_committed(tmp_path: Path) -> None:
@@ -1033,7 +1079,8 @@ def test_quiescence_blocks_late_writer_until_publication_is_committed(tmp_path: 
     assert result.replaced is True
     assert not minimiser.writer.is_alive()
     assert (corpus / "late-after-release").read_bytes() == b"late"
-    assert [call[0] for call in controller.calls].count("resume") == 1
+    assert [call[0] for call in controller.calls].count("replace") == 1
+    assert [call[0] for call in controller.calls].count("resume") == 0
 
 
 def test_corpus_sync_requires_exact_contract_and_revalidates_each_input(tmp_path: Path) -> None:

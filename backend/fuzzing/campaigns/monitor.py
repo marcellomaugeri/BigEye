@@ -56,7 +56,7 @@ class CampaignEngineSample:
     queue_files: int
     crash_files: int
     artifacts: tuple[CampaignArtifactObservation, ...]
-    next_artifact_cursors: tuple[tuple[str, str], ...] = ()
+    next_artifact_cursors: tuple[tuple[str, int, str], ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -73,8 +73,10 @@ class CampaignEngineSample:
             or len({(item.kind, item.relative_path) for item in self.artifacts}) != len(self.artifacts)
             or not isinstance(self.next_artifact_cursors, tuple)
             or any(
-                not isinstance(item, tuple) or len(item) != 2
-                or not all(isinstance(value, str) and value for value in item)
+                not isinstance(item, tuple) or len(item) != 3
+                or item[0] not in {"queue", "crashes"}
+                or type(item[1]) is not int or item[1] < 0
+                or not isinstance(item[2], str) or not item[2]
                 for item in self.next_artifact_cursors
             )
         ):
@@ -85,7 +87,7 @@ def collect_campaign_sample(
     root_descriptor: int,
     engine: str,
     logs: bytes | str = b"",
-    artifact_cursors: dict[str, str] | None = None,
+    artifact_cursors: dict[str, tuple[int, str]] | None = None,
 ) -> CampaignEngineSample:
     """Collect one engine sample without following links or trusting container output."""
 
@@ -124,7 +126,7 @@ def collect_campaign_sample(
             key=lambda item: (0 if item.kind == "crash" else 1, item.relative_path),
         )),
         next_artifact_cursors=tuple(
-            (name, value)
+            (name, value[0], value[1])
             for name, value in (("queue", queue_cursor), ("crashes", crash_cursor))
             if value is not None
         ),
@@ -196,14 +198,14 @@ def _artifacts(
     kind: str,
     *,
     ignored: frozenset[str] = frozenset(),
-    after: str | None = None,
+    after: tuple[int, str] | None = None,
     accepted_prefixes: tuple[str, ...] | None = None,
-) -> tuple[int, tuple[CampaignArtifactObservation, ...], str | None]:
+) -> tuple[int, tuple[CampaignArtifactObservation, ...], tuple[int, str] | None]:
     directory = _open_relative_directory(root_descriptor, parts)
     if directory is None:
         return 0, (), after
     try:
-        names: list[str] = []
+        entries: list[tuple[int, str]] = []
         for index, name in enumerate(os.listdir(directory), start=1):
             if index > _MAX_DIRECTORY_ENTRIES:
                 raise OverflowError("campaign output file count exceeds its bound")
@@ -214,14 +216,18 @@ def _artifacts(
             details = os.stat(name, dir_fd=directory, follow_symlinks=False)
             if not stat.S_ISREG(details.st_mode):
                 raise ValueError("campaign output contains an unsafe entry")
-            names.append(name)
-        names.sort()
-        start = bisect_right(names, after) if after is not None else 0
-        selected = names[start:start + _MAX_OBSERVED_ARTIFACTS]
-        if not selected and names:
-            selected = names[:_MAX_OBSERVED_ARTIFACTS]
+            entries.append((details.st_mtime_ns, name))
+        entries.sort()
+        if after is not None and (
+            not isinstance(after, tuple) or len(after) != 2
+            or type(after[0]) is not int or after[0] < 0
+            or not isinstance(after[1], str) or not after[1]
+        ):
+            raise ValueError("campaign artifact cursor is invalid")
+        start = bisect_right(entries, after) if after is not None else 0
+        selected = entries[start:start + _MAX_OBSERVED_ARTIFACTS]
         observations = []
-        for name in selected:
+        for _observed_ns, name in selected:
             content = _read_at(directory, name, _MAX_ARTIFACT_BYTES)
             observations.append(CampaignArtifactObservation(
                 kind=kind,
@@ -229,7 +235,7 @@ def _artifacts(
                 content_sha256=sha256(content).hexdigest(),
                 size_bytes=len(content),
             ))
-        return len(names), tuple(observations), selected[-1] if selected else after
+        return len(entries), tuple(observations), selected[-1] if selected else after
     finally:
         os.close(directory)
 

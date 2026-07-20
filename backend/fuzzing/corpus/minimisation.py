@@ -49,7 +49,13 @@ class CorpusFile:
 
 
 class NativeCorpusRunner(Protocol):
-    def run(self, campaign: CorpusCampaign, command: tuple[str, ...], output: Path) -> None: ...
+    def run(
+        self,
+        campaign: CorpusCampaign,
+        command: tuple[str, ...],
+        output: Path,
+        source: Path | None = None,
+    ) -> None: ...
 
 
 @dataclass
@@ -189,7 +195,12 @@ class CorpusMinimiser:
                                 "-o", f"/campaign/tmin/{'/'.join(relative)}", "--", *campaign.target_command,
                             )
                             commands.append(command)
-                            self._runner.run(campaign, command, output)
+                            self._runner.run(
+                                campaign,
+                                command,
+                                output,
+                                staging_path.joinpath(*relative),
+                            )
                         candidate_name = tmin_name
                         candidate_descriptor = os.dup(tmin_descriptor)
                     finally:
@@ -299,6 +310,8 @@ class CorpusMinimiser:
                 ),
             )
             after_count = self._quiescence_service.execute(ownership, publication)
+            self._remove_entry_at(parent_descriptor, retired_name)
+            os.fsync(parent_descriptor)
             return CorpusResult(
                 True,
                 "clean coverage preserved",

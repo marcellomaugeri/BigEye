@@ -68,6 +68,31 @@ CREATE TABLE campaign_container_counters (
     FOREIGN KEY (campaign_id) REFERENCES campaigns (id)
 );
 
+CREATE TABLE campaign_artifacts (
+    project_id BIGINT NOT NULL,
+    campaign_id BIGINT NOT NULL,
+    kind TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    accepted BOOLEAN NOT NULL,
+    evidence_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    durable_relative_path TEXT,
+    PRIMARY KEY (project_id, campaign_id, kind, content_sha256),
+    FOREIGN KEY (project_id) REFERENCES projects (id),
+    FOREIGN KEY (campaign_id) REFERENCES campaigns (id)
+);
+
+CREATE TABLE campaign_artifact_cursors (
+    project_id BIGINT NOT NULL,
+    campaign_id BIGINT NOT NULL,
+    kind TEXT NOT NULL,
+    last_seen_ns BIGINT NOT NULL,
+    last_name TEXT NOT NULL,
+    PRIMARY KEY (project_id, campaign_id, kind),
+    FOREIGN KEY (project_id) REFERENCES projects (id),
+    FOREIGN KEY (campaign_id) REFERENCES campaigns (id)
+);
+
 CREATE TABLE coverage_evidence (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     project_id BIGINT NOT NULL,
@@ -134,3 +159,5 @@ CREATE INDEX campaigns_project_started_at_idx ON campaigns (project_id, started_
 CREATE INDEX coverage_evidence_project_source_line_idx ON coverage_evidence (project_id, source_path, line_number);
 CREATE INDEX coverage_checkpoints_project_campaign_idx ON coverage_checkpoints (project_id, campaign_id, id);
 CREATE INDEX findings_project_created_at_idx ON findings (project_id, created_at, id);
+
+COMMENT ON SCHEMA public IS 'bigeye-schema:release-1';

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -96,6 +97,12 @@ def test_validated_prepared_target_is_published_and_started(tmp_path) -> None:
     campaigns.create.assert_awaited_once()
     assert campaigns.create.await_args.kwargs["configuration_purpose"] == "default"
     invocations.publish.assert_awaited_once()
+    sanitizer_evidence = json.loads(
+        invocations.publish.await_args.kwargs["configuration_files"]["sanitizer-intent.json"]
+    )
+    assert sanitizer_evidence["proposal_intent"] == "address and undefined"
+    assert sanitizer_evidence["applied_primary"] == ["address", "undefined"]
+    assert sanitizer_evidence["trusted_instructions"] is False
     containers.start_exact.assert_awaited_once_with(project, campaign)
     events.append.assert_awaited_once_with(7, "events", {"name": "campaigns"})
     assert result is campaign
@@ -207,6 +214,258 @@ def test_runtime_reconciles_persisted_state_and_builds_real_agent_context(tmp_pa
     assert context.project_id == 7 and context.commit_sha == "a" * 40
     assert context.repository_root == repository.resolve()
     assert evidence and all(item["trusted_instructions"] is False for item in evidence)
+
+
+def test_runtime_publishes_one_typed_current_progression_action(tmp_path) -> None:
+    import pytest
+
+    from backend.services.campaigns.production_runtime import (
+        CampaignProgressObservation,
+        ContainerObservation,
+        RepositoryCampaignRuntime,
+    )
+
+    project = SimpleNamespace(id=7, commit_sha="a" * 40, worker_count=2)
+    campaign = SimpleNamespace(
+        id=9, project_id=7, target_asset_id=31, engine="afl", stopped_at=None,
+        next_review_after=None, error=None,
+    )
+    progress_value = CampaignProgressObservation(
+        9, 1.0, NOW, 2, 0, "progress:9", "container-9",
+        executions=100, executions_per_second=20.0,
+    )
+    tasks = AsyncMock()
+    tasks.list_for_project.return_value = [
+        SimpleNamespace(name="repository clone", finished_at=NOW, error=None),
+        SimpleNamespace(name="LLVM toolchain preparation", finished_at=NOW, error=None),
+    ]
+    assets = AsyncMock()
+    assets.list_for_project.return_value = []
+    campaigns = AsyncMock()
+    campaigns.list_for_project.return_value = [campaign]
+    containers = AsyncMock()
+    containers.reconcile.return_value = ContainerObservation(
+        active_campaign_ids=(9,), progress=(progress_value,),
+    )
+    discovery = SimpleNamespace(
+        evidence=lambda _project_id: ({
+            "evidence_id": "source:parser.c:8", "path": "parser.c",
+            "excerpt": 'strcmp(input, "MAGIC")', "trusted_instructions": False,
+        },),
+    )
+    contexts = AsyncMock()
+    contexts.list_contexts_for_project.return_value = {}
+    runtime = RepositoryCampaignRuntime(
+        tasks=tasks, assets=assets, campaigns=campaigns,
+        discovery=discovery, containers=containers, campaign_contexts=contexts,
+    )
+
+    snapshot = run(runtime.reconcile(project))
+    evidence = run(runtime.review_evidence(project, snapshot, None))
+    recommendation = next(item for item in evidence if item.get("kind") == "campaign_progression")
+
+    assert recommendation["action"] == "enable dictionary"
+    assert snapshot.corpus_opportunity is True
+    actions = runtime.progression_actions(7)
+    assert len(actions) == 1
+    assert actions[0].action_id == recommendation["evidence_id"]
+    assert actions[0].dictionary_content == 'token_000="MAGIC"\n'
+
+
+def test_progression_completion_is_scoped_to_the_same_target_lineage() -> None:
+    from backend.services.campaigns.production_runtime import (
+        CampaignProgressObservation,
+        ContainerObservation,
+        RepositoryCampaignRuntime,
+    )
+
+    project = SimpleNamespace(id=7, commit_sha="a" * 40, worker_count=2)
+    campaigns_values = [
+        SimpleNamespace(
+            id=9, project_id=7, target_asset_id=31, engine="afl",
+            stopped_at=None, next_review_after=None, error=None,
+        ),
+        SimpleNamespace(
+            id=10, project_id=7, target_asset_id=41, engine="afl",
+            stopped_at=None, next_review_after=None, error=None,
+        ),
+        SimpleNamespace(
+            id=11, project_id=7, target_asset_id=31, engine="afl",
+            stopped_at=NOW, next_review_after=None, error=None,
+        ),
+    ]
+    tasks = AsyncMock()
+    tasks.list_for_project.return_value = [
+        SimpleNamespace(name="repository clone", finished_at=NOW, error=None),
+        SimpleNamespace(name="LLVM toolchain preparation", finished_at=NOW, error=None),
+    ]
+    assets = AsyncMock()
+    assets.list_for_project.return_value = []
+    campaigns = AsyncMock()
+    campaigns.list_for_project.return_value = campaigns_values
+    progresses = tuple(
+        CampaignProgressObservation(
+            identifier, 1.0, NOW, 2, 0, f"progress:{identifier}",
+            f"container-{identifier}", executions=100, executions_per_second=20.0,
+        )
+        for identifier in (9, 10)
+    )
+    containers = AsyncMock()
+    containers.reconcile.return_value = ContainerObservation(
+        active_campaign_ids=(9, 10), progress=progresses,
+    )
+    contexts = AsyncMock()
+    contexts.list_contexts_for_project.return_value = {
+        9: {"configuration_purpose": "default", "retirement_reason": None},
+        10: {"configuration_purpose": "default", "retirement_reason": None},
+        11: {"configuration_purpose": "enable dictionary", "retirement_reason": None},
+    }
+    discovery = SimpleNamespace(evidence=lambda _project_id: ({
+        "evidence_id": "source:parser.c:8", "path": "parser.c",
+        "excerpt": 'strcmp(input, "MAGIC")', "trusted_instructions": False,
+    },))
+    runtime = RepositoryCampaignRuntime(
+        tasks=tasks, assets=assets, campaigns=campaigns,
+        discovery=discovery, containers=containers, campaign_contexts=contexts,
+    )
+
+    snapshot = run(runtime.reconcile(project))
+    evidence = run(runtime.review_evidence(project, snapshot, None))
+    actions = {
+        item["campaign_id"]: item["action"]
+        for item in evidence if item.get("kind") == "campaign_progression"
+    }
+
+    assert actions == {9: "enable CmpLog", 10: "enable dictionary"}
+
+
+def test_deterministic_progression_action_starts_a_sibling_without_target_preparation() -> None:
+    from backend.agents.outputs.campaign_decision import CampaignDecision
+    from backend.agents.outputs.campaign_review import (
+        CampaignReviewCollection,
+        ProgressionActionRecord,
+    )
+    from backend.fuzzing.engines.contracts import ContainerInvocation
+    from backend.services.campaigns.decision_executor import DecisionExecutor
+    from backend.services.campaigns.production_runtime import RepositoryCampaignRuntime
+
+    project = SimpleNamespace(id=7, commit_sha="a" * 40, worker_count=2)
+    base = SimpleNamespace(
+        id=9, project_id=7, target_asset_id=31, configuration_asset_id=32,
+        engine="afl", stopped_at=None, error=None,
+    )
+    sibling = SimpleNamespace(
+        id=12, project_id=7, target_asset_id=31, configuration_asset_id=32,
+        engine="afl", stopped_at=None, error=None,
+    )
+    invocation = ContainerInvocation(
+        engine="afl", image_id="sha256:" + "b" * 64,
+        command=[
+            "afl-fuzz", "-i", "/campaign/corpus", "-o", "/campaign/output",
+            "-M", "main", "-t", "1000+", "-m", "0", "--",
+            "/opt/bigeye/parser", "@@",
+        ],
+        environment={"AFL_NO_UI": "1"}, campaign_labels={},
+        network_disabled=True, read_only_source=True,
+        timeout_ms=1_000, memory_limit_mb=1_024,
+    )
+    campaigns = AsyncMock()
+    campaigns.create.return_value = sibling
+    campaigns.get.return_value = base
+    clone_variant = AsyncMock()
+    invocations = SimpleNamespace(
+        load=lambda *_args: invocation,
+        clone_variant=clone_variant,
+    )
+    containers = AsyncMock()
+    runtime = RepositoryCampaignRuntime(
+        tasks=AsyncMock(), assets=AsyncMock(), campaigns=campaigns,
+        discovery=AsyncMock(), containers=containers, invocations=invocations,
+    )
+    runtime._persisted_campaigns[7] = (base,)
+    action = ProgressionActionRecord(
+        action_id="campaign-progression:7:9:abcd1234abcd1234",
+        project_id=7, base_campaign_id=9, target_asset_id=31,
+        action_name="enable dictionary",
+        evidence_ids=("source:parser.c:8",),
+        dictionary_content='token_000="MAGIC"\n',
+    )
+    collection = CampaignReviewCollection()
+    collection.record_progression(action)
+    review = collection.result(CampaignDecision(
+        decision="add dictionary sibling", motivation="comparison evidence",
+        evidence_ids=[action.action_id], bounded_actions=[action.action_id],
+        next_review_condition="after sibling health probe", uncertainty="coverage delta unknown",
+    ))
+    target_preparation = AsyncMock()
+    executor = DecisionExecutor(target_preparation, campaign_control=runtime)
+
+    results = run(executor.execute(project, review))
+
+    assert results[0].succeeded is True
+    target_preparation.prepare.assert_not_awaited()
+    campaigns.create.assert_awaited_once()
+    assert campaigns.create.await_args.kwargs["target_asset_id"] == 31
+    assert campaigns.create.await_args.kwargs["configuration_asset_id"] == 32
+    clone_variant.assert_awaited_once()
+    clone = clone_variant.await_args
+    assert clone.args[:3] == (7, 9, 12)
+    assert clone.kwargs["configuration_files"] == {
+        "tokens.dict": b'token_000="MAGIC"\n',
+    }
+    containers.start_exact.assert_awaited_once_with(project, sibling)
+
+
+def test_configuration_progression_never_splits_an_input_option_from_its_placeholder() -> None:
+    from backend.agents.outputs.campaign_review import ProgressionActionRecord
+    from backend.fuzzing.engines.contracts import ContainerInvocation
+    from backend.services.campaigns.production_runtime import RepositoryCampaignRuntime
+
+    project = SimpleNamespace(id=7, commit_sha="a" * 40, worker_count=2)
+    base = SimpleNamespace(
+        id=9, project_id=7, target_asset_id=31, configuration_asset_id=32,
+        engine="afl", stopped_at=None, error=None,
+    )
+    sibling = SimpleNamespace(
+        id=12, project_id=7, target_asset_id=31, configuration_asset_id=32,
+        engine="afl", stopped_at=None, error=None,
+    )
+    invocation = ContainerInvocation(
+        engine="afl", image_id="sha256:" + "b" * 64,
+        command=[
+            "afl-fuzz", "-i", "/campaign/corpus", "-o", "/campaign/output",
+            "-M", "main", "-t", "1000+", "-m", "0", "--",
+            "/opt/bigeye/parser", "--file", "@@",
+        ],
+        environment={"AFL_NO_UI": "1"}, campaign_labels={},
+        network_disabled=True, read_only_source=True,
+        timeout_ms=1_000, memory_limit_mb=1_024,
+    )
+    campaigns = AsyncMock()
+    campaigns.get.return_value = base
+    campaigns.create.return_value = sibling
+    clone_variant = AsyncMock()
+    invocations = SimpleNamespace(
+        load=lambda *_args: invocation, clone_variant=clone_variant,
+    )
+    runtime = RepositoryCampaignRuntime(
+        tasks=AsyncMock(), assets=AsyncMock(), campaigns=campaigns,
+        discovery=AsyncMock(), containers=AsyncMock(), invocations=invocations,
+    )
+    action = ProgressionActionRecord(
+        action_id="campaign-progression:7:9:abcd1234abcd1234",
+        project_id=7, base_campaign_id=9, target_asset_id=31,
+        action_name="try configuration", evidence_ids=("docs:README:42",),
+        arguments=("--encrypt",), detail="--encrypt",
+    )
+
+    run(runtime.progress(project, action))
+
+    variant = clone_variant.await_args.args[3]
+    assert variant.command[-4:] == [
+        "/opt/bigeye/parser", "--file", "@@", "--encrypt",
+    ]
+    assert clone_variant.await_args.kwargs["coverage_arguments"] == ("--encrypt",)
 
 
 def test_retirement_is_a_known_typed_action_and_executes_only_after_selection() -> None:
@@ -347,6 +606,64 @@ def test_unchanged_reconciliation_does_not_emit_campaign_invalidation() -> None:
     events.append.assert_not_awaited()
 
 
+def test_missing_worker_is_unhealthy_but_does_not_consume_a_worker_slot() -> None:
+    from backend.services.campaigns.production_runtime import (
+        ContainerObservation,
+        RepositoryCampaignRuntime,
+    )
+
+    project = SimpleNamespace(id=7, commit_sha="a" * 40, worker_count=1)
+    campaign = SimpleNamespace(
+        id=9, project_id=7, target_asset_id=31, configuration_asset_id=32,
+        stopped_at=None, next_review_after=None, error=None,
+    )
+    tasks, assets, campaigns = AsyncMock(), AsyncMock(), AsyncMock()
+    tasks.list_for_project.return_value = []
+    assets.list_for_project.return_value = []
+    campaigns.list_for_project.return_value = [campaign]
+    campaigns.record_heartbeat.return_value = False
+    containers = AsyncMock()
+    containers.reconcile.return_value = ContainerObservation((), (9,), (), ())
+    runtime = RepositoryCampaignRuntime(
+        tasks=tasks, assets=assets, campaigns=campaigns,
+        discovery=SimpleNamespace(evidence=lambda _project_id: ()), containers=containers,
+    )
+
+    snapshot = run(runtime.reconcile(project))
+
+    assert snapshot.active_workers == 0
+    assert snapshot.free_slots == 1
+    assert snapshot.unhealthy_worker is True
+
+
+def test_worker_limit_stops_and_durably_retires_lowest_investment_campaigns() -> None:
+    from backend.services.campaigns.production_runtime import (
+        ContainerObservation,
+        RepositoryCampaignRuntime,
+    )
+
+    project = SimpleNamespace(id=7, commit_sha="a" * 40, worker_count=1)
+    values = [
+        SimpleNamespace(id=9, project_id=7, stopped_at=None, cpu_seconds=100.0),
+        SimpleNamespace(id=10, project_id=7, stopped_at=None, cpu_seconds=2.0),
+        SimpleNamespace(id=11, project_id=7, stopped_at=None, cpu_seconds=2.0),
+    ]
+    campaigns = AsyncMock()
+    campaigns.list_for_project.return_value = values
+    campaigns.stop_for_worker_limit.return_value = True
+    containers = AsyncMock()
+    runtime = RepositoryCampaignRuntime(
+        tasks=None, assets=None, campaigns=campaigns, discovery=None, containers=containers,
+    )
+    runtime._observations[7] = ContainerObservation((9, 10, 11), (), (), ())
+
+    run(runtime.enforce_worker_count(project, 2))
+
+    assert [call.args[1].id for call in containers.stop_exact.await_args_list] == [11, 10]
+    assert [call.args[1] for call in campaigns.stop_for_worker_limit.await_args_list] == [11, 10]
+    assert all(call.args[0] == 7 for call in campaigns.stop_for_worker_limit.await_args_list)
+
+
 def test_campaign_project_read_uses_a_hard_sql_sentinel_limit() -> None:
     import pytest
 
@@ -374,7 +691,7 @@ def test_runtime_accounts_observed_cpu_and_analyzes_persisted_histories() -> Non
     project = SimpleNamespace(id=7, commit_sha="a" * 40, worker_count=1)
     campaign = SimpleNamespace(
         id=9, project_id=7, target_asset_id=31, configuration_asset_id=32,
-        stopped_at=None, next_review_after=NOW, cpu_seconds=5.0, error=None,
+        engine="afl", stopped_at=None, next_review_after=NOW, cpu_seconds=5.0, error=None,
     )
     tasks, assets, campaigns = AsyncMock(), AsyncMock(), AsyncMock()
     tasks.list_for_project.return_value = []

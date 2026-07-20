@@ -32,6 +32,7 @@ class ResolvedCoverageTarget:
     cpu_exposure_seconds: float
     repository_root: Path
     source_root: str = "/src"
+    replay_environment: tuple[tuple[str, str], ...] = ()
 
 
 class CleanCoverageTargetResolver:
@@ -87,6 +88,7 @@ class CleanCoverageTargetResolver:
             coverage_asset_id=request.coverage_asset_id,
             cpu_exposure_seconds=0.0,
             repository_root=checkout.root,
+            replay_environment=tuple(getattr(request, "replay_environment", ())),
         )
 
 

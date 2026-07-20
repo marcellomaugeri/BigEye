@@ -6,6 +6,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from dataclasses import dataclass, replace
+import hashlib
 import inspect
 
 from backend.fuzzing.coverage.overlap import RetirementCandidate
@@ -15,6 +16,15 @@ from backend.services.campaigns.wake_rules import CampaignSnapshot, ReviewTrigge
 
 MANAGER_RETRY_DELAY_SECONDS = 30
 MAX_MANAGER_REVIEW_ATTEMPTS = 2
+NEXT_REVIEW_DELAY = timedelta(minutes=30)
+
+
+class ActionExecutionFailed(RuntimeError):
+    """Keep a manager-selected deterministic action retryable without hiding its failure."""
+
+    def __init__(self, evidence: dict):
+        super().__init__("one or more selected campaign actions failed")
+        self.evidence = evidence
 
 
 @dataclass(frozen=True)
@@ -24,7 +34,7 @@ class _PendingReview:
     retry_after: datetime
     context: object | None = None
     evidence: tuple[dict, ...] = ()
-    prepared_actions: tuple[RetirementActionRecord, ...] = ()
+    prepared_actions: tuple[object, ...] = ()
 
 
 class PostgresProjectLock:
@@ -139,7 +149,7 @@ class ProjectCoordinator:
 
             pending = self._pending_reviews.get(project_id)
             retirement_evidence = ()
-            retirement_actions = pending.prepared_actions if pending is not None else ()
+            prepared_actions = pending.prepared_actions if pending is not None else ()
             if pending is None:
                 retirement_candidates = await self._retirement_candidates(project, snapshot)
                 if any(candidate.project_id != project_id for candidate in retirement_candidates):
@@ -150,6 +160,13 @@ class ProjectCoordinator:
                 retirement_actions = tuple(
                     _retirement_action(candidate) for candidate in retirement_candidates
                 )
+                progression_actions = ()
+                progression_provider = getattr(type(self._runtime), "progression_actions", None)
+                if progression_provider is not None:
+                    progression_actions = tuple(
+                        await _await(progression_provider(self._runtime, project_id))
+                    )
+                prepared_actions = (*retirement_actions, *progression_actions)
                 if retirement_evidence:
                     snapshot = replace(
                         snapshot,
@@ -191,30 +208,48 @@ class ProjectCoordinator:
                     if not isinstance(evidence, list):
                         raise TypeError("campaign review evidence must be a list")
                     evidence = [*evidence, *retirement_evidence]
-                if retirement_actions:
+                if prepared_actions:
                     decision = await self._manager.review(
                         context, evidence, trigger.reason,
-                        prepared_actions=retirement_actions,
+                        prepared_actions=prepared_actions,
                     )
                 else:
                     decision = await self._manager.review(context, evidence, trigger.reason)
-                await self.decision_executor.execute(project, decision)
+                results = await self.decision_executor.execute(project, decision)
+                if isinstance(results, list):
+                    failures = [result for result in results if getattr(result, "succeeded", True) is False]
+                    if failures:
+                        raise ActionExecutionFailed(_action_failure_evidence(project_id, failures))
+                schedule = getattr(self._runtime, "schedule_next_review", None)
+                if schedule is not None:
+                    await _await(schedule(
+                        project, now + NEXT_REVIEW_DELAY, "periodic campaign supervision",
+                    ))
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 attempts = (pending.attempts if pending is not None else 0) + 1
+                retry_evidence = tuple(dict(item) for item in evidence)
+                if isinstance(error, ActionExecutionFailed):
+                    retry_evidence = (*retry_evidence, error.evidence)
                 if attempts < MAX_MANAGER_REVIEW_ATTEMPTS:
                     self._pending_reviews[project_id] = _PendingReview(
-                        trigger,
-                        attempts,
+                        trigger, attempts,
                         now + timedelta(seconds=MANAGER_RETRY_DELAY_SECONDS),
                         context,
-                        tuple(dict(item) for item in evidence),
-                        retirement_actions,
+                        retry_evidence,
+                        prepared_actions,
                     )
                 else:
                     self._pending_reviews.pop(project_id, None)
                     self._previous[project_id] = _consumed_snapshot(snapshot, trigger)
+                    if isinstance(error, ActionExecutionFailed):
+                        schedule = getattr(self._runtime, "schedule_next_review", None)
+                        if schedule is not None:
+                            await _await(schedule(
+                                project, now + NEXT_REVIEW_DELAY,
+                                "reconsider failed campaign action",
+                            ))
                 await self._record_manager_failure(project_id, trigger, error)
             else:
                 self._pending_reviews.pop(project_id, None)
@@ -319,6 +354,23 @@ class ProjectCoordinator:
 
 async def _await(value):
     return await value if inspect.isawaitable(value) else value
+
+
+def _action_failure_evidence(project_id: int, failures: list[object]) -> dict:
+    action_ids = sorted({str(result.action_id)[:128] for result in failures})
+    error_types = sorted({
+        str(result.error.error_type)[:64]
+        for result in failures
+        if getattr(result, "error", None) is not None
+    })
+    identity = "\0".join((*action_ids, *error_types)).encode("utf-8")
+    digest = hashlib.sha256(identity).hexdigest()[:16]
+    return {
+        "evidence_id": f"action-failure:{project_id}:{digest}",
+        "kind": "action_execution_failure",
+        "action_ids": action_ids,
+        "error_types": error_types,
+    }
 
 
 def _project_id(value: int) -> None:

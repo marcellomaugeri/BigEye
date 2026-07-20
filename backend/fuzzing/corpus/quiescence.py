@@ -101,6 +101,10 @@ class CampaignWriterController(Protocol):
 
     def resume(self, identity: CampaignWriterIdentity, prior_state: CampaignWriterState) -> None: ...
 
+    def replace(
+        self, identity: CampaignWriterIdentity, prior_state: CampaignWriterState,
+    ) -> CampaignWriterIdentity: ...
+
 
 class QuiescedOperation(Protocol, Generic[Result]):
     """A transaction that keeps its rollback source until verified commit."""
@@ -215,8 +219,7 @@ class CampaignQuiescenceService:
             if prior_state.active:
                 self._resume_or_raise(identity, prior_state, primary_error)
             raise
-        if prior_state.active:
-            self._resume_or_raise(identity, prior_state, None)
+        self._replace_or_raise(identity, prior_state)
         return result
 
     def _handle_partial_quiesce(
@@ -276,6 +279,41 @@ class CampaignQuiescenceService:
                 writer_state=self._safe_inspect(identity),
                 recovery_required=False,
             ) from (primary_error or resume_error)
+
+    def _replace_or_raise(
+        self,
+        identity: CampaignWriterIdentity,
+        prior_state: CampaignWriterState,
+    ) -> None:
+        try:
+            replacement = self._controller.replace(identity, prior_state)
+            current = os.stat(identity.corpus_path, follow_symlinks=False)
+            if (
+                not isinstance(replacement, CampaignWriterIdentity)
+                or replacement.project_id != identity.project_id
+                or replacement.campaign_id != identity.campaign_id
+                or replacement.container_id == identity.container_id
+                or replacement.corpus_path != identity.corpus_path
+                or replacement.corpus_device != current.st_dev
+                or replacement.corpus_inode != current.st_ino
+                or (replacement.corpus_device, replacement.corpus_inode)
+                == (identity.corpus_device, identity.corpus_inode)
+                or not stat.S_ISDIR(current.st_mode)
+            ):
+                raise CampaignOwnershipMismatch(
+                    "replacement writer does not own the committed corpus"
+                )
+            replaced = self._inspect_exact(replacement)
+            if replaced.state != prior_state.state or replaced.active != prior_state.active:
+                raise RuntimeError("replacement writer did not restore the prior exact state")
+        except BaseException as replacement_error:
+            raise CampaignQuiescenceRecoveryError(
+                "committed corpus requires campaign writer recovery",
+                primary_error=None,
+                resume_error=replacement_error,
+                writer_state=self._safe_inspect(identity),
+                recovery_required=True,
+            ) from replacement_error
 
     def _resolve_owned_writer(self, ownership: CampaignCorpusOwnership) -> CampaignWriterIdentity:
         identity = self._controller.resolve(ownership.project_id, ownership.campaign_id)

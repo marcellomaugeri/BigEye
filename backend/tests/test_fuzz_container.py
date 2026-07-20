@@ -76,6 +76,7 @@ class FakeContainer:
         self._start_status = start_status
         self._log_delay = log_delay
         self.calls = []
+        self.removed = False
 
     def start(self):
         self.calls.append(("start",))
@@ -104,6 +105,16 @@ class FakeContainer:
         self.status = "exited"
         self.attrs["State"]["Status"] = "exited"
 
+    def pause(self):
+        self.calls.append(("pause",))
+        self.status = "paused"
+        self.attrs["State"]["Status"] = "paused"
+
+    def unpause(self):
+        self.calls.append(("unpause",))
+        self.status = "running"
+        self.attrs["State"]["Status"] = "running"
+
     def kill(self):
         self.calls.append(("kill",))
         self.status = "exited"
@@ -111,6 +122,7 @@ class FakeContainer:
 
     def remove(self, force=False):
         self.calls.append(("remove", force))
+        self.removed = True
 
 
 class FakeContainers:
@@ -126,6 +138,7 @@ class FakeContainers:
         self.next_kill_error = None
 
     def create(self, image, command, **options):
+        container_id = f"container-{len(self.created) + 3}"
         environment = dict(BASE_ENVIRONMENT)
         environment.update(options["environment"])
         labels = dict(BASE_LABELS)
@@ -138,7 +151,7 @@ class FakeContainers:
             for source, mount in options["volumes"].items()
         ]
         attrs = {
-            "Id": "container-3",
+            "Id": container_id,
             "Image": image,
             "Platform": "linux",
             "Name": f"/{options['name']}",
@@ -191,6 +204,7 @@ class FakeContainers:
             "NetworkSettings": {"Networks": {}},
         }
         container = FakeContainer(
+            container_id=container_id,
             attrs=attrs,
             logs=self.next_logs,
             start_error=self.next_start_error,
@@ -210,7 +224,7 @@ class FakeContainers:
 
     def list(self, **kwargs):
         self.list_calls = getattr(self, "list_calls", []) + [kwargs]
-        return list(self.listed)
+        return [container for container in self.listed if not container.removed]
 
     def get(self, container_id):
         return self.by_id[container_id]
@@ -623,6 +637,67 @@ class TestFuzzContainerRecovery:
 
 
 class TestFuzzContainerLifecycle:
+    def test_owned_runtime_state_survives_an_intentional_quiesced_corpus_swap(
+        self, tmp_path: Path,
+    ) -> None:
+        service, _client = _service(tmp_path)
+        identity = service.start(_campaign(), _invocation())
+        corpus = _campaign_path(_workspace(tmp_path)) / "corpus"
+        corpus.rename(corpus.with_name("retired-corpus"))
+        corpus.mkdir()
+
+        observed = service.inspect_owned(identity)
+
+        assert observed.container_id == identity.container_id
+        assert observed.state == "running"
+
+    def test_owned_runtime_is_replaced_after_committed_corpus_swap(
+        self, tmp_path: Path,
+    ) -> None:
+        service, client = _service(tmp_path)
+        identity = service.start(_campaign(), _invocation())
+        log_path = service.log_path(identity)
+        old_container = client.containers.created[0][3]
+        old_container.pause()
+        corpus = _campaign_path(_workspace(tmp_path)) / "corpus"
+        corpus.rename(corpus.with_name("retired-corpus"))
+        corpus.mkdir()
+        committed = corpus.stat()
+
+        replacement = service.replace_owned(
+            identity, _campaign(), _invocation(), (committed.st_dev, committed.st_ino),
+        )
+
+        container = old_container
+        assert ("unpause",) in container.calls
+        assert ("stop", 10) in container.calls
+        assert container.calls[-1] == ("remove", False)
+        assert log_path.read_bytes() == b"final log\n"
+        assert replacement.container_id != identity.container_id
+        assert len(client.containers.created) == 2
+        new_labels = client.containers.created[1][3].attrs["Config"]["Labels"]
+        assert new_labels["com.bigeye.mount.corpus"] == (
+            f"{committed.st_dev}:{committed.st_ino}"
+        )
+
+    @pytest.mark.parametrize("committed_identity", [(0, 1), (1, 0), (True, 1), [1, 2]])
+    def test_replacement_rejects_an_invalid_committed_corpus_identity_before_control(
+        self, tmp_path: Path, committed_identity,
+    ) -> None:
+        service, client = _service(tmp_path)
+        identity = service.start(_campaign(), _invocation())
+        container = client.containers.created[0][3]
+
+        with pytest.raises(ValueError, match="positive"):
+            service.replace_owned(
+                identity, _campaign(), _invocation(), committed_identity,
+            )
+
+        assert not any(
+            call[0] in {"unpause", "stop", "kill", "remove", "logs"}
+            for call in container.calls[2:]
+        )
+
     def test_stream_logs_rechecks_full_owned_contract(self, tmp_path: Path) -> None:
         service, client = _service(tmp_path)
         identity = service.start(_campaign(), _invocation())

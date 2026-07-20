@@ -116,6 +116,24 @@ def test_recovery_restarts_a_stopped_healthy_campaign_from_its_durable_corpus(tm
     assert records[0].action == "restarted"
 
 
+def test_recovery_resumes_a_paused_healthy_campaign_from_its_durable_corpus(tmp_path: Path) -> None:
+    from backend.fuzzing.campaigns.recovery import CampaignRecovery
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _campaign_workspace(workspace)
+    control = RecoveryControl()
+
+    records = CampaignRecovery(workspace, control).recover(
+        project_id=7,
+        campaigns=(_campaign(),),
+        containers=(_container(state="paused"),),
+    )
+
+    assert control.calls == [("restart", 3, "container-3")]
+    assert records[0].action == "restarted"
+
+
 def test_recovery_quarantines_a_same_campaign_identity_mismatch(tmp_path: Path) -> None:
     from backend.fuzzing.campaigns.recovery import CampaignRecovery
 

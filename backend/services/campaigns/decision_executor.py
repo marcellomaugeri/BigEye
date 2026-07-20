@@ -9,6 +9,7 @@ from typing import Generic, TypeVar
 from backend.agents.outputs.campaign_review import (
     CampaignReviewResult,
     ContainedOperationRequestRecord,
+    ProgressionActionRecord,
     RetirementActionRecord,
     TargetProposalRecord,
     TriageResultRecord,
@@ -100,6 +101,11 @@ class DecisionExecutor:
                     raise ValueError("no campaign control service is configured")
                 output = await self._campaign_control.retire(project, record)
                 return ActionResult(action_id, output)
+            if isinstance(record, ProgressionActionRecord):
+                if self._campaign_control is None:
+                    raise ValueError("no campaign control service is configured")
+                output = await self._campaign_control.progress(project, record)
+                return ActionResult(action_id, output)
             raise TypeError("manager-selected action record type is unsupported")
         except Exception as error:
             return ActionResult(
@@ -116,6 +122,7 @@ class DecisionExecutor:
             *((record.result_id, record) for record in decision.known_triage_results),
             *((record.request_id, record) for record in decision.known_operation_requests),
             *((record.action_id, record) for record in decision.known_retirement_actions),
+            *((record.action_id, record) for record in decision.known_progression_actions),
         )
         for action_id, record in values:
             if action_id in records:
@@ -131,6 +138,7 @@ class DecisionExecutor:
             *((record.result_id, record) for record in decision.selected_triage_results),
             *((record.request_id, record) for record in decision.selected_operation_requests),
             *((record.action_id, record) for record in decision.selected_retirement_actions),
+            *((record.action_id, record) for record in decision.selected_progression_actions),
         )
         for action_id, record in values:
             if action_id in records:

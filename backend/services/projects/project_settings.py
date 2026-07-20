@@ -40,7 +40,17 @@ class ProjectSettingsService:
 
     async def resume(self, project_id: int):
         await self.get(project_id)
-        await self._projects.resume(project_id)
         if self._coordinator_registry is not None:
             await self._coordinator_registry.resume(project_id)
+        try:
+            await self._projects.resume(project_id)
+        except BaseException as error:
+            if self._coordinator_registry is not None:
+                try:
+                    await self._coordinator_registry.pause(project_id)
+                except BaseException as cleanup_error:
+                    error.add_note(f"resume rollback also failed: {cleanup_error}")
+            raise
+        if self._coordinator_registry is not None:
+            await self._coordinator_registry.settings_changed(project_id)
         return await self.get(project_id)
