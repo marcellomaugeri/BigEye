@@ -470,20 +470,57 @@ class CampaignReviewCollection:
         with self._lock:
             pending = self._pending_operations.pop(invocation.key, {})
             pending_pipeline = self._pending_pipeline_operations.pop(invocation.key, {})
-            for request_id, record in pending.items():
-                if accepted:
-                    self._operations.setdefault(request_id, record)
-                    values = pending_pipeline.get(request_id)
-                    if values is not None:
-                        pipeline = self._promote_pipeline(invocation, record, values)
-                        existing_action = self._pipeline_operations.setdefault(
-                            pipeline.action_id, pipeline,
-                        )
-                        if existing_action != pipeline:
-                            raise ValueError("pipeline action identifier is not unique")
-                        self._pipeline_by_request.setdefault(request_id, pipeline.action_id)
-                else:
+            if not accepted:
+                for request_id, record in pending.items():
                     self._quarantined_operations.setdefault(request_id, record)
+                return
+
+            promoted = {}
+            try:
+                bound_targets = {
+                    value.target_proposal.result_id: value.action_id
+                    for value in self._pipeline_operations.values()
+                    if value.target_proposal is not None
+                }
+                for request_id, values in pending_pipeline.items():
+                    pipeline = self._promote_pipeline(
+                        invocation, pending[request_id], dict(values),
+                    )
+                    if pipeline.target_proposal is not None:
+                        target_id = pipeline.target_proposal.result_id
+                        existing = bound_targets.get(target_id)
+                        if existing is not None and existing != pipeline.action_id:
+                            raise ValueError(
+                                "target proposal requested multiple build/probe pipeline actions"
+                            )
+                        bound_targets[target_id] = pipeline.action_id
+                    promoted[request_id] = pipeline
+            except Exception:
+                for request_id, record in pending.items():
+                    self._quarantined_operations.setdefault(request_id, record)
+                self._targets = {
+                    key: value for key, value in self._targets.items()
+                    if (
+                        value.worker_assignment, value.tool_call_id, value.attempt, value.model
+                    ) != invocation.key
+                }
+                self._triage = {
+                    key: value for key, value in self._triage.items()
+                    if (
+                        value.worker_assignment, value.tool_call_id, value.attempt, value.model
+                    ) != invocation.key
+                }
+                raise
+
+            for request_id, record in pending.items():
+                self._operations.setdefault(request_id, record)
+            for request_id, pipeline in promoted.items():
+                existing_action = self._pipeline_operations.setdefault(
+                    pipeline.action_id, pipeline,
+                )
+                if existing_action != pipeline:
+                    raise ValueError("pipeline action identifier is not unique")
+                self._pipeline_by_request.setdefault(request_id, pipeline.action_id)
 
     def _promote_pipeline(self, invocation, request, values) -> PipelineOperationRecord:
         target = None

@@ -142,3 +142,9 @@ longer a selectable or manager-visible action. The targeted immutable-selection 
 18.4 FK suite passed `12` tests, the lifecycle overlap suite passed `17` tests, and the schema
 contract returned `DO` against the same disposable database. No broad suite was run for this final
 correction, as requested.
+
+Promotion also rejects a worker attempt that requests both build and probe for the same bound
+proposal. The collection validates all pending promotions before publishing any action, quarantines
+the ambiguous audit requests, and removes the attempt's unbound outputs on failure. A focused
+regression confirms that one build or one probe remains valid while the combined pair yields no
+actionable ID (`12 passed`).

@@ -163,6 +163,44 @@ def test_pipeline_promotion_rejects_incomplete_or_extra_generated_path_snapshots
         collection.complete_attempt(invocation, accepted=True)
 
 
+def test_one_build_or_probe_is_valid_but_both_for_one_proposal_are_rejected() -> None:
+    from backend.agents.outputs.campaign_review import CampaignReviewCollection, WorkerInvocation
+
+    invocation = WorkerInvocation("prepare parser", "call-parser", 1, "gpt-5.6-luna")
+
+    def add_request(collection, operation):
+        return collection.record_operation(
+            invocation,
+            {
+                "project_id": 7, "operation": operation,
+                "asset_paths": ["targets/parser/harness.c"],
+                "assertions": ["seed reaches parser project code"], "executed": False,
+                "provenance": "agent_request", "trusted_instructions": False,
+            },
+            project_commit_sha="a" * 40,
+            draft_sha256s=(("targets/parser/harness.c", "b" * 64),),
+            evidence_ids=("source:parser.c:42",),
+        )
+
+    for operation in ("build", "probe"):
+        collection = CampaignReviewCollection()
+        request = add_request(collection, operation)
+        collection.record_worker_outcome(invocation, _proposal_record().proposal)
+        collection.complete_attempt(invocation, accepted=True)
+        assert collection.actionable_ids() == frozenset({
+            collection.pipeline_action_id(request.request_id),
+        })
+
+    ambiguous = CampaignReviewCollection()
+    add_request(ambiguous, "build")
+    add_request(ambiguous, "probe")
+    ambiguous.record_worker_outcome(invocation, _proposal_record().proposal)
+
+    with pytest.raises(ValueError, match="multiple build/probe"):
+        ambiguous.complete_attempt(invocation, accepted=True)
+    assert ambiguous.actionable_ids() == frozenset()
+
+
 def test_real_typed_production_adapters_execute_all_four_operation_shapes() -> None:
     from datetime import UTC, datetime
     from backend.fuzzing.campaigns.monitor import CampaignArtifactObservation
