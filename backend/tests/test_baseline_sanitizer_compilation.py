@@ -168,6 +168,58 @@ def test_cmake_project_descriptions_may_name_compilers_without_overriding_them(t
 @pytest.mark.parametrize(
     "project_option",
     (
+        "-DENABLE_ENCRYPTION:BOOL=ON",
+        "-DWORKER_COUNT=8",
+        "-DPROTOCOL:STRING=auxiliary",
+        "-DSCHEMA:FILEPATH=/src/config/schema.json",
+        "-DSOURCE_HINT:PATH=src/tools/gcc",
+        "'-DTOOL_DESCRIPTION:STRING=Clang based parser'",
+    ),
+)
+def test_cmake_project_options_preserve_safe_scalar_values(
+    tmp_path, project_option: str,
+) -> None:
+    target, _coverage = _generated_scripts(
+        tmp_path,
+        instance_type="system-level",
+        build_command=(
+            f"cmake -S /src -B /opt/bigeye/build {project_option} && "
+            "cmake --build /opt/bigeye/build --target fuzz-target"
+        ),
+    )
+
+    assert project_option in target
+
+
+@pytest.mark.parametrize(
+    "project_option",
+    (
+        "'-DEXTRA_OPTIONS:STRING=$<JOIN:-fno;-sanitize=all,>'",
+        "'-DEXTRA_OPTIONS:STRING=$ENV{BIGEYE_FLAGS}'",
+        "'-DEXTRA_OPTIONS:STRING=-O2'",
+        "'-DEXTRA_OPTIONS:STRING=@/src/flags.rsp'",
+        "'-DEXTRA_OPTIONS:STRING=debug;release'",
+        "'-DEXTRA_OPTIONS:STRING=SHELL:-O2'",
+        "'-DEXTRA_OPTIONS:STRING=LINKER:-z,defs'",
+    ),
+)
+def test_cmake_project_options_reject_non_scalar_transformations(
+    tmp_path, project_option: str,
+) -> None:
+    with pytest.raises(ValueError, match="safe scalar"):
+        _generated_scripts(
+            tmp_path,
+            instance_type="system-level",
+            build_command=(
+                f"cmake -S /src -B /opt/bigeye/build {project_option} && "
+                "cmake --build /opt/bigeye/build --target fuzz-target"
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "project_option",
+    (
         "-DEXTRA_C_FLAGS:STRING=-fno-sanitize=all",
         "-DEXTRA_OPTIONS:STRING=-mllvm;-asan-stack=0",
         "-DLINK_OPTIONS:STRING=-Xlinker;-plugin;/src/replace-sanitizer.so",
@@ -221,7 +273,7 @@ def test_real_cmake_late_target_flags_cannot_disable_baseline_sanitizers(tmp_pat
         tmp_path,
         instance_type="system-level",
         build_command=(
-            "cmake -S /src -B /opt/bigeye/build -DEXTRA_C_FLAGS:STRING=-g && "
+            "cmake -S /src -B /opt/bigeye/build -DBIGEYE_MODE:STRING=debug && "
             "cmake --build /opt/bigeye/build --target fuzz-target"
         ),
     )
@@ -248,7 +300,6 @@ def test_real_cmake_late_target_flags_cannot_disable_baseline_sanitizers(tmp_pat
     link_command = (actual_build / "CMakeFiles/fuzz-target.dir/link.txt").read_text()
     assert "-fsanitize=address,undefined" in compile_command
     assert "-fsanitize=address,undefined" in link_command
-    assert " -g" in compile_command
 
     with pytest.raises(ValueError, match="compiler or sanitizer policy"):
         _generated_scripts(
@@ -390,19 +441,60 @@ def test_direct_compiler_rejects_backend_plugin_and_pass_through_policy(
         )
 
 
+@pytest.mark.parametrize(
+    "build_command",
+    (
+        "clang --for-linker=-plugin harness.c -o /opt/bigeye/fuzz-target",
+        "clang --for-linker -plugin harness.c -o /opt/bigeye/fuzz-target",
+        "clang --ld-path=/src/tooling/ld harness.c -o /opt/bigeye/fuzz-target",
+        "clang --ld-path /src/tooling/ld harness.c -o /opt/bigeye/fuzz-target",
+        "clang --config=/src/tooling/hostile.cfg harness.c -o /opt/bigeye/fuzz-target",
+        "clang --config /src/tooling/hostile.cfg harness.c -o /opt/bigeye/fuzz-target",
+        "clang --config-system-dir=/src/tooling harness.c -o /opt/bigeye/fuzz-target",
+        "clang --config-user-dir /src/tooling harness.c -o /opt/bigeye/fuzz-target",
+        "clang --no-default-config harness.c -o /opt/bigeye/fuzz-target",
+        "clang --driver-mode=g++ harness.c -o /opt/bigeye/fuzz-target",
+        "clang --gcc-toolchain=/src/tooling harness.c -o /opt/bigeye/fuzz-target",
+        "clang -gcc-toolchain /src/tooling harness.c -o /opt/bigeye/fuzz-target",
+        "clang --gcc-install-dir=/src/tooling harness.c -o /opt/bigeye/fuzz-target",
+        "clang --resource-dir=/src/tooling harness.c -o /opt/bigeye/fuzz-target",
+        "clang -resource-dir /src/tooling harness.c -o /opt/bigeye/fuzz-target",
+        "clang -ccc-install-dir /src/tooling harness.c -o /opt/bigeye/fuzz-target",
+        "clang -cc1 harness.c -o /opt/bigeye/fuzz-target",
+        "clang -cc1as harness.c -o /opt/bigeye/fuzz-target",
+        "clang -Xarch_host=-fno-sanitize=all harness.c -o /opt/bigeye/fuzz-target",
+        "clang -Xoffload-linker=x86_64=-plugin harness.c -o /opt/bigeye/fuzz-target",
+        "clang --offload-linker=-plugin harness.c -o /opt/bigeye/fuzz-target",
+    ),
+)
+def test_direct_compiler_rejects_driver_configuration_front_doors(
+    tmp_path, build_command: str,
+) -> None:
+    with pytest.raises(ValueError, match="compiler or sanitizer policy"):
+        _generated_scripts(
+            tmp_path,
+            instance_type="system-level",
+            build_command=build_command,
+        )
+
+
 def test_direct_compiler_allows_benign_paths_named_after_backend_options(tmp_path) -> None:
     target, _coverage = _generated_scripts(
         tmp_path,
         instance_type="system-level",
         build_command=(
             "clang src/mllvm/parser.c src/plugins/fpass-plugin/registry.c "
-            "-o /opt/bigeye/fuzz-target"
+            "src/config-system-dir/reader.c -DHELP_TEXT=--config "
+            "-o /opt/bigeye/ld-path-target"
         ),
     )
 
     command = target.splitlines()[-1]
     assert "src/mllvm/parser.c" in command
     assert "src/plugins/fpass-plugin/registry.c" in command
+    assert "src/config-system-dir/reader.c" in command
+    assert "-DHELP_TEXT=--config" in command
+    assert "/opt/bigeye/ld-path-target" in command
 
 
 @pytest.mark.parametrize(

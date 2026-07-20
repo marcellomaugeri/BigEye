@@ -506,11 +506,33 @@ def _reject_agent_compiler_policy(arguments: list[str]) -> None:
 
 def _is_compiler_policy_override(argument: str) -> bool:
     upper = argument.upper()
+    exact_or_assigned_options = (
+        "--FOR-LINKER",
+        "--LD-PATH",
+        "--CONFIG",
+        "--CONFIG-SYSTEM-DIR",
+        "--CONFIG-USER-DIR",
+        "--DRIVER-MODE",
+        "--GCC-TOOLCHAIN",
+        "-GCC-TOOLCHAIN",
+        "--GCC-INSTALL-DIR",
+        "--RESOURCE-DIR",
+        "-RESOURCE-DIR",
+        "-CCC-INSTALL-DIR",
+        "-CC1",
+        "-CC1AS",
+    )
+    if upper == "--NO-DEFAULT-CONFIG" or any(
+        upper == option or upper.startswith(option + "=")
+        for option in exact_or_assigned_options
+    ):
+        return True
     if upper.startswith((
         "-FSANITIZE", "-FNO-SANITIZE", "-FOMIT-FRAME-POINTER",
         "-FPROFILE-INSTR", "-FNO-PROFILE-INSTR",
         "-FCOVERAGE-MAPPING", "-FNO-COVERAGE-MAPPING",
         "-MLLVM", "-XCLANG", "-XLINKER",
+        "-XARCH_", "-XOFFLOAD-LINKER", "--OFFLOAD-LINKER",
         "-FPLUGIN", "-FPASS-PLUGIN",
         "-SPECS=", "--SPECS=", "-FUSE-LD=", "-WRAPPER",
     )):
@@ -548,6 +570,20 @@ _CMAKE_POLICY_VALUE = re.compile(
 
 def _cmake_value_overrides_compiler_policy(value: str) -> bool:
     return _CMAKE_POLICY_VALUE.search(value) is not None
+
+
+def _validate_cmake_scalar(value: str) -> None:
+    stripped = value.lstrip()
+    transformation = re.search(r"(?:^|\s)(?:SHELL|LINKER):", value, re.IGNORECASE)
+    if (
+        any(character in value for character in ("\x00", "\r", "\n", ";", "$", "`"))
+        or stripped.startswith(("-", "@"))
+        or transformation is not None
+    ):
+        raise ValueError(
+            "CMake project option values must be safe scalars under BigEye "
+            "compiler or sanitizer policy"
+        )
 
 
 def _instrument_cmake_build(
@@ -696,6 +732,7 @@ def _validate_cmake_project_options(options: list[str]) -> list[str]:
         value = match.group(3)
         if key.startswith("CMAKE_"):
             raise ValueError("CMake application-owned options cannot be overridden")
+        _validate_cmake_scalar(value)
         if (
             key in {"CC", "CXX", "CFLAGS", "CXXFLAGS", "LDFLAGS", "RUSTFLAGS"}
             or key.endswith(("_CC", "_CXX", "_CFLAGS", "_CXXFLAGS", "_LDFLAGS"))
