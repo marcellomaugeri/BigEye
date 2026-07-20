@@ -538,9 +538,17 @@ def _tool(
             collection.pipeline_action_id(request_id)
             for request_id in output.operation_request_ids
         ]
+        bound_target_ids = {
+            operation.target_proposal.result_id
+            for request_id in output.operation_request_ids
+            if (operation := collection.pipeline_operation(request_id)).target_proposal is not None
+        }
         return {
             "result": output.model_dump(mode="json", exclude={"operation_request_ids"}),
-            "target_result_ids": [record.result_id for record in target_records],
+            "target_result_ids": [
+                record.result_id for record in target_records
+                if record.result_id not in bound_target_ids
+            ],
             "triage_result_ids": [record.result_id for record in triage_records],
             "pipeline_action_ids": operation_action_ids,
         }

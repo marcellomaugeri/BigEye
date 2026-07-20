@@ -187,28 +187,49 @@ class AssetRepository:
         self, *, project_id: int, asset_id: int, content_hash: str, attempt_revision: int,
     ) -> bool:
         """Delete only the exact unreferenced failed target revision authorised by lifecycle CAS."""
-        deleted = await self._pool.fetchval(
-            """DELETE FROM assets AS asset
-               WHERE asset.id = $2 AND asset.project_id = $1 AND asset.kind = 'harness'
-                 AND asset.content_hash = $3
-                 AND NOT EXISTS (SELECT 1 FROM campaigns WHERE target_asset_id = asset.id)
-                 AND NOT EXISTS (
-                     SELECT 1 FROM target_probe_attempts
-                      WHERE target_asset_id = asset.id AND successful IS TRUE
-                 )
-                 AND (SELECT COALESCE(MAX(id), 0) FROM target_probe_attempts
-                       WHERE target_asset_id = asset.id) = $4
-                 AND EXISTS (
-                     SELECT 1 FROM target_probe_attempts
-                      WHERE target_asset_id = asset.id AND successful IS FALSE
-                 )
-               RETURNING asset.id""",
-            project_id, asset_id, content_hash, attempt_revision,
-        )
-        return deleted == asset_id
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                candidate = await connection.fetchval(
+                    """SELECT asset.id FROM assets AS asset
+                       WHERE asset.id = $2 AND asset.project_id = $1
+                         AND asset.kind = 'harness' AND asset.content_hash = $3
+                         AND NOT EXISTS (
+                             SELECT 1 FROM campaigns WHERE target_asset_id = asset.id
+                         )
+                         AND NOT EXISTS (
+                             SELECT 1 FROM target_probe_attempts
+                              WHERE target_asset_id = asset.id AND successful IS TRUE
+                         )
+                         AND (SELECT COALESCE(MAX(id), 0) FROM target_probe_attempts
+                               WHERE target_asset_id = asset.id) = $4
+                         AND EXISTS (
+                             SELECT 1 FROM target_probe_attempts
+                              WHERE target_asset_id = asset.id AND successful IS FALSE
+                         )
+                       FOR UPDATE""",
+                    project_id, asset_id, content_hash, attempt_revision,
+                )
+                if candidate != asset_id:
+                    return False
+                # Probe rows are the FK dependants whose exact revision authorised
+                # this deletion. Remove them only after the locked CAS succeeds;
+                # any later asset failure rolls this removal back.
+                await connection.execute(
+                    """DELETE FROM target_probe_attempts
+                       WHERE project_id = $1 AND target_asset_id = $2""",
+                    project_id, asset_id,
+                )
+                deleted = await connection.fetchval(
+                    """DELETE FROM assets
+                       WHERE id = $2 AND project_id = $1 AND content_hash = $3
+                       RETURNING id""",
+                    project_id, asset_id, content_hash,
+                )
+                return deleted == asset_id
 
     async def delete_overlap_authorized(
-        self, *, project_id: int, asset_id: int, content_hash: str, revision: int,
+        self, *, project_id: int, campaign_id: int, asset_id: int,
+        content_hash: str, revision: int,
     ) -> bool:
         """Detach one stopped strategy configuration and delete its exact unused version."""
         if revision != asset_id:
@@ -227,16 +248,33 @@ class AssetRepository:
                            SELECT 1 FROM campaigns
                             WHERE project_id = $1 AND configuration_asset_id = $2
                               AND stopped_at IS NULL
+                       ) OR NOT EXISTS (
+                           SELECT 1 FROM campaigns
+                            WHERE id = $3 AND project_id = $1
+                              AND configuration_asset_id = $2 AND stopped_at IS NOT NULL
                        )""",
-                    project_id, asset_id,
+                    project_id, asset_id, campaign_id,
                 )
                 if active:
                     return False
+                # Remove only the authorised redundant campaign's rows which hold
+                # FKs to this strategy. Retained-strategy and sibling-campaign
+                # evidence remains and will make the final asset CAS fail closed.
+                await connection.execute(
+                    """DELETE FROM coverage_evidence
+                       WHERE project_id = $1 AND campaign_id = $2 AND asset_id = $3""",
+                    project_id, campaign_id, asset_id,
+                )
+                await connection.execute(
+                    """DELETE FROM coverage_checkpoints
+                       WHERE project_id = $1 AND campaign_id = $2 AND strategy_asset_id = $3""",
+                    project_id, campaign_id, asset_id,
+                )
                 await connection.execute(
                     """UPDATE campaigns SET configuration_asset_id = NULL
-                       WHERE project_id = $1 AND configuration_asset_id = $2
-                         AND stopped_at IS NOT NULL""",
-                    project_id, asset_id,
+                       WHERE id = $2 AND project_id = $1
+                         AND configuration_asset_id = $3 AND stopped_at IS NOT NULL""",
+                    project_id, campaign_id, asset_id,
                 )
                 deleted = await connection.fetchval(
                     """DELETE FROM assets

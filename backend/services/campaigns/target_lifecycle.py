@@ -332,7 +332,8 @@ class TargetLifecycleService:
                 for asset_id, _kind, content_hash, revision in action.asset_revisions:
                     deleted = await self._call(
                         self._assets.delete_overlap_authorized,
-                        project_id=project.id, asset_id=asset_id,
+                        project_id=project.id, campaign_id=action.campaign_id,
+                        asset_id=asset_id,
                         content_hash=content_hash, revision=revision,
                     )
                     if deleted is not True:

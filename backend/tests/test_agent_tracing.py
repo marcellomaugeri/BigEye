@@ -419,12 +419,13 @@ def test_campaign_manager_returns_selectable_specialist_result_and_audit_operati
             run_config=RunConfig(),
         )
         worker = await target_tool.on_invoke_tool(target_context, target_context.tool_arguments)
-        target_id = worker["target_result_ids"][0]
+        assert worker["target_result_ids"] == []
+        action_id = worker["pipeline_action_ids"][0]
         return SimpleNamespace(
             final_output=CampaignDecision(
                 decision="probe", motivation="proposal ready",
-                evidence_ids=["known", target_id],
-                bounded_actions=[target_id],
+                evidence_ids=["known", action_id],
+                bounded_actions=[action_id],
                 next_review_delay_seconds=900,
                 next_review_reason="Recheck after the probe", uncertainty="not probed",
             ), raw_responses=[], new_items=[],
@@ -436,11 +437,12 @@ def test_campaign_manager_returns_selectable_specialist_result_and_audit_operati
     ))
 
     assert manager_calls == 1
-    assert review.known_target_proposals[0].proposal.target_name == "parser"
+    assert review.known_target_proposals == ()
+    assert review.known_pipeline_operations[0].target_proposal.proposal.target_name == "parser"
     assert review.known_operation_requests[0].operation == "probe"
     assert review.known_operation_requests[0].tool_call_id == "call-specialist"
     assert review.known_operation_requests[0].actionable is False
-    assert review.decision.bounded_actions == [review.known_target_proposals[0].result_id]
+    assert review.decision.bounded_actions == [review.known_pipeline_operations[0].action_id]
     assert review.decision.evidence_ids == ["known"]
     assert review.selected_action_ids == tuple(review.decision.bounded_actions)
     assert review.selected_operation_requests == ()
@@ -450,10 +452,10 @@ def test_campaign_manager_returns_selectable_specialist_result_and_audit_operati
         if event["event"] == "workflow.result" and event["agent"] == "Campaign manager"
     )
     assert workflow_result["output"]["evidence_ids"] == [
-        "known", review.known_target_proposals[0].result_id,
+        "known", review.known_pipeline_operations[0].action_id,
     ]
     normalized = next(event for event in debug if event["event"] == "manager.decision.normalized")
-    assert normalized["removed_action_ids"] == [review.known_target_proposals[0].result_id]
+    assert normalized["removed_action_ids"] == [review.known_pipeline_operations[0].action_id]
     assert normalized["normalized_evidence_ids"] == ["known"]
     assert read_payloads(store, "activity")[-1]["evidence_ids"] == ["known"]
 

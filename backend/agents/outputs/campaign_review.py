@@ -494,9 +494,9 @@ class CampaignReviewCollection:
                 if (
                     record.worker_assignment, record.tool_call_id, record.attempt, record.model
                 ) == invocation.key
-                and set(request.asset_paths).issubset({
+                and set(request.asset_paths) == {
                     intent.relative_path for intent in record.proposal.generated_asset_intents
-                })
+                }
                 and set(request.assertions).issubset(set(record.proposal.probe_assertions))
             )
             if len(candidates) != 1:
@@ -532,8 +532,14 @@ class CampaignReviewCollection:
 
     def actionable_ids(self) -> frozenset[str]:
         with self._lock:
+            pipeline_target_ids = {
+                value.target_proposal.result_id
+                for value in self._pipeline_operations.values()
+                if value.target_proposal is not None
+            }
             return frozenset((
-                *self._targets, *self._triage, *self._retirements, *self._progressions,
+                *(key for key in self._targets if key not in pipeline_target_ids),
+                *self._triage, *self._retirements, *self._progressions,
                 *self._pipeline_operations,
                 *self._lifecycles,
             ))
@@ -572,8 +578,14 @@ class CampaignReviewCollection:
     def result(self, decision: CampaignDecision) -> CampaignReviewResult:
         with self._lock:
             selected_ids = tuple(decision.bounded_actions)
+            pipeline_target_ids = {
+                value.target_proposal.result_id
+                for value in self._pipeline_operations.values()
+                if value.target_proposal is not None
+            }
             selectable_ids = frozenset((
-                *self._targets, *self._triage, *self._retirements, *self._progressions,
+                *(key for key in self._targets if key not in pipeline_target_ids),
+                *self._triage, *self._retirements, *self._progressions,
                 *self._pipeline_operations,
                 *self._lifecycles,
             ))
@@ -587,14 +599,17 @@ class CampaignReviewCollection:
             # Unselected operation requests remain inert audit data. A selected pipeline
             # operation enters the executable known-action set only in that exact review.
             known_ids = frozenset((
-                *self._targets,
+                *(key for key in self._targets if key not in pipeline_target_ids),
                 *self._triage,
                 *self._retirements,
                 *self._progressions,
                 *self._lifecycles,
-                *(value for value in selected_ids if value in self._pipeline_operations),
+                *self._pipeline_operations,
             ))
-            target_values = tuple(self._targets[key] for key in sorted(self._targets))
+            target_values = tuple(
+                self._targets[key] for key in sorted(self._targets)
+                if key not in pipeline_target_ids
+            )
             triage_values = tuple(self._triage[key] for key in sorted(self._triage))
             operation_values = tuple(self._operations[key] for key in sorted(self._operations))
             retirement_values = tuple(self._retirements[key] for key in sorted(self._retirements))

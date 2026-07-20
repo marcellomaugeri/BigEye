@@ -91,7 +91,7 @@ def test_manager_selection_promotes_an_inert_worker_request_to_one_stable_action
         draft_sha256s=(("targets/parser/harness.c", "b" * 64),),
         evidence_ids=("source:parser.c:42",),
     )
-    collection.record_worker_outcome(invocation, _proposal_record().proposal)
+    proposal = collection.record_worker_outcome(invocation, _proposal_record().proposal)
     collection.complete_attempt(invocation, accepted=True)
     action_id = collection.pipeline_action_id(audit.request_id)
 
@@ -106,6 +106,61 @@ def test_manager_selection_promotes_an_inert_worker_request_to_one_stable_action
     assert review.selected_pipeline_operations == review.known_pipeline_operations
     assert review.selected_pipeline_operations[0].action_id == action_id
     assert review.known_operation_requests[0].executed is False
+    assert proposal.result_id not in collection.actionable_ids()
+    assert action_id in collection.actionable_ids()
+    assert review.known_target_proposals == ()
+    assert review.known_action_ids == (action_id,)
+
+    with pytest.raises(ValueError, match="outside this review"):
+        collection.result(CampaignDecision(
+            decision="bypass immutable action", motivation="select raw proposal",
+            evidence_ids=["source:parser.c:42"], bounded_actions=[proposal.result_id],
+            next_review_delay_seconds=120,
+            next_review_reason="inspect deterministic probe evidence",
+            uncertainty="the probe has not run",
+        ))
+
+
+@pytest.mark.parametrize(
+    ("proposal_paths", "request_paths"),
+    [
+        (("targets/parser/harness.c",), ()),
+        (("targets/parser/harness.c", "targets/parser/config.sh"),
+         ("targets/parser/harness.c",)),
+        (("targets/parser/harness.c",),
+         ("targets/parser/harness.c", "targets/parser/extra.sh")),
+    ],
+    ids=("empty", "subset", "extra"),
+)
+def test_pipeline_promotion_rejects_incomplete_or_extra_generated_path_snapshots(
+    proposal_paths, request_paths,
+) -> None:
+    from backend.agents.outputs.campaign_review import CampaignReviewCollection, WorkerInvocation
+    from backend.agents.outputs.target_proposal import TargetProposal
+
+    collection = CampaignReviewCollection()
+    invocation = WorkerInvocation("prepare parser", "call-parser", 1, "gpt-5.6-luna")
+    proposal_values = _proposal_record().proposal.model_dump(mode="json")
+    proposal_values["generated_asset_intents"] = [
+        {"relative_path": path, "purpose": "target preparation"}
+        for path in proposal_paths
+    ]
+    proposal = TargetProposal.model_validate(proposal_values)
+    collection.record_operation(
+        invocation,
+        {
+            "project_id": 7, "operation": "probe", "asset_paths": list(request_paths),
+            "assertions": ["seed reaches parser project code"], "executed": False,
+            "provenance": "agent_request", "trusted_instructions": False,
+        },
+        project_commit_sha="a" * 40,
+        draft_sha256s=tuple((path, "b" * 64) for path in request_paths),
+        evidence_ids=("source:parser.c:42",),
+    )
+    collection.record_worker_outcome(invocation, proposal)
+
+    with pytest.raises(ValueError, match="exact target proposal"):
+        collection.complete_attempt(invocation, accepted=True)
 
 
 def test_real_typed_production_adapters_execute_all_four_operation_shapes() -> None:
@@ -341,6 +396,7 @@ def test_manager_worker_result_exposes_pipeline_ids_without_audit_ids() -> None:
     assert '"pipeline_action_ids": operation_action_ids' in source
     assert '"operation_request_ids": operation_action_ids' not in source
     assert 'exclude={"operation_request_ids"}' in source
+    assert 'if record.result_id not in bound_target_ids' in source
 
 
 def test_pipeline_service_uses_explicit_operation_adapters_only() -> None:

@@ -25,7 +25,9 @@ prepared campaign controls provide selectable application-owned action IDs. Copy
 result or action IDs exactly into bounded actions. Contained operation requests are audit and
 planning records, never selectable actions, and their IDs are never returned to you. A worker tool
 result may include `pipeline_action_ids`; these are immutable application-owned actions and may be
-selected. The nested worker result never exposes audit-only operation-request IDs.
+selected. When build or probe promotion binds a target proposal, its raw target result ID is not
+returned and only the corresponding pipeline action is selectable. The nested worker result never
+exposes audit-only operation-request IDs.
 Evidence IDs contain only factual assigned evidence.
 Selectable result or action IDs belong only in bounded actions.
 Evidence IDs must never contain operation-request IDs. Never write tool names, invent IDs, or

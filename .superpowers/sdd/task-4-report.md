@@ -131,3 +131,14 @@ recovery cleanup, and development database tests. Additional compatibility verif
 stale count assertion, which was corrected. The full backend suite was deliberately deferred at the
 integration owner's request to prioritise the demo handoff; it must be run once after all concurrent
 task branches are integrated.
+
+The final critical review tightened three remaining boundaries. Never-functional deletion now locks
+and revalidates the exact failed attempt revision, removes only that asset's probe FK rows, and
+deletes the asset in the same transaction. Overlap deletion now accepts the exact authorised
+campaign identity, removes only its candidate-strategy coverage rows/checkpoints, detaches only that
+stopped campaign, and leaves retained-strategy evidence intact. Build/probe promotion requires the
+complete generated-path set and matching SHA snapshot; once promoted, the raw proposal ID is no
+longer a selectable or manager-visible action. The targeted immutable-selection and real PostgreSQL
+18.4 FK suite passed `12` tests, the lifecycle overlap suite passed `17` tests, and the schema
+contract returned `DO` against the same disposable database. No broad suite was run for this final
+correction, as requested.
