@@ -222,6 +222,11 @@ class TraceabilityService:
     async def project_tree(self, project_id: int, limit: int = 1_000, offset: int = 0):
         commit = await self._project_commit(project_id, allow_empty=True)
         page = await self._repository.aggregate_project(project_id, commit, limit=limit, offset=offset)
+        history_method = getattr(self._repository, "coverage_history", None)
+        history = (
+            await history_method(project_id, commit, limit=128)
+            if history_method is not None else ()
+        )
         await self._checkouts.resolve(project_id, commit)
         files = [self._coverage_file(item) for item in page.items]
         return {
@@ -232,6 +237,7 @@ class TraceabilityService:
                 dimension: self._sum_measurement(files, dimension)
                 for dimension in ("lines", "functions", "branches")
             },
+            "history": list(history),
             "pagination": {"limit": limit, "offset": offset, "total": page.total},
         }
 

@@ -10,7 +10,7 @@ export function SourceTree({ files, selectedPath, onSelect }: {
     <h2>Source files</h2>
     {files.length === 0
       ? <p className="muted-copy">No clean coverage has been recorded yet.</p>
-      : <ul aria-label="Source assurance files">
+      : <ul aria-label="Coverage files">
         {files.map((file) => <li key={file.path}>
           <button
             aria-current={selectedPath === file.path ? 'true' : undefined}

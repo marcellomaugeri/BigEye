@@ -271,7 +271,7 @@ def test_project_source_exposure_uses_campaign_maximum_then_sums_campaigns() -> 
     assert page.items[0]["cpu_exposure_seconds"] == 25.0
 
 
-def test_project_function_union_uses_exact_function_inventory_not_line_names() -> None:
+def test_project_coverage_uses_conservative_clean_summary_counts() -> None:
     from unittest.mock import AsyncMock
 
     from backend.repositories.coverage_repository import CoverageRepository
@@ -282,11 +282,14 @@ def test_project_function_union_uses_exact_function_inventory_not_line_names() -
     run(CoverageRepository(pool).aggregate_project(7, "a" * 40))
 
     query = pool.fetch.await_args.args[0]
-    assert "coverage_function_evidence" in query
-    assert "COUNT(DISTINCT function_name)" not in query
+    assert "MAX(covered_lines)" in query
+    assert "MAX(covered_functions)" in query
+    assert "MAX(covered_branches)" in query
+    assert "coverage_function_evidence" not in query
+    assert "coverage_branch_evidence" not in query
 
 
-def test_project_branch_union_keeps_both_outcomes_and_reports_seven_of_eight() -> None:
+def test_project_summary_reports_conservative_branch_coverage() -> None:
     from unittest.mock import AsyncMock
 
     from backend.repositories.coverage_repository import CoverageRepository
@@ -307,6 +310,6 @@ def test_project_branch_union_keeps_both_outcomes_and_reports_seven_of_eight() -
     page = run(CoverageRepository(pool).aggregate_project(7, "a" * 40))
 
     query = pool.fetch.await_args.args[0]
-    assert "outcome_index" in query
+    assert "LEAST(MAX(covered_branches), MIN(total_branches))" in query
     assert page.items[0]["covered_branches"] == 7
     assert page.summary["branches"] == {"covered": 7, "total": 8, "percent": 87.5}

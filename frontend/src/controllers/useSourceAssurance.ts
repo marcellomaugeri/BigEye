@@ -5,7 +5,7 @@ import type { Project } from '../models/project';
 import { friendlyApiError, type BigEyeApi } from '../services/apiClient';
 import type { ProjectEventStream, ProjectInvalidation } from '../services/eventStream';
 
-const UNAVAILABLE = 'BigEye local services are temporarily unavailable.';
+const UNAVAILABLE = 'Could not load source evidence.';
 const SOURCE_PAGE_SIZE = 500;
 
 function sourceLocation(): { path: string; line: number | null } | null {
@@ -86,7 +86,7 @@ export function useSourceAssurance(
     try {
       const [value, functionPage] = await Promise.all([
         api.getSourceFile(projectId, path, startLine, startLine + SOURCE_PAGE_SIZE - 1),
-        api.getCoverageFunctions(projectId, path),
+        api.getCoverageFunctions(projectId, path).catch(() => null),
       ]);
       if (
         requestGeneration !== sourceGeneration.current ||

@@ -8,7 +8,9 @@ export function FirstVisitIntro({ visible }: { visible: boolean }) {
     role="status"
   >
     <div className="first-visit-intro-content">
-      <div aria-label="BigEye logo placeholder" className="first-visit-logo">BigEye</div>
+      <div className="first-visit-logo">
+        <img alt="BigEye" src="/assets/logo.png" />
+      </div>
       <div aria-label="Loading BigEye" className="first-visit-progress" role="progressbar">
         <span />
       </div>

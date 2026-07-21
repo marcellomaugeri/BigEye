@@ -65,7 +65,7 @@ describe('App journey', () => {
     render(<App api={apiDouble()} />);
 
     expect(await screen.findByRole('navigation', { name: 'Main navigation' })).toBeVisible();
-    expect(screen.getAllByText('BigEye')).toHaveLength(1);
+    expect(screen.getByRole('img', { name: 'BigEye' })).toBeVisible();
     expect(screen.queryByText('Continuous assurance')).not.toBeInTheDocument();
     expect(screen.queryByText('Campaign workspace')).not.toBeInTheDocument();
     expect(screen.queryByText('Repository intelligence')).not.toBeInTheDocument();
@@ -119,7 +119,7 @@ describe('App journey', () => {
     render(<App api={apiDouble({ listProjects: vi.fn().mockResolvedValue([]) })} />);
 
     await screen.findByRole('heading', { name: 'Projects' });
-    for (const page of ['Overview', 'Fuzzing', 'Source', 'Findings', 'Activity', 'Settings']) {
+    for (const page of ['Overview', 'Fuzzing', 'Coverage', 'Findings', 'Activity', 'Settings']) {
       await user.click(screen.getByRole('link', { name: page }));
       expect(await screen.findByRole('status')).toHaveTextContent('Select or create a project first.');
       expect(screen.getByRole('heading', { name: 'Projects' })).toBeVisible();

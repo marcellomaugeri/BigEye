@@ -25,6 +25,11 @@ export function OverviewView({ model }: { model: ProjectOverviewModel }) {
     if (campaign.last_heartbeat_at) return `Last observed ${new Date(campaign.last_heartbeat_at).toLocaleString()}`;
     return 'Configured';
   };
+  const latestGain = (gain: number | null) => {
+    if (gain === null) return 'Latest clean gain: not measured yet';
+    if (gain === 0) return 'Latest clean gain: no new lines';
+    return `Latest clean gain: +${gain} ${gain === 1 ? 'line' : 'lines'}`;
+  };
   const activeJobs = campaignEvidence.filter((campaign) => (
     campaign.activity === 'running' && campaign.stopped_at === null
     && campaign.error === null && campaign.retirement_reason === null
@@ -51,7 +56,11 @@ export function OverviewView({ model }: { model: ProjectOverviewModel }) {
             </details>
           </> : <p>No active fuzzing focus is available.</p>}
         </section>
-        <CoverageMap files={model.coverage?.files ?? []} summary={model.coverage?.summary ?? null} />
+        <CoverageMap
+          files={model.coverage?.files ?? []}
+          history={model.coverage?.history ?? []}
+          summary={model.coverage?.summary ?? null}
+        />
       </div>
 
       <aside className="overview-aside" aria-label="Project assurance summary">
@@ -62,7 +71,7 @@ export function OverviewView({ model }: { model: ProjectOverviewModel }) {
           <p>Only deterministic replay results are counted.</p>
         </section>
         <section>
-          <p className="eyebrow">Persisted reach</p>
+          <p className="eyebrow">Campaign-only evidence</p>
           <h2>Campaign evidence</h2>
           {campaignEvidence.length === 0
             ? <p>No campaign evidence is available yet.</p>
@@ -70,8 +79,9 @@ export function OverviewView({ model }: { model: ProjectOverviewModel }) {
               <strong>{campaign.target_name}</strong>
               {campaign.configuration_name && <span>{campaign.configuration_name}</span>}
               <span>{campaignObservation(campaign)}</span>
-              {campaign.unique_line_count !== null && <span>{campaign.unique_line_count} unique lines</span>}
-              {campaign.overlapping_line_count !== null && <span>{campaign.overlapping_line_count} overlapping lines</span>}
+              {campaign.unique_line_count !== null && <span>{campaign.unique_line_count} reproducible campaign lines</span>}
+              <span>{latestGain(campaign.recent_line_gain)}</span>
+              {campaign.overlapping_line_count !== null && <span>{campaign.overlapping_line_count} lines also reached by other campaigns</span>}
               {campaign.configuration_purpose && <p>{campaign.configuration_purpose}</p>}
               {campaign.retirement_reason && <p className="retirement-reason">{campaign.retirement_reason}</p>}
             </li>)}</ul>}

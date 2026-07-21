@@ -5,10 +5,8 @@ from pathlib import Path
 import re
 import threading
 
-from backend.fuzzing.docker.client import DOCKER_REQUEST_TIMEOUT_SECONDS
-
-
 PLATFORM = "linux/amd64"
+IMAGE_BUILD_REQUEST_TIMEOUT_SECONDS = 21_600
 IMAGE_BUILD_LOG_MAX_BYTES = 5 * 1024 * 1024
 IMAGE_BUILD_DETAIL_MAX_CHARS = 32 * 1024
 
@@ -113,7 +111,8 @@ class ImageBuilder:
             raise ValueError("dockerfile must be an existing Dockerfile")
         kwargs = {
             "path": str(dockerfile.parent), "dockerfile": dockerfile.name, "tag": tag,
-            "platform": PLATFORM, "decode": True, "rm": True, "timeout": DOCKER_REQUEST_TIMEOUT_SECONDS,
+            "platform": PLATFORM, "decode": True, "rm": True,
+            "timeout": IMAGE_BUILD_REQUEST_TIMEOUT_SECONDS,
         }
         if network_mode is not None:
             kwargs["network_mode"] = network_mode

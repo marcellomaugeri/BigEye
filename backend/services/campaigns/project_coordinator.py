@@ -20,7 +20,7 @@ from backend.services.observability.redaction import redact
 MANAGER_RETRY_DELAY_SECONDS = 30
 MANAGER_FAILURE_BACKOFF_SECONDS = 300
 MAX_MANAGER_REVIEW_ATTEMPTS = 2
-MANAGER_REVIEW_TIMEOUT_SECONDS = 120
+MANAGER_REVIEW_TIMEOUT_SECONDS = 3_600
 
 
 class ActionExecutionFailed(RuntimeError):

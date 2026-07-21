@@ -31,7 +31,7 @@ export function useProjects(api: BigEyeApi, onProjectCreated: () => void) {
       replaceProject(project);
     } catch (requestError) {
       if (generation === projectRequestGeneration.current && selectedProjectIdRef.current === projectId) {
-        setError(friendlyApiError(requestError, 'BigEye local services are temporarily unavailable.'));
+        setError(friendlyApiError(requestError, 'Could not refresh the selected project.'));
       }
     }
   }, [api, replaceProject]);
@@ -59,7 +59,7 @@ export function useProjects(api: BigEyeApi, onProjectCreated: () => void) {
       setSelectedProjectId(nextId);
       if (nextId && nextProjects.some((project) => project.id === nextId)) void refreshProject(nextId);
     }).catch((requestError: unknown) => {
-      if (active) setError(friendlyApiError(requestError, 'BigEye local services are temporarily unavailable.'));
+      if (active) setError(friendlyApiError(requestError, 'Could not load projects.'));
     }).finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [api, refreshProject]);

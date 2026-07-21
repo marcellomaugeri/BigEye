@@ -58,8 +58,7 @@ describe('first-visit introduction', () => {
     render(<FirstVisitIntro visible />);
 
     const intro = screen.getByRole('status', { name: 'BigEye is starting' });
-    expect(intro).toHaveTextContent('BigEye');
-    expect(screen.getByLabelText('BigEye logo placeholder')).toBeVisible();
+    expect(intro).toContainElement(screen.getByRole('img', { name: 'BigEye' }));
     expect(screen.getByRole('progressbar', { name: 'Loading BigEye' })).toBeVisible();
     expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
   });

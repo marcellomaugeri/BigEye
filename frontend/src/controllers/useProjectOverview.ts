@@ -5,7 +5,7 @@ import type { Project } from '../models/project';
 import { friendlyApiError, type BigEyeApi } from '../services/apiClient';
 import type { ProjectEventStream, ProjectInvalidation } from '../services/eventStream';
 
-const UNAVAILABLE = 'BigEye local services are temporarily unavailable.';
+const UNAVAILABLE = 'Could not refresh the project overview.';
 
 export interface ProjectOverviewModel {
   project: Project | null;

@@ -25,7 +25,7 @@ export interface Campaign {
   unique_line_count: number | null;
   overlapping_line_count: number | null;
   total_reached_lines: number | null;
-  covered_line_delta_5m: number | null;
+  recent_line_gain: number | null;
   activity: 'failed' | 'stopped' | 'running' | 'waiting';
 }
 

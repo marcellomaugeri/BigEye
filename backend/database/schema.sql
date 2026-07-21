@@ -157,6 +157,17 @@ CREATE TABLE coverage_source_summaries (
     CHECK (covered_branches BETWEEN 0 AND total_branches)
 );
 
+CREATE TABLE coverage_history (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    project_id BIGINT NOT NULL,
+    commit_sha TEXT NOT NULL,
+    observed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    covered_lines INTEGER NOT NULL,
+    total_lines INTEGER NOT NULL,
+    FOREIGN KEY (project_id) REFERENCES projects (id),
+    CHECK (covered_lines BETWEEN 0 AND total_lines)
+);
+
 CREATE TABLE coverage_branch_evidence (
     project_id BIGINT NOT NULL,
     commit_sha TEXT NOT NULL,
@@ -251,6 +262,7 @@ CREATE INDEX campaigns_project_started_at_idx ON campaigns (project_id, started_
 CREATE INDEX target_probe_attempts_project_target_idx ON target_probe_attempts (project_id, target_asset_id, id);
 CREATE INDEX coverage_evidence_project_source_line_idx ON coverage_evidence (project_id, source_path, line_number);
 CREATE INDEX coverage_source_summaries_project_source_idx ON coverage_source_summaries (project_id, source_path);
+CREATE INDEX coverage_history_project_observed_idx ON coverage_history (project_id, commit_sha, observed_at, id);
 CREATE INDEX coverage_branch_evidence_project_source_line_idx ON coverage_branch_evidence (project_id, source_path, line_number);
 CREATE INDEX coverage_function_evidence_project_source_idx ON coverage_function_evidence (project_id, source_path);
 CREATE INDEX coverage_checkpoints_project_campaign_idx ON coverage_checkpoints (project_id, campaign_id, id);

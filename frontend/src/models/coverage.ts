@@ -30,11 +30,19 @@ export interface CoverageSummary {
   branches: CoverageMeasurement | null;
 }
 
+export interface CoverageHistoryPoint {
+  observed_at: string;
+  covered: number;
+  total: number;
+  percent: number;
+}
+
 export interface CoverageTree {
   project_id: number;
   commit_sha: string;
   files: CoverageFile[];
   summary: CoverageSummary;
+  history: CoverageHistoryPoint[];
   pagination: Pagination;
 }
 

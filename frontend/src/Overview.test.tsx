@@ -25,7 +25,7 @@ const campaigns = {
     next_review_reason: 'Coverage is still increasing in the parser.', error: null,
     configuration_purpose: 'Exercise encrypted parser input.', retirement_reason: null,
     reached_line_count: 16, unique_line_count: 12, overlapping_line_count: 4,
-    total_reached_lines: 19, covered_line_delta_5m: 2, activity: 'running' as const,
+    total_reached_lines: 19, recent_line_gain: 2, activity: 'running' as const,
   }],
   assets: [{ id: 33, kind: 'strategy', name: 'Parser strategy', parent_id: 31 }]
 };
@@ -42,6 +42,10 @@ const coverage = {
     functions: null,
     branches: null,
   },
+  history: [
+    { observed_at: '2026-07-20T08:30:00Z', covered: 8, total: 40, percent: 20 },
+    { observed_at: '2026-07-20T09:00:00Z', covered: 19, total: 40, percent: 47.5 },
+  ],
   pagination: { limit: 1000, offset: 0, total: 3 }
 };
 
@@ -87,7 +91,11 @@ describe('Overview', () => {
     expect(screen.getByText('12 covered lines')).toBeVisible();
     expect(screen.getByText('1.5 CPU exposure hours')).toBeVisible();
     expect(screen.getByText('19 / 40')).toBeVisible();
-    expect(screen.getByText('47.5%')).toBeVisible();
+    expect(screen.getAllByText('47.5%')).not.toHaveLength(0);
+    const history = screen.getByRole('img', { name: 'Absolute line coverage over time' });
+    expect(history).toBeVisible();
+    expect(within(history).getByText('20%')).toBeVisible();
+    expect(within(history).getByText('47.5%')).toBeVisible();
     expect(screen.getAllByText('Unavailable')).toHaveLength(2);
     expect(screen.getByText('1 active heavy job')).toBeVisible();
     expect(screen.queryByText(/gpt-5.6|luna|terra/i)).not.toBeInTheDocument();
@@ -117,8 +125,9 @@ describe('Overview', () => {
     const evidence = screen.getByRole('heading', { name: 'Campaign evidence' }).closest('section')!;
     const parserEvidence = within(evidence).getByText('Parser input path').closest('li')!;
     expect(within(parserEvidence).getByText('Encrypted mode')).toBeVisible();
-    expect(within(parserEvidence).getByText('12 unique lines')).toBeVisible();
-    expect(within(parserEvidence).getByText('4 overlapping lines')).toBeVisible();
+    expect(within(parserEvidence).getByText('12 reproducible campaign lines')).toBeVisible();
+    expect(within(parserEvidence).getByText('Latest clean gain: +2 lines')).toBeVisible();
+    expect(within(parserEvidence).getByText('4 lines also reached by other campaigns')).toBeVisible();
     expect(within(evidence).getByText('Stopped decoder')).toBeVisible();
     expect(within(evidence).getByText('Its clean reach remained a subset.')).toBeVisible();
     expect(within(evidence).getByText('Broken socket')).toBeVisible();
@@ -205,14 +214,15 @@ describe('Overview', () => {
     expect(screen.getByRole('navigation', { name: 'Main navigation' })).toBeVisible();
   });
 
-  it('keeps Overview usable and translates an unavailable backend without raw HTTP codes', async () => {
+  it('keeps Overview usable and reports the failed project list without claiming all services are unavailable', async () => {
     window.history.replaceState(null, '', '/#overview');
     render(<App api={apiDouble({
       listProjects: vi.fn().mockRejectedValue(new Error('Request failed (500).'))
     })} events={eventStream()} />);
 
     expect(await screen.findByRole('heading', { name: 'Overview' })).toBeVisible();
-    expect(await screen.findByText('BigEye local services are temporarily unavailable.')).toBeVisible();
+    expect(await screen.findByText('Could not load projects.')).toBeVisible();
+    expect(screen.queryByText('BigEye local services are temporarily unavailable.')).not.toBeInTheDocument();
     expect(screen.queryByText(/500|Request failed/i)).not.toBeInTheDocument();
   });
 
@@ -222,7 +232,8 @@ describe('Overview', () => {
       listProjects: vi.fn().mockRejectedValue(new Error('secret at /Users/private/key.txt'))
     })} events={eventStream()} />);
 
-    expect(await screen.findByText('BigEye local services are temporarily unavailable.')).toBeVisible();
+    expect(await screen.findByText('Could not load projects.')).toBeVisible();
+    expect(screen.queryByText('BigEye local services are temporarily unavailable.')).not.toBeInTheDocument();
     expect(screen.queryByText(/secret|\/Users\/private/i)).not.toBeInTheDocument();
   });
 

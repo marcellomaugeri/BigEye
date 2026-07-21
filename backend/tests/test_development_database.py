@@ -52,7 +52,7 @@ class DevelopmentDatabaseTests(unittest.TestCase):
 
         for table in ("projects", "tasks", "assets", "campaigns", "coverage_evidence", "findings"):
             self.assertIn(f"CREATE TABLE {table}", schema)
-        for table in ("coverage_source_summaries", "coverage_branch_evidence", "coverage_function_evidence"):
+        for table in ("coverage_source_summaries", "coverage_branch_evidence", "coverage_function_evidence", "coverage_history"):
             self.assertIn(f"CREATE TABLE {table}", schema)
         self.assertNotIn("CREATE TYPE", schema)
         self.assertNotIn("metadata", schema.lower())
@@ -72,6 +72,12 @@ class DevelopmentDatabaseTests(unittest.TestCase):
         self.assertTrue({"line_number", "branch_index", "outcome_index", "covered"} <= branches)
         self.assertNotIn("activity", campaigns)
         self.assertNotIn("type", campaigns)
+
+        history = self._columns_for("coverage_history", schema)
+        self.assertEqual(
+            history,
+            {"id", "project_id", "commit_sha", "observed_at", "covered_lines", "total_lines"},
+        )
 
     def test_projects_store_manager_review_deadlines_without_a_user_pause_state(self) -> None:
         schema = (ROOT / "backend/database/schema.sql").read_text()

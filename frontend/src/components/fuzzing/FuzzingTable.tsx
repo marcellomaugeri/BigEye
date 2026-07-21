@@ -18,8 +18,8 @@ export function FuzzingTable({ rows }: { rows: FuzzingRow[] }) {
   >
     <table aria-label="Autonomous fuzzing campaigns" className="evidence-table fuzzing-table">
       <thead><tr>
-        <th scope="col">Target</th><th scope="col">Activity</th><th scope="col">5m change</th>
-        <th scope="col">Total reach</th><th scope="col">CPU time</th><th scope="col">Last evidence</th><th scope="col">State</th>
+        <th scope="col">Target</th><th scope="col">Activity</th><th scope="col">Latest gain</th>
+        <th scope="col">Reproducible lines</th><th scope="col">CPU time</th><th scope="col">Last evidence</th><th scope="col">State</th>
       </tr></thead>
       <tbody>{rows.map((row) => <tr key={row.id}>
         <th scope="row">
@@ -29,8 +29,8 @@ export function FuzzingTable({ rows }: { rows: FuzzingRow[] }) {
           <small className="technical-metadata">{row.engine}</small>
         </th>
         <td>{title(row.activity)}</td>
-        <td>{row.coverageDelta5m === null ? 'Unavailable' : `${row.coverageDelta5m >= 0 ? '+' : ''}${row.coverageDelta5m} lines`}</td>
-        <td>{row.totalReach === null ? 'Unavailable' : `${row.totalReach} lines`}</td>
+        <td>{row.recentLineGain === null ? 'Not measured yet' : row.recentLineGain === 0 ? 'No new lines' : `+${row.recentLineGain} lines`}</td>
+        <td>{row.reproducibleLines === null ? 'Not measured yet' : `${row.reproducibleLines} reproducible lines`}</td>
         <td>{cpu(row.cpuExposureSeconds)}</td>
         <td>{row.lastEvidenceAt === null ? 'Unavailable' : new Date(row.lastEvidenceAt).toLocaleString()}</td>
         <td className="campaign-state" data-state={row.state}>{row.state}</td>

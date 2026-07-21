@@ -7,8 +7,8 @@ export interface FuzzingRow {
   purpose: string | null;
   engine: string;
   activity: Campaign['activity'];
-  coverageDelta5m: number | null;
-  totalReach: number | null;
+  recentLineGain: number | null;
+  reproducibleLines: number | null;
   cpuExposureSeconds: number;
   lastEvidenceAt: string | null;
   state: string;

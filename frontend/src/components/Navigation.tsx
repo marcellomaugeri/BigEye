@@ -4,7 +4,7 @@ const pages: { id: Page; label: string }[] = [
   { id: 'projects', label: 'Projects' },
   { id: 'overview', label: 'Overview' },
   { id: 'fuzzing', label: 'Fuzzing' },
-  { id: 'source', label: 'Source' },
+  { id: 'source', label: 'Coverage' },
   { id: 'findings', label: 'Findings' },
   { id: 'activity', label: 'Activity' },
   { id: 'settings', label: 'Settings' }

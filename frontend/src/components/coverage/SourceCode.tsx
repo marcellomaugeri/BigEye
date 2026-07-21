@@ -26,17 +26,13 @@ export function SourceCode({ source, selectedLine, onSelect, onPreviousPage, onN
         <button
           aria-label={`Line ${line.number}, ${line.covered ? 'covered' : 'uncovered'}, ${formatCpuExposure(line.cpu_exposure_seconds)}`}
           aria-pressed={selectedLine === line.number}
-          className={selectedLine === line.number ? 'selected' : ''}
+          className={`${line.covered ? 'coverage-covered' : 'coverage-uncovered'}${selectedLine === line.number ? ' selected' : ''}`}
           onClick={() => onSelect(line.number)}
           type="button"
         >
           <span aria-hidden="true" className="source-line-number">{line.number}</span>
           <code className="source-line-code">{line.text || ' '}</code>
-          <span className="source-line-assurance">
-            <span>{line.covered ? 'covered' : 'uncovered'}</span>
-            <small>{line.branches === null ? 'Branches Unavailable' : `Branches ${line.branches.filter(Boolean).length} / ${line.branches.length}`}</small>
-            <small>{compactExposure(line.cpu_exposure_seconds)}</small>
-          </span>
+          <span className="source-line-cpu">{compactExposure(line.cpu_exposure_seconds)}</span>
         </button>
       </li>)}
     </ol>}

@@ -42,7 +42,7 @@ class CampaignReadService:
             "reached_line_count": None,
             "unique_line_count": None,
             "overlapping_line_count": None,
-            "covered_line_delta_5m": None,
+            "recent_line_gain": None,
             "total_reached_lines": None,
         }
         if history is None or not history.checkpoints:
@@ -63,9 +63,7 @@ class CampaignReadService:
             "reached_line_count": len(reached),
             "unique_line_count": len(reached - comparable_reach),
             "overlapping_line_count": len(overlapping),
-            # Checkpoints currently carry no observation timestamp. A five-minute
-            # delta is therefore honestly unavailable rather than inferred from order.
-            "covered_line_delta_5m": None,
+            "recent_line_gain": len(history.checkpoints[-1].recent_marginal_lines),
             "total_reached_lines": len(reached),
         })
         return summary

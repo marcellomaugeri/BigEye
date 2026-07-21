@@ -61,8 +61,9 @@ describe('Accessibility', () => {
   });
 
   it('uses readable muted text and keeps technical summaries visibly focusable', () => {
-    expect(styles).toContain('--color-grey: #5f5f5f;');
-    expect(styles).toMatch(/summary\s*\{[^}]*color:\s*var\(--color-black\)/s);
-    expect(styles).toMatch(/summary:(?:hover|focus-visible)[^}]*color:\s*var\(--color-red\)/s);
+    expect(styles).toContain('--color-grey: #888078;');
+    expect(styles).toContain('--color-text-muted: #C8C2BC;');
+    expect(styles).toMatch(/summary\s*\{[^}]*color:\s*var\(--color-white\)/s);
+    expect(styles).toMatch(/summary:(?:hover|focus-visible)[^}]*color:\s*var\(--color-red-text\)/s);
   });
 });

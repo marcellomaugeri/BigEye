@@ -1305,6 +1305,12 @@ def test_project_summary_is_not_recomputed_from_the_paginated_file_page(tmp_path
                 "branches": {"covered": 2, "total": 8, "percent": 25.0},
             })
 
+        async def coverage_history(self, *_args, **_kwargs):
+            return ({
+                "observed_at": "2026-07-20T09:00:00Z",
+                "covered": 11, "total": 22, "percent": 50.0,
+            },)
+
     result = run(TraceabilityService(
         tmp_path, Repository(), lambda _request: True, _Registry(checkout),
     ).project_tree(7, limit=1, offset=0))
@@ -1312,6 +1318,30 @@ def test_project_summary_is_not_recomputed_from_the_paginated_file_page(tmp_path
     assert len(result["files"]) == 1
     assert result["pagination"]["total"] == 2
     assert result["summary"]["lines"] == {"covered": 11, "total": 22, "percent": 50.0}
+    assert result["history"][0]["covered"] == 11
+
+
+def test_repository_reads_bounded_absolute_coverage_history_chronologically():
+    from datetime import UTC, datetime
+    from unittest.mock import AsyncMock
+
+    from backend.repositories.coverage_repository import CoverageRepository
+
+    pool = AsyncMock()
+    pool.fetch.return_value = [
+        {"observed_at": datetime(2026, 7, 20, 9, 0, tzinfo=UTC), "covered_lines": 2, "total_lines": 10},
+        {"observed_at": datetime(2026, 7, 20, 9, 5, tzinfo=UTC), "covered_lines": 4, "total_lines": 10},
+    ]
+
+    history = run(CoverageRepository(pool).coverage_history(7, "a" * 40, limit=128))
+
+    query = pool.fetch.await_args.args[0]
+    assert "ORDER BY id DESC LIMIT $3" in query
+    assert "ORDER BY id" in query
+    assert history[-1] == {
+        "observed_at": datetime(2026, 7, 20, 9, 5, tzinfo=UTC),
+        "covered": 4, "total": 10, "percent": 40.0,
+    }
 
 
 def test_replay_requires_exact_binary_argv_and_bounded_arguments(tmp_path: Path):
@@ -1727,6 +1757,7 @@ def test_project_tree_returns_truthful_empty_coverage_for_committed_project(tmp_
         "commit_sha": "a" * 40,
         "files": [],
         "summary": {"lines": None, "functions": None, "branches": None},
+        "history": [],
         "pagination": {"limit": 10, "offset": 0, "total": 0},
     }
 

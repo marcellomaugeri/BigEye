@@ -215,6 +215,69 @@ class CoverageRepository:
                         branch.end_line, branch.end_column, branch.branch_index,
                         branch.outcome_index, branch.covered,
                     )
+                await self._record_coverage_history(
+                    connection, snapshot.project_id, snapshot.commit_sha,
+                )
+
+    @staticmethod
+    async def _record_coverage_history(connection, project_id: int, commit_sha: str) -> None:
+        totals = await connection.fetchrow(
+            """WITH per_source AS (
+                   SELECT source_path,
+                          LEAST(MAX(covered_lines), MIN(total_lines)) AS covered_lines,
+                          MIN(total_lines) AS total_lines
+                   FROM coverage_source_summaries
+                   WHERE project_id = $1 AND commit_sha = $2 AND total_lines IS NOT NULL
+                   GROUP BY source_path
+               )
+               SELECT SUM(covered_lines) AS covered_lines, SUM(total_lines) AS total_lines
+               FROM per_source""",
+            project_id, commit_sha,
+        )
+        if totals is None or totals["total_lines"] is None:
+            return
+        covered_lines = int(totals["covered_lines"] or 0)
+        total_lines = int(totals["total_lines"])
+        previous = await connection.fetchrow(
+            """SELECT covered_lines, total_lines FROM coverage_history
+               WHERE project_id = $1 AND commit_sha = $2 ORDER BY id DESC LIMIT 1""",
+            project_id, commit_sha,
+        )
+        if previous is not None and (
+            int(previous["covered_lines"]), int(previous["total_lines"])
+        ) == (covered_lines, total_lines):
+            return
+        await connection.execute(
+            """INSERT INTO coverage_history
+                      (project_id, commit_sha, covered_lines, total_lines)
+               VALUES ($1, $2, $3, $4)""",
+            project_id, commit_sha, covered_lines, total_lines,
+        )
+
+    async def coverage_history(
+        self, project_id: int, commit_sha: str, limit: int = 128,
+    ) -> tuple[dict, ...]:
+        if type(limit) is not int or not 1 <= limit <= 512:
+            raise ValueError("coverage history limit is outside its bounded range")
+        rows = await self._pool.fetch(
+            """SELECT observed_at, covered_lines, total_lines
+               FROM (
+                   SELECT id, observed_at, covered_lines, total_lines
+                   FROM coverage_history
+                   WHERE project_id = $1 AND commit_sha = $2
+                   ORDER BY id DESC LIMIT $3
+               ) AS recent ORDER BY id""",
+            project_id, commit_sha, limit,
+        )
+        return tuple({
+            "observed_at": row["observed_at"],
+            "covered": int(row["covered_lines"]),
+            "total": int(row["total_lines"]),
+            "percent": (
+                int(row["covered_lines"]) * 100.0 / int(row["total_lines"])
+                if int(row["total_lines"]) else 0.0
+            ),
+        } for row in rows)
 
     async def apply_exposure_observation(
         self, *, campaign_id: int, observed_cpu_seconds: float,
@@ -386,59 +449,31 @@ class CoverageRepository:
                ), exposure AS (
                    SELECT source_path, SUM(cpu_exposure_seconds) AS cpu_exposure_seconds
                    FROM per_campaign GROUP BY source_path
-               ), line_union AS (
-                   SELECT source_path, COUNT(DISTINCT line_number) AS covered_lines
-                   FROM coverage_evidence
-                   WHERE project_id = $1 AND commit_sha = $2 GROUP BY source_path
-               ), function_union AS (
-                   SELECT source_path, COUNT(*) FILTER (WHERE covered IS TRUE) AS covered_functions
-                   FROM (
-                       SELECT source_path, function_name, start_line, start_column,
-                              BOOL_OR(covered) AS covered
-                       FROM coverage_function_evidence
-                       WHERE project_id = $1 AND commit_sha = $2
-                       GROUP BY source_path, function_name, start_line, start_column
-                   ) AS exact_functions GROUP BY source_path
-               ), branch_union AS (
-                   SELECT source_path,
-                          COUNT(*) FILTER (WHERE covered IS TRUE) AS covered_branches
-                   FROM (
-                       SELECT source_path, line_number, start_column, end_line, end_column,
-                              branch_index, outcome_index, BOOL_OR(covered) AS covered
-                       FROM coverage_branch_evidence
-                       WHERE project_id = $1 AND commit_sha = $2
-                       GROUP BY source_path, line_number, start_column, end_line,
-                                end_column, branch_index, outcome_index
-                   ) AS exact_branches GROUP BY source_path
                ), inventories AS (
                    SELECT source_path,
+                          COALESCE(
+                              LEAST(MAX(covered_lines), MIN(total_lines)), 0
+                          ) AS covered_lines,
+                          CASE WHEN MIN(total_functions) IS NULL THEN NULL ELSE COALESCE(
+                              LEAST(MAX(covered_functions), MIN(total_functions)), 0
+                          ) END AS covered_functions,
+                          CASE WHEN MIN(total_branches) IS NULL THEN NULL ELSE COALESCE(
+                              LEAST(MAX(covered_branches), MIN(total_branches)), 0
+                          ) END AS covered_branches,
                           MIN(total_lines) AS total_lines,
                           MIN(total_functions) AS total_functions,
-                          MIN(total_branches) AS total_branches,
-                          COUNT(DISTINCT source_sha256) > 1 AS source_hash_conflict,
-                          COUNT(DISTINCT total_lines) FILTER (WHERE total_lines IS NOT NULL) > 1
-                              AS line_total_conflict,
-                          COUNT(DISTINCT total_functions) FILTER (WHERE total_functions IS NOT NULL) > 1
-                              AS function_total_conflict,
-                          COUNT(DISTINCT total_branches) FILTER (WHERE total_branches IS NOT NULL) > 1
-                              AS branch_total_conflict
+                          MIN(total_branches) AS total_branches
                    FROM coverage_source_summaries
                    WHERE project_id = $1 AND commit_sha = $2 GROUP BY source_path
                ), grouped AS (
                    SELECT inventories.source_path,
-                          COALESCE(line_union.covered_lines, 0) AS covered_lines,
-                          COALESCE(function_union.covered_functions, 0) AS covered_functions,
-                          CASE WHEN inventories.total_branches IS NULL THEN NULL
-                               ELSE COALESCE(branch_union.covered_branches, 0) END AS covered_branches,
+                          inventories.covered_lines,
+                          inventories.covered_functions,
+                          inventories.covered_branches,
                           inventories.total_lines, inventories.total_functions,
                           inventories.total_branches,
-                          COALESCE(exposure.cpu_exposure_seconds, 0) AS cpu_exposure_seconds,
-                          source_hash_conflict, line_total_conflict,
-                          function_total_conflict, branch_total_conflict
+                          COALESCE(exposure.cpu_exposure_seconds, 0) AS cpu_exposure_seconds
                    FROM inventories
-                   LEFT JOIN line_union USING (source_path)
-                   LEFT JOIN function_union USING (source_path)
-                   LEFT JOIN branch_union USING (source_path)
                    LEFT JOIN exposure USING (source_path)
                ), page AS (
                    SELECT *
@@ -465,11 +500,6 @@ class CoverageRepository:
         for row in rows:
             if row["source_path"] is None:
                 continue
-            if any(_row_value(row, name, False) for name in (
-                "source_hash_conflict", "line_total_conflict",
-                "function_total_conflict", "branch_total_conflict",
-            )):
-                raise ValueError("coverage source hashes or denominators conflict")
             covered_lines = int(row["covered_lines"])
             total_lines = _optional_int(_row_value(row, "total_lines"))
             covered_functions = _optional_int(_row_value(row, "covered_functions"))

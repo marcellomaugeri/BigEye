@@ -1,6 +1,6 @@
 import { act, render, renderHook, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ManagerActivityFooter } from './components/activity/ManagerActivityFooter';
 import {
   managerActivityMessage,
@@ -28,7 +28,7 @@ const campaigns: CampaignList = {
     next_review_after: '2026-07-20T10:30:00Z', next_review_reason: 'Periodic review',
     error: null, configuration_purpose: 'Exercise encrypted input.', retirement_reason: null,
     reached_line_count: 16, unique_line_count: 12, overlapping_line_count: 4,
-    total_reached_lines: 16, covered_line_delta_5m: 1, activity: 'running',
+    total_reached_lines: 16, recent_line_gain: 1, activity: 'running',
   }],
   assets: [],
 };
@@ -59,6 +59,8 @@ function apiDouble(overrides: Partial<BigEyeApi> = {}): BigEyeApi {
 function idleEvents(): ProjectEventStream {
   return { subscribe: vi.fn().mockReturnValue(() => undefined) };
 }
+
+afterEach(() => vi.useRealTimers());
 
 describe('manager activity footer', () => {
   it('prioritises a manager review that is currently in progress', () => {
@@ -112,7 +114,7 @@ describe('manager activity footer', () => {
     expect(onOpenActivity).toHaveBeenCalledOnce();
   });
 
-  it('refetches only the invalidated resource', async () => {
+  it('coalesces a burst of debug invalidations into one refresh', async () => {
     let invalidate!: (name: ProjectInvalidation) => void;
     const events: ProjectEventStream = {
       subscribe: vi.fn((_projectId, onEvent) => { invalidate = onEvent; return () => undefined; }),
@@ -125,8 +127,13 @@ describe('manager activity footer', () => {
     act(() => invalidate('campaigns'));
     await waitFor(() => expect(api.listCampaigns).toHaveBeenCalledTimes(2));
     expect(api.getProjectLog).toHaveBeenCalledTimes(2);
-    act(() => invalidate('debug'));
-    await waitFor(() => expect(api.getProjectLog).toHaveBeenCalledTimes(3));
+    vi.useFakeTimers();
+    act(() => {
+      for (let index = 0; index < 20; index += 1) invalidate('debug');
+    });
+    expect(api.getProjectLog).toHaveBeenCalledTimes(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    expect(api.getProjectLog).toHaveBeenCalledTimes(3);
     expect(api.getProjectLog).toHaveBeenLastCalledWith('7', 'debug', -1, 64);
   });
 

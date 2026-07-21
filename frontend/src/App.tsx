@@ -124,7 +124,9 @@ function BigEyeApplication({ api, events }: AppProps) {
 
   return <main className="app-shell">
     <aside className="sidebar">
-      <div className="brand"><span>BigEye</span></div>
+      <div className="brand">
+        <img alt="BigEye" className="brand-logo" src="/assets/logo.png" />
+      </div>
       <Navigation activePage={page} onNavigate={navigate} />
     </aside>
     <div className="work-surface">

@@ -21,7 +21,10 @@ class _Coverage:
             "lines": {"covered": 2, "total": 3, "percent": 66.66666666666667},
             "functions": {"covered": 1, "total": 2, "percent": 50.0},
             "branches": None,
-        }, "pagination": {"limit": limit, "offset": offset, "total": 1}}
+        }, "history": [{
+            "observed_at": "2026-07-20T09:00:00Z", "covered": 2, "total": 3,
+            "percent": 66.66666666666667,
+        }], "pagination": {"limit": limit, "offset": offset, "total": 1}}
 
     async def source_file(self, project_id, path, start_line, end_line):
         return {
@@ -91,6 +94,10 @@ def test_coverage_routes_expose_tree_source_functions_and_first_hit_evidence():
     assert tree.json()["summary"]["lines"] == {
         "covered": 2, "total": 3, "percent": 66.66666666666667,
     }
+    assert tree.json()["history"] == [{
+        "observed_at": "2026-07-20T09:00:00Z", "covered": 2, "total": 3,
+        "percent": 66.66666666666667,
+    }]
     assert tree.json()["pagination"] == {"limit": 1000, "offset": 0, "total": 1}
     assert source.status_code == 200
     assert source.json()["lines"][0]["covered"] is True
@@ -183,6 +190,7 @@ def test_tree_route_returns_a_truthful_empty_success_when_no_coverage_exists():
             return {
                 "project_id": project_id, "commit_sha": "a" * 40, "files": [],
                 "summary": {"lines": None, "functions": None, "branches": None},
+                "history": [],
                 "pagination": {"limit": limit, "offset": offset, "total": 0},
             }
 

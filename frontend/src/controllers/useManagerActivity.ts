@@ -7,6 +7,7 @@ import type { ProjectEventStream, ProjectInvalidation } from '../services/eventS
 
 const ACTIVITY_PAGE_SIZE = 1;
 const DEBUG_PAGE_SIZE = 64;
+const DEBUG_REFRESH_DELAY_MILLISECONDS = 1_000;
 const RECENT_DECISION_MILLISECONDS = 90_000;
 const FRESH_HEARTBEAT_MILLISECONDS = 120_000;
 const FUTURE_CLOCK_TOLERANCE_MILLISECONDS = 30_000;
@@ -162,13 +163,22 @@ export function useManagerActivity(
     void Promise.allSettled([loadCampaigns(), loadLog('activity'), loadLog('debug')]).finally(() => {
       if (isCurrent()) setLoading(false);
     });
+    let debugRefreshTimer: number | null = null;
+    const scheduleDebugRefresh = () => {
+      if (debugRefreshTimer !== null) window.clearTimeout(debugRefreshTimer);
+      debugRefreshTimer = window.setTimeout(() => {
+        debugRefreshTimer = null;
+        void loadLog('debug');
+      }, DEBUG_REFRESH_DELAY_MILLISECONDS);
+    };
     const unsubscribe = events.subscribe(projectId, (name: ProjectInvalidation) => {
       if (name === 'campaigns') void loadCampaigns();
       if (name === 'activity') void loadLog('activity');
-      if (name === 'debug') void loadLog('debug');
+      if (name === 'debug') scheduleDebugRefresh();
     });
     const clock = window.setInterval(() => setNow(new Date()), 15_000);
     return () => {
+      if (debugRefreshTimer !== null) window.clearTimeout(debugRefreshTimer);
       window.clearInterval(clock);
       unsubscribe();
     };

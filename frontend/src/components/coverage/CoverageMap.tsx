@@ -1,4 +1,5 @@
-import type { CoverageFile, CoverageSummary } from '../../models/coverage';
+import type { CoverageFile, CoverageHistoryPoint, CoverageSummary } from '../../models/coverage';
+import { CoverageHistoryChart } from './CoverageHistoryChart';
 
 export function formatCpuExposure(seconds: number): string {
   const hours = seconds / 3600;
@@ -16,7 +17,11 @@ function measurement(value: CoverageSummary['lines']): React.ReactNode {
   return <dd><strong>{value.covered} / {value.total}</strong><span>{value.percent}%</span></dd>;
 }
 
-export function CoverageMap({ files, summary = null }: { files: CoverageFile[]; summary?: CoverageSummary | null }) {
+export function CoverageMap({ files, history = [], summary = null }: {
+  files: CoverageFile[];
+  history?: CoverageHistoryPoint[];
+  summary?: CoverageSummary | null;
+}) {
   const areas = files.reduce<Map<string, CoverageFile[]>>((result, file) => {
     const area = sourceArea(file.path);
     result.set(area, [...(result.get(area) ?? []), file]);
@@ -37,6 +42,8 @@ export function CoverageMap({ files, summary = null }: { files: CoverageFile[]; 
       <div><dt>Branches</dt>{measurement(summary.branches)}</div>
       <div><dt>Functions</dt>{measurement(summary.functions)}</div>
     </dl>}
+
+    <CoverageHistoryChart points={history} />
 
     {files.length > 0 && <>
       <div aria-label="Source coverage map" className="coverage-map" role="img">

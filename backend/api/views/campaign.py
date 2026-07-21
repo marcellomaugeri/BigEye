@@ -42,7 +42,7 @@ class CampaignResponse(BaseModel):
     unique_line_count: int | None = Field(default=None, ge=0)
     overlapping_line_count: int | None = Field(default=None, ge=0)
     total_reached_lines: int | None = Field(default=None, ge=0)
-    covered_line_delta_5m: int | None = None
+    recent_line_gain: int | None = Field(default=None, ge=0)
     activity: str = Field(min_length=1, max_length=32)
 
     @classmethod

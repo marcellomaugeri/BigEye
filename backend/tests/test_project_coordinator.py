@@ -252,10 +252,10 @@ def test_wait_uses_the_persisted_project_manager_deadline_after_reconstruction()
     assert seen[0][2] == wake_at
 
 
-def test_manager_review_timeout_is_bounded_to_two_minutes() -> None:
+def test_manager_review_timeout_allows_long_multi_agent_repairs() -> None:
     from backend.services.campaigns.project_coordinator import MANAGER_REVIEW_TIMEOUT_SECONDS
 
-    assert MANAGER_REVIEW_TIMEOUT_SECONDS == 120
+    assert MANAGER_REVIEW_TIMEOUT_SECONDS == 3_600
 
 
 def test_repeated_manager_failure_is_bounded_to_two_attempts() -> None:

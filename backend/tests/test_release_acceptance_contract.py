@@ -52,7 +52,7 @@ def test_browser_acceptance_uses_real_services_and_covers_the_release_journey() 
         "Start project",
         "Overview",
         "Activity",
-        "Source assurance",
+        "Coverage",
         "Download first testcase",
         "Findings",
         "Debug",

@@ -1,5 +1,7 @@
 """HTTP views for clean source coverage and first-hit evidence."""
 
+from datetime import datetime
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from backend.services.observability.redaction import redact_environment
@@ -27,6 +29,15 @@ class CoverageSummaryResponse(BaseModel):
     branches: CoverageMeasurementResponse | None
 
 
+class CoverageHistoryPointResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    observed_at: datetime
+    covered: int = Field(ge=0)
+    total: int = Field(ge=0)
+    percent: float = Field(ge=0, le=100)
+
+
 class CoverageFileResponse(BaseModel):
     path: str
     covered_lines: int
@@ -46,6 +57,7 @@ class CoverageTreeResponse(BaseModel):
     commit_sha: str
     files: list[CoverageFileResponse]
     summary: CoverageSummaryResponse
+    history: list[CoverageHistoryPointResponse] = Field(default_factory=list)
     pagination: PaginationResponse
 
 

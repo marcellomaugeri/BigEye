@@ -7,12 +7,12 @@ import type { SourceAssuranceModel } from '../controllers/useSourceAssurance';
 
 export function SourceAssuranceView({ model }: { model: SourceAssuranceModel }) {
   if (model.project === null) {
-    return <EmptyState title="Source assurance">Select or create a project to inspect source assurance.</EmptyState>;
+    return <EmptyState title="Coverage">Select or create a project to inspect coverage.</EmptyState>;
   }
 
   return <section aria-labelledby="source-assurance-heading" className="source-assurance-view">
     <header className="view-title">
-      <div><p className="eyebrow">Reproducible reach</p><h2 id="source-assurance-heading">Source assurance</h2></div>
+      <div><p className="eyebrow">Clean build</p><h2 id="source-assurance-heading">Coverage</h2></div>
       {model.tree && <p className="commit-reference">Clean revision {model.tree.commit_sha.slice(0, 12)}</p>}
     </header>
     {model.error && <StatusText tone="error">{model.error}</StatusText>}

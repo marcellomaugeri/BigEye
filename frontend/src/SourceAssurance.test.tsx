@@ -21,7 +21,7 @@ const campaigns = {
     next_review_after: null, next_review_reason: 'Review after coverage plateaus.', error: null,
     configuration_purpose: 'Exercise parser input.', retirement_reason: null,
     reached_line_count: 2, unique_line_count: 2, overlapping_line_count: 0,
-    total_reached_lines: 2, covered_line_delta_5m: null, activity: 'waiting' as const,
+    total_reached_lines: 2, recent_line_gain: null, activity: 'waiting' as const,
   }],
   assets: [
     { id: 33, kind: 'strategy', name: 'Parser strategy', parent_id: 31 },
@@ -33,6 +33,7 @@ const tree = {
   project_id: 7, commit_sha: 'a'.repeat(40),
   files: [{ path: 'src/parser.c', covered_lines: 1, total_lines: 742, covered_functions: 1, total_functions: 2, covered_branches: 1, total_branches: 2, lines: { covered: 1, total: 742, percent: 0.13 }, functions: { covered: 1, total: 2, percent: 50 }, branches: { covered: 1, total: 2, percent: 50 }, cpu_exposure_seconds: 5400 }],
   summary: { lines: { covered: 1, total: 742, percent: 0.13 }, functions: { covered: 1, total: 2, percent: 50 }, branches: { covered: 1, total: 2, percent: 50 } },
+  history: [],
   pagination: { limit: 1000, offset: 0, total: 1 }
 };
 
@@ -84,8 +85,15 @@ function apiDouble(overrides: Partial<BigEyeApi> = {}): BigEyeApi {
 
 const events: ProjectEventStream = { subscribe: vi.fn().mockReturnValue(() => undefined) };
 
-describe('Source assurance', () => {
+describe('Coverage', () => {
   afterEach(() => { window.history.replaceState(null, '', '/'); });
+
+  it('presents the source evidence workspace as Coverage', () => {
+    render(<SourceAssuranceView model={model()} />);
+
+    expect(screen.getByRole('heading', { name: 'Coverage' })).toBeVisible();
+    expect(screen.queryByText('Source assurance')).not.toBeInTheDocument();
+  });
 
   it('shows selectable source lines, strategy-filtered first testcase evidence and CPU exposure', async () => {
     const user = userEvent.setup();
@@ -94,10 +102,16 @@ describe('Source assurance', () => {
 
     const sourceRegion = screen.getByRole('region', { name: 'Source code' });
     const selected = within(sourceRegion).getByRole('button', { name: /Line 42.*covered.*1.5 CPU exposure hours/i });
+    const uncovered = within(sourceRegion).getByRole('button', { name: /Line 43.*uncovered.*0 CPU exposure hours/i });
+    expect(selected).toHaveClass('coverage-covered');
+    expect(uncovered).toHaveClass('coverage-uncovered');
     selected.focus();
     await user.keyboard('{Enter}');
     expect(onSelectLine).toHaveBeenCalledWith(42);
-    expect(within(sourceRegion).getByText('uncovered')).toBeVisible();
+    expect(within(sourceRegion).queryByText('covered')).not.toBeInTheDocument();
+    expect(within(sourceRegion).queryByText('uncovered')).not.toBeInTheDocument();
+    expect(within(sourceRegion).queryByText(/Branches/)).not.toBeInTheDocument();
+    expect(within(selected).getByText('1.5 CPU h')).toBeVisible();
 
     expect(screen.getByRole('combobox', { name: 'Reaching strategy' })).toHaveValue('33');
     const testcaseLink = screen.getByRole('link', { name: 'Download first testcase for Parser strategy' });
@@ -110,11 +124,11 @@ describe('Source assurance', () => {
     expect(screen.queryByRole('button', { name: /run replay/i })).not.toBeInTheDocument();
   });
 
-  it('shows reached functions and exact branch state when backend evidence is available', () => {
+  it('shows reached functions without repeating branch state on source rows', () => {
     render(<SourceAssuranceView model={model()} />);
     expect(screen.getByText('decode')).toBeVisible();
     expect(screen.getByText('1 reached function')).toBeVisible();
-    expect(screen.getByText('Branches 1 / 2')).toBeVisible();
+    expect(screen.queryByText('Branches 1 / 2')).not.toBeInTheDocument();
   });
 
   it('generation-guards stale line evidence after keyboard selection changes', async () => {
@@ -163,11 +177,23 @@ describe('Source assurance', () => {
     expect(result.current.error).toBeNull();
   });
 
+  it('loads source coverage when optional function evidence is unavailable', async () => {
+    const api = apiDouble({
+      getCoverageFunctions: vi.fn().mockRejectedValue(new Error('coverage not found')),
+    });
+    const { result } = renderHook(() => useSourceAssurance(api, events, project, true));
+
+    await waitFor(() => expect(result.current.source?.path).toBe('src/parser.c'));
+
+    expect(result.current.functions).toBeNull();
+    expect(result.current.error).toBeNull();
+  });
+
   it('exposes an accessible source list equivalent', () => {
     render(<SourceAssuranceView model={model()} />);
 
     expect(screen.getByRole('navigation', { name: 'Project source files' })).toBeVisible();
-    expect(screen.getByRole('list', { name: 'Source assurance files' })).toBeVisible();
+    expect(screen.getByRole('list', { name: 'Coverage files' })).toBeVisible();
     expect(screen.getByRole('region', { name: 'Selected line evidence' })).toBeVisible();
   });
 

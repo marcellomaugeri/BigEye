@@ -156,7 +156,7 @@ export class ApiClient implements BigEyeApi {
 
   private async request<T>(path: string, init?: RequestInit): Promise<T> {
     const response = await fetch(`${this.baseUrl}${path}`, init);
-    if (!response.ok) throw new Error('BigEye local services are temporarily unavailable.');
+    if (!response.ok) throw new Error('Request failed.');
     return response.json() as Promise<T>;
   }
 }
