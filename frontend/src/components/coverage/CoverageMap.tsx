@@ -12,9 +12,13 @@ function sourceArea(path: string): string {
   return separator === -1 ? path : path.slice(0, separator);
 }
 
+function formatPercent(value: number): string {
+  return `${Number(value.toFixed(2))}%`;
+}
+
 function measurement(value: CoverageSummary['lines']): React.ReactNode {
   if (value === null) return <dd>Unavailable</dd>;
-  return <dd><strong>{value.covered} / {value.total}</strong><span>{value.percent}%</span></dd>;
+  return <dd><strong>{value.covered} / {value.total}</strong><span>{formatPercent(value.percent)}</span></dd>;
 }
 
 export function CoverageMap({ files, history = [], summary = null }: {

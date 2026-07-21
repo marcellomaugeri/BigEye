@@ -77,6 +77,21 @@ function eventStream(): ProjectEventStream {
 describe('Overview', () => {
   afterEach(() => { window.history.replaceState(null, '', '/'); });
 
+  it('limits project coverage percentages to two decimal places', () => {
+    render(<OverviewView model={viewModel({
+      coverage: {
+        ...coverage,
+        summary: {
+          ...coverage.summary,
+          lines: { covered: 19, total: 40, percent: 47.512345 },
+        },
+      },
+    })} />);
+
+    expect(screen.getByText('47.51%')).toBeVisible();
+    expect(screen.queryByText('47.512345%')).not.toBeInTheDocument();
+  });
+
   it('prioritises current focus and truthful covered-line evidence over technical metadata', async () => {
     const user = userEvent.setup();
     render(<OverviewView model={viewModel()} />);

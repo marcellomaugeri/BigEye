@@ -63,7 +63,7 @@ BigEye opens at [http://127.0.0.1:8000/](http://127.0.0.1:8000/). On a Linux hos
 Select **+ New project** and provide a public HTTP(S) Git repository, an exact branch, tag or commit, and the maximum number of concurrent compilation or fuzzing jobs. A project-specific read-only token can be supplied for a private repository.
 
 <p align="center">
-  <img src="docs/assets/new-project.jpg" alt="BigEye New project dialog" width="820">
+  <img src="docs/assets/new-project-libexpat.jpg" alt="BigEye New project dialog configured for libexpat revision R_2_7_1" width="654">
 </p>
 
 #### Recommended demonstration project
@@ -123,13 +123,25 @@ flowchart LR
 
 Every image build and campaign container explicitly requests `linux/amd64`. BigEye does not use OSS-Fuzz or OSS-Fuzz-Gen images or source code.
 
-### Evidence in the interface
+### Inspectable evidence
 
 - **Overview** presents current focus, active strategies, replayed findings and measured source reach.
 - **Fuzzing** shows each target and configuration, current activity, recent coverage movement, total reach and CPU exposure.
-- **Source** connects covered lines to reaching strategies and the first retained testcase for each target.
+- **Coverage** connects covered lines to reaching strategies and the first retained testcase for each target.
 - **Findings** presents grouped replay evidence, priority, uncertainty, a minimal input and contained reproduction output.
 - **Activity** records decisions, motivations, tool calls, model usage and sanitised runtime logs.
+
+The Overview separates clean whole-project coverage from campaign-only reach and plots absolute line coverage over time.
+
+<p align="center">
+  <img src="docs/assets/overview-coverage.jpg" alt="BigEye Overview showing libexpat line, branch and function coverage with the absolute line coverage chart" width="654">
+</p>
+
+The Coverage view highlights covered and uncovered source lines while retaining the CPU exposure and first testcase needed to inspect reproducibility.
+
+<p align="center">
+  <img src="docs/assets/line-coverage.jpg" alt="BigEye Coverage view showing covered and uncovered libexpat source lines with CPU exposure" width="654">
+</p>
 
 CPU exposure is cumulative container CPU time attributed to lines reached by a campaign's clean-coverage replay. It is not wall-clock time and does not imply that every path through a line was tested.
 
