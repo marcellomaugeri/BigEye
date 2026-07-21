@@ -37,7 +37,11 @@ The execution engine is secondary to the campaign objective. BigEye decides what
 
 ## Demo
 
-> **Video demo placeholder:** a public, voice-over YouTube link of less than three minutes will be added before the OpenAI Build Week submission.
+<p align="center">
+  <a href="https://youtu.be/tDa2Z2_gqNw">
+    <img src="https://img.youtube.com/vi/tDa2Z2_gqNw/maxresdefault.jpg" alt="Watch the BigEye video demo on YouTube" width="654">
+  </a>
+</p>
 
 ## Getting started
 
