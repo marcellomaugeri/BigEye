@@ -21,6 +21,20 @@ export interface ReplayVariant {
   error: string | null;
 }
 
+export interface CrashGrouping {
+  version: 1;
+  commit_sha: string;
+  failure_class: string;
+  reproducible: boolean;
+  minimisation_accepted: boolean;
+  minimised_sha256: string;
+  harness_misuse: boolean;
+  frames: Array<{
+    function: string;
+    source_location: string | null;
+  }>;
+}
+
 export interface FindingDetail extends FindingSummary {
   uncertainty: string;
   evidence_ids: string[];
@@ -34,6 +48,7 @@ export interface FindingDetail extends FindingSummary {
   minimisation: { accepted: boolean; original_size: number; minimal_size: number } | null;
   correction: Record<string, unknown> | null;
   repair_intent: string | null;
+  grouping: CrashGrouping | null;
   evidence_events: Array<{
     evidence_id: string;
     stream: 'activity' | 'debug';

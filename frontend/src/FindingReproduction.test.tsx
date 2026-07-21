@@ -10,20 +10,47 @@ const run = {
   run_id: 'a'.repeat(32), phase: 'starting' as const,
   started_at: '2026-07-20T10:00:00Z', completed_at: null,
   image_id: `sha256:${'b'.repeat(64)}`, command: ['/target', '{input}'],
-  exit_code: null, terminal_reason: null,
+  exit_code: null, terminal_reason: null, sanitizer_crash_observed: false,
 };
 
 describe('finding reproduction', () => {
   it('renders exact streamed output in a read-only log with no input surface', () => {
     render(<ReproductionTerminal run={{ ...run, phase: 'completed', exit_code: 1, terminal_reason: 'exited' }} output={[
-      { stream: 'stderr', text: 'AddressSanitizer: heap-buffer-overflow\n' },
+      { stream: 'stderr', text: 'AddressSanitizer: heap-buffer-overflow at decoder.c:36\n' },
     ]} />);
 
     const terminal = screen.getByRole('log', { name: 'Finding reproduction output' });
     expect(terminal).toHaveTextContent('AddressSanitizer: heap-buffer-overflow');
-    expect(terminal).toHaveTextContent('Completed');
+    expect(terminal).toHaveTextContent('decoder.c:36');
+    expect(terminal).toHaveTextContent('Completed: exited (exit 1)');
     expect(terminal).toHaveAttribute('aria-live', 'polite');
     expect(terminal.querySelector('input, textarea, [contenteditable="true"]')).toBeNull();
+  });
+
+  it('renders a verified emulator cleanup timeout as reproduced with a caveat', () => {
+    render(<ReproductionTerminal run={{
+      ...run,
+      phase: 'timed_out',
+      terminal_reason: 'AddressSanitizer crash reproduced; emulator cleanup timed out',
+      sanitizer_crash_observed: true,
+    }} output={[
+      { stream: 'stderr', text: 'ERROR: AddressSanitizer: stack-buffer-overflow at decoder.c:36\n' },
+    ]} />);
+
+    expect(screen.getByText('Reproduced')).toBeInTheDocument();
+    expect(screen.getByRole('log')).toHaveTextContent(
+      'Reproduced: AddressSanitizer crash reproduced; emulator cleanup timed out',
+    );
+    expect(screen.getByText('AddressSanitizer crash reproduced; emulator cleanup timed out')).toBeInTheDocument();
+  });
+
+  it('keeps an unverified timeout as a failure', () => {
+    render(<ReproductionTerminal run={{
+      ...run, phase: 'timed_out', terminal_reason: 'reproduction timed out',
+    }} output={[]} />);
+
+    expect(screen.getAllByText(/Timed out/).length).toBeGreaterThan(0);
+    expect(screen.queryByText('Reproduced')).not.toBeInTheDocument();
   });
 
   it('starts one run and appends output and terminal lifecycle from SSE', async () => {

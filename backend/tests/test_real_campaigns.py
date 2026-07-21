@@ -308,6 +308,7 @@ def test_real_linux_amd64_probe_uses_the_application_sanitizer_runtime(tmp_path:
     from backend.fuzzing.docker.container_runner import ContainerRunner
     from backend.fuzzing.docker.image_builder import ImageBuilder
     from backend.fuzzing.docker.image_inspector import ImageInspector
+    from backend.fuzzing.sanitizer_environment import BASELINE_SANITIZER_ENVIRONMENT
     from backend.fuzzing.toolchain.builder import ToolchainBuilder
 
     client = _docker_client()
@@ -500,6 +501,7 @@ def test_real_system_and_component_campaigns_run_concurrently_and_clean_up(tmp_p
     )
     from backend.fuzzing.coverage.llvm_coverage import DockerCoverageExecutor, LlvmCoverage
     from backend.fuzzing.coverage.replay_verifier import ResolvedCoverageTarget
+    from backend.fuzzing.crashes.fingerprint import failure_signature
     from backend.fuzzing.crashes.minimisation import CrashMinimiser
     from backend.fuzzing.crashes.quarantine import CrashObservation, CrashQuarantine
     from backend.fuzzing.crashes.triage import CrashPipeline
@@ -612,6 +614,38 @@ def test_real_system_and_component_campaigns_run_concurrently_and_clean_up(tmp_p
         assert libfuzzer_stats.execution_count > 0 and libfuzzer_stats.corpus_count > 1
         assert system_identity.container_id != component_identity.container_id
         assert component_path.joinpath("corpus").is_dir()
+
+        afl_crashes = _wait_for(
+            "two AFL++-retained coverage-distinct crashes",
+            lambda: _regular_files(
+                system_path / "output" / "main" / "crashes", ignored={"README.txt"}, minimum=2,
+            ),
+            timeout=60.0,
+        )
+        assert len({sha256(path.read_bytes()).hexdigest() for path in afl_crashes}) >= 2
+        crash_replayer = DockerCrashReplayExecutor(client, workspace, timeout_seconds=10)
+        replayed_crashes = []
+        for crash_path in afl_crashes[:2]:
+            content = crash_path.read_bytes()
+            replayed = asyncio.run(crash_replayer.replay(CrashObservation(
+                project_id=PROJECT_ID,
+                campaign_id=system_campaign_id,
+                commit_sha=COMMIT,
+                engine="afl",
+                image_id=system_image,
+                target_asset_id=91001,
+                sanitizer="address+undefined",
+                command=(
+                    "/opt/bigeye/bigeye_system_fixture", "--mode", "plain",
+                    "--file", "/bigeye/input/crash",
+                ),
+                input_bytes=content,
+                input_mode="file",
+            ), content, "original"))
+            assert replayed.crashed is True
+            replayed_crashes.append(replayed)
+        assert len({failure_signature(result) for result in replayed_crashes}) == 1
+        assert len({result.source_location for result in replayed_crashes}) == 1
 
         coverage_target = ResolvedCoverageTarget(
             id=system_campaign_id,
@@ -906,3 +940,16 @@ def _first_regular_file(directory: Path):
         if path.is_file() and not path.is_symlink() and path.stat().st_size <= 16 * 1024 * 1024:
             return path
     return None
+
+
+def _regular_files(
+    directory: Path, *, ignored: set[str], minimum: int,
+) -> tuple[Path, ...] | None:
+    if not directory.is_dir() or directory.is_symlink():
+        return None
+    values = tuple(
+        path for path in sorted(directory.iterdir(), key=lambda item: item.name)
+        if path.name not in ignored and path.is_file() and not path.is_symlink()
+        and path.stat().st_size <= 16 * 1024 * 1024
+    )
+    return values if len(values) >= minimum else None

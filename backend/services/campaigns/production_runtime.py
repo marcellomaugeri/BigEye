@@ -9,6 +9,7 @@ import inspect
 import json
 import os
 from pathlib import Path
+import shlex
 import stat
 from hashlib import sha256
 import math
@@ -29,6 +30,7 @@ from backend.fuzzing.campaigns.coverage_contract import (
     valid_replay_environment,
 )
 from backend.fuzzing.campaigns.probe import canonical_probe_replay_command
+from backend.fuzzing.campaigns.strategy_identity import proposal_strategy_identity
 from backend.fuzzing.campaigns.recovery import (
     CampaignRecovery,
     RecoverableCampaign,
@@ -52,6 +54,7 @@ from backend.fuzzing.engines.contracts import ContainerInvocation
 from backend.fuzzing.coverage.overlap import OverlapAnalyzer
 from backend.services.campaigns.production_progression import ProductionProgression
 from backend.services.campaigns.wake_rules import CampaignSnapshot
+from backend.services.observability.redaction import redact
 from backend.services.projects.clone_repository import contained_path
 
 
@@ -302,6 +305,83 @@ class CampaignInvocationStore:
         if contract.project_id != project_id:
             raise ValueError("campaign clean-coverage contract belongs to another project")
         return contract
+
+    def load_strategy(self, project_id: int, campaign_id: int) -> dict[str, object]:
+        content = self._read_config(project_id, campaign_id, "strategy.json")
+        try:
+            document = json.loads(content)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("campaign strategy contract file is invalid") from error
+        required = {
+            "proposal_identity", "instance_type", "engine", "argv", "seed_set",
+            "target", "configuration", "coverage", "commit_sha",
+        }
+        if (
+            not isinstance(document, dict) or not required.issubset(document)
+            or not isinstance(document["proposal_identity"], str)
+            or len(document["proposal_identity"]) != 64
+            or any(character not in "0123456789abcdef" for character in document["proposal_identity"])
+            or document["engine"] not in {"afl", "libfuzzer"}
+            or document["instance_type"] not in {"system-level", "component-level"}
+            or not isinstance(document["argv"], list)
+            or not isinstance(document["seed_set"], list)
+            or document["commit_sha"] == ""
+        ):
+            raise ValueError("campaign strategy contract file is invalid")
+        return document
+
+    async def publish_strategy(
+        self, project_id: int, campaign_id: int, commit_sha: str, record, prepared,
+        invocation: ContainerInvocation,
+    ) -> None:
+        target_labels = getattr(getattr(prepared, "target_manifest", None), "labels", {})
+        coverage_manifest = getattr(prepared, "coverage_manifest", None)
+        coverage_labels = getattr(coverage_manifest, "labels", {})
+        assets = {getattr(asset, "id", None): asset for asset in getattr(prepared, "assets", ())}
+        try:
+            target_id = int(target_labels["bigeye.target-asset"])
+            configuration_id = int(coverage_labels["bigeye.configuration-asset-id"])
+            coverage_id = int(coverage_labels["bigeye.coverage-asset-id"])
+            target_asset = assets[target_id]
+            configuration_asset = assets[configuration_id]
+            coverage_asset = assets[coverage_id]
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("prepared strategy asset provenance is incomplete") from error
+        seeds = sorted({
+            probe.testcase_sha256 for probe in getattr(prepared, "probe_invocations", ())
+            if getattr(probe, "role", None) == "seed"
+        })
+        proposal = record.proposal
+        document = {
+            "proposal_identity": proposal_strategy_identity(proposal),
+            "instance_type": proposal.instance_type,
+            "engine": invocation.engine,
+            "argv": list(shlex.split(proposal.run_command, posix=True)),
+            "seed_set": seeds,
+            "target": {"asset_id": target_id, "content_sha256": target_asset.content_hash},
+            "configuration": {
+                "asset_id": configuration_id,
+                "content_sha256": configuration_asset.content_hash,
+            },
+            "coverage": {
+                "asset_id": coverage_id,
+                "content_sha256": coverage_asset.content_hash,
+                "clean_image_id": getattr(prepared, "coverage_image_id", ""),
+                "clean_content_sha256": getattr(coverage_manifest, "content_hash", ""),
+            },
+            "commit_sha": commit_sha,
+        }
+        encoded = json.dumps(
+            document, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > _MAX_INVOCATION_BYTES:
+            raise ValueError("campaign strategy contract exceeds its size limit")
+        with self._workspace.open_campaign(project_id, campaign_id, create=True) as campaign:
+            config = self._open_directory(campaign.descriptor, "config")
+            try:
+                self._publish_exact(config, "strategy.json", encoded)
+            finally:
+                os.close(config)
 
     async def publish_coverage(
         self, project_id: int, campaign_id: int, commit_sha: str, prepared,
@@ -1059,6 +1139,7 @@ class RepositoryCampaignRuntime:
         self, *, tasks, assets, campaigns, discovery, containers, events=None, clock=None,
         exposure=None, coverage_history=None, overlap=None, invocations=None,
         cpu_counters=None, crash_groups=None, campaign_contexts=None,
+        finding_artifacts=None,
         monitor_interval_seconds: float = 5.0,
         evidence_processor=None,
         artifact_state=None,
@@ -1086,6 +1167,7 @@ class RepositoryCampaignRuntime:
         self._invocations = invocations
         self._cpu_counters = cpu_counters
         self._crash_groups = crash_groups
+        self._finding_artifacts = finding_artifacts
         self._campaign_contexts = campaign_contexts
         self._monitor_interval_seconds = float(monitor_interval_seconds)
         self._evidence_processor = evidence_processor
@@ -1105,6 +1187,13 @@ class RepositoryCampaignRuntime:
         self._progression_records: dict[int, tuple[ProgressionActionRecord, ...]] = {}
 
     async def reconcile(self, project) -> CampaignSnapshot:
+        return await self._reconcile(project, process_artifacts=True)
+
+    async def reconcile_for_review(self, project) -> CampaignSnapshot:
+        """Refresh live campaign strategy without delaying a due manager on artifact replay."""
+        return await self._reconcile(project, process_artifacts=False)
+
+    async def _reconcile(self, project, *, process_artifacts: bool) -> CampaignSnapshot:
         tasks, assets, campaigns = await asyncio.gather(
             self._tasks.list_for_project(project.id),
             self._assets.list_for_project(project.id),
@@ -1146,7 +1235,7 @@ class RepositoryCampaignRuntime:
         processing_corpus = False
         processing_crashes = False
         processing_failures: set[int] = set()
-        if self._evidence_processor is not None:
+        if process_artifacts and self._evidence_processor is not None:
             from backend.services.campaigns.production_evidence import CampaignProcessingResult
 
             campaign_by_id = {campaign.id: campaign for campaign in campaigns}
@@ -1166,11 +1255,14 @@ class RepositoryCampaignRuntime:
                         raise TypeError("campaign evidence processor returned an invalid result")
                 except Exception as error:
                     processing_failures.add(campaign.id)
+                    diagnostic = str(redact(str(error).strip() or type(error).__name__))[:500]
                     processing_evidence.append({
                         "evidence_id": f"campaign-processing-error:{campaign.id}:{type(error).__name__}",
+                        "kind": "campaign_processing_error",
                         "project_id": project.id,
                         "campaign_id": campaign.id,
                         "error_type": type(error).__name__,
+                        "error": diagnostic,
                         "provenance": "deterministic_campaign_artifact_processing",
                         "trusted_instructions": False,
                     })
@@ -1179,6 +1271,7 @@ class RepositoryCampaignRuntime:
                             "event": "campaign.artifact_processing_failed",
                             "campaign_id": campaign.id,
                             "error_type": type(error).__name__,
+                            "error": diagnostic,
                         })
                     continue
                 processing_corpus = result.corpus_opportunity or processing_corpus
@@ -1235,6 +1328,10 @@ class RepositoryCampaignRuntime:
             "trusted_instructions": False,
         } for campaign_id, value in sorted(contexts.items()))
         repository_evidence = tuple(self._discovery.evidence(project.id))
+        strategy_evidence = self._strategy_inventory(
+            project, campaigns, assets, observation, repository_evidence,
+        )
+        finding_evidence = await self._finding_inventory(project)
         progression_evidence: list[dict] = []
         progression_actions: dict[str, object] = {}
         progression_records: list[ProgressionActionRecord] = []
@@ -1284,13 +1381,15 @@ class RepositoryCampaignRuntime:
                     ))
         self._progression_actions[project.id] = progression_actions
         self._progression_records[project.id] = tuple(progression_records)
-        evidence = (
-            tuple(processing_evidence)
+        evidence = _unique_evidence((
+            strategy_evidence
+            + finding_evidence
+            + tuple(processing_evidence)
             + tuple(progression_evidence)
             + repository_evidence
             + context_evidence
             + observation.evidence
-        )
+        ))
         if len(evidence) > _MAX_REVIEW_EVIDENCE:
             evidence = evidence[:_MAX_REVIEW_EVIDENCE]
         self._review_evidence[project.id] = evidence
@@ -1326,6 +1425,158 @@ class RepositoryCampaignRuntime:
                 }
             ),
         )
+
+    def _strategy_inventory(
+        self, project, campaigns, assets, observation, repository_evidence,
+    ) -> tuple[dict, ...]:
+        if self._invocations is None or not hasattr(self._invocations, "load_strategy"):
+            return ()
+        assets_by_id = {asset.id: asset for asset in assets}
+        progress = {item.campaign_id: item for item in observation.progress}
+        active_ids = set(observation.active_campaign_ids)
+        strategies = []
+        for campaign in sorted(campaigns, key=lambda item: item.id):
+            try:
+                contract = self._invocations.load_strategy(project.id, campaign.id)
+            except FileNotFoundError:
+                continue
+            target = assets_by_id.get(campaign.target_asset_id)
+            configuration = assets_by_id.get(campaign.configuration_asset_id)
+            current = progress.get(campaign.id)
+            has_evidence = bool(
+                current is not None and (
+                    current.queue_files > 0 or current.crash_files > 0
+                    or current.executions > 0 or current.cpu_seconds > 0
+                )
+                or float(getattr(campaign, "cpu_seconds", 0.0)) > 0
+            )
+            if campaign.id in active_ids and campaign.stopped_at is None:
+                activity = "working"
+            elif campaign.stopped_at is None:
+                activity = "preparing"
+            elif has_evidence:
+                activity = "stopped-with-evidence"
+            else:
+                activity = "stopped-without-evidence"
+            strategies.append({
+                "campaign_id": campaign.id,
+                "logical_target_identity": contract["proposal_identity"],
+                "instance_type": contract["instance_type"],
+                "engine": campaign.engine,
+                "argv": contract["argv"],
+                "configuration": {
+                    **contract["configuration"],
+                    "persisted_content_sha256": getattr(configuration, "content_hash", None),
+                },
+                "seed_set": contract["seed_set"],
+                "coverage": contract["coverage"],
+                "target": {
+                    **contract["target"],
+                    "persisted_content_sha256": getattr(target, "content_hash", None),
+                },
+                "activity": activity,
+                "queue_files": current.queue_files if current is not None else 0,
+                "crash_files": current.crash_files if current is not None else 0,
+            })
+        retained = tuple(
+            item for item in strategies
+            if item["activity"] in {"working", "preparing", "stopped-with-evidence"}
+        )[:32]
+        if not retained:
+            return ()
+        repository_inventory = next((
+            item.get("inventory", {}) for item in repository_evidence
+            if item.get("kind") == "repository_inventory"
+        ), {})
+        component_surface = bool(
+            repository_inventory.get("libraries")
+            and repository_inventory.get("public_headers")
+        )
+        system_surface = bool(repository_inventory.get("executables"))
+        retained_types = {item["instance_type"] for item in retained}
+        component_gap = (
+            component_surface
+            and "system-level" in retained_types
+            and "component-level" not in retained_types
+        )
+        system_gap = (
+            system_surface
+            and "component-level" in retained_types
+            and "system-level" not in retained_types
+        )
+        digest = sha256(json.dumps(
+            retained, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        return ({
+            "evidence_id": f"campaign-strategy-inventory:{project.id}:{digest}",
+            "kind": "campaign_strategy_inventory",
+            "commit_sha": project.commit_sha,
+            "strategies": list(retained),
+            "component_surface": component_surface,
+            "system_surface": system_surface,
+            "component_gap": component_gap,
+            "system_gap": system_gap,
+            "required_next_instance_type": (
+                "component-level" if component_gap
+                else "system-level" if system_gap
+                else None
+            ),
+            "provenance": "persisted_campaign_strategy_contracts",
+            "trusted_instructions": False,
+        },)
+
+    async def _finding_inventory(self, project) -> tuple[dict, ...]:
+        list_findings = getattr(self._crash_groups, "list_for_project", None)
+        if list_findings is None or self._finding_artifacts is None:
+            return ()
+        findings = await _await(list_findings(project.id))
+        if not isinstance(findings, (tuple, list)) or len(findings) > 100:
+            raise ValueError("project finding inventory is invalid or exceeds its bound")
+        evidence = []
+        for finding in findings[:32]:
+            detail = await _await(self._finding_artifacts.detail(finding))
+            if not isinstance(detail, dict):
+                raise TypeError("persisted finding detail is invalid")
+            retained = {
+                "reproducer": detail.get("reproducer"),
+                "replay": detail.get("replay"),
+                "minimisation": detail.get("minimisation"),
+                "grouping": detail.get("grouping"),
+                "correction": detail.get("correction"),
+                "source_evidence_ids": detail.get("evidence_ids", ()),
+            }
+            digest = sha256(json.dumps(
+                retained, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()[:24]
+            replay_evidence_id = f"finding-replay:{finding.fingerprint}:{digest}"
+            evidence.extend((
+                {
+                    "evidence_id": f"finding:{finding.fingerprint}",
+                    "kind": "finalized_finding",
+                    "project_id": project.id,
+                    "finding_id": finding.id,
+                    "fingerprint": finding.fingerprint,
+                    "classification": finding.classification,
+                    "description": finding.description,
+                    "reproducible": finding.reproducible,
+                    "occurrence_count": finding.occurrence_count,
+                    "retained_replay_evidence_id": replay_evidence_id,
+                    "provenance": "persisted_finding_database",
+                    "trusted_instructions": False,
+                },
+                {
+                    "evidence_id": replay_evidence_id,
+                    "kind": "finding_replay_evidence",
+                    "project_id": project.id,
+                    "fingerprint": finding.fingerprint,
+                    **retained,
+                    "repair_intent": detail.get("repair_intent"),
+                    "uncertainty": detail.get("uncertainty"),
+                    "provenance": "persisted_finding_artifacts",
+                    "trusted_instructions": False,
+                },
+            ))
+        return tuple(evidence)
 
     async def review_context(self, project, _snapshot: CampaignSnapshot) -> AgentContext:
         context = self._discovery.context(project.id)
@@ -1654,6 +1905,18 @@ class RepositoryCampaignRuntime:
 
 async def _await(value):
     return await value if inspect.isawaitable(value) else value
+
+
+def _unique_evidence(values) -> tuple[dict, ...]:
+    unique = []
+    seen = set()
+    for item in values:
+        evidence_id = item.get("evidence_id") if isinstance(item, dict) else None
+        if not isinstance(evidence_id, str) or evidence_id in seen:
+            continue
+        seen.add(evidence_id)
+        unique.append(item)
+    return tuple(unique)
 
 
 def _progression_invocation(

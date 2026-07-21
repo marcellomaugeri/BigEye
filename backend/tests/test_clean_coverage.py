@@ -29,10 +29,15 @@ class _CoverageExecutor:
     def __init__(self, exports: dict[str, dict], sources: dict[str, bytes] | None = None):
         self.exports = exports
         self.sources = sources or {}
-        self.calls: list[tuple[str, tuple[str, ...], dict[str, str], Path, Path | None]] = []
+        self.calls: list[tuple[str, tuple[str, ...], dict[str, str], Path, Path | None, int]] = []
 
-    def run(self, image_id, command, environment, profile_directory, input_file=None):
-        self.calls.append((image_id, command, environment, profile_directory, input_file))
+    def run(
+        self, image_id, command, environment, profile_directory, input_file=None,
+        *, project_id=0,
+    ):
+        self.calls.append((
+            image_id, command, environment, profile_directory, input_file, project_id,
+        ))
         if "LLVM_PROFILE_FILE" in environment:
             profile = Path(environment["LLVM_PROFILE_FILE"].replace("%p", "123")).name
             destination = profile_directory / profile
@@ -280,6 +285,7 @@ def test_replay_uses_unique_profiles_exact_tools_and_only_clean_project_source(t
     assert sum(command[0] == "llvm-cov-18" for command in commands) == 3
     assert [command for command in commands if command[0] == "cat"] == [("cat", "/src/src/a.c")]
     assert all(not isinstance(command, str) for command in commands)
+    assert {call[5] for call in executor.calls} == {7}
     assert {(line.source_path, line.line_number) for line in snapshot.lines} == {("src/a.c", 12)}
     assert len(snapshot.hits) == 1
     assert snapshot.hits[0].testcase == b"first"
@@ -358,7 +364,7 @@ def test_docker_executor_is_isolated_and_returns_stdout_only(tmp_path: Path):
     client = SimpleNamespace(containers=containers)
 
     result = DockerCoverageExecutor(client, timeout_seconds=30).run(
-        CLEAN_IMAGE_ID, ("llvm-cov-18", "export"), {}, tmp_path
+        CLEAN_IMAGE_ID, ("llvm-cov-18", "export"), {}, tmp_path, project_id=7,
     )
 
     assert result == b"result"
@@ -370,6 +376,17 @@ def test_docker_executor_is_isolated_and_returns_stdout_only(tmp_path: Path):
     assert created["cap_drop"] == ["ALL"]
     assert created["user"] == f"{__import__('os').getuid()}:{__import__('os').getgid()}"
     assert created["detach"] is True
+    from backend.fuzzing.docker.container_runner import (
+        ContainerRunner,
+        ephemeral_container_identity,
+    )
+    run_id = created["labels"]["com.bigeye.ephemeral.run_id"]
+    expected_identity = ephemeral_container_identity(run_id, "clean-coverage", 7)
+    assert created["name"] == expected_identity["name"]
+    assert created["labels"] == expected_identity["labels"]
+    assert ContainerRunner._is_exact_ephemeral(SimpleNamespace(
+        name=created["name"], labels=created["labels"],
+    )) is True
 
     with pytest.raises(ValueError, match="shell"):
         DockerCoverageExecutor(client, timeout_seconds=30).run(
@@ -423,6 +440,62 @@ def test_docker_executor_reports_only_bounded_classified_stderr_on_failure(tmp_p
     assert "must-not-be-reported" not in diagnostic
     assert len(diagnostic) < 300
     assert container.removed is True
+
+
+def test_docker_coverage_target_replay_accepts_afl_queue_application_rejection(tmp_path: Path):
+    """AFL retains coverage-increasing inputs even when the target returns one."""
+    from backend.fuzzing.coverage.llvm_coverage import DockerCoverageExecutor
+
+    class Container:
+        def start(self): pass
+        def wait(self, timeout): return {"StatusCode": 1}
+        def logs(self, **kwargs): return []
+        def remove(self, force): pass
+
+    client = SimpleNamespace(
+        containers=SimpleNamespace(create=lambda *_args, **_kwargs: Container()),
+    )
+    queue_input = tmp_path / "afl-queue-input"
+    queue_input.write_bytes(b"a")
+
+    assert DockerCoverageExecutor(client, timeout_seconds=30).run_target(
+        CLEAN_IMAGE_ID,
+        ("/opt/bigeye/build/decoder_cli", "/coverage/input"),
+        {"LLVM_PROFILE_FILE": "/coverage/profiles/input-000000-%p.profraw"},
+        tmp_path,
+        input_file=queue_input,
+    ) == b""
+
+
+@pytest.mark.parametrize("exit_code", [126, 127, 134, 139])
+def test_docker_coverage_target_replay_rejects_non_application_exit_codes(
+    tmp_path: Path, exit_code: int,
+):
+    from backend.fuzzing.coverage.llvm_coverage import (
+        CoverageIntegrityError,
+        DockerCoverageExecutor,
+    )
+
+    class Container:
+        def start(self): pass
+        def wait(self, timeout): return {"StatusCode": exit_code}
+        def logs(self, **kwargs): return []
+        def remove(self, force): pass
+
+    client = SimpleNamespace(
+        containers=SimpleNamespace(create=lambda *_args, **_kwargs: Container()),
+    )
+    queue_input = tmp_path / "afl-queue-input"
+    queue_input.write_bytes(b"a")
+
+    with pytest.raises(CoverageIntegrityError, match=f"exit {exit_code}"):
+        DockerCoverageExecutor(client, timeout_seconds=30).run_target(
+            CLEAN_IMAGE_ID,
+            ("/opt/bigeye/build/decoder_cli", "/coverage/input"),
+            {"LLVM_PROFILE_FILE": "/coverage/profiles/input-000000-%p.profraw"},
+            tmp_path,
+            input_file=queue_input,
+        )
 
 
 def test_docker_coverage_executor_feeds_exact_stdin_without_mounting_input(tmp_path: Path):
@@ -508,11 +581,17 @@ def test_llvm_coverage_stdin_replay_strips_marker_and_preserves_input_identity(t
     seed.write_bytes(b"\x00stdin-seed\xff")
 
     class Executor(_CoverageExecutor):
-        def run(self, image_id, command, environment, profile_directory, input_file=None, stdin_bytes=None):
+        def run(
+            self, image_id, command, environment, profile_directory, input_file=None,
+            stdin_bytes=None, *, project_id=0,
+        ):
             self.stdin_calls = getattr(self, "stdin_calls", [])
             if "LLVM_PROFILE_FILE" in environment:
                 self.stdin_calls.append((command, input_file, stdin_bytes))
-            return super().run(image_id, command, environment, profile_directory, input_file)
+            return super().run(
+                image_id, command, environment, profile_directory, input_file,
+                project_id=project_id,
+            )
 
     executor = Executor(
         {"input-000000": _export(), "merged": _export()},
@@ -1431,6 +1510,124 @@ def test_checkout_drift_after_async_replay_rolls_back_artifact(tmp_path: Path):
     assert list((tmp_path / "projects/7/coverage/first-hits").rglob("evidence.json")) == []
 
 
+def test_traceability_releases_database_claim_while_replay_is_awaited(tmp_path: Path):
+    from backend.fuzzing.coverage.traceability import TraceabilityService
+
+    checkout = tmp_path / "repository"
+    (checkout / "src").mkdir(parents=True)
+    (checkout / "src/a.c").write_text("x\n")
+
+    class Repository(_MemoryCoverageRepository):
+        def __init__(self):
+            super().__init__()
+            self.claim_active = False
+            self.claim_entries = 0
+
+        @asynccontextmanager
+        async def claim(self, **key):
+            self.claim_entries += 1
+            self.claim_active = True
+            try:
+                async with super().claim(**key) as claim:
+                    yield claim
+            finally:
+                self.claim_active = False
+
+    repository = Repository()
+
+    async def verifier(_request):
+        assert repository.claim_active is False
+        await asyncio.sleep(0)
+        assert repository.claim_active is False
+        return True
+
+    created = run(TraceabilityService(
+        tmp_path, repository, verifier, _Registry(checkout),
+    ).record(_snapshot(source_hash=sha256(b"x\n").hexdigest())))
+
+    assert len(created) == 1
+    assert repository.claim_entries == 2
+    assert repository.claim_active is False
+
+
+def test_timed_out_replay_releases_claim_abandons_artifact_and_can_recover(tmp_path: Path):
+    from backend.fuzzing.coverage.traceability import TraceabilityService
+
+    checkout = tmp_path / "repository"
+    (checkout / "src").mkdir(parents=True)
+    (checkout / "src/a.c").write_text("x\n")
+
+    class Repository(_MemoryCoverageRepository):
+        def __init__(self):
+            super().__init__()
+            self.claim_active = False
+
+        @asynccontextmanager
+        async def claim(self, **key):
+            self.claim_active = True
+            try:
+                async with super().claim(**key) as claim:
+                    yield claim
+            finally:
+                self.claim_active = False
+
+    repository = Repository()
+    async def verifier(_request):
+        assert repository.claim_active is False
+        await asyncio.Event().wait()
+
+    async def scenario():
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.02):
+                await TraceabilityService(
+                    tmp_path, repository, verifier, _Registry(checkout),
+                ).record(_snapshot(source_hash=sha256(b"x\n").hexdigest()))
+
+    run(scenario())
+
+    assert repository.claim_active is False
+    assert repository.rows == []
+    assert list((tmp_path / "projects/7/coverage/first-hits").rglob("evidence.json")) == []
+
+    recovered = run(TraceabilityService(
+        tmp_path, repository, lambda _request: True, _Registry(checkout),
+    ).record(_snapshot(source_hash=sha256(b"x\n").hexdigest())))
+
+    assert len(recovered) == 1
+    assert len(repository.rows) == 1
+
+
+def test_concurrent_recorders_remain_idempotent_across_replay_and_final_cas(tmp_path: Path):
+    from backend.fuzzing.coverage.traceability import TraceabilityService
+
+    checkout = tmp_path / "repository"
+    (checkout / "src").mkdir(parents=True)
+    (checkout / "src/a.c").write_text("x\n")
+    repository = _MemoryCoverageRepository()
+    both_replaying = asyncio.Event()
+    replay_count = 0
+
+    async def verifier(_request):
+        nonlocal replay_count
+        replay_count += 1
+        if replay_count == 2:
+            both_replaying.set()
+        await asyncio.wait_for(both_replaying.wait(), 1)
+        return True
+
+    async def scenario():
+        snapshot = _snapshot(source_hash=sha256(b"x\n").hexdigest())
+        first = TraceabilityService(tmp_path, repository, verifier, _Registry(checkout))
+        second = TraceabilityService(tmp_path, repository, verifier, _Registry(checkout))
+        return await asyncio.gather(first.record(snapshot), second.record(snapshot))
+
+    results = run(scenario())
+
+    assert sum(len(result) for result in results) == 1
+    assert len(repository.rows) == 1
+    assert len(list((tmp_path / "projects/7/coverage/first-hits").rglob("evidence.json"))) == 1
+
+
 def test_replay_rejects_mutated_input_and_unexpected_profile_output(tmp_path: Path):
     from backend.fuzzing.coverage.llvm_coverage import CoverageIntegrityError, LlvmCoverage
 
@@ -1441,8 +1638,14 @@ def test_replay_rejects_mutated_input_and_unexpected_profile_output(tmp_path: Pa
     seed.write_bytes(b"seed")
 
     class MutatingExecutor(_CoverageExecutor):
-        def run(self, image_id, command, environment, profile_directory, input_file=None):
-            result = super().run(image_id, command, environment, profile_directory, input_file)
+        def run(
+            self, image_id, command, environment, profile_directory, input_file=None,
+            *, project_id=0,
+        ):
+            result = super().run(
+                image_id, command, environment, profile_directory, input_file,
+                project_id=project_id,
+            )
             if input_file is not None:
                 input_file.chmod(0o600)
                 input_file.write_bytes(b"changed")
@@ -1452,8 +1655,14 @@ def test_replay_rejects_mutated_input_and_unexpected_profile_output(tmp_path: Pa
         LlvmCoverage(_client(), MutatingExecutor({}), tmp_path / "work").replay(_campaign(tmp_path), [seed])
 
     class ExtraOutputExecutor(_CoverageExecutor):
-        def run(self, image_id, command, environment, profile_directory, input_file=None):
-            result = super().run(image_id, command, environment, profile_directory, input_file)
+        def run(
+            self, image_id, command, environment, profile_directory, input_file=None,
+            *, project_id=0,
+        ):
+            result = super().run(
+                image_id, command, environment, profile_directory, input_file,
+                project_id=project_id,
+            )
             if environment:
                 (profile_directory / "unexpected").write_bytes(b"x")
             return result
@@ -1463,8 +1672,14 @@ def test_replay_rejects_mutated_input_and_unexpected_profile_output(tmp_path: Pa
         LlvmCoverage(_client(), ExtraOutputExecutor({}), tmp_path / "work2").replay(_campaign(tmp_path), [seed])
 
     class ReplacingProfileExecutor(_CoverageExecutor):
-        def run(self, image_id, command, environment, profile_directory, input_file=None):
-            result = super().run(image_id, command, environment, profile_directory, input_file)
+        def run(
+            self, image_id, command, environment, profile_directory, input_file=None,
+            *, project_id=0,
+        ):
+            result = super().run(
+                image_id, command, environment, profile_directory, input_file,
+                project_id=project_id,
+            )
             if command[0] == "llvm-profdata-18":
                 raw = next(profile_directory.glob("*.profraw"))
                 raw.write_bytes(b"replaced")

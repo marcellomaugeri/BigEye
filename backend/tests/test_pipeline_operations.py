@@ -426,6 +426,40 @@ def test_pipeline_cas_rejects_later_sibling_edit_before_any_adapter_side_effect(
     assert any(call.args[1] == "debug" for call in events.append.await_args_list)
 
 
+def test_pipeline_failure_records_original_error_and_emits_valid_manager_wake(tmp_path) -> None:
+    from backend.fuzzing.campaigns.target_preparation import TargetPreparationFailed
+    from backend.services.campaigns.pipeline_operations import PipelineOperationService
+    from backend.services.observability.event_store import ProjectEventStore
+
+    class FailingAdapter:
+        async def execute(self, _project, _record):
+            raise TargetPreparationFailed(
+                "asset script name is unsafe for a Dockerfile",
+                agent_attempts=("gpt-5.6-luna",), retained_target=None,
+            )
+
+    class UnusedAdapter:
+        async def execute(self, _project, _record):
+            raise AssertionError("unexpected adapter")
+
+    events = ProjectEventStore(tmp_path)
+    service = PipelineOperationService(
+        build=FailingAdapter(), probe=UnusedAdapter(), replay=UnusedAdapter(),
+        coverage=UnusedAdapter(), events=events,
+    )
+
+    with pytest.raises(TargetPreparationFailed, match="asset script name"):
+        run(service.execute(SimpleNamespace(id=7, commit_sha="a" * 40), record("build")))
+
+    debug = run(events.read(7, "debug", -1, 20))
+    operation = next(event.payload for event in debug if event.payload.get("event") == "pipeline.operation")
+    assert operation["status"] == "failed"
+    assert operation["error_type"] == "TargetPreparationFailed"
+    assert operation["error"] == "asset script name is unsafe for a Dockerfile"
+    invalidations = run(events.read(7, "events", -1, 20))
+    assert invalidations[-1].payload == {"name": "campaigns"}
+
+
 def test_manager_worker_result_exposes_pipeline_ids_without_audit_ids() -> None:
     from pathlib import Path
 

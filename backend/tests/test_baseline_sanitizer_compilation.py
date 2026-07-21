@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from backend.agents.prompts.fuzzing_worker import FUZZING_WORKER_PROMPT
+from backend.agents.tools.code_navigation import CodeNavigationError
 from backend.fuzzing.campaigns.production_factory import ProposalPreparationPlanner
 
 
@@ -68,6 +69,39 @@ def _generated_scripts(
         target.read_text(),
         coverage.read_text(),
     )
+
+
+@pytest.mark.parametrize(
+    ("seed_path", "message"),
+    [
+        ("missing.input", "repository file was not found"),
+        ("../outside.input", "path escapes the repository"),
+    ],
+)
+def test_preparation_preserves_exact_repository_seed_path_diagnostic(
+    tmp_path: Path, seed_path: str, message: str,
+) -> None:
+    project_root = tmp_path / "projects" / "7"
+    repository = project_root / "repository"
+    repository.mkdir(parents=True)
+    context = SimpleNamespace(
+        repository_root=repository,
+        generated_assets_root=project_root / "generated",
+    )
+    proposal = SimpleNamespace(
+        instance_type="system-level",
+        build_command="cmake --build /opt/bigeye/build --target parser",
+        run_command="/opt/bigeye/build/parser",
+        seeds=(SimpleNamespace(path=seed_path),),
+        generated_asset_intents=(),
+    )
+    planner = ProposalPreparationPlanner(
+        discovery=SimpleNamespace(context=lambda _project_id: context),
+        asset_store=AsyncMock(),
+    )
+
+    with pytest.raises(CodeNavigationError, match=message):
+        asyncio.run(planner.plan(SimpleNamespace(id=7), proposal))
 
 
 def test_concurrent_proposals_publish_from_distinct_immutable_preparation_sources(
@@ -328,6 +362,8 @@ def test_dynamic_worker_receives_the_supported_explicit_cmake_form() -> None:
     assert "project -D options" in prompt
     assert "&& cmake --build" in prompt
     assert "direct Clang or GCC" in prompt
+    assert "bare supported compiler name" in prompt
+    assert "never an absolute compiler path" in prompt
     assert "Do not use make, Ninja, a script" in prompt
 
 
@@ -338,11 +374,11 @@ def test_system_target_uses_afl_compilers_and_baseline_sanitizers(tmp_path) -> N
     assert "export CXX=afl-clang-fast++\n" in target
     assert (
         'export CFLAGS="-fsanitize=address,undefined '
-        '-fno-omit-frame-pointer"\n'
+        '-fno-omit-frame-pointer -gline-tables-only"\n'
     ) in target
     assert (
         'export CXXFLAGS="-fsanitize=address,undefined '
-        '-fno-omit-frame-pointer"\n'
+        '-fno-omit-frame-pointer -gline-tables-only"\n'
     ) in target
     assert 'export LDFLAGS="-fsanitize=address,undefined"\n' in target
     assert "fuzzer-no-link" not in target
@@ -836,6 +872,33 @@ def test_versioned_direct_compiler_is_rewritten(
     )
 
 
+def test_direct_link_creates_its_contained_output_parent_before_compilation(tmp_path) -> None:
+    target, _coverage = _generated_scripts(
+        tmp_path,
+        instance_type="component-level",
+        build_command=(
+            "clang -I/src/include /src/src/decoder.c "
+            "/opt/bigeye/generated-assets/decoder_fuzz.c "
+            "-o /opt/bigeye/build/decoder_fuzz"
+        ),
+    )
+
+    lines = target.splitlines()
+    compile_index = next(
+        index for index, line in enumerate(lines) if line.startswith("clang-18 ")
+    )
+    assert lines[compile_index - 1] == "mkdir -p -- /opt/bigeye/build"
+
+
+def test_direct_link_rejects_output_outside_the_contained_bigeye_root(tmp_path) -> None:
+    with pytest.raises(ValueError, match="contained /opt/bigeye"):
+        _generated_scripts(
+            tmp_path,
+            instance_type="component-level",
+            build_command="clang harness.c -o /tmp/decoder_fuzz",
+        )
+
+
 def test_real_cmake_reconfiguration_compiles_and_links_with_system_policy(tmp_path) -> None:
     cmake, clang, clangxx = _host_cmake_and_clang()
     source = tmp_path / "source"
@@ -1025,7 +1088,7 @@ def test_system_direct_clang_link_is_rewritten_with_explicit_instrumentation(tmp
 
     assert target.splitlines()[-1] == (
         "afl-clang-fast++ -fsanitize=address,undefined "
-        "-fno-omit-frame-pointer harness.cc -o /opt/bigeye/fuzz-target"
+        "-fno-omit-frame-pointer -gline-tables-only harness.cc -o /opt/bigeye/fuzz-target"
     )
 
 
@@ -1036,11 +1099,11 @@ def test_component_target_compiles_with_clang_and_links_libfuzzer(tmp_path) -> N
     assert "export CXX=clang++-18\n" in target
     assert (
         'export CFLAGS="-fsanitize=fuzzer-no-link,address,undefined '
-        '-fno-omit-frame-pointer"\n'
+        '-fno-omit-frame-pointer -gline-tables-only"\n'
     ) in target
     assert (
         'export CXXFLAGS="-fsanitize=fuzzer-no-link,address,undefined '
-        '-fno-omit-frame-pointer"\n'
+        '-fno-omit-frame-pointer -gline-tables-only"\n'
     ) in target
     assert 'export LDFLAGS="-fsanitize=fuzzer,address,undefined"\n' in target
 
@@ -1054,7 +1117,7 @@ def test_component_direct_clang_link_keeps_libfuzzer_link_instrumentation(tmp_pa
 
     assert target.splitlines()[-1] == (
         "clang++-18 -fsanitize=fuzzer,address,undefined "
-        "-fno-omit-frame-pointer harness.cc -o /opt/bigeye/fuzz-target"
+        "-fno-omit-frame-pointer -gline-tables-only harness.cc -o /opt/bigeye/fuzz-target"
     )
 
 
@@ -1067,7 +1130,7 @@ def test_component_direct_compile_uses_fuzzer_no_link_instrumentation(tmp_path) 
 
     assert target.splitlines()[-1] == (
         "clang++-18 -fsanitize=fuzzer-no-link,address,undefined "
-        "-fno-omit-frame-pointer -c harness.cc -o harness.o"
+        "-fno-omit-frame-pointer -gline-tables-only -c harness.cc -o harness.o"
     )
 
 

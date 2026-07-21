@@ -5,6 +5,20 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from types import MappingProxyType
+
+
+class ProjectCapacityUnavailable(RuntimeError):
+    """A heavy job was not started because its project has no free worker slot."""
+
+    def __init__(self, ledger: "_ProjectLedger"):
+        super().__init__("project compilation capacity is unavailable")
+        self.failure_detail = MappingProxyType({
+            "phase": "compilation-admission",
+            "capacity_limit": ledger.limit,
+            "occupied_slots": ProjectExecutionSlots._occupied(ledger),
+            "running_campaign_ids": tuple(sorted(ledger.running_campaign_ids)),
+        })
 
 
 @dataclass(frozen=True)
@@ -103,7 +117,7 @@ class ProjectExecutionSlots:
 
     @asynccontextmanager
     async def compilation(self, project, operation_id: str):
-        """Reserve one heavy-job slot and allow atomic promotion to a running fuzzer."""
+        """Reserve a free heavy-job slot without waiting on manager-owned capacity."""
         project_id = await self._ensure_initial_limit(project)
         if (
             not isinstance(operation_id, str) or not operation_id.strip()
@@ -114,7 +128,8 @@ class ProjectExecutionSlots:
         async with ledger.condition:
             if operation_id in ledger.compilations:
                 raise ValueError("compilation operation ID is already active")
-            await ledger.condition.wait_for(lambda: self._available(ledger))
+            if not self._available(ledger):
+                raise ProjectCapacityUnavailable(ledger)
             ledger.compilations[operation_id] = None
         lease = _CompilationLease(self, project_id, operation_id)
         try:
@@ -193,11 +208,15 @@ class ProjectExecutionSlots:
 
     @staticmethod
     def _available(ledger: _ProjectLedger) -> bool:
+        return ProjectExecutionSlots._occupied(ledger) < ledger.limit
+
+    @staticmethod
+    def _occupied(ledger: _ProjectLedger) -> int:
         return (
             len(ledger.compilations)
             + len(ledger.pending_starts)
             + len(ledger.running_campaign_ids)
-        ) < ledger.limit
+        )
 
     @staticmethod
     async def _notify(ledger: _ProjectLedger) -> None:

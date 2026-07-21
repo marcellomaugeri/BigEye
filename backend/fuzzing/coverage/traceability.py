@@ -164,32 +164,44 @@ class TraceabilityService:
                 ) as claim:
                     if claim.existing is not None:
                         continue
-                    retained = self._publish(snapshot, hit, source_hash)
-                    attempt_active = True
-                    self._require_retained(retained)
-                    verification = self._verification(snapshot, hit, retained)
-                    if self._replay_verifier is None:
-                        raise CoverageIntegrityError("coverage replay verifier is not configured")
-                    outcome = self._replay_verifier(verification)
-                    if inspect.isawaitable(outcome):
-                        outcome = await outcome
-                    if outcome is not True:
-                        raise CoverageIntegrityError("retained testcase did not reproduce the source line")
-                    await self._checkouts.verify(checkout)
-                    self._require_retained(retained)
-                    evidence = await claim.create(
-                        function_name=line.function_name,
-                        campaign_id=snapshot.campaign_id,
-                        first_testcase_sha256=hit.testcase_sha256,
-                        cpu_exposure_seconds=0.0,
-                    )
-                    won = getattr(claim, "created", True) is True
-                    if won:
-                        await self._checkouts.verify(checkout)
-                        self._require_retained(retained)
+                # The initial claim transaction is deliberately complete before filesystem
+                # publication and Docker replay. A second short claim performs the final
+                # unique-key CAS after deterministic verification.
+                retained = self._publish(snapshot, hit, source_hash)
+                attempt_active = retained.created
+                self._require_retained(retained)
+                verification = self._verification(snapshot, hit, retained)
+                if self._replay_verifier is None:
+                    raise CoverageIntegrityError("coverage replay verifier is not configured")
+                outcome = self._replay_verifier(verification)
+                if inspect.isawaitable(outcome):
+                    outcome = await outcome
+                if outcome is not True:
+                    raise CoverageIntegrityError("retained testcase did not reproduce the source line")
+                await self._checkouts.verify(checkout)
+                self._require_retained(retained)
+                async with self._repository.claim(
+                    project_id=snapshot.project_id,
+                    commit_sha=snapshot.commit_sha,
+                    source_path=source_path,
+                    line_number=hit.line_number,
+                    asset_id=snapshot.strategy_asset_id,
+                ) as claim:
+                    if claim.existing is not None:
+                        evidence = claim.existing
+                        won = False
                     else:
-                        self._remove_attempt(retained)
-                        attempt_active = False
+                        evidence = await claim.create(
+                            function_name=line.function_name,
+                            campaign_id=snapshot.campaign_id,
+                            first_testcase_sha256=hit.testcase_sha256,
+                            cpu_exposure_seconds=0.0,
+                        )
+                        won = getattr(claim, "created", True) is True
+                if not won:
+                    # A concurrent recorder completed the same durable identity first. Its
+                    # immutable artifact may be the one just replayed, so never remove it.
+                    attempt_active = False
             except BaseException:
                 if retained is not None and attempt_active:
                     self._remove_attempt(retained)
@@ -420,9 +432,21 @@ class TraceabilityService:
             if existing is not None:
                 try:
                     self._require_files(existing, testcase_name, hit.testcase, metadata_name, metadata_content)
-                finally:
+                    details = os.fstat(existing)
+                    testcase_identity = _file_identity(os.stat(
+                        testcase_name, dir_fd=existing, follow_symlinks=False,
+                    ))
+                    metadata_identity = _file_identity(os.stat(
+                        metadata_name, dir_fd=existing, follow_symlinks=False,
+                    ))
+                    return _RetainedHit(
+                        parent, existing, logical, parent_path / logical,
+                        (details.st_dev, details.st_ino), testcase_name, metadata_name,
+                        testcase_identity, metadata_identity, hit.testcase, metadata_content, False,
+                    )
+                except BaseException:
                     os.close(existing)
-                self._remove_orphan(parent, logical, testcase_name, metadata_name)
+                    raise
             staging = f".{logical}.staging-{uuid4().hex}"
             os.mkdir(staging, 0o700, dir_fd=parent)
             staging_fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)

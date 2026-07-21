@@ -7,16 +7,14 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from hashlib import sha256
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shlex
 import shutil
 from tempfile import mkdtemp
 
 from backend.agents.tools.code_navigation import (
-    _open_contained_file,
-    _opened_repository_root,
-    _relative_parts,
+    read_repository_bytes,
 )
 from backend.agents.tools.generated_assets import (
     GeneratedAssetError,
@@ -469,13 +467,13 @@ class _ProjectBoundPreparation:
 def _application_file(context, relative_path: str, content: str) -> tuple[Path, str]:
     digest = sha256(content.encode("utf-8")).hexdigest()
     try:
-        existing = read_asset_file(context, relative_path)
+        existing = read_asset_file(context, relative_path, _allow_reserved=True)
     except GeneratedAssetError:
         try:
-            write_asset_file(context, relative_path, content, None)
+            write_asset_file(context, relative_path, content, None, _allow_reserved=True)
         except GeneratedAssetError as error:
             try:
-                concurrent = read_asset_file(context, relative_path)
+                concurrent = read_asset_file(context, relative_path, _allow_reserved=True)
             except GeneratedAssetError:
                 raise error
             if concurrent["content"] != content:
@@ -552,7 +550,7 @@ def _build_script(command: str, *, instance_type: str, coverage: bool) -> str:
         if component
         else "-fsanitize=address,undefined"
     )
-    compile_flags = f"{compile_sanitizers} -fno-omit-frame-pointer"
+    compile_flags = f"{compile_sanitizers} -fno-omit-frame-pointer -gline-tables-only"
     link_flags = link_sanitizers
     if coverage:
         compile_flags += " -fprofile-instr-generate -fcoverage-mapping"
@@ -939,13 +937,32 @@ def _instrument_direct_compiler(
         selected_compiler = "clang++-18" if cxx else "clang-18"
     else:
         selected_compiler = "afl-clang-fast++" if cxx else "afl-clang-fast"
-    if "-c" in arguments:
+    linking = "-c" not in arguments
+    if not linking:
         direct_flags = compile_flags
     else:
-        direct_flags = link_flags + " -fno-omit-frame-pointer"
+        direct_flags = link_flags + " -fno-omit-frame-pointer -gline-tables-only"
         if coverage:
             direct_flags += " -fcoverage-mapping"
-    return shlex.join((selected_compiler, *shlex.split(direct_flags), *arguments[1:]))
+    command = shlex.join((selected_compiler, *shlex.split(direct_flags), *arguments[1:]))
+    if not linking:
+        return command
+    outputs = tuple(
+        arguments[index + 1]
+        for index, argument in enumerate(arguments[:-1])
+        if argument == "-o"
+    )
+    if len(outputs) != 1:
+        return command
+    output = PurePosixPath(outputs[0])
+    if (
+        not output.is_absolute()
+        or output.parts[:3] != ("/", "opt", "bigeye")
+        or any(part in {"", ".", ".."} for part in output.parts)
+        or output.name in {"", ".", ".."}
+    ):
+        raise ValueError("direct compiler output must use a contained /opt/bigeye path")
+    return f"mkdir -p -- {shlex.quote(output.parent.as_posix())}\n{command}"
 
 
 def _probe_invocations(context, proposal) -> tuple[ProbeInvocation, ...]:
@@ -983,16 +1000,4 @@ def _probe_invocations(context, proposal) -> tuple[ProbeInvocation, ...]:
 
 
 def _repository_bytes(repository_root: Path, relative_path: str) -> bytes:
-    parts = _relative_parts(relative_path)
-    with _opened_repository_root(repository_root) as (_, root):
-        descriptor = _open_contained_file(root, parts)
-        try:
-            details = os.fstat(descriptor)
-            if details.st_size > _MAX_SEED_BYTES:
-                raise ValueError("repository seed exceeds its size limit")
-            content = os.read(descriptor, _MAX_SEED_BYTES + 1)
-        finally:
-            os.close(descriptor)
-    if len(content) > _MAX_SEED_BYTES:
-        raise ValueError("repository seed exceeds its size limit")
-    return content
+    return read_repository_bytes(repository_root, relative_path, _MAX_SEED_BYTES)

@@ -8,6 +8,7 @@ class SeedReference(BaseModel):
 
     path: str = Field(min_length=1, max_length=500)
     provenance: str = Field(min_length=1, max_length=100)
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class GeneratedAssetIntent(BaseModel):

@@ -413,6 +413,202 @@ def test_runtime_periodically_resamples_without_a_review_deadline() -> None:
     asyncio.run(exercise())
 
 
+def test_system_only_campaign_inventory_exposes_the_supported_component_gap() -> None:
+    from backend.services.campaigns.production_runtime import (
+        ContainerObservation,
+        RepositoryCampaignRuntime,
+    )
+
+    strategy = {
+        "proposal_identity": "d" * 64,
+        "instance_type": "system-level",
+        "engine": "afl",
+        "argv": ["/opt/bigeye/build/decoder_cli"],
+        "seed_set": ["e" * 64],
+        "target": {"asset_id": 4, "content_sha256": "a" * 64},
+        "configuration": {"asset_id": 2, "content_sha256": "b" * 64},
+        "coverage": {
+            "asset_id": 5,
+            "content_sha256": "c" * 64,
+            "clean_image_id": "sha256:" + "f" * 64,
+        },
+        "commit_sha": "1" * 40,
+    }
+    runtime = RepositoryCampaignRuntime(
+        tasks=None, assets=None, campaigns=None, discovery=None, containers=None,
+        invocations=SimpleNamespace(load_strategy=lambda _project, _campaign: strategy),
+    )
+    campaign = SimpleNamespace(
+        id=1, target_asset_id=4, configuration_asset_id=2, engine="afl",
+        stopped_at=None, cpu_seconds=1.0,
+    )
+    assets = (
+        SimpleNamespace(id=2, content_hash="b" * 64),
+        SimpleNamespace(id=4, content_hash="a" * 64),
+    )
+    repository_evidence = ({
+        "kind": "repository_inventory",
+        "inventory": {"libraries": ["decoder"], "public_headers": ["include/decoder.h"]},
+    },)
+
+    evidence = runtime._strategy_inventory(
+        SimpleNamespace(id=7, commit_sha="1" * 40),
+        (campaign,), assets, ContainerObservation(active_campaign_ids=(1,)),
+        repository_evidence,
+    )[0]
+
+    assert evidence["strategies"][0]["activity"] == "working"
+    assert evidence["strategies"][0]["engine"] == "afl"
+    assert evidence["component_gap"] is True
+    assert evidence["system_gap"] is False
+    assert evidence["required_next_instance_type"] == "component-level"
+
+
+def test_component_only_campaign_inventory_exposes_the_supported_system_gap() -> None:
+    from backend.services.campaigns.production_runtime import (
+        ContainerObservation,
+        RepositoryCampaignRuntime,
+    )
+
+    strategy = {
+        "proposal_identity": "d" * 64,
+        "instance_type": "component-level",
+        "engine": "libfuzzer",
+        "argv": ["/opt/bigeye/decoder_decode_fuzz"],
+        "seed_set": ["e" * 64],
+        "target": {"asset_id": 4, "content_sha256": "a" * 64},
+        "configuration": {"asset_id": 2, "content_sha256": "b" * 64},
+        "coverage": {
+            "asset_id": 5,
+            "content_sha256": "c" * 64,
+            "clean_image_id": "sha256:" + "f" * 64,
+        },
+        "commit_sha": "1" * 40,
+    }
+    runtime = RepositoryCampaignRuntime(
+        tasks=None, assets=None, campaigns=None, discovery=None, containers=None,
+        invocations=SimpleNamespace(load_strategy=lambda _project, _campaign: strategy),
+    )
+    campaign = SimpleNamespace(
+        id=1, target_asset_id=4, configuration_asset_id=2, engine="libfuzzer",
+        stopped_at=None, cpu_seconds=1.0,
+    )
+    assets = (
+        SimpleNamespace(id=2, content_hash="b" * 64),
+        SimpleNamespace(id=4, content_hash="a" * 64),
+    )
+    repository_evidence = ({
+        "kind": "repository_inventory",
+        "inventory": {"executables": ["decoder_cli"], "libraries": ["decoder"]},
+    },)
+
+    evidence = runtime._strategy_inventory(
+        SimpleNamespace(id=7, commit_sha="1" * 40),
+        (campaign,), assets, ContainerObservation(active_campaign_ids=(1,)),
+        repository_evidence,
+    )[0]
+
+    assert evidence["component_gap"] is False
+    assert evidence["system_surface"] is True
+    assert evidence["system_gap"] is True
+    assert evidence["required_next_instance_type"] == "system-level"
+
+
+@pytest.mark.parametrize(
+    ("instance_type", "inventory"),
+    [
+        ("system-level", {"executables": ["decoder_cli"]}),
+        ("component-level", {"libraries": ["decoder"], "public_headers": ["decoder.h"]}),
+    ],
+)
+def test_campaign_inventory_does_not_force_an_unsupported_second_target_class(
+    instance_type: str, inventory: dict,
+) -> None:
+    from backend.services.campaigns.production_runtime import (
+        ContainerObservation,
+        RepositoryCampaignRuntime,
+    )
+
+    strategy = {
+        "proposal_identity": "d" * 64,
+        "instance_type": instance_type,
+        "engine": "afl" if instance_type == "system-level" else "libfuzzer",
+        "argv": ["/opt/bigeye/target"],
+        "seed_set": [],
+        "target": {"asset_id": 4, "content_sha256": "a" * 64},
+        "configuration": {"asset_id": 2, "content_sha256": "b" * 64},
+        "coverage": {"asset_id": 5, "content_sha256": "c" * 64},
+        "commit_sha": "1" * 40,
+    }
+    runtime = RepositoryCampaignRuntime(
+        tasks=None, assets=None, campaigns=None, discovery=None, containers=None,
+        invocations=SimpleNamespace(load_strategy=lambda _project, _campaign: strategy),
+    )
+    campaign = SimpleNamespace(
+        id=1, target_asset_id=4, configuration_asset_id=2,
+        engine=strategy["engine"], stopped_at=None, cpu_seconds=1.0,
+    )
+    assets = (
+        SimpleNamespace(id=2, content_hash="b" * 64),
+        SimpleNamespace(id=4, content_hash="a" * 64),
+    )
+
+    evidence = runtime._strategy_inventory(
+        SimpleNamespace(id=7, commit_sha="1" * 40),
+        (campaign,), assets, ContainerObservation(active_campaign_ids=(1,)),
+        ({"kind": "repository_inventory", "inventory": inventory},),
+    )[0]
+
+    assert evidence["required_next_instance_type"] is None
+
+
+def test_finalized_finding_inventory_exposes_retained_replay_evidence() -> None:
+    from backend.services.campaigns.production_runtime import RepositoryCampaignRuntime
+
+    fingerprint = "f" * 64
+    finding = SimpleNamespace(
+        id=3, project_id=7, fingerprint=fingerprint,
+        classification="true vulnerability",
+        description="stable address sanitizer failure",
+        reproducible=True, occurrence_count=1,
+    )
+    detail = {
+        "evidence_ids": ["replay:original:1", "replay:original:2", "replay:original:3"],
+        "reproducer": {"sha256": "a" * 64, "size": 11},
+        "replay": {
+            "attempts": 3, "matching": 3,
+            "clean_variant": {
+                "crashed": True, "sanitizer": "address",
+                "source_location": "src/decoder.c:36",
+            },
+        },
+        "minimisation": {"accepted": True, "original_size": 11, "minimal_size": 11},
+        "grouping": {
+            "failure_class": "address", "reproducible": True,
+            "frames": [{"function": "decode_payload", "source_location": "decoder.c:36"}],
+        },
+        "correction": None,
+        "repair_intent": "Review decoder.c:36.",
+        "uncertainty": "Impact requires source review.",
+    }
+    runtime = RepositoryCampaignRuntime(
+        tasks=None, assets=None, campaigns=None, discovery=None, containers=None,
+        crash_groups=SimpleNamespace(list_for_project=lambda _project_id: [finding]),
+        finding_artifacts=SimpleNamespace(detail=lambda _finding: detail),
+    )
+
+    evidence = asyncio.run(runtime._finding_inventory(SimpleNamespace(id=7)))
+
+    summary = next(item for item in evidence if item["kind"] == "finalized_finding")
+    replay = next(item for item in evidence if item["kind"] == "finding_replay_evidence")
+    assert summary["classification"] == "true vulnerability"
+    assert summary["reproducible"] is True
+    assert summary["retained_replay_evidence_id"] == replay["evidence_id"]
+    assert replay["replay"]["matching"] == 3
+    assert replay["minimisation"]["accepted"] is True
+    assert replay["grouping"]["frames"][0]["source_location"] == "decoder.c:36"
+
+
 def test_recovery_queues_stopped_campaigns_when_attested_running_campaigns_use_the_limit(
     tmp_path: Path,
 ) -> None:
@@ -569,6 +765,229 @@ def test_artifact_processor_runs_crash_pipeline_before_corpus_and_persists_obser
     assert [call[1] for call in events.calls] == ["activity", "activity", "debug"]
 
 
+def test_artifact_processor_deduplicates_two_paths_with_the_same_durable_identity() -> None:
+    from backend.fuzzing.campaigns.monitor import CampaignArtifactObservation
+    from backend.services.campaigns.production_evidence import (
+        ArtifactProcessingOutcome,
+        CampaignEvidenceProcessor,
+    )
+    from backend.services.campaigns.production_runtime import CampaignProgressObservation
+
+    processed = []
+
+    class Corpus:
+        async def process(self, **values):
+            artifact = values["artifact"]
+            processed.append(artifact.relative_path)
+            return ArtifactProcessingOutcome(
+                artifact=artifact,
+                accepted=False,
+                evidence_id=f"corpus:9:{artifact.content_sha256}",
+                reason="artifact already processed",
+            )
+
+    digest = "b" * 64
+    original = CampaignArtifactObservation("corpus", "corpus/original-name", digest, 4)
+    durable = CampaignArtifactObservation("corpus", f"corpus/{digest}", digest, 4)
+    progress = CampaignProgressObservation(
+        campaign_id=9, cpu_seconds=2.0, heartbeat_at=NOW,
+        queue_files=2, crash_files=0, evidence_id="progress:9", container_id="container-9",
+        artifacts=(original, durable),
+    )
+    service = CampaignEvidenceProcessor(
+        corpus=Corpus(), crashes=SimpleNamespace(),
+        minimiser=SimpleNamespace(minimise_if_needed=lambda **_values: None),
+    )
+
+    result = asyncio.run(service.process(
+        project=SimpleNamespace(id=7), campaign=SimpleNamespace(id=9),
+        invocation=SimpleNamespace(engine="libfuzzer"), progress=progress, assets=(),
+    ))
+
+    assert len(processed) == 1
+    assert processed[0] in {"corpus/original-name", f"corpus/{digest}"}
+    assert result.evidence_ids == (f"corpus:9:{digest}",)
+
+
+def test_runtime_retains_bounded_artifact_processing_value_error_detail() -> None:
+    from unittest.mock import AsyncMock
+
+    from backend.services.campaigns.production_runtime import (
+        CampaignProgressObservation,
+        ContainerObservation,
+        RepositoryCampaignRuntime,
+    )
+
+    project = SimpleNamespace(id=7, commit_sha="a" * 40, worker_count=1)
+    campaign = SimpleNamespace(
+        id=9, project_id=7, target_asset_id=31, configuration_asset_id=32,
+        engine="libfuzzer", stopped_at=None, next_review_after=None, error=None,
+    )
+    tasks, assets, campaigns = AsyncMock(), AsyncMock(), AsyncMock()
+    tasks.list_for_project.return_value = []
+    assets.list_for_project.return_value = []
+    campaigns.list_for_project.return_value = [campaign]
+    campaigns.record_heartbeat.return_value = False
+    progress = CampaignProgressObservation(
+        9, 2.0, NOW, 1, 0, "progress:9", "container-9",
+    )
+    containers = AsyncMock()
+    containers.reconcile.return_value = ContainerObservation(
+        (9,), (), ({"evidence_id": "progress:9"},), (progress,),
+    )
+    processor = AsyncMock()
+    processor.process.side_effect = ValueError(
+        "campaign processing evidence IDs must be complete and unique"
+    )
+    events = AsyncMock()
+    runtime = RepositoryCampaignRuntime(
+        tasks=tasks, assets=assets, campaigns=campaigns,
+        discovery=SimpleNamespace(evidence=lambda _project_id: ()), containers=containers,
+        events=events,
+        invocations=SimpleNamespace(load=lambda *_args: SimpleNamespace(engine="libfuzzer")),
+        evidence_processor=processor,
+    )
+
+    asyncio.run(runtime.reconcile(project))
+
+    evidence = asyncio.run(runtime.review_evidence(project, None, None))
+    failure = next(item for item in evidence if item["kind"] == "campaign_processing_error")
+    assert failure["error"] == "campaign processing evidence IDs must be complete and unique"
+    debug = next(
+        call.args[2] for call in events.append.await_args_list
+        if call.args[1] == "debug"
+        and call.args[2].get("event") == "campaign.artifact_processing_failed"
+    )
+    assert debug["error"] == failure["error"]
+
+
+def test_two_distinct_crashes_may_share_one_stable_finding_evidence_id() -> None:
+    from unittest.mock import AsyncMock
+
+    from backend.fuzzing.campaigns.monitor import CampaignArtifactObservation
+    from backend.services.campaigns.production_evidence import (
+        ArtifactProcessingOutcome,
+        CampaignEvidenceProcessor,
+    )
+    from backend.services.campaigns.production_runtime import CampaignProgressObservation
+
+    first = CampaignArtifactObservation("crash", "output/crash-a", "a" * 64, 16)
+    second = CampaignArtifactObservation("crash", "output/crash-b", "b" * 64, 19)
+    crashes = AsyncMock()
+    crashes.process.side_effect = [
+        ArtifactProcessingOutcome(item, True, "finding:grouped", "retained")
+        for item in (first, second)
+    ]
+    events = AsyncMock()
+    processor = CampaignEvidenceProcessor(
+        corpus=SimpleNamespace(), crashes=crashes,
+        minimiser=SimpleNamespace(minimise_if_needed=lambda **_values: None),
+        events=events,
+    )
+    progress = CampaignProgressObservation(
+        9, 2.0, NOW, 0, 2, "progress:9", "container-9",
+        artifacts=(first, second),
+    )
+
+    result = asyncio.run(processor.process(
+        project=SimpleNamespace(id=7), campaign=SimpleNamespace(id=9),
+        invocation=SimpleNamespace(engine="afl"), progress=progress, assets=(),
+    ))
+
+    assert crashes.process.await_count == 2
+    assert result.evidence_ids == ("finding:grouped",)
+    activity = [
+        call.args[2] for call in events.append.await_args_list
+        if call.args[1] == "activity"
+    ]
+    assert [item["evidence_ids"] for item in activity] == [
+        ["finding:grouped"], ["finding:grouped"],
+    ]
+
+
+def test_grouped_distinct_crash_page_advances_cursor_and_is_not_replayed_after_restart() -> None:
+    from unittest.mock import AsyncMock
+
+    from backend.fuzzing.campaigns.monitor import CampaignArtifactObservation
+    from backend.services.campaigns.production_evidence import (
+        ArtifactProcessingOutcome,
+        CampaignEvidenceProcessor,
+    )
+    from backend.services.campaigns.production_runtime import (
+        CampaignProgressObservation,
+        ContainerObservation,
+        RepositoryCampaignRuntime,
+    )
+
+    project = SimpleNamespace(id=7, commit_sha="a" * 40, worker_count=1)
+    campaign = SimpleNamespace(
+        id=9, project_id=7, target_asset_id=31, configuration_asset_id=32,
+        engine="afl", stopped_at=None, next_review_after=None, error=None,
+    )
+    first = CampaignArtifactObservation("crash", "output/crash-a", "a" * 64, 16)
+    second = CampaignArtifactObservation("crash", "output/crash-b", "b" * 64, 19)
+
+    class ArtifactState:
+        def __init__(self):
+            self.values = {}
+
+        async def cursors(self, project_id, campaign_id):
+            return dict(self.values.get((project_id, campaign_id), {}))
+
+        async def advance_cursors(self, project_id, campaign_id, cursors):
+            self.values[(project_id, campaign_id)] = {
+                kind: (observed_ns, name) for kind, observed_ns, name in cursors
+            }
+
+    artifact_state = ArtifactState()
+    containers = AsyncMock()
+
+    def observe(_project, _campaigns, _assets, cursors):
+        after = cursors[9].get("crashes")
+        artifacts = () if after == (20, "crash-b") else (first, second)
+        next_cursors = () if not artifacts else (("crashes", 20, "crash-b"),)
+        progress = CampaignProgressObservation(
+            9, 2.0, NOW, 0, 2, "progress:9", "container-9",
+            artifacts=artifacts, next_artifact_cursors=next_cursors,
+        )
+        return ContainerObservation((9,), (), (), (progress,))
+
+    containers.reconcile.side_effect = observe
+    crashes = AsyncMock()
+    crashes.process.side_effect = lambda **values: ArtifactProcessingOutcome(
+        values["artifact"], True, "finding:grouped", "retained",
+    )
+    processor = CampaignEvidenceProcessor(
+        corpus=SimpleNamespace(), crashes=crashes,
+        minimiser=SimpleNamespace(minimise_if_needed=lambda **_values: None),
+    )
+    tasks, assets, campaigns = AsyncMock(), AsyncMock(), AsyncMock()
+    tasks.list_for_project.return_value = []
+    assets.list_for_project.return_value = []
+    campaigns.list_for_project.return_value = [campaign]
+    campaigns.record_heartbeat.return_value = False
+
+    def runtime():
+        return RepositoryCampaignRuntime(
+            tasks=tasks, assets=assets, campaigns=campaigns,
+            discovery=SimpleNamespace(evidence=lambda _project_id: ()),
+            containers=containers,
+            invocations=SimpleNamespace(load=lambda *_args: SimpleNamespace(engine="afl")),
+            evidence_processor=processor, artifact_state=artifact_state,
+        )
+
+    first_snapshot = asyncio.run(runtime().reconcile(project))
+    assert crashes.process.await_count == 2
+    assert "finding:grouped" in first_snapshot.evidence_ids
+    assert artifact_state.values[(7, 9)]["crashes"] == (20, "crash-b")
+
+    asyncio.run(runtime().reconcile(project))
+    assert crashes.process.await_count == 2
+    assert containers.reconcile.await_args_list[-1].args[3] == {
+        9: {"crashes": (20, "crash-b")},
+    }
+
+
 def test_runtime_passes_monitor_artifacts_to_processor_and_exposes_only_validated_wake_facts() -> None:
     from unittest.mock import AsyncMock
 
@@ -607,7 +1026,18 @@ def test_runtime_passes_monitor_artifacts_to_processor_and_exposes_only_validate
     runtime = RepositoryCampaignRuntime(
         tasks=tasks, assets=assets, campaigns=campaigns,
         discovery=SimpleNamespace(evidence=lambda _project_id: ()), containers=containers,
-        invocations=SimpleNamespace(load=lambda *_args: SimpleNamespace(engine="libfuzzer")),
+        invocations=SimpleNamespace(
+            load=lambda *_args: SimpleNamespace(engine="libfuzzer"),
+            load_strategy=lambda *_args: {
+                "proposal_identity": "component:decoder",
+                "instance_type": "component-level",
+                "argv": ["/opt/bigeye/decoder_fuzz"],
+                "configuration": {},
+                "seed_set": [],
+                "coverage": {},
+                "target": {},
+            },
+        ),
         evidence_processor=processor,
     )
 
@@ -617,6 +1047,14 @@ def test_runtime_passes_monitor_artifacts_to_processor_and_exposes_only_validate
     assert snapshot.corpus_opportunity is False
     assert "finding:abc" in snapshot.evidence_ids
     processor.process.assert_awaited_once()
+
+    processor.process.reset_mock()
+    review_snapshot = asyncio.run(runtime.reconcile_for_review(project))
+    review_evidence = asyncio.run(runtime.review_evidence(project, review_snapshot, None))
+
+    assert review_snapshot.active_workers == 1
+    assert any(item.get("kind") == "campaign_strategy_inventory" for item in review_evidence)
+    processor.process.assert_not_awaited()
 
 
 def test_runtime_advances_durable_artifact_cursors_only_after_the_complete_page_succeeds() -> None:

@@ -42,6 +42,12 @@ const detail: FindingDetail = {
   minimisation: { accepted: true, original_size: 512, minimal_size: 128 },
   correction: null,
   repair_intent: null,
+  grouping: {
+    version: 1, commit_sha: 'a'.repeat(40), failure_class: 'heap-buffer-overflow',
+    reproducible: true, minimisation_accepted: true, minimised_sha256: 'b'.repeat(64),
+    harness_misuse: false,
+    frames: [{ function: 'decode_length', source_location: 'src/parser.c:42' }],
+  },
   evidence_events: [{
     evidence_id: 'coverage:src/parser.c:42', stream: 'activity', event_id: 812,
   }],

@@ -111,6 +111,33 @@ class CorrectionResponse(BaseModel):
         return self
 
 
+class CrashGroupFrameResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    function: str = Field(min_length=1, max_length=500)
+    source_location: str | None = Field(
+        default=None,
+        pattern=(
+            r"^(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+"
+            r"\.(?:c|cc|cpp|cxx|h|hh|hpp|hxx|rs|swift|m|mm):"
+            r"[1-9][0-9]*(?::[1-9][0-9]*)?$"
+        ),
+    )
+
+
+class CrashGroupingResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[1]
+    commit_sha: str = Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+    failure_class: str = Field(min_length=1, max_length=200)
+    reproducible: bool
+    minimisation_accepted: bool
+    minimised_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    harness_misuse: bool
+    frames: list[CrashGroupFrameResponse] = Field(min_length=1, max_length=64)
+
+
 class FindingEvidenceEventResponse(BaseModel):
     evidence_id: str = Field(min_length=1, max_length=2_000)
     stream: Literal["activity", "debug"]
@@ -125,6 +152,7 @@ class FindingDetailResponse(FindingResponse):
     minimisation: MinimisationResponse | None = None
     correction: CorrectionResponse | None = None
     repair_intent: str | None = Field(default=None, max_length=2_000)
+    grouping: CrashGroupingResponse | None = None
     evidence_events: list[FindingEvidenceEventResponse] = Field(default_factory=list, max_length=64)
 
     @classmethod

@@ -1,0 +1,70 @@
+name: release-gate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - name: Install Python 3.14
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.14'
+      - name: Install Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Prepare local environment
+        run: |
+          umask 077
+          cp .env_example .env
+          scripts/setup.sh
+      - name: Run checked-in release gate
+        run: scripts/check.sh --live-docker
+      - name: Install the pinned browser
+        run: frontend/node_modules/.bin/playwright install --with-deps chromium
+      - name: Run the real browser journey
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo 'OPENAI_API_KEY is required for the live browser release gate.' >&2
+            exit 1
+          fi
+          umask 077
+          printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY" >> .env
+          npm --prefix frontend run e2e
+      - name: Run the live manager-to-specialist smoke
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BIGEYE_LIVE_OPENAI: '1'
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo 'OPENAI_API_KEY is required for the live agent release gate.' >&2
+            exit 1
+          fi
+          backend/.venv/bin/python -m pytest -o addopts= backend/tests/test_agent_live.py
+      - name: Upload browser failure evidence
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: bigeye-release-failure-evidence
+          if-no-files-found: ignore
+          path: |
+            workspace/e2e/services/*.log
+            workspace/e2e/screenshots/
+            workspace/e2e/playwright-results/
+            workspace/e2e/playwright-report/
+      - name: Clean labelled acceptance resources
+        if: always()
+        run: docker compose down

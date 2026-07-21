@@ -193,7 +193,62 @@ class CampaignManager:
                 decision.decision, decision.motivation, decision.evidence_ids,
                 decision.next_review_reason,
             )
-            return collection.result(decision)
+            review = collection.result(decision)
+            _validate_supervision_priority(review, evidence_records)
+            return review
         except Exception as error:
             trace.error(agent, error)
             raise
+
+
+def _validate_supervision_priority(review, evidence_records: Mapping[str, dict]) -> None:
+    failures = tuple(
+        record for record in evidence_records.values()
+        if record.get("kind") == "action_execution_failure"
+    )
+    required_types = {
+        record.get("required_next_instance_type")
+        for record in evidence_records.values()
+        if record.get("kind") == "campaign_strategy_inventory"
+        and record.get("required_next_instance_type") is not None
+    }
+    if len(required_types) > 1:
+        raise WorkerValidationError("campaign evidence has conflicting target-class priorities")
+    required_type = next(iter(required_types), None)
+    if not failures and required_type is None:
+        return
+    finalized = any(
+        record.get("kind") == "finalized_finding"
+        and record.get("reproducible") is True
+        and record.get("classification") not in {None, "unresolved"}
+        for record in evidence_records.values()
+    )
+    if finalized and getattr(review, "selected_triage_results", ()):
+        raise WorkerValidationError(
+            "manager re-triaged a reproducible finalized finding before target repair"
+        )
+    corrective = list(getattr(review, "selected_target_proposals", ()))
+    corrective.extend(
+        record.target_proposal
+        for record in getattr(review, "selected_pipeline_operations", ())
+        if getattr(record, "operation", None) in {"build", "probe"}
+        and getattr(record, "target_proposal", None) is not None
+    )
+    if not corrective:
+        raise WorkerValidationError(
+            "manager must select a distinct target correction before lower-priority work"
+        )
+    selected_ids = set(getattr(review, "selected_action_ids", ()))
+    failed_action_ids = {
+        action_id for record in failures for action_id in record.get("action_ids", ())
+        if isinstance(action_id, str)
+    }
+    if selected_ids & failed_action_ids:
+        raise WorkerValidationError("manager repeated the failed action identity")
+    if required_type is not None and not any(
+        getattr(record.proposal, "instance_type", None) == required_type
+        for record in corrective
+    ):
+        raise WorkerValidationError(
+            f"manager must select the required {required_type} target correction"
+        )

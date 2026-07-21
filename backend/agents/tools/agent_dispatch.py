@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
 import shlex
 import threading
 import unicodedata
 from collections.abc import Iterable
 from contextvars import ContextVar
+from hashlib import sha256
 from pathlib import PurePosixPath
 
 from agents import MaxTurnsExceeded, RunConfig, RunContextWrapper, RunHooks, Runner, function_tool
@@ -30,7 +32,12 @@ from backend.agents.tools.contained_operations import (
     contained_operation_error,
     contained_operation_request,
 )
-from backend.agents.tools.generated_assets import _relative_path, read_asset_file
+from backend.agents.tools.code_navigation import CodeNavigationError, read_repository_bytes
+from backend.agents.tools.generated_assets import (
+    GeneratedAssetError,
+    _relative_path,
+    read_asset_file,
+)
 from backend.agents.tools.evidence_retrieval import (
     EvidenceLimit,
     EvidenceQuestion,
@@ -43,6 +50,8 @@ from backend.agents.tools.web_research import (
     official_documentation_domains,
     validate_official_citations,
 )
+from backend.fuzzing.campaigns.strategy_identity import proposal_strategy_identity
+from backend.fuzzing.campaigns.production_factory import _build_script
 
 
 class WorkerValidationError(ValueError):
@@ -103,12 +112,87 @@ def _reject_operation_request_evidence_ids(values: Iterable[str]) -> None:
 
 
 def _safe_seed_path(value: str) -> None:
+    if not isinstance(value, str):
+        raise WorkerValidationError("worker returned an invalid seed path")
     path = PurePosixPath(value)
     if (
-        not isinstance(value, str) or not value or len(value) > 500 or path.is_absolute()
+        not value or len(value) > 500 or path.is_absolute()
         or any(part in {"", ".", ".."} or part.casefold() == ".git" for part in path.parts)
+        or any(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+@-]*", part) is None for part in path.parts)
     ):
-        raise WorkerValidationError("worker returned an unsafe seed path")
+        raise WorkerValidationError("worker returned an invalid seed path")
+
+
+def _validate_seed_references(proposal: TargetProposal, context: AgentContext) -> None:
+    generated_paths = {
+        intent.relative_path for intent in proposal.generated_asset_intents
+    }
+    paths = [seed.path for seed in proposal.seeds]
+    if len(paths) != len(set(paths)):
+        raise WorkerValidationError("worker returned duplicate seed paths")
+    for seed in proposal.seeds:
+        if seed.path in generated_paths:
+            if seed.sha256 is None:
+                raise WorkerValidationError(
+                    "worker generated seed requires an exact sha256"
+                )
+            try:
+                record = read_asset_file(context, seed.path)
+            except GeneratedAssetError as error:
+                raise WorkerValidationError(
+                    "worker generated seed was not published"
+                ) from error
+            if record["sha256"] != seed.sha256:
+                raise WorkerValidationError(
+                    "worker generated seed hash does not match the published asset"
+                )
+            continue
+        try:
+            content = read_repository_bytes(context.repository_root, seed.path)
+        except CodeNavigationError as error:
+            if str(error) == "repository file was not found":
+                message = "worker repository seed was not found"
+            elif str(error) == "path escapes the repository":
+                message = "worker repository seed path escapes the repository"
+            else:
+                message = f"worker repository seed rejected: {error}"
+            raise WorkerValidationError(message) from error
+        if seed.sha256 is not None and sha256(content).hexdigest() != seed.sha256:
+            raise WorkerValidationError("worker repository seed hash does not match")
+
+
+def _validate_build_output_contract(build_command: str, run_command: str) -> None:
+    build_arguments = shlex.split(build_command, posix=True)
+    run_arguments = shlex.split(run_command, posix=True)
+    executable = run_arguments[0]
+    if (
+        build_arguments[0] == "cmake"
+        and "&&" in build_arguments
+        and any(
+            value == "-S" or value.startswith("-S") and len(value) > 2
+            for value in build_arguments
+        )
+    ):
+        if PurePosixPath(executable).parent.as_posix() != "/opt/bigeye/build":
+            raise WorkerValidationError(
+                "worker CMake executable must be under /opt/bigeye/build"
+            )
+        return
+    if re.fullmatch(
+        r"(?:cc|c\+\+|gcc(?:-[0-9]+(?:\.[0-9]+)*)?|g\+\+(?:-[0-9]+(?:\.[0-9]+)*)?"
+        r"|clang(?:-[0-9]+(?:\.[0-9]+)*)?|clang\+\+(?:-[0-9]+(?:\.[0-9]+)*)?)",
+        build_arguments[0],
+    ) is None:
+        return
+    try:
+        output_index = build_arguments.index("-o")
+        output = build_arguments[output_index + 1]
+    except (ValueError, IndexError):
+        return
+    if executable != output:
+        raise WorkerValidationError(
+            "worker run executable must match the direct compiler output"
+        )
 
 
 def _has_unquoted_shell_syntax(value: str) -> bool:
@@ -180,7 +264,10 @@ def _validate_run_command(value: str, expected_type: str) -> None:
         )
 
 
-def _validate_target(output, allowed: frozenset[str], expected_type: str) -> TargetProposal:
+def _validate_target(
+    output, allowed: frozenset[str], expected_type: str,
+    *, context: AgentContext | None = None,
+) -> TargetProposal:
     try:
         proposal = output if isinstance(output, TargetProposal) else TargetProposal.model_validate(output)
     except (ValidationError, TypeError) as error:
@@ -191,15 +278,28 @@ def _validate_target(output, allowed: frozenset[str], expected_type: str) -> Tar
         )
     if proposal.instance_type != expected_type:
         proposal = proposal.model_copy(update={"instance_type": expected_type})
+    try:
+        _build_script(
+            proposal.build_command,
+            instance_type=expected_type,
+            coverage=False,
+        )
+    except ValueError as error:
+        raise WorkerValidationError(
+            f"worker build_command failed deterministic validation: {error}"
+        ) from error
     _validate_run_command(proposal.run_command, expected_type)
+    _validate_build_output_contract(proposal.build_command, proposal.run_command)
     _validate_evidence_ids(proposal.evidence_ids, allowed)
-    for seed in proposal.seeds:
-        _safe_seed_path(seed.path)
     for intent in proposal.generated_asset_intents:
         try:
             _relative_path(intent.relative_path)
         except ValueError as error:
             raise WorkerValidationError("worker returned an unsafe generated asset intent") from error
+    for seed in proposal.seeds:
+        _safe_seed_path(seed.path)
+    if context is not None:
+        _validate_seed_references(proposal, context)
     if any(not value.strip() or len(value) > 500 for value in proposal.probe_assertions):
         raise WorkerValidationError("worker returned an invalid probe assertion")
     return proposal
@@ -221,6 +321,11 @@ def _validate_triage(output, allowed: frozenset[str]) -> TriageResult:
 
 def _validate_worker_result(
     output, allowed: frozenset[str], operation_request_ids: frozenset[str],
+    *, rejected_strategy_ids: frozenset[str] = frozenset(),
+    required_instance_type: str | None = None,
+    repair_required: bool = False,
+    finalized_finding: bool = False,
+    context: AgentContext | None = None,
 ) -> FuzzingWorkerResult:
     try:
         result = (
@@ -239,8 +344,29 @@ def _validate_worker_result(
             expected_type = "component-level"
         else:
             raise WorkerValidationError("worker returned an unsupported target type")
-        targets.append(_validate_target(proposal, allowed, expected_type))
+        target = _validate_target(proposal, allowed, expected_type, context=context)
+        if required_instance_type is not None and target.instance_type != required_instance_type:
+            raise WorkerValidationError(
+                f"current campaign inventory requires the next target to be {required_instance_type}"
+            )
+        if proposal_strategy_identity(target) in rejected_strategy_ids:
+            raise WorkerValidationError(
+                "worker returned an exact duplicate of a working, preparing, or evidenced "
+                "campaign strategy; propose a distinct target, operational configuration, "
+                "or seed set"
+            )
+        targets.append(target)
     triage = [_validate_triage(value, allowed) for value in result.triage_results]
+    if (repair_required or required_instance_type is not None) and not targets:
+        required = required_instance_type or "evidence-backed"
+        raise WorkerValidationError(
+            f"pending target repair requires a distinct {required} target proposal before other work"
+        )
+    if finalized_finding and triage:
+        raise WorkerValidationError(
+            "a reproducible finalized finding cannot be re-triaged without new occurrence, "
+            "replay, correction, or classification evidence"
+        )
     request_ids = result.operation_request_ids
     if (
         len(request_ids) != len(set(request_ids))
@@ -266,6 +392,66 @@ def _tool(
     worker_hooks = hooks or RunHooks()
     assignment_evidence: dict[tuple[str, str, int, str], set[str]] = {}
     assignment_lock = threading.Lock()
+    strategy_lock = threading.Lock()
+    existing_strategy_ids = frozenset(
+        strategy.get("logical_target_identity")
+        for record in evidence_records.values()
+        if record.get("kind") == "campaign_strategy_inventory"
+        for strategy in record.get("strategies", ())
+        if isinstance(strategy, dict)
+        and isinstance(strategy.get("logical_target_identity"), str)
+    )
+    required_instance_types = {
+        record.get("required_next_instance_type")
+        for record in evidence_records.values()
+        if record.get("kind") == "campaign_strategy_inventory"
+        and record.get("required_next_instance_type") is not None
+    }
+    if len(required_instance_types) > 1:
+        raise ValueError("campaign strategy inventory has conflicting target requirements")
+    required_instance_type = next(iter(required_instance_types), None)
+    repair_required = any(
+        record.get("kind") == "action_execution_failure"
+        for record in evidence_records.values()
+    )
+    finalized_finding = any(
+        record.get("kind") == "finalized_finding"
+        and record.get("reproducible") is True
+        and record.get("classification") not in {None, "unresolved"}
+        for record in evidence_records.values()
+    )
+    accepted_strategy_ids: set[str] = set()
+
+    def validate_and_record_worker(output, invocation: WorkerInvocation):
+        with strategy_lock:
+            result = _validate_worker_result(
+                output,
+                exact_assignment_evidence(invocation),
+                collection.pending_operation_ids(invocation),
+                rejected_strategy_ids=frozenset(
+                    (*existing_strategy_ids, *accepted_strategy_ids)
+                ),
+                required_instance_type=required_instance_type,
+                repair_required=repair_required,
+                finalized_finding=finalized_finding,
+                context=context,
+            )
+            if _DIFFICULTY_MARKER in result.uncertainty:
+                raise WorkerValidationError(
+                    "Luna reported that the bounded assignment exceeds its capability"
+                )
+            target_records, triage_records = collection.record_worker(
+                invocation, result.target_proposals, result.triage_results,
+            )
+            try:
+                collection.complete_attempt(invocation, accepted=True)
+            except ValueError as error:
+                raise WorkerValidationError(str(error)) from error
+            accepted_strategy_ids.update(
+                proposal_strategy_identity(proposal)
+                for proposal in result.target_proposals
+            )
+            return result, target_records, triage_records
 
     def initialise_assignment(invocation: WorkerInvocation, values: Iterable[str]) -> None:
         with assignment_lock:
@@ -440,15 +626,9 @@ def _tool(
                 web_citations(getattr(result, "raw_responses", ())), web_domains,
             )
             add_assignment_evidence(luna_invocation, citations)
-            output = _validate_worker_result(
-                getattr(result, "final_output", None),
-                exact_assignment_evidence(luna_invocation),
-                collection.pending_operation_ids(luna_invocation),
+            output, target_records, triage_records = validate_and_record_worker(
+                getattr(result, "final_output", None), luna_invocation,
             )
-            if _DIFFICULTY_MARKER in output.uncertainty:
-                raise WorkerValidationError(
-                    "Luna reported that the bounded assignment exceeds its capability"
-                )
         except (WorkerValidationError, UnofficialWebCitation) as error:
             validation_error = WorkerValidationError(str(error))
             collection.complete_attempt(luna_invocation, accepted=False)
@@ -505,10 +685,8 @@ def _tool(
                     web_citations(getattr(retry_result, "raw_responses", ())), web_domains,
                 )
                 add_assignment_evidence(terra_invocation, citations)
-                output = _validate_worker_result(
-                    getattr(retry_result, "final_output", None),
-                    exact_assignment_evidence(terra_invocation),
-                    collection.pending_operation_ids(terra_invocation),
+                output, target_records, triage_records = validate_and_record_worker(
+                    getattr(retry_result, "final_output", None), terra_invocation,
                 )
                 successful_evidence_ids = exact_assignment_evidence(terra_invocation)
             except (WorkerValidationError, UnofficialWebCitation) as retry_error:
@@ -529,10 +707,6 @@ def _tool(
         else:
             successful_invocation = luna_invocation
             successful_evidence_ids = exact_assignment_evidence(luna_invocation)
-        target_records, triage_records = collection.record_worker(
-            successful_invocation, output.target_proposals, output.triage_results,
-        )
-        collection.complete_attempt(successful_invocation, accepted=True)
         accepted_review_ids.update(successful_evidence_ids)
         operation_action_ids = [
             collection.pipeline_action_id(request_id)

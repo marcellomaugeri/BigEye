@@ -17,6 +17,11 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _FRONTEND_UNAVAILABLE = "Frontend build is unavailable. Run npm --prefix frontend run build."
 
 
+def configured_workspace() -> Path:
+    """Return the host workspace, with an explicit acceptance-test override."""
+    return Path(os.environ.get("BIGEYE_WORKSPACE", "workspace"))
+
+
 def _verified_frontend_build(frontend_dist: Path) -> tuple[Path, Path] | None:
     """Accept only a real Vite index and assets directory, never symlink substitutes."""
     root = Path(os.path.abspath(frontend_dist))
@@ -45,6 +50,9 @@ def create_app(
             pool = await create_pool()
             app.state.services = build_services(pool, workspace or Path("workspace"))
         try:
+            ephemeral_recovery = getattr(app.state.services, "ephemeral_recovery", None)
+            if ephemeral_recovery is not None:
+                await ephemeral_recovery.recover()
             await app.state.services.recovery.recover()
             yield
         finally:
@@ -81,4 +89,4 @@ def create_app(
     return app
 
 
-app = create_app()
+app = create_app(workspace=configured_workspace())

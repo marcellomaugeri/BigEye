@@ -19,6 +19,7 @@ MAX_DIRECTORIES = 64
 MAX_DIRECTORY_ENTRIES = 256
 MAX_DIRECTORY_DEPTH = 12
 MAX_FILE_BYTES = 1_000_000
+MAX_REPOSITORY_SEED_BYTES = 16 * 1024 * 1024
 MAX_TOTAL_READ_BYTES = 4_000_000
 MAX_LINE_RANGE = 200
 MAX_QUERY_LENGTH = 200
@@ -78,7 +79,7 @@ def _relative_parts(relative_path: str) -> tuple[str, ...]:
     normalised = relative_path.replace("\\", "/")
     path = PurePosixPath(normalised)
     if path.is_absolute() or any(part in {"", ".", ".."} or part.casefold() == ".git" for part in path.parts):
-        raise CodeNavigationError("path is outside the allowed repository files")
+        raise CodeNavigationError("path escapes the repository")
     return path.parts
 
 
@@ -114,6 +115,8 @@ def _open_contained_file(root_descriptor: int, parts: tuple[str, ...]) -> int:
             if not stat.S_ISDIR(os.fstat(directory_descriptor).st_mode):
                 raise CodeNavigationError("path must identify a file")
         descriptor = os.open(parts[-1], _open_flags(), dir_fd=directory_descriptor)
+    except FileNotFoundError as error:
+        raise CodeNavigationError("repository file was not found") from error
     except OSError as error:
         raise CodeNavigationError("path escapes the repository") from error
     finally:
@@ -125,6 +128,43 @@ def _open_contained_file(root_descriptor: int, parts: tuple[str, ...]) -> int:
         os.close(descriptor)
         raise
     return descriptor
+
+
+def read_repository_bytes(
+    repository_root: Path,
+    relative_path: str,
+    max_bytes: int = MAX_REPOSITORY_SEED_BYTES,
+) -> bytes:
+    """Read one bounded regular repository file without following symlinks."""
+    if (
+        not isinstance(max_bytes, int) or isinstance(max_bytes, bool)
+        or max_bytes < 1 or max_bytes > MAX_REPOSITORY_SEED_BYTES
+    ):
+        raise CodeNavigationError("repository file read limit is invalid")
+    parts = _relative_parts(relative_path)
+    with _opened_repository_root(repository_root) as (_, root_descriptor):
+        descriptor = _open_contained_file(root_descriptor, parts)
+        try:
+            if os.fstat(descriptor).st_size > max_bytes:
+                raise CodeNavigationError("repository file exceeds the read limit")
+            chunks: list[bytes] = []
+            remaining = max_bytes + 1
+            while remaining:
+                chunk = os.read(descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+        except CodeNavigationError:
+            raise
+        except OSError as error:
+            raise CodeNavigationError("repository file cannot be read") from error
+        finally:
+            os.close(descriptor)
+    content = b"".join(chunks)
+    if len(content) > max_bytes:
+        raise CodeNavigationError("repository file exceeds the read limit")
+    return content
 
 
 def _read_open_text(descriptor: int) -> str:

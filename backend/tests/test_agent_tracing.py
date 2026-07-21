@@ -354,7 +354,9 @@ def test_campaign_manager_returns_selectable_specialist_result_and_audit_operati
     (draft / "config.sh").write_text("#!/bin/sh\n", encoding="utf-8")
     proposal = {
         "target_name": "parser", "instance_type": "system-level", "byte_path": "stdin -> parser",
-        "expected_project_reach": "parser", "build_command": "build", "run_command": "run",
+        "expected_project_reach": "parser",
+        "build_command": "cmake --build /opt/bigeye/build --target parser",
+        "run_command": "/opt/bigeye/parser",
         "seeds": [], "configuration": "default", "sanitizer_plan": "ASan and UBSan",
         "generated_asset_intents": [{
             "relative_path": "system/parser/config.sh", "purpose": "probe configuration",

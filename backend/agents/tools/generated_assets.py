@@ -27,6 +27,7 @@ _ALLOWED_SUFFIXES = frozenset({
     ".diff", ".dict", ".json", ".yaml", ".yml", ".toml", ".txt", ".proto", ".grammar",
     ".options", ".cfg", ".cmake", ".mk",
 })
+_RESERVED_NAMES = frozenset({"target-build.sh", "coverage-build.sh"})
 
 
 class GeneratedAssetError(ValueError):
@@ -41,7 +42,7 @@ def generated_asset_request_error(_context, _error: Exception) -> str:
     )
 
 
-def _relative_path(value: str) -> PurePosixPath:
+def _relative_path(value: str, *, _allow_reserved: bool = False) -> PurePosixPath:
     if not isinstance(value, str) or len(value) > MAX_GENERATED_PATH_CHARS or "\x00" in value or "\\" in value:
         raise GeneratedAssetError("generated asset path is invalid")
     path = PurePosixPath(value)
@@ -53,6 +54,8 @@ def _relative_path(value: str) -> PurePosixPath:
         raise GeneratedAssetError("generated asset path is invalid")
     if path.name != "Dockerfile" and path.suffix.casefold() not in _ALLOWED_SUFFIXES:
         raise GeneratedAssetError("generated asset type is not allowed")
+    if not _allow_reserved and path.name.casefold() in _RESERVED_NAMES:
+        raise GeneratedAssetError("generated asset path is reserved for BigEye")
     return path
 
 
@@ -168,9 +171,11 @@ def _read_path(context: AgentContext, path: PurePosixPath) -> bytes:
         os.close(project_descriptor)
 
 
-def read_asset_file(context: AgentContext, relative_path: str) -> dict[str, object]:
+def read_asset_file(
+    context: AgentContext, relative_path: str, *, _allow_reserved: bool = False,
+) -> dict[str, object]:
     """Read one generated draft with its complete text and compare-and-swap hash."""
-    path = _relative_path(relative_path)
+    path = _relative_path(relative_path, _allow_reserved=_allow_reserved)
     content = _read_path(context, path)
     try:
         text = content.decode("utf-8")
@@ -263,10 +268,11 @@ def _diff(path: str, previous: bytes | None, current: bytes) -> str:
 
 
 def write_asset_file(
-    context: AgentContext, relative_path: str, content: str, expected_sha256: str | None
+    context: AgentContext, relative_path: str, content: str, expected_sha256: str | None,
+    *, _allow_reserved: bool = False,
 ) -> dict[str, object]:
     """Create a generated draft or replace its exact known version atomically."""
-    path = _relative_path(relative_path)
+    path = _relative_path(relative_path, _allow_reserved=_allow_reserved)
     encoded = _content_bytes(content)
     if expected_sha256 is not None and (
         not isinstance(expected_sha256, str) or len(expected_sha256) != 64

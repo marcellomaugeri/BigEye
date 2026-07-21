@@ -44,6 +44,19 @@ class FindingArtifacts:
             "evidence_ids": ["replay:original:1"],
             "reproducer": {"sha256": "b" * 64, "size": 5},
             "replay": {"attempts": 3, "matching": 3},
+            "grouping": {
+                "version": 1,
+                "commit_sha": "c" * 40,
+                "failure_class": "address",
+                "reproducible": True,
+                "minimisation_accepted": True,
+                "minimised_sha256": "b" * 64,
+                "harness_misuse": False,
+                "frames": [{
+                    "function": "decode_payload",
+                    "source_location": "decoder.c:36",
+                }],
+            },
         }
 
     def read_reproducer(self, finding, max_bytes):
@@ -124,6 +137,7 @@ def test_detail_is_project_scoped_and_exposes_bounded_evidence_not_logs_or_paths
     body = response.json()
     assert body["uncertainty"].startswith("Reachability")
     assert body["reproducer"]["size"] == 5
+    assert body["grouping"]["frames"][0]["source_location"] == "decoder.c:36"
     assert "path" not in str(body).casefold()
     assert "log" not in str(body).casefold()
     assert wrong_project.status_code == 404
@@ -175,6 +189,7 @@ def test_exact_reproduction_is_accepted_and_streamed_only_as_sse():
     assert started.status_code == 202
     assert duplicate.status_code == 409
     assert started.json()["command"] == ["/opt/bigeye/reproduce", "/finding/input"]
+    assert started.json()["sanitizer_crash_observed"] is False
     assert wrong_project.status_code == 404
     assert stream.headers["content-type"].startswith("text/event-stream")
     assert "event: output\ndata: {\"stream\":\"stderr\",\"text\":\"asan\\n\"}" in stream.text

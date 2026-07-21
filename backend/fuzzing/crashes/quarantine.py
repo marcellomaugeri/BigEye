@@ -230,6 +230,8 @@ class CrashObservation:
 @dataclass(frozen=True)
 class QuarantinedCrash:
     project_id: int
+    campaign_id: int
+    engine: str
     group_key: str
     occurrence: int
     input_sha256: str
@@ -296,6 +298,8 @@ class CrashQuarantine:
                     raise ValueError("canonical quarantine directory changed during publication")
                 return QuarantinedCrash(
                     project_id=observation.project_id,
+                    campaign_id=observation.campaign_id,
+                    engine=observation.engine,
                     group_key=group_key,
                     occurrence=occurrence,
                     input_sha256=metadata["input_sha256"],

@@ -53,7 +53,11 @@ from backend.fuzzing.crashes.fingerprint import failure_signature
 from backend.fuzzing.crashes.minimisation import CrashMinimiser
 from backend.fuzzing.crashes.quarantine import CrashObservation, CrashQuarantine
 from backend.fuzzing.crashes.replay import ReplayResult
-from backend.fuzzing.crashes.triage import CrashPipeline
+from backend.fuzzing.crashes.triage import (
+    CrashPipeline,
+    confirmed_project_memory_safety,
+)
+from backend.fuzzing.docker.container_runner import ephemeral_container_identity
 from backend.fuzzing.docker.fuzz_container import FuzzCampaign, FuzzContainerService
 from backend.fuzzing.docker.image_builder import PLATFORM
 from backend.fuzzing.docker.stdin import close_attached_stdin, send_exact_stdin
@@ -374,6 +378,9 @@ class DockerNativeCorpusRunner:
             volumes[os.fspath(source)] = {
                 "bind": "/campaign/minimisation-input", "mode": "ro",
             }
+        identity = ephemeral_container_identity(
+            uuid4().hex, "corpus-minimisation", campaign.project_id,
+        )
         container = self._client.containers.create(
             self._invocation.image_id,
             list(container_command),
@@ -398,6 +405,8 @@ class DockerNativeCorpusRunner:
             user=_unprivileged_user(),
             auto_remove=False,
             detach=True,
+            name=identity["name"],
+            labels=identity["labels"],
         )
         try:
             container.start()
@@ -509,6 +518,9 @@ class DockerCrashReplayExecutor:
         try:
             stdin_mode = crash.engine == "afl" and crash.input_mode == "stdin"
             command = crash.clean_command if variant == "clean" else crash.command
+            identity = ephemeral_container_identity(
+                uuid4().hex, "crash-replay", crash.project_id,
+            )
             container = self._client.containers.create(
                 image_id,
                 list(command),
@@ -538,6 +550,8 @@ class DockerCrashReplayExecutor:
                 tty=False,
                 auto_remove=False,
                 detach=not stdin_mode,
+                name=identity["name"],
+                labels=identity["labels"],
             )
             if stdin_mode:
                 attached = container.attach_socket(params={"stdin": 1, "stream": 1})
@@ -643,7 +657,11 @@ class ProductionCrashTriageWorker:
         assignment = (
             "Triage the supplied replay, minimisation, variant, source, contract, and correction "
             "evidence as one bounded crash group. Return exactly one triage result and no target "
-            "proposal or pipeline-operation request."
+            "proposal or pipeline-operation request. Classification is distinct from exploitability: "
+            "a confirmed project memory-safety failure is a true vulnerability even when impact or "
+            "exploitability is unknown and no correction patch exists. A system-level project CLI "
+            "does not use a component harness contract; only concrete contradictory contract or "
+            "harness evidence can justify another class."
         )
         prompt = (
             assignment
@@ -651,19 +669,22 @@ class ProductionCrashTriageWorker:
             + json.dumps(asdict(evidence), ensure_ascii=False, default=list)
         )
         last_error = None
+        correction = ""
+        confirmed = confirmed_project_memory_safety(evidence)
         for attempt, model in enumerate(("gpt-5.6-luna", "gpt-5.6-terra")):
             agent, allowed_ids, operation_requested = _crash_worker_attempt_agent(
                 model, domains, evidence.evidence_ids,
             )
             try:
+                attempt_prompt = prompt + correction
                 result = await self._runner(
-                    agent, prompt, context=context, hooks=hooks,
+                    agent, attempt_prompt, context=context, hooks=hooks,
                     max_turns=_CRASH_WORKER_MAX_TURNS,
                     run_config=trace.run_config(
                         "BigEye crash triage" if attempt == 0 else "BigEye crash triage validation retry",
                     ),
                 )
-                trace.record_result(agent, prompt, result, retry_count=attempt)
+                trace.record_result(agent, attempt_prompt, result, retry_count=attempt)
                 if operation_requested():
                     raise WorkerValidationError(
                         "crash triage requested a deterministic pipeline operation"
@@ -696,6 +717,23 @@ class ProductionCrashTriageWorker:
                 if not deterministic_ids:
                     raise WorkerValidationError(
                         "crash triage cited no deterministic crash evidence"
+                    )
+                contradictory_ids = set(evidence.harness_misuse_evidence)
+                if (
+                    confirmed
+                    and validated.classification != "true vulnerability"
+                    and not (cited & contradictory_ids)
+                ):
+                    correction = (
+                        "\nDeterministic validation correction for Terra: the exact supplied evidence "
+                        "confirms a project memory-safety failure: all 3 original replays match, the "
+                        "clean unmodified-project variant reproduces, the primary frame is in project "
+                        "source, and no harness misuse is evidenced. Do not require exploitability or "
+                        "a correction patch. Classify this as true vulnerability unless you cite a "
+                        "concrete contradictory contract or harness evidence ID from this same boundary."
+                    )
+                    raise WorkerValidationError(
+                        "confirmed project memory-safety evidence was classified without contradiction"
                     )
                 return validated.model_copy(update={"evidence_ids": deterministic_ids})
             except (WorkerValidationError, UnofficialWebCitation) as error:

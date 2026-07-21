@@ -108,9 +108,7 @@ class CampaignTargetPreparation:
                 "error": (str(error) or type(error).__name__)[:2_000],
                 "trusted_instructions": False,
             })
-            await self._events.append(project.id, "events", {
-                "name": "campaigns", "evidence_id": evidence_id,
-            })
+            await self._events.append(project.id, "events", {"name": "campaigns"})
 
     async def _record_attempt(
         self, project_id, target_asset_id, proposal_result_id, successful, outcome,
@@ -146,6 +144,11 @@ class CampaignTargetPreparation:
                 project.id, campaign.id, invocation, prepared.probe_invocations,
                 configuration_files=configuration_files,
             )
+            publish_strategy = getattr(self._invocations, "publish_strategy", None)
+            if publish_strategy is not None:
+                await publish_strategy(
+                    project.id, campaign.id, project.commit_sha, record, prepared, invocation,
+                )
             publish_coverage = getattr(self._invocations, "publish_coverage", None)
             if publish_coverage is not None:
                 await publish_coverage(project.id, campaign.id, project.commit_sha, prepared)

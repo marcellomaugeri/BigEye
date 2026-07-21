@@ -578,6 +578,26 @@ class TestApi:
 
 
 class TestRecovery:
+    def test_lifespan_recovers_ephemeral_containers_before_projects(self) -> None:
+        order = []
+        services = SimpleNamespace(
+            ephemeral_recovery=SimpleNamespace(
+                recover=AsyncMock(side_effect=lambda: order.append("containers")),
+            ),
+            recovery=SimpleNamespace(
+                recover=AsyncMock(side_effect=lambda: order.append("projects")),
+            ),
+            close=AsyncMock(),
+        )
+        from backend.api.app import create_app
+
+        async def scenario():
+            app = create_app(services=services)
+            async with app.router.lifespan_context(app):
+                assert order == ["containers", "projects"]
+
+        run(scenario())
+
     def test_recovery_schedules_each_unfinished_project_without_claiming_success(self) -> None:
         from backend.services.run_project_backbone import ProjectBackboneService
 

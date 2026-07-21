@@ -9,6 +9,7 @@ export interface ReproductionRun {
   command: string[];
   exit_code: number | null;
   terminal_reason: string | null;
+  sanitizer_crash_observed: boolean;
 }
 
 export interface ReproductionOutput {

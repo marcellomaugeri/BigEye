@@ -48,14 +48,13 @@ describe('App', () => {
     await user.click(screen.getByRole('button', { name: 'New project' }));
     await user.type(screen.getByLabelText('Repository URL'), project.repository_url);
     await user.type(screen.getByLabelText('Revision'), project.requested_revision);
-    await user.clear(screen.getByLabelText('Worker count'));
-    await user.type(screen.getByLabelText('Worker count'), '2');
+    expect(screen.getByLabelText('Worker count')).toHaveValue(4);
     await user.click(screen.getByRole('button', { name: 'Start project' }));
 
     expect(api.createProject).toHaveBeenCalledWith({
       repository_url: project.repository_url,
       revision: project.requested_revision,
-      worker_count: 2
+      worker_count: 4
     });
     expect(await screen.findByRole('heading', { name: 'Overview' })).toBeInTheDocument();
   });

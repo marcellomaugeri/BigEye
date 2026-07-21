@@ -154,6 +154,24 @@ class ReproductionBundleStore:
             raise
         return self._verified_bundle(request, destination, manifest)
 
+    async def freeze_for_finding(self, project_id: int, finding_id: int) -> ReproductionBundle:
+        """Resolve and freeze the currently selected validated finding generation."""
+        if type(project_id) is not int or project_id <= 0 or type(finding_id) is not int or finding_id <= 0:
+            raise ValueError("reproduction bundle identity is invalid")
+        resolve = getattr(self._resolver, "resolve", None)
+        if resolve is None:
+            raise ValueError("reproduction bundle authoritative resolver cannot construct a bundle")
+        request = resolve(project_id, finding_id)
+        if inspect.isawaitable(request):
+            request = await request
+        if (
+            not isinstance(request, ReproductionBundleRequest)
+            or request.project_id != project_id
+            or request.finding_id != finding_id
+        ):
+            raise ValueError("resolved reproduction bundle identity is invalid")
+        return await self.freeze(request)
+
     async def verify(self, project_id: int, bundle_id: str) -> bool:
         if type(project_id) is not int or project_id <= 0 or _DIGEST.fullmatch(bundle_id) is None:
             return False
@@ -328,40 +346,89 @@ class ProductionReproductionBundleResolver:
         self._invocations = invocations
         self._docker = docker
 
-    async def verify(self, request: ReproductionBundleRequest) -> bool:
-        project = await self._projects.get(request.project_id)
-        finding = await self._findings.get(request.finding_id)
+    async def resolve(self, project_id: int, finding_id: int) -> ReproductionBundleRequest:
+        """Construct the bundle only from the selected generation and exact clean contract."""
+        if type(project_id) is not int or project_id <= 0 or type(finding_id) is not int or finding_id <= 0:
+            raise ValueError("reproduction bundle identity is invalid")
+        project = await self._projects.get(project_id)
+        finding = await self._findings.get(finding_id)
         if (
-            project is None or project.commit_sha != request.commit_sha
-            or finding is None or finding.project_id != request.project_id
-            or self._finding_artifacts.read_reproducer(finding) != request.minimal_testcase
+            project is None or finding is None or finding.project_id != project_id
+            or not finding.reproducible or finding.error is not None
         ):
-            return False
-        assets = await self._assets.list_for_project(request.project_id)
-        hashes = {asset.content_hash for asset in assets if asset.validated_at is not None and asset.error is None}
-        if not {
-            request.target_asset_hash,
-            request.configuration_asset_hash,
-            request.coverage_asset_hash,
-        }.issubset(hashes):
-            return False
-        campaigns = await self._campaigns.for_finding(request.project_id, finding.fingerprint)
-        contract_matches = False
+            raise ValueError("reproducible finding is unavailable")
+        evidence = self._finding_artifacts.detail(finding)
+        replay = evidence.get("replay") if isinstance(evidence, dict) else None
+        clean = replay.get("clean_variant") if isinstance(replay, dict) else None
+        if (
+            not isinstance(clean, dict) or clean.get("crashed") is not True
+            or clean.get("error") is not None
+            or _IMAGE.fullmatch(str(clean.get("image_id"))) is None
+            or not isinstance(clean.get("sanitizer"), str) or not clean["sanitizer"]
+        ):
+            raise ValueError("selected finding lacks a validated clean replay")
+        reproducer = self._finding_artifacts.read_reproducer(finding)
+        assets = await self._assets.list_for_project(project_id)
+        by_id = {
+            asset.id: asset for asset in assets
+            if asset.project_id == project_id and asset.validated_at is not None and asset.error is None
+        }
+        campaigns = await self._campaigns.for_finding(project_id, finding.fingerprint)
+        candidates: list[ReproductionBundleRequest] = []
         for campaign in campaigns:
-            invocation = self._invocations.load(request.project_id, campaign.id)
-            commands = {tuple(invocation.command)}
-            images = {invocation.image_id}
+            if campaign.project_id != project_id:
+                continue
             try:
-                coverage = self._invocations.load_coverage(request.project_id, campaign.id)
+                coverage = self._invocations.load_coverage(project_id, campaign.id)
             except (FileNotFoundError, ValueError):
-                coverage = None
-            if coverage is not None:
-                commands.add(tuple(coverage.replay_command))
-                images.add(coverage.clean_image_id)
-            if request.command in commands and request.image_id in images:
-                contract_matches = True
-                break
-        if not contract_matches:
+                continue
+            configuration_id = coverage.clean_build_configuration_asset_id
+            if (
+                coverage.project_id != project_id or coverage.commit_sha != project.commit_sha
+                or coverage.clean_image_id != clean["image_id"]
+                or coverage.target_asset_id != campaign.target_asset_id
+                or coverage.configuration_asset_id != campaign.configuration_asset_id
+                or configuration_id is None
+            ):
+                continue
+            try:
+                target = by_id[coverage.target_asset_id]
+                configuration = by_id[configuration_id]
+                coverage_asset = by_id[coverage.coverage_asset_id]
+            except KeyError:
+                continue
+            lineage = json.dumps({
+                "campaign_id": campaign.id,
+                "clean_content_hash": coverage.clean_content_hash,
+                "target_asset_id": coverage.target_asset_id,
+                "configuration_asset_id": coverage.configuration_asset_id,
+                "clean_build_configuration_asset_id": configuration_id,
+                "coverage_asset_id": coverage.coverage_asset_id,
+            }, sort_keys=True, separators=(",", ":"))
+            candidates.append(ReproductionBundleRequest(
+                project_id=project_id,
+                finding_id=finding_id,
+                commit_sha=project.commit_sha,
+                image_id=coverage.clean_image_id,
+                command=tuple(coverage.replay_command),
+                environment=tuple(coverage.replay_environment),
+                sanitizer=clean["sanitizer"],
+                configuration=lineage,
+                minimal_testcase=reproducer,
+                target_asset_hash=target.content_hash,
+                configuration_asset_hash=configuration.content_hash,
+                coverage_asset_hash=coverage_asset.content_hash,
+            ))
+        if not candidates or any(candidate != candidates[0] for candidate in candidates[1:]):
+            raise ValueError("finding reproduction contract is unavailable or ambiguous")
+        return candidates[0]
+
+    async def verify(self, request: ReproductionBundleRequest) -> bool:
+        try:
+            authoritative = await self.resolve(request.project_id, request.finding_id)
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            return False
+        if authoritative != request:
             return False
         client = self._docker.connect()
         try:

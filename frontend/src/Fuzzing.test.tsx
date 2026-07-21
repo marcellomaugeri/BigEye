@@ -48,6 +48,8 @@ describe('Fuzzing workspace', () => {
   it('shows authoritative campaign evidence while keeping the fuzzer secondary', () => {
     render(<FuzzingView model={model()} />);
 
+    const scroller = screen.getByRole('region', { name: 'Scrollable autonomous fuzzing campaigns' });
+    expect(scroller).toHaveAttribute('tabindex', '0');
     const table = screen.getByRole('table', { name: 'Autonomous fuzzing campaigns' });
     expect(within(table).getByText('Encrypted parser path')).toBeVisible();
     expect(within(table).getByText('Exercise encrypted parser input.')).toBeVisible();

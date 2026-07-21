@@ -13,7 +13,12 @@ from unittest.mock import AsyncMock
 import pytest
 
 from backend.agents.outputs.triage_result import TriageResult
-from backend.fuzzing.crashes.fingerprint import crash_fingerprint
+from backend.fuzzing.crashes.fingerprint import (
+    ProjectCrashFrame,
+    compatible_crash_groups,
+    crash_fingerprint,
+    crash_group_identity,
+)
 from backend.fuzzing.crashes.minimisation import CrashMinimiser
 from backend.fuzzing.crashes.quarantine import CrashObservation, CrashQuarantine
 from backend.fuzzing.crashes.replay import ReplayResult
@@ -133,6 +138,12 @@ class Findings:
         )
         self.rows[key] = finding
         return finding
+
+    async def list_for_project(self, project_id):
+        return [
+            finding for (candidate_project_id, _fingerprint), finding in self.rows.items()
+            if candidate_project_id == project_id
+        ]
 
     async def link_campaign(self, campaign_id, project_id, fingerprint):
         self.links.append((campaign_id, project_id, fingerprint))
@@ -367,6 +378,188 @@ def test_duplicate_crashes_become_one_group_with_occurrence_count(tmp_path: Path
     expected = min((b"one", b"two"), key=lambda value: __import__("hashlib").sha256(value).hexdigest())
     assert retained == expected
     assert metadata == {"sha256": __import__("hashlib").sha256(retained).hexdigest(), "size": len(retained)}
+
+
+def test_partial_component_and_symbolized_afl_evidence_form_one_cross_engine_group(
+    tmp_path: Path,
+) -> None:
+    class SequenceSpecialist(Specialist):
+        def __init__(self):
+            super().__init__()
+            self.classifications = iter(("unresolved", "true vulnerability"))
+
+        async def triage(self, evidence):
+            self.classification = next(self.classifications)
+            return await super().triage(evidence)
+
+    service, repository, _ = pipeline(tmp_path, specialist=SequenceSpecialist())
+    component = observation(
+        campaign_id=11,
+        engine="libfuzzer",
+        input_mode="inprocess",
+        stack=(
+            "#1 0x111 in decode_payload decoder.c\n"
+            "#2 0x222 in decoder_decode (/opt/bigeye/decoder_decode_fuzz+0x10)\n"
+            "#3 0x333 in LLVMFuzzerTestOneInput (/opt/bigeye/decoder_decode_fuzz+0x20)"
+        ),
+        source_location=None,
+        input_bytes=b"component-observation",
+    )
+    afl = observation(
+        campaign_id=12,
+        engine="afl",
+        input_mode="stdin",
+        command=("/opt/bigeye/build/decoder_cli",),
+        stack=(
+            "#1 0xaaa in decode_payload /src/src/decoder.c:36:5\n"
+            "#2 0xbbb in decoder_decode /src/src/decoder.c:59:24\n"
+            "#3 0xccc in main /src/src/decoder_cli.c:72:19"
+        ),
+        source_location="src/decoder.c:36",
+        input_bytes=b"afl-observation",
+    )
+
+    first = run(service.process(component))
+    second = run(service.process(afl))
+
+    assert first.id == second.id
+    assert second.occurrence_count == 2
+    assert second.classification == "true vulnerability"
+    assert len(repository.rows) == 1
+    assert repository.links == [(11, 7, first.fingerprint), (12, 7, first.fingerprint)]
+    occurrences = sorted((tmp_path / "projects/7/findings" / first.fingerprint / "occurrences").iterdir())
+    provenance = [json.loads(path.read_text(encoding="utf-8")) for path in occurrences]
+    assert {(item["campaign_id"], item["engine"]) for item in provenance} == {
+        (11, "libfuzzer"), (12, "afl"),
+    }
+    assert len({item["input_sha256"] for item in provenance}) == 2
+
+
+def test_partial_symbols_require_the_identical_minimised_testcase_to_group() -> None:
+    component = ReplayResult(
+        variant="original", crashed=True, signal=None,
+        stack="#1 0x111 in decode_payload decoder.c\n#2 0x222 in decoder_decode",
+        sanitizer="address", source_location=None, coverage=(), exit_code=1,
+        image_id="sha256:" + "a" * 64,
+    )
+    afl = replace(
+        component,
+        stack=(
+            "#1 0xaaa in decode_payload /src/src/decoder.c:36:5\n"
+            "#2 0xbbb in decoder_decode /src/src/decoder.c:59:24"
+        ),
+        source_location="src/decoder.c:36",
+    )
+    partial = crash_group_identity(
+        component, commit_sha="a" * 40, reproducible=True,
+        minimised_testcase=b"C:abcdefghi", minimisation_accepted=True,
+        harness_misuse=False,
+    )
+    same_input = crash_group_identity(
+        afl, commit_sha="a" * 40, reproducible=True,
+        minimised_testcase=b"C:abcdefghi", minimisation_accepted=True,
+        harness_misuse=False,
+    )
+    different_input = crash_group_identity(
+        afl, commit_sha="a" * 40, reproducible=True,
+        minimised_testcase=b"C:123456789", minimisation_accepted=True,
+        harness_misuse=False,
+    )
+
+    assert compatible_crash_groups(partial, same_input) is True
+    assert compatible_crash_groups(partial, different_input) is False
+
+
+def test_known_primary_frame_groups_observed_component_and_afl_shapes_with_different_minima() -> None:
+    component = ReplayResult(
+        variant="original", crashed=True, signal=None,
+        stack=(
+            "#1 0x111 in decode_payload /src/src/decoder.c:36:5\n"
+            "#2 0x222 in decoder_decode (/opt/bigeye/decoder_decode_fuzz+0x10)\n"
+            "#3 0x333 in LLVMFuzzerTestOneInput (/opt/bigeye/decoder_decode_fuzz+0x20)"
+        ),
+        sanitizer="address", source_location="src/decoder.c:36", coverage=(), exit_code=1,
+        image_id="sha256:" + "a" * 64,
+    )
+    afl = replace(
+        component,
+        stack=(
+            "#1 0xaaa in decode_payload /src/src/decoder.c:36:5\n"
+            "#2 0xbbb in decoder_decode (/opt/bigeye/build/decoder_cli+0x20)\n"
+            "#3 0xccc in main (/opt/bigeye/build/decoder_cli+0x30)\n"
+            "#4 0xddd in _start (/opt/bigeye/build/decoder_cli+0x40)"
+        ),
+    )
+    component_identity = crash_group_identity(
+        component, commit_sha="a" * 40, reproducible=True,
+        minimised_testcase=b"C:bcdHHHHef", minimisation_accepted=True,
+        harness_misuse=False,
+    )
+    afl_identity = crash_group_identity(
+        afl, commit_sha="a" * 40, reproducible=True,
+        minimised_testcase=b"C:bnefgh|jk", minimisation_accepted=True,
+        harness_misuse=False,
+    )
+
+    assert component_identity.frames == (
+        ProjectCrashFrame("decode_payload", "decoder.c:36"),
+        ProjectCrashFrame("decoder_decode", None),
+    )
+    assert afl_identity.frames == (
+        ProjectCrashFrame("decode_payload", "decoder.c:36"),
+        ProjectCrashFrame("decoder_decode", None),
+        ProjectCrashFrame("main", None),
+        ProjectCrashFrame("_start", None),
+    )
+    assert component_identity.minimised_sha256 != afl_identity.minimised_sha256
+    assert compatible_crash_groups(component_identity, afl_identity) is True
+
+
+def test_known_conflicting_project_locations_and_functions_remain_separate() -> None:
+    base = ReplayResult(
+        variant="original", crashed=True, signal=None,
+        stack="#1 0x111 in decode_payload /src/src/decoder.c:36:5",
+        sanitizer="address", source_location="src/decoder.c:36", coverage=(), exit_code=1,
+        image_id="sha256:" + "a" * 64,
+    )
+    line_conflict = replace(
+        base, stack="#1 0x222 in decode_payload /src/src/decoder.c:37:5",
+        source_location="src/decoder.c:37",
+    )
+    function_conflict = replace(
+        base, stack="#1 0x333 in decode_header /src/src/decoder.c:36:5",
+    )
+
+    def identity(result):
+        return crash_group_identity(
+            result, commit_sha="a" * 40, reproducible=True,
+            minimised_testcase=b"same", minimisation_accepted=True,
+            harness_misuse=False,
+        )
+
+    assert compatible_crash_groups(identity(base), identity(line_conflict)) is False
+    assert compatible_crash_groups(identity(base), identity(function_conflict)) is False
+
+
+def test_harness_misuse_evidence_never_merges_with_a_project_defect() -> None:
+    result = ReplayResult(
+        variant="original", crashed=True, signal=None,
+        stack="#1 0x111 in decode_payload /src/src/decoder.c:36:5",
+        sanitizer="address", source_location="src/decoder.c:36", coverage=(), exit_code=1,
+        image_id="sha256:" + "a" * 64,
+    )
+    harness = crash_group_identity(
+        result, commit_sha="a" * 40, reproducible=True,
+        minimised_testcase=b"same", minimisation_accepted=True,
+        harness_misuse=True,
+    )
+    project = crash_group_identity(
+        result, commit_sha="a" * 40, reproducible=True,
+        minimised_testcase=b"same", minimisation_accepted=True,
+        harness_misuse=False,
+    )
+
+    assert compatible_crash_groups(harness, project) is False
 
 
 def test_parallel_duplicates_keep_database_fields_and_selected_artifact_consistent(tmp_path: Path):

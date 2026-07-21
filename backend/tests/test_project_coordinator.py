@@ -283,7 +283,19 @@ def test_failed_selected_action_is_retried_once_with_sanitized_failure_evidence(
     current_time = [NOW]
     subject = coordinator(manager=manager)
     subject.decision_executor.execute.return_value = [
-        ActionResult("target_1", None, ActionError("RuntimeError", "build failed")),
+        ActionResult("target_1", None, ActionError(
+            "RuntimeError", "build failed",
+            {
+                "phase": "target-build",
+                "command": "clang /opt/bigeye/generated-assets/decoder_fuzz.c",
+                "exit_code": 1,
+                "stderr": "decoder_fuzz.c: file not found",
+                "generated_path_mapping": [{
+                    "relative_path": "decoder_fuzz.c",
+                    "container_path": "/opt/bigeye/generated-assets/decoder_fuzz.c",
+                }],
+            },
+        )),
     ]
     subject._clock = lambda: current_time[0]
     observation = healthy_snapshot(corpus_opportunity=True)
@@ -301,8 +313,664 @@ def test_failed_selected_action_is_retried_once_with_sanitized_failure_evidence(
     )
     assert failure["action_ids"] == ["target_1"]
     assert failure["error_types"] == ["RuntimeError"]
-    assert "build failed" not in repr(failure)
+    assert failure["failures"] == [{
+        "action_id": "target_1",
+        "error_type": "RuntimeError",
+        "message": "build failed",
+        "phase": "target-build",
+        "command": "clang /opt/bigeye/generated-assets/decoder_fuzz.c",
+        "exit_code": 1,
+        "stderr": "decoder_fuzz.c: file not found",
+        "generated_path_mapping": [{
+            "relative_path": "decoder_fuzz.c",
+            "container_path": "/opt/bigeye/generated-assets/decoder_fuzz.c",
+        }],
+    }]
     assert 7 not in subject._pending_reviews
+
+
+def test_action_failure_survives_coordinator_reconstruction_and_unrelated_crash_evidence(
+    tmp_path,
+) -> None:
+    from backend.services.campaigns.decision_executor import ActionError, ActionResult
+    from backend.services.observability.event_store import ProjectEventStore
+
+    events = ProjectEventStore(tmp_path)
+    runtime = AsyncMock()
+    runtime.retirement_candidates.return_value = ()
+    runtime.review_context.return_value = SimpleNamespace(project_id=7)
+    runtime.review_evidence.return_value = [{"evidence_id": "repository:inventory"}]
+    first_manager = AsyncMock()
+    first_manager.review.return_value = object()
+    first = coordinator(manager=first_manager, runtime=runtime, events=events)
+    first.decision_executor.execute.return_value = [
+        ActionResult("pipeline_bad_cli", None, ActionError(
+            "TargetPreparationFailed", "bad fixed argv",
+            {"phase": "probe", "command": ["/opt/bigeye/decoder_cli"]},
+        )),
+    ]
+
+    run(first.tick(7, healthy_snapshot(corpus_opportunity=True)))
+
+    recovered_runtime = AsyncMock()
+    recovered_runtime.retirement_candidates.return_value = ()
+    recovered_runtime.review_context.return_value = SimpleNamespace(project_id=7)
+    recovered_runtime.review_evidence.return_value = [{
+        "evidence_id": "finding:stable", "kind": "finalized_finding",
+        "classification": "true vulnerability", "reproducible": True,
+    }]
+    recovered_manager = AsyncMock()
+    recovered_manager.review.return_value = object()
+    recovered = coordinator(
+        manager=recovered_manager, runtime=recovered_runtime, events=events,
+    )
+    recovered_runtime.review_evidence.return_value = [{
+        "evidence_id": "finding:stable", "kind": "finalized_finding",
+        "classification": "true vulnerability", "reproducible": True,
+    }]
+    recovered.decision_executor.execute.return_value = []
+
+    run(recovered.tick(7, healthy_snapshot(replayed_crash=True)))
+
+    supplied = recovered_manager.review.await_args.args[1]
+    failure = next(item for item in supplied if item.get("kind") == "action_execution_failure")
+    assert failure["action_ids"] == ["pipeline_bad_cli"]
+    assert "finding:stable" in [item["evidence_id"] for item in supplied], supplied
+    assert supplied.index(failure) < next(
+        index for index, item in enumerate(supplied) if item["evidence_id"] == "finding:stable"
+    )
+
+
+def test_distinct_successful_target_correction_resolves_retained_action_failure(
+    tmp_path,
+) -> None:
+    from backend.services.campaigns.decision_executor import ActionError, ActionResult
+    from backend.services.observability.event_store import ProjectEventStore
+
+    events = ProjectEventStore(tmp_path)
+    runtime = AsyncMock()
+    runtime.retirement_candidates.return_value = ()
+    runtime.review_context.return_value = SimpleNamespace(project_id=7)
+    runtime.review_evidence.return_value = [{"evidence_id": "repository:inventory"}]
+    correction = SimpleNamespace(
+        selected_pipeline_operations=(SimpleNamespace(
+            action_id="pipeline_corrected_cli", operation="probe",
+        ),),
+        selected_target_proposals=(),
+    )
+    manager = AsyncMock()
+    manager.review.side_effect = [object(), correction, object()]
+    current_time = [NOW]
+    subject = coordinator(manager=manager, runtime=runtime, events=events)
+    subject._clock = lambda: current_time[0]
+    subject.decision_executor.execute.side_effect = [
+        [ActionResult("pipeline_bad_cli", None, ActionError(
+            "TargetPreparationFailed", "bad fixed argv", {"phase": "probe"},
+        ))],
+        [ActionResult("pipeline_corrected_cli", SimpleNamespace(campaign_id=2))],
+        [],
+    ]
+    observation = healthy_snapshot(corpus_opportunity=True)
+
+    run(subject.tick(7, observation))
+    current_time[0] += timedelta(seconds=30)
+    run(subject.tick(7, observation))
+    runtime.review_evidence.return_value = [{
+        "evidence_id": "finding:stable", "kind": "finalized_finding",
+        "classification": "true vulnerability", "reproducible": True,
+    }]
+    current_time[0] += timedelta(seconds=1)
+    run(subject.tick(7, healthy_snapshot(replayed_crash=True)))
+
+    supplied = manager.review.await_args_list[2].args[1]
+    assert all(item.get("kind") != "action_execution_failure" for item in supplied)
+    resolution = next(
+        event.payload for event in run(events.read_latest(7, "debug", -1, 100))
+        if event.payload.get("event") == "campaign.action_failures_resolved"
+    )
+    assert resolution["correction_action_ids"] == ["pipeline_corrected_cli"]
+
+
+def test_distinct_success_does_not_resolve_two_ambiguous_action_failure_groups(
+    tmp_path,
+) -> None:
+    from backend.services.observability.event_store import ProjectEventStore
+
+    events = ProjectEventStore(tmp_path)
+    subject = coordinator(events=events)
+    component_failure = {
+        "evidence_id": "action-failure:7:component",
+        "kind": "action_execution_failure",
+        "action_ids": ["component_bad_harness"],
+        "error_types": ["TargetPreparationFailed"],
+        "failures": [],
+    }
+    system_failure = {
+        "evidence_id": "action-failure:7:system",
+        "kind": "action_execution_failure",
+        "action_ids": ["system_bad_argv"],
+        "error_types": ["TargetPreparationFailed"],
+        "failures": [],
+    }
+    subject._action_failures[7] = {
+        component_failure["evidence_id"]: component_failure,
+        system_failure["evidence_id"]: system_failure,
+    }
+
+    run(subject._resolve_action_failures(
+        7,
+        [component_failure, system_failure],
+        ("component_corrected_harness",),
+    ))
+
+    retained = run(subject._unresolved_action_failures(7))
+    assert {item["evidence_id"] for item in retained} == {
+        "action-failure:7:component",
+        "action-failure:7:system",
+    }
+    assert all(
+        event.payload.get("event") != "campaign.action_failures_resolved"
+        for event in run(events.read_latest(7, "debug", -1, 100))
+    )
+
+
+def test_distinct_success_does_not_resolve_one_group_with_two_failed_actions(
+    tmp_path,
+) -> None:
+    from backend.services.observability.event_store import ProjectEventStore
+
+    events = ProjectEventStore(tmp_path)
+    subject = coordinator(events=events)
+    grouped_failure = {
+        "evidence_id": "action-failure:7:grouped",
+        "kind": "action_execution_failure",
+        "action_ids": ["component_bad_harness", "system_bad_argv"],
+        "error_types": ["TargetPreparationFailed"],
+        "failures": [
+            {
+                "action_id": "component_bad_harness",
+                "error_type": "TargetPreparationFailed",
+                "message": "component build failed",
+            },
+            {
+                "action_id": "system_bad_argv",
+                "error_type": "TargetPreparationFailed",
+                "message": "system probe failed",
+            },
+        ],
+    }
+    subject._action_failures[7] = {
+        grouped_failure["evidence_id"]: grouped_failure,
+    }
+
+    run(subject._resolve_action_failures(
+        7,
+        [grouped_failure],
+        ("component_corrected_harness",),
+    ))
+
+    assert run(subject._unresolved_action_failures(7)) == (grouped_failure,)
+    assert all(
+        event.payload.get("event") != "campaign.action_failures_resolved"
+        for event in run(events.read_latest(7, "debug", -1, 100))
+    )
+
+
+def test_next_review_receives_exact_component_path_and_cli_seed_failures() -> None:
+    from backend.services.campaigns.decision_executor import ActionError, ActionResult
+
+    manager = AsyncMock(return_value=object())
+    current_time = [NOW]
+    subject = coordinator(manager=manager)
+    subject._clock = lambda: current_time[0]
+    subject.decision_executor.execute.return_value = [
+        ActionResult("component", None, ActionError(
+            "TargetPreparationFailed", "component build failed",
+            {
+                "phase": "target-build", "exit_code": 1,
+                "command": "clang /opt/bigeye/generated-assets/decoder_fuzz.c",
+                "stderr": "decoder_fuzz.c: file not found",
+                "generated_path_mapping": [{
+                    "relative_path": "generated-assets/decoder_fuzz.c",
+                    "container_path": (
+                        "/opt/bigeye/generated-assets/generated-assets/decoder_fuzz.c"
+                    ),
+                }],
+            },
+        )),
+        ActionResult("cli", None, ActionError(
+            "TargetPreparationFailed", "fixed argv rejected seed",
+            {
+                "phase": "clean-coverage", "exit_code": 1,
+                "command": ["/opt/bigeye/build/decoder_cli", "--file", "{input}"],
+                "stderr": "configuration-incompatible seed",
+                "failing_seed": "seeds/framed.input",
+                "testcase_sha256": "a" * 64,
+            },
+        )),
+    ]
+    observation = healthy_snapshot(corpus_opportunity=True)
+
+    run(subject.tick(7, observation))
+    current_time[0] += timedelta(seconds=30)
+    run(subject.tick(7, observation))
+
+    retry_evidence = manager.review.await_args_list[1].args[1]
+    failure = next(item for item in retry_evidence if item.get("kind") == "action_execution_failure")
+    by_action = {item["action_id"]: item for item in failure["failures"]}
+    assert by_action["component"]["generated_path_mapping"][0]["container_path"] == (
+        "/opt/bigeye/generated-assets/generated-assets/decoder_fuzz.c"
+    )
+    assert by_action["component"]["stderr"] == "decoder_fuzz.c: file not found"
+    assert by_action["cli"]["failing_seed"] == "seeds/framed.input"
+    assert by_action["cli"]["command"][-1] == "{input}"
+
+
+def test_sibling_action_failure_persists_a_near_wake_and_recovery_sees_current_evidence() -> None:
+    from backend.services.campaigns.decision_executor import ActionError, ActionResult
+
+    project_value = project()
+    current_time = [NOW]
+    first_manager = AsyncMock()
+    first_manager.review.return_value = SimpleNamespace(decision=SimpleNamespace(
+        next_review_delay_seconds=180,
+        next_review_reason="Review both prepared campaigns.",
+    ))
+    runtime = AsyncMock()
+    runtime.retirement_candidates.return_value = ()
+    runtime.review_context.return_value = SimpleNamespace(project_id=7)
+    runtime.review_evidence.return_value = [{"evidence_id": "repository:inventory"}]
+    subject = coordinator(value=project_value, manager=first_manager, runtime=runtime)
+    subject._clock = lambda: current_time[0]
+
+    async def execute_siblings(_project, _decision):
+        current_time[0] += timedelta(seconds=40)
+        return [
+            ActionResult("system", SimpleNamespace(campaign_id=1)),
+            ActionResult("component", None, ActionError(
+                "TargetPreparationFailed", "unsupported compiler frontend", {},
+            )),
+        ]
+
+    async def schedule(project_id, wake_at, reason):
+        assert project_id == 7
+        project_value.manager_wake_at = wake_at
+        project_value.manager_wake_reason = reason
+
+    subject.decision_executor.execute.side_effect = execute_siblings
+    subject.projects.schedule_manager_review.side_effect = schedule
+
+    run(subject.tick(7, healthy_snapshot(corpus_opportunity=True)))
+
+    correction_wake = NOW + timedelta(seconds=70)
+    assert project_value.manager_wake_at == correction_wake
+    subject.projects.schedule_manager_review.assert_awaited_once_with(
+        7,
+        correction_wake,
+        "Retry after ActionExecutionFailed: validated corpus opportunity",
+    )
+    runtime.schedule_next_review.assert_awaited_once_with(
+        project_value,
+        correction_wake,
+        "Retry after ActionExecutionFailed: validated corpus opportunity",
+    )
+    runtime.stop_campaigns.assert_not_awaited()
+
+    current_inventory = {
+        "evidence_id": "campaign-strategies:current",
+        "kind": "campaign_strategy_inventory",
+        "strategies": [{"engine": "afl", "activity": "working"}],
+        "required_next_instance_type": "component-level",
+    }
+    current_failure = {
+        "evidence_id": "target-attempt:component:failed",
+        "kind": "target_preparation_attempt",
+        "status": "failed",
+    }
+    recovered_runtime = AsyncMock()
+    recovered_runtime.retirement_candidates.return_value = ()
+    recovered_runtime.review_context.return_value = SimpleNamespace(project_id=7)
+    recovered_runtime.review_evidence.return_value = [current_failure, current_inventory]
+    recovered_manager = AsyncMock()
+    recovered_manager.review.return_value = SimpleNamespace(decision=SimpleNamespace(
+        next_review_delay_seconds=900,
+        next_review_reason="Review corrected component campaign.",
+    ))
+    recovered = coordinator(
+        value=project_value, manager=recovered_manager, runtime=recovered_runtime,
+    )
+    recovered_runtime.review_evidence.return_value = [current_failure, current_inventory]
+    current_time[0] = correction_wake
+    recovered._clock = lambda: current_time[0]
+    recovered.decision_executor.execute.return_value = []
+
+    run(recovered.tick(7, healthy_snapshot(active_workers=1, free_slots=0)))
+
+    recovered_manager.review.assert_awaited_once()
+    assert recovered_manager.review.await_args.args[1] == [current_failure, current_inventory]
+    assert recovered_manager.review.await_args.args[2] == "review window expired"
+
+
+def test_active_run_retries_failed_sibling_on_durable_deadline_without_restarting() -> None:
+    from backend.services.campaigns.decision_executor import ActionError, ActionResult
+    from backend.services.campaigns.project_coordinator import ProjectCoordinator
+
+    value = project()
+    value.manager_wake_reason = None
+    projects = AsyncMock()
+    projects.get.return_value = value
+
+    async def schedule(_project_id, wake_at, reason):
+        value.manager_wake_at = wake_at
+        value.manager_wake_reason = reason
+
+    projects.schedule_manager_review.side_effect = schedule
+    healthy_campaign = {"running": False}
+    full_reconciles = 0
+    fast_reconciles = 0
+    current_inventory = {
+        "evidence_id": "campaign-strategies:current",
+        "kind": "campaign_strategy_inventory",
+        "strategies": [{"engine": "afl", "activity": "working"}],
+        "required_next_instance_type": "component-level",
+    }
+
+    class Runtime:
+        async def reconcile(self, _project):
+            nonlocal full_reconciles
+            full_reconciles += 1
+            return healthy_snapshot(corpus_opportunity=True, active_workers=int(healthy_campaign["running"]))
+
+        async def reconcile_for_review(self, _project):
+            nonlocal fast_reconciles
+            fast_reconciles += 1
+            assert healthy_campaign["running"] is True
+            return healthy_snapshot(active_workers=1, free_slots=1)
+
+        async def review_context(self, _project, _snapshot):
+            return SimpleNamespace(project_id=7)
+
+        async def review_evidence(self, _project, _snapshot, _trigger):
+            return [current_inventory] if healthy_campaign["running"] else [
+                {"evidence_id": "repository:inventory"},
+            ]
+
+        async def retirement_candidates(self, _project, _snapshot):
+            return ()
+
+        async def schedule_next_review(self, _project, _deadline, _reason):
+            return None
+
+        async def apply_cpu_checkpoint(self, _project, _snapshot):
+            return None
+
+    runtime = Runtime()
+    manager = AsyncMock()
+    manager.review.side_effect = [
+        SimpleNamespace(decision=SimpleNamespace(
+            next_review_delay_seconds=180,
+            next_review_reason="Review both prepared campaigns.",
+        )),
+        SimpleNamespace(decision=SimpleNamespace(
+            next_review_delay_seconds=900,
+            next_review_reason="Review corrected component campaign.",
+        )),
+    ]
+    executor = AsyncMock()
+    repaired = asyncio.Event()
+
+    async def execute(_project, _decision):
+        if executor.execute.await_count == 1:
+            healthy_campaign["running"] = True
+            return [
+                ActionResult("system", SimpleNamespace(campaign_id=1)),
+                ActionResult("component", None, ActionError(
+                    "TargetPreparationFailed", "unsupported compiler frontend", {},
+                )),
+            ]
+        assert healthy_campaign["running"] is True
+        repaired.set()
+        return [ActionResult("component-repair", SimpleNamespace(campaign_id=2))]
+
+    executor.execute.side_effect = execute
+    subject = ProjectCoordinator(
+        projects=projects,
+        bootstrap=AsyncMock(),
+        discovery=AsyncMock(),
+        manager=manager,
+        decision_executor=executor,
+        runtime=runtime,
+        advisory_lock=Lock(),
+        manager_retry_delay_seconds=0.02,
+    )
+
+    async def scenario():
+        task = asyncio.create_task(subject.run(7))
+        await asyncio.wait_for(repaired.wait(), 1)
+        await asyncio.sleep(0.04)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    run(scenario())
+
+    assert manager.review.await_count == 2
+    retry_evidence = manager.review.await_args_list[1].args[1]
+    assert retry_evidence[0]["kind"] == "action_execution_failure"
+    assert current_inventory in retry_evidence
+    assert executor.execute.await_count == 2
+    assert healthy_campaign["running"] is True
+    assert full_reconciles == 1
+    assert fast_reconciles == 1
+
+
+def test_durable_backoff_interrupts_long_reconcile_and_runs_one_manager_review() -> None:
+    from backend.services.campaigns.decision_executor import ActionError, ActionResult
+    from backend.services.campaigns.project_coordinator import ProjectCoordinator
+
+    value = project()
+    value.manager_wake_reason = None
+    projects = AsyncMock()
+    projects.get.return_value = value
+
+    async def schedule(_project_id, wake_at, reason):
+        value.manager_wake_at = wake_at
+        value.manager_wake_reason = reason
+
+    projects.schedule_manager_review.side_effect = schedule
+    healthy_campaign = {"running": False}
+    full_reconciles = 0
+    fast_reconciles = 0
+    long_reconcile_started = asyncio.Event()
+    long_reconcile_cancelled = asyncio.Event()
+    current_inventory = {
+        "evidence_id": "campaign-strategies:current",
+        "kind": "campaign_strategy_inventory",
+        "strategies": [{"engine": "afl", "activity": "working"}],
+        "required_next_instance_type": "component-level",
+    }
+
+    class Runtime:
+        async def reconcile(self, _project):
+            nonlocal full_reconciles
+            full_reconciles += 1
+            if full_reconciles == 1:
+                return healthy_snapshot(corpus_opportunity=True)
+            long_reconcile_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                long_reconcile_cancelled.set()
+
+        async def reconcile_for_review(self, _project):
+            nonlocal fast_reconciles
+            fast_reconciles += 1
+            assert healthy_campaign["running"] is True
+            return healthy_snapshot(active_workers=1, free_slots=1)
+
+        async def review_context(self, _project, _snapshot):
+            return SimpleNamespace(project_id=7)
+
+        async def review_evidence(self, _project, _snapshot, _trigger):
+            return [current_inventory] if healthy_campaign["running"] else [
+                {"evidence_id": "repository:inventory"},
+            ]
+
+        async def retirement_candidates(self, _project, _snapshot):
+            return ()
+
+        async def schedule_next_review(self, _project, _deadline, _reason):
+            return None
+
+        async def apply_cpu_checkpoint(self, _project, _snapshot):
+            return None
+
+    manager = AsyncMock()
+    manager.review.side_effect = [
+        SimpleNamespace(decision=SimpleNamespace(
+            next_review_delay_seconds=180,
+            next_review_reason="Review both prepared campaigns.",
+        )),
+        RuntimeError("bounded manager attempt failed"),
+        SimpleNamespace(decision=SimpleNamespace(
+            next_review_delay_seconds=900,
+            next_review_reason="Review corrected component campaign.",
+        )),
+    ]
+    executor = AsyncMock()
+    repaired = asyncio.Event()
+
+    async def execute(_project, _decision):
+        if executor.execute.await_count == 1:
+            healthy_campaign["running"] = True
+            return [
+                ActionResult("system", SimpleNamespace(campaign_id=1)),
+                ActionResult("component", None, ActionError(
+                    "TargetPreparationFailed", "unsupported compiler frontend", {},
+                )),
+            ]
+        repaired.set()
+        return [ActionResult("component-repair", SimpleNamespace(campaign_id=2))]
+
+    executor.execute.side_effect = execute
+    subject = ProjectCoordinator(
+        projects=projects,
+        bootstrap=AsyncMock(),
+        discovery=AsyncMock(),
+        manager=manager,
+        decision_executor=executor,
+        runtime=Runtime(),
+        advisory_lock=Lock(),
+        manager_retry_delay_seconds=0.02,
+        manager_failure_backoff_seconds=0.03,
+    )
+
+    async def scenario():
+        task = asyncio.create_task(subject.run(7))
+        await asyncio.wait_for(long_reconcile_started.wait(), 1)
+        await asyncio.wait_for(repaired.wait(), 1)
+        await asyncio.sleep(0.04)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    run(scenario())
+
+    assert long_reconcile_cancelled.is_set()
+    assert manager.review.await_count == 3
+    final_evidence = manager.review.await_args_list[2].args[1]
+    assert final_evidence[0]["kind"] == "action_execution_failure"
+    assert current_inventory in final_evidence
+    assert executor.execute.await_count == 2
+    assert healthy_campaign["running"] is True
+    assert full_reconciles == 2
+    assert fast_reconciles == 2
+
+
+def test_reconstructed_coordinator_timer_interrupts_reconcile_for_persisted_wake() -> None:
+    from backend.services.campaigns.project_coordinator import ProjectCoordinator
+
+    value = project(manager_wake_at=datetime.now(UTC) + timedelta(seconds=0.02))
+    value.manager_wake_reason = "Failure backoff after TimeoutError: initial supervision completed"
+    projects = AsyncMock()
+    projects.get.return_value = value
+
+    async def schedule(_project_id, wake_at, reason):
+        value.manager_wake_at = wake_at
+        value.manager_wake_reason = reason
+
+    projects.schedule_manager_review.side_effect = schedule
+    reconcile_started = asyncio.Event()
+    reconcile_cancelled = asyncio.Event()
+    fast_reconciles = 0
+
+    class Runtime:
+        async def reconcile(self, _project):
+            reconcile_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                reconcile_cancelled.set()
+
+        async def reconcile_for_review(self, _project):
+            nonlocal fast_reconciles
+            fast_reconciles += 1
+            return healthy_snapshot(active_workers=1)
+
+        async def review_context(self, _project, _snapshot):
+            return SimpleNamespace(project_id=7)
+
+        async def review_evidence(self, _project, _snapshot, _trigger):
+            return [{
+                "evidence_id": "campaign-strategies:current",
+                "kind": "campaign_strategy_inventory",
+                "strategies": [{"engine": "afl", "activity": "working"}],
+            }]
+
+        async def retirement_candidates(self, _project, _snapshot):
+            return ()
+
+        async def schedule_next_review(self, _project, _deadline, _reason):
+            return None
+
+        async def apply_cpu_checkpoint(self, _project, _snapshot):
+            return None
+
+    reviewed = asyncio.Event()
+    manager = AsyncMock()
+
+    async def review(*_args, **_kwargs):
+        reviewed.set()
+        return SimpleNamespace(decision=SimpleNamespace(
+            next_review_delay_seconds=900,
+            next_review_reason="Review recovered campaign.",
+        ))
+
+    manager.review.side_effect = review
+    subject = ProjectCoordinator(
+        projects=projects,
+        bootstrap=AsyncMock(),
+        discovery=AsyncMock(),
+        manager=manager,
+        decision_executor=AsyncMock(execute=AsyncMock(return_value=[])),
+        runtime=Runtime(),
+        advisory_lock=Lock(),
+    )
+
+    async def scenario():
+        task = asyncio.create_task(subject.run(7))
+        await asyncio.wait_for(reconcile_started.wait(), 1)
+        await asyncio.wait_for(reviewed.wait(), 1)
+        await asyncio.sleep(0.04)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    run(scenario())
+
+    assert reconcile_cancelled.is_set()
+    assert fast_reconciles == 1
+    assert manager.review.await_count == 1
 
 
 def test_successful_manager_review_persists_the_manager_selected_deadline() -> None:

@@ -252,6 +252,108 @@ def test_probe_runs_empty_minimum_and_real_seed_twice_and_records_exact_evidence
     assert ProbePolicy.accept(evidence).accepted is True
 
 
+def test_probe_quarantines_a_deterministically_incompatible_seed_for_fixed_argv() -> None:
+    runner = _ProbeRunner(
+        [_probe_output() for _ in range(6)]
+        + [ContainerResult(1, "mode rejected\n"), ContainerResult(1, "mode rejected\n")]
+    )
+    target = SimpleNamespace(
+        image="sha256:" + "b" * 64,
+        probe_invocations=(
+            ProbeInvocation("empty", "empty", ("/opt/bigeye/parser", "{input}"), b""),
+            ProbeInvocation("minimum", "minimum", ("/opt/bigeye/parser", "{input}"), b"0"),
+            ProbeInvocation(
+                "seed:plain.input", "seed", ("/opt/bigeye/parser", "{input}"), b"plain",
+            ),
+            ProbeInvocation(
+                "seed:framed.input", "seed", ("/opt/bigeye/parser", "{input}"), b"framed",
+            ),
+        ),
+        project_id=7,
+        commit_sha="a" * 40,
+        coverage_image_id="sha256:" + "c" * 64,
+        replay_environment=BASELINE_SANITIZER_ENVIRONMENT,
+    )
+    clean = _CleanCoverage(_attestations_for(target)[:6])
+
+    evidence = run(ProbeService(
+        ProbeRunner(runner), clean, timeout_seconds=2.0,
+    ).run(target))
+
+    assert evidence.accepted_seed_names == frozenset({"seed:plain.input"})
+    assert [item.name for item in evidence.rejected_seeds] == ["seed:framed.input"]
+    assert evidence.rejected_seeds[0].first.exit_code == 1
+    assert evidence.rejected_seeds[0].deterministic is True
+    assert len(clean.calls) == 6
+    acceptance = ProbePolicy.accept(evidence)
+    assert acceptance.accepted is True
+    assert "quarantined deterministic non-crash input rejections: framed.input" in acceptance.reason
+
+
+def test_probe_accepts_plain_cli_seed_when_synthetic_minimum_is_rejected() -> None:
+    runner = _ProbeRunner(
+        [_probe_output(), _probe_output()]
+        + [ContainerResult(1, "malformed\n"), ContainerResult(1, "malformed\n")]
+        + [_probe_output(), _probe_output()]
+    )
+    target = SimpleNamespace(
+        image="sha256:" + "b" * 64,
+        probe_invocations=(
+            ProbeInvocation("empty", "empty", ("/opt/bigeye/decoder_cli", "{stdin}"), b""),
+            ProbeInvocation("minimum", "minimum", ("/opt/bigeye/decoder_cli", "{stdin}"), b"0"),
+            ProbeInvocation(
+                "seed:plain.input", "seed", ("/opt/bigeye/decoder_cli", "{stdin}"),
+                b"A:abcdefghijklmnop",
+            ),
+        ),
+        project_id=7, commit_sha="a" * 40,
+        coverage_image_id="sha256:" + "c" * 64,
+        replay_environment=BASELINE_SANITIZER_ENVIRONMENT,
+    )
+    attestations = _attestations_for(target)
+    clean = _CleanCoverage(attestations[:2] + attestations[4:6])
+
+    evidence = run(ProbeService(
+        ProbeRunner(runner), clean, timeout_seconds=2.0,
+    ).run(target))
+
+    assert evidence.accepted_seed_names == frozenset({"seed:plain.input"})
+    assert evidence.rejected_input_names == frozenset({"minimum"})
+    assert evidence.rejected_inputs[0].role == "minimum"
+    assert ProbePolicy.accept(evidence).accepted is True
+
+
+def test_probe_rejects_target_when_every_real_seed_is_a_normal_nonzero_rejection() -> None:
+    runner = _ProbeRunner(
+        [_probe_output(), _probe_output()]
+        + [ContainerResult(1, "malformed\n") for _ in range(4)]
+    )
+    target = SimpleNamespace(
+        image="sha256:" + "b" * 64,
+        probe_invocations=(
+            ProbeInvocation("empty", "empty", ("/opt/bigeye/decoder_cli", "{stdin}"), b""),
+            ProbeInvocation("minimum", "minimum", ("/opt/bigeye/decoder_cli", "{stdin}"), b"0"),
+            ProbeInvocation(
+                "seed:bad.input", "seed", ("/opt/bigeye/decoder_cli", "{stdin}"), b"bad",
+            ),
+        ),
+        project_id=7, commit_sha="a" * 40,
+        coverage_image_id="sha256:" + "c" * 64,
+        replay_environment=BASELINE_SANITIZER_ENVIRONMENT,
+    )
+    clean = _CleanCoverage(_attestations_for(target)[:2])
+
+    evidence = run(ProbeService(
+        ProbeRunner(runner), clean, timeout_seconds=2.0,
+    ).run(target))
+
+    assert evidence.accepted_seed_names == frozenset()
+    assert evidence.rejected_input_names == frozenset({"minimum", "seed:bad.input"})
+    acceptance = ProbePolicy.accept(evidence)
+    assert acceptance.accepted is False
+    assert "accepted real seed" in acceptance.reason
+
+
 def test_probe_runner_strips_internal_stdin_marker_and_feeds_exact_testcase_bytes() -> None:
     class BoundedRunner:
         async def run(
@@ -737,6 +839,8 @@ def test_preparation_validates_normal_build_publishes_only_plan_assets_and_build
     assert normal.calls == 1
     assert [asset.kind for asset in assets.created] == ["harness"]
     assert len(target_layers.calls) == len(coverage_layers.calls) == 1
+    assert coverage_layers.calls[0][1] == assets.created[0].id
+    assert coverage_layers.calls[0][5] == assets.created[0].id
     assert prepared.target_manifest.tag.startswith("bigeye-target:")
     assert prepared.coverage_manifest.tag.startswith("bigeye-coverage:")
     assert prepared.image == "sha256:" + "b" * 64
@@ -1294,6 +1398,80 @@ def test_failed_production_preparation_releases_compilation_before_persisting_ma
     assert "repairer=None" in source
 
 
+def test_full_fuzzer_capacity_is_a_retained_decision_result_without_starting_a_build() -> None:
+    from backend.services.campaigns.execution_slots import ProjectExecutionSlots
+    from backend.services.campaigns.production_preparation import CampaignTargetPreparation
+
+    class Preparation:
+        async def prepare(self, _project, _record):
+            raise AssertionError("capacity rejection must happen before target preparation")
+
+    async def scenario():
+        value = project()
+        value.worker_count = 4
+        slots = ProjectExecutionSlots()
+        await slots.observe_running(value.id, frozenset({31, 32, 33, 34}))
+        production = CampaignTargetPreparation(
+            preparation=Preparation(), campaigns=SimpleNamespace(),
+            invocation_store=SimpleNamespace(), containers=SimpleNamespace(),
+            execution_slots=slots,
+        )
+        return await asyncio.wait_for(
+            DecisionExecutor(production).execute(value, _review()),
+            timeout=0.1,
+        )
+
+    result = run(scenario())[0]
+
+    assert result.succeeded is False
+    assert result.error.error_type == "ProjectCapacityUnavailable"
+    assert result.error.message == "project compilation capacity is unavailable"
+    assert result.error.details == {
+        "phase": "compilation-admission",
+        "capacity_limit": 4,
+        "occupied_slots": 4,
+        "running_campaign_ids": (31, 32, 33, 34),
+    }
+
+
+def test_failed_production_preparation_preserves_original_error_and_valid_wake(tmp_path) -> None:
+    from backend.services.campaigns.production_preparation import CampaignTargetPreparation
+    from backend.services.observability.event_store import ProjectEventStore
+
+    original = TargetPreparationFailed(
+        "bounded deterministic probe failed", agent_attempts=("gpt-5.6-luna",),
+        retained_target=None, target_asset_id=91,
+    )
+
+    class Preparation:
+        async def prepare(self, _project, _record):
+            raise original
+
+    class Attempts:
+        async def record_probe_attempt(self, **_values):
+            return "target-attempt:7:failed"
+
+    events = ProjectEventStore(tmp_path)
+    subject = CampaignTargetPreparation(
+        preparation=Preparation(), campaigns=SimpleNamespace(),
+        invocation_store=SimpleNamespace(), containers=SimpleNamespace(),
+        events=events, attempts=Attempts(),
+    )
+
+    with pytest.raises(TargetPreparationFailed) as captured:
+        run(subject.prepare(project(), _record()))
+
+    assert captured.value is original
+    failed = next(
+        event.payload for event in run(events.read(7, "debug", -1, 20))
+        if event.payload.get("event") == "target.preparation_failed"
+    )
+    assert failed["error"] == "bounded deterministic probe failed"
+    assert failed["evidence_id"] == "target-attempt:7:failed"
+    invalidations = run(events.read(7, "events", -1, 20))
+    assert invalidations[-1].payload == {"name": "campaigns"}
+
+
 def _review(*, selected=("target_known",), decision_actions=("target_known",)) -> CampaignReviewResult:
     record = _record()
     return CampaignReviewResult(
@@ -1377,6 +1555,30 @@ def test_decision_executor_waits_for_siblings_and_returns_typed_failures() -> No
     )
     assert results[1].succeeded is True
     assert results[1].output.target_name == "succeeded"
+
+
+def test_decision_executor_retains_bounded_preparation_details_for_next_review() -> None:
+    class Preparation:
+        async def prepare(self, _project, _record):
+            raise TargetPreparationFailed(
+                "clean coverage command failed",
+                agent_attempts=("gpt-5.6-luna",), retained_target=None,
+                failure_detail={
+                    "phase": "clean-coverage",
+                    "command": ["/opt/bigeye/build/decoder_cli", "--file", "{input}"],
+                    "exit_code": 1,
+                    "stderr": "fixed argv rejected seed",
+                    "failing_seed": "seeds/framed.input",
+                    "testcase_sha256": "a" * 64,
+                },
+            )
+
+    result = run(DecisionExecutor(Preparation()).execute(project(), _review()))[0]
+
+    assert result.error.error_type == "TargetPreparationFailed"
+    assert result.error.details["phase"] == "clean-coverage"
+    assert result.error.details["failing_seed"] == "seeds/framed.input"
+    assert result.error.details["exit_code"] == 1
 
 
 @pytest.mark.parametrize(

@@ -5,6 +5,7 @@ from collections.abc import Mapping
 import re
 import threading
 from dataclasses import dataclass
+from uuid import uuid4
 import docker
 
 from requests.exceptions import ReadTimeout
@@ -20,6 +21,11 @@ from backend.fuzzing.crashes.artifacts import sanitise_terminal_output
 
 class ContainerTimedOut(RuntimeError):
     """Raised when a verification container exceeds its bounded wait."""
+
+    def __init__(self, message: str, *, stderr: str = "", cleanup_verified: bool = False):
+        super().__init__(message)
+        self.stderr = stderr
+        self.cleanup_verified = cleanup_verified
 
 
 class ContainerOutputExceeded(RuntimeError):
@@ -40,6 +46,27 @@ _MAX_ENVIRONMENT_ENTRIES = 16
 _MAX_ENVIRONMENT_VALUE_BYTES = 4_096
 _MAX_ENVIRONMENT_BYTES = 16 * 1_024
 _RUN_ID = re.compile(r"[0-9a-f]{32}\Z")
+_PURPOSE = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
+
+
+def ephemeral_container_identity(run_id: str, purpose: str, project_id: int = 0) -> dict:
+    if (
+        _RUN_ID.fullmatch(run_id or "") is None
+        or _PURPOSE.fullmatch(purpose or "") is None
+        or type(project_id) is not int
+        or project_id < 0
+    ):
+        raise ValueError("ephemeral container identity is invalid")
+    return {
+        "run_id": run_id,
+        "name": f"bigeye-ephemeral-{run_id}",
+        "labels": {
+            "com.bigeye.managed": "bounded-verification",
+            "com.bigeye.ephemeral.run_id": run_id,
+            "com.bigeye.purpose": purpose,
+            "com.bigeye.project_id": str(project_id),
+        },
+    }
 
 
 def reproduction_container_identity(run_id: str, project_id: int, finding_id: int) -> dict:
@@ -71,6 +98,8 @@ class ContainerRunner:
         self, image: str, command: list[str], timeout: float, sink, *,
         stdin_bytes: bytes | None = None,
         environment: Mapping[str, str] | None = None,
+        project_id: int = 0,
+        purpose: str = "verification",
     ) -> ContainerResult:
         if timeout <= 0:
             raise ValueError("timeout must be positive")
@@ -79,29 +108,33 @@ class ContainerRunner:
         ):
             raise ValueError("container stdin exceeds its byte bound")
         bounded_environment = _bounded_environment(environment)
+        identity = ephemeral_container_identity(uuid4().hex, purpose, project_id)
         holder: dict[str, object] = {"cancel_requested": False, "cleanup_started": False, "lock": threading.Lock()}
         worker = asyncio.create_task(asyncio.to_thread(
             self._run_blocking, holder, image, command, timeout, sink, stdin_bytes,
-            bounded_environment,
+            bounded_environment, identity,
         ))
         worker.add_done_callback(self._observe_worker)
         try:
-            return await asyncio.wait_for(worker, timeout=timeout)
+            return await self._await_worker(worker, timeout)
         except asyncio.TimeoutError as error:
             self._request_cancellation(holder)
             await self._cleanup_holder(holder, stop=True)
+            await self._settle_worker(worker)
             raise ContainerTimedOut(f"container exceeded {timeout} seconds") from error
         except BaseException:
             self._request_cancellation(holder)
             await self._cleanup_holder(holder, stop=True)
+            await self._settle_worker(worker)
             raise
 
     async def run_reproduction(
         self, image: str, command: list[str], timeout: float, sink,
         testcase_path, *, environment: Mapping[str, str] | None = None,
+        stdin_bytes: bytes | None = None,
         run_id: str, project_id: int, finding_id: int,
     ) -> ContainerResult:
-        """Stream one read-only testcase without exposing stdin or a shell."""
+        """Stream one sealed testcase by a read-only mount or bounded stdin."""
         from pathlib import Path
 
         if timeout <= 0:
@@ -110,31 +143,54 @@ class ContainerRunner:
         if testcase.is_symlink() or not testcase.is_file():
             raise ValueError("reproduction testcase is unavailable or unsafe")
         testcase = testcase.resolve(strict=True)
+        if stdin_bytes is not None and (
+            not isinstance(stdin_bytes, bytes) or len(stdin_bytes) > MAX_STDIN_BYTES
+        ):
+            raise ValueError("reproduction stdin exceeds its byte bound")
+        if stdin_bytes is not None and (
+            testcase.stat().st_size > MAX_STDIN_BYTES
+            or testcase.read_bytes() != stdin_bytes
+        ):
+            raise ValueError("reproduction stdin does not match the sealed testcase")
         bounded_environment = _bounded_environment(environment)
         identity = reproduction_container_identity(run_id, project_id, finding_id)
         holder: dict[str, object] = {
             "cancel_requested": False, "cleanup_started": False,
             "lock": threading.Lock(), "strict_cleanup": True,
+            "stderr_chunks": [], "cleanup_verified": False,
         }
         worker = asyncio.create_task(asyncio.to_thread(
             self._run_reproduction_blocking, holder, image, command, timeout,
-            sink, testcase, bounded_environment, identity,
+            sink, testcase, stdin_bytes, bounded_environment, identity,
         ))
         worker.add_done_callback(self._observe_worker)
         try:
-            return await asyncio.wait_for(worker, timeout=timeout)
+            return await self._await_worker(worker, timeout)
         except asyncio.TimeoutError as error:
             self._request_cancellation(holder)
             await self._cleanup_holder(holder, stop=True)
-            raise ContainerTimedOut(f"container exceeded {timeout} seconds") from error
+            await self._settle_worker(worker)
+            raise ContainerTimedOut(
+                f"container exceeded {timeout} seconds",
+                stderr="".join(holder["stderr_chunks"]),
+                cleanup_verified=bool(holder["cleanup_verified"]),
+            ) from error
+        except ContainerTimedOut as error:
+            self._request_cancellation(holder)
+            await self._cleanup_holder(holder, stop=True)
+            await self._settle_worker(worker)
+            error.stderr = "".join(holder["stderr_chunks"])
+            error.cleanup_verified = bool(holder["cleanup_verified"])
+            raise
         except BaseException:
             self._request_cancellation(holder)
             await self._cleanup_holder(holder, stop=True)
+            await self._settle_worker(worker)
             raise
 
     def _run_reproduction_blocking(
         self, holder, image: str, command: list[str], timeout: float, sink,
-        testcase, environment: dict[str, str], identity: dict,
+        testcase, stdin_bytes: bytes | None, environment: dict[str, str], identity: dict,
     ) -> ContainerResult:
         options = {
             "platform": PLATFORM, "network_disabled": True, "read_only": True,
@@ -142,9 +198,12 @@ class ContainerRunner:
             "pids_limit": 64, "mem_limit": "512m", "nano_cpus": 1_000_000_000,
             "tmpfs": {"/tmp": "rw,nosuid,nodev,exec,size=64m,mode=1777"},
             "detach": True, "user": "65534:65534",
-            "volumes": {str(testcase): {"bind": "/finding/input", "mode": "ro"}},
             "name": identity["name"], "labels": identity["labels"],
         }
+        if stdin_bytes is None:
+            options["volumes"] = {str(testcase): {"bind": "/finding/input", "mode": "ro"}}
+        else:
+            options.update({"stdin_open": True, "tty": False})
         if environment:
             options["environment"] = environment
         container = self._client.containers.create(image, command, **options)
@@ -152,12 +211,27 @@ class ContainerRunner:
             holder["container"] = container
             cancelled = holder["cancel_requested"]
         failed = True
+        attached = None
         chunks: list[str] = []
         output_size = 0
         try:
             if cancelled:
                 raise ContainerCancelled(f"container {container.id} was cancelled before start")
+            if stdin_bytes is not None:
+                attached = container.attach_socket(params={"stdin": 1, "stream": 1})
+                with holder["lock"]:
+                    holder["attached"] = attached
+                    cancelled = holder["cancel_requested"] or holder["cleanup_started"]
+                if cancelled:
+                    try:
+                        close_attached_stdin(attached)
+                    finally:
+                        raise ContainerCancelled(
+                            f"container {container.id} was cancelled during stdin attachment"
+                        )
             container.start()
+            if attached is not None:
+                send_exact_stdin(attached, stdin_bytes, timeout)
             output = container.attach(
                 stream=True, logs=True, stdout=True, stderr=True, demux=True,
             )
@@ -182,8 +256,17 @@ class ContainerRunner:
                         raise ContainerOutputExceeded(message.rstrip())
                     text = sanitise_terminal_output(chunk)
                     chunks.append(text)
+                    if stream == "stderr":
+                        with holder["lock"]:
+                            holder["stderr_chunks"].append(text)
                     sink(stream, text)
-            waited = container.wait(timeout=timeout)
+            try:
+                waited = container.wait(timeout=timeout)
+            except (TimeoutError, ReadTimeout) as error:
+                raise ContainerTimedOut(
+                    f"container {container.id} exceeded {timeout} seconds",
+                    stderr="".join(holder["stderr_chunks"]),
+                ) from error
             failed = False
             return ContainerResult(int(waited["StatusCode"]), "".join(chunks))
         finally:
@@ -191,13 +274,14 @@ class ContainerRunner:
 
     def _run_blocking(
         self, holder, image: str, command: list[str], timeout: float, sink,
-        stdin_bytes: bytes | None, environment: dict[str, str],
+        stdin_bytes: bytes | None, environment: dict[str, str], identity: dict,
     ) -> ContainerResult:
         options = {
             "platform": PLATFORM, "network_disabled": True, "read_only": True,
             "cap_drop": ["ALL"], "security_opt": ["no-new-privileges"], "pids_limit": 64,
             "mem_limit": "512m", "nano_cpus": 1_000_000_000, "detach": True,
             "tmpfs": {"/tmp": "rw,nosuid,nodev,exec,size=64m,mode=1777"},
+            "name": identity["name"], "labels": identity["labels"],
         }
         if stdin_bytes is not None:
             options.update({"detach": False, "stdin_open": True, "tty": False})
@@ -258,6 +342,20 @@ class ContainerRunner:
         if not worker.cancelled():
             worker.exception()
 
+    @staticmethod
+    async def _settle_worker(worker: asyncio.Task) -> None:
+        try:
+            await worker
+        except BaseException:
+            pass
+
+    @staticmethod
+    async def _await_worker(worker: asyncio.Task, timeout: float) -> ContainerResult:
+        done, _pending = await asyncio.wait({worker}, timeout=timeout)
+        if not done:
+            raise asyncio.TimeoutError
+        return await worker
+
     def _cleanup_holder_blocking(self, holder, stop: bool) -> None:
         with holder["lock"]:
             container = holder.get("container")
@@ -280,6 +378,8 @@ class ContainerRunner:
                     pass
         if holder.get("strict_cleanup"):
             self._cleanup_reproduction(container, stop)
+            with holder["lock"]:
+                holder["cleanup_verified"] = True
         else:
             self._cleanup(container, stop)
 
@@ -326,6 +426,61 @@ class ContainerRunner:
         ):
             raise ContainerCleanupFailed("orphan reproduction container removal could not be verified")
 
+    def reconcile_ephemeral(self) -> None:
+        """Remove only bounded containers carrying an exact BigEye-owned identity."""
+        managed = "com.bigeye.managed=bounded-verification"
+        candidates = self._client.containers.list(all=True, filters={"label": [managed]})
+        for container in candidates:
+            labels = (
+                getattr(container, "labels", None)
+                or getattr(container, "attrs", {}).get("Config", {}).get("Labels", {})
+            )
+            try:
+                project_id = int(labels.get("com.bigeye.project_id", ""))
+                expected = ephemeral_container_identity(
+                    labels.get("com.bigeye.ephemeral.run_id"),
+                    labels.get("com.bigeye.purpose"),
+                    project_id,
+                )
+            except (TypeError, ValueError):
+                continue
+            bigeye_labels = {
+                key: value for key, value in labels.items()
+                if isinstance(key, str) and key.startswith("com.bigeye.")
+            }
+            if (
+                bigeye_labels == expected["labels"]
+                and getattr(container, "name", None) == expected["name"]
+            ):
+                self._cleanup_reproduction(container, stop=True)
+
+        remaining = self._client.containers.list(all=True, filters={"label": [managed]})
+        if any(self._is_exact_ephemeral(item) for item in remaining):
+            raise ContainerCleanupFailed("orphan ephemeral container removal could not be verified")
+
+    @staticmethod
+    def _is_exact_ephemeral(container) -> bool:
+        labels = (
+            getattr(container, "labels", None)
+            or getattr(container, "attrs", {}).get("Config", {}).get("Labels", {})
+        )
+        try:
+            expected = ephemeral_container_identity(
+                labels.get("com.bigeye.ephemeral.run_id"),
+                labels.get("com.bigeye.purpose"),
+                int(labels.get("com.bigeye.project_id", "")),
+            )
+        except (TypeError, ValueError):
+            return False
+        bigeye_labels = {
+            key: value for key, value in labels.items()
+            if isinstance(key, str) and key.startswith("com.bigeye.")
+        }
+        return (
+            bigeye_labels == expected["labels"]
+            and getattr(container, "name", None) == expected["name"]
+        )
+
     @staticmethod
     def _cleanup(container, stop: bool) -> None:
         if stop:
@@ -341,6 +496,22 @@ class ContainerRunner:
             container.remove(force=True)
         except Exception:
             pass
+
+
+class DeferredEphemeralContainerRecovery:
+    """Recover exact BigEye-owned bounded containers before project work resumes."""
+
+    def __init__(self, docker_client):
+        self._docker_client = docker_client
+
+    async def recover(self) -> None:
+        client = await asyncio.to_thread(self._docker_client.connect)
+        try:
+            await asyncio.to_thread(ContainerRunner(client).reconcile_ephemeral)
+        finally:
+            close = getattr(client, "close", None)
+            if close is not None:
+                await asyncio.to_thread(close)
 
 
 def _bounded_environment(environment: Mapping[str, str] | None) -> dict[str, str]:

@@ -230,6 +230,7 @@ def test_setup_uses_a_fail_closed_exact_schema_catalog_contract() -> None:
         "projects", "tasks", "assets", "campaigns", "campaign_contexts",
         "campaign_container_counters", "coverage_evidence", "coverage_checkpoints",
         "findings", "campaign_crash_groups", "campaign_artifacts",
+        "campaign_artifact_cursors", "campaign_progression_actions",
     ):
         assert relation in contract
     assert "information_schema.columns" in contract

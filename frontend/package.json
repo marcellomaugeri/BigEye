@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "e2e": "npm run build && playwright test --config ../playwright.config.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
@@ -21,6 +22,8 @@
     "vite": "8.1.5"
   },
   "devDependencies": {
+    "@axe-core/playwright": "4.12.1",
+    "@playwright/test": "1.61.1",
     "@testing-library/jest-dom": "6.9.1",
     "@testing-library/react": "16.3.2",
     "@testing-library/user-event": "14.6.1",

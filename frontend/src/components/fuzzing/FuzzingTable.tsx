@@ -10,7 +10,12 @@ function cpu(seconds: number): string {
 
 export function FuzzingTable({ rows }: { rows: FuzzingRow[] }) {
   if (rows.length === 0) return <p className="muted-copy">No fuzzing work is active yet.</p>;
-  return <div className="table-scroll fuzzing-table-scroll">
+  return <div
+    aria-label="Scrollable autonomous fuzzing campaigns"
+    className="table-scroll fuzzing-table-scroll"
+    role="region"
+    tabIndex={0}
+  >
     <table aria-label="Autonomous fuzzing campaigns" className="evidence-table fuzzing-table">
       <thead><tr>
         <th scope="col">Target</th><th scope="col">Activity</th><th scope="col">5m change</th>

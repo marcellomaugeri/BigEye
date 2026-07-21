@@ -95,6 +95,126 @@ def test_target_layer_labels_exact_persisted_asset_lineage_for_crash_correction(
     assert manifest.labels["bigeye.target-content-hash"] == target.content_hash
 
 
+def test_target_layer_uses_contained_script_path_not_logical_asset_name(tmp_path: Path) -> None:
+    from backend.fuzzing.layers.target_layer import TargetLayerService
+
+    project = SimpleNamespace(id=7, commit_sha="a" * 40)
+    parent = _manifest(tmp_path, "project", "project:tag")
+    target = SimpleNamespace(
+        id=31, content_hash="", name="target:decoder_decode_libfuzzer", kind="harness",
+        parent_id=None,
+    )
+    configuration = SimpleNamespace(
+        id=32, content_hash="", name="target-build:decoder_decode_libfuzzer.sh", kind="script",
+    )
+    target_root = tmp_path / "projects/7/assets/31/generated-assets"
+    target_root.mkdir(parents=True)
+    (target_root / "decoder_fuzz.c").write_text(
+        "int LLVMFuzzerTestOneInput(void) { return 0; }\n",
+    )
+    _rehash_asset(target, target_root.parent)
+    target.project_id = 7
+    target.validated_at = object()
+    target.error = None
+    configuration_root = tmp_path / "projects/7/assets/32/nested"
+    configuration_root.mkdir(parents=True)
+    (configuration_root / "target-build.sh").write_text("#!/bin/sh\ntrue\n")
+    _rehash_asset(configuration, configuration_root.parent)
+    configuration.project_id = 7
+    configuration.validated_at = object()
+    configuration.error = None
+    inspector = SimpleNamespace(
+        inspect=lambda _tag: SimpleNamespace(
+            image_id="sha256:parent", os="linux", architecture="amd64",
+        ),
+    )
+
+    manifest = TargetLayerService(tmp_path, _Builder(), inspector).prepare(
+        project, parent, target, configuration, lambda _text: None,
+    )
+    dockerfile = manifest.dockerfile.read_text()
+
+    assert "RUN /bin/sh /bigeye/configuration/nested/target-build.sh" in dockerfile
+    assert configuration.name not in dockerfile
+    assert (manifest.context_dir / "target/generated-assets/decoder_fuzz.c").is_file()
+    assert "COPY target/ /opt/bigeye/generated-assets/" in dockerfile
+
+
+def test_component_target_and_clean_coverage_share_exact_generated_asset_mapping(tmp_path: Path) -> None:
+    from backend.fuzzing.layers.coverage_layer import CoverageLayerService
+    from backend.fuzzing.layers.target_layer import TargetLayerService
+
+    project = SimpleNamespace(id=7, commit_sha="a" * 40)
+    parent = _manifest(tmp_path, "project", "project:tag")
+    harness = SimpleNamespace(id=31, content_hash="", name="target:decoder", kind="harness")
+    target_configuration = SimpleNamespace(
+        id=32, content_hash="", name="target-build:decoder.sh", kind="script",
+    )
+    coverage_configuration = SimpleNamespace(
+        id=33, content_hash="", name="coverage-build:decoder.sh", kind="script",
+    )
+    harness_root = tmp_path / "projects/7/assets/31/fuzz"
+    harness_root.mkdir(parents=True)
+    (harness_root / "decoder.c").write_text(
+        "int LLVMFuzzerTestOneInput(void) { return 0; }\n",
+    )
+    _rehash_asset(harness, harness_root.parent)
+    harness.project_id = 7
+    harness.validated_at = object()
+    harness.error = None
+    _asset(tmp_path, 7, target_configuration, "target-build.sh", "#!/bin/sh\ntrue\n")
+    _asset(tmp_path, 7, coverage_configuration, "coverage-build.sh", "#!/bin/sh\ntrue\n")
+    inspector = SimpleNamespace(inspect=lambda _tag: SimpleNamespace(
+        image_id="sha256:parent", os="linux", architecture="amd64",
+    ))
+    builder = _Builder()
+
+    target = TargetLayerService(tmp_path, builder, inspector).prepare(
+        project, parent, harness, target_configuration, lambda _text: None,
+    )
+    coverage_service = CoverageLayerService(tmp_path, builder, inspector)
+    coverage = coverage_service.prepare(
+        project, parent, harness, coverage_configuration, lambda _text: None,
+        target_asset_id=31, configuration_asset_id=32, coverage_asset_id=31,
+    )
+    reused = coverage_service.prepare(
+        project, parent, harness, coverage_configuration, lambda _text: None,
+        target_asset_id=31, configuration_asset_id=32, coverage_asset_id=31,
+    )
+
+    expected = Path("fuzz/decoder.c")
+    assert (target.context_dir / "target" / expected).read_bytes() == (
+        coverage.context_dir / "adapter" / expected
+    ).read_bytes()
+    assert "COPY target/ /opt/bigeye/generated-assets/" in target.dockerfile.read_text()
+    assert "COPY adapter/ /opt/bigeye/generated-assets/" in coverage.dockerfile.read_text()
+    assert reused.tag == coverage.tag
+
+
+def test_layer_entrypoint_rejects_traversal_and_symlinks(tmp_path: Path) -> None:
+    from backend.fuzzing.layers.project_layer import ProjectLayerService
+
+    project = SimpleNamespace(id=7, commit_sha="a" * 40)
+    parent = _manifest(tmp_path, "repository", "repository:tag")
+    asset = SimpleNamespace(
+        id=1, content_hash="", name="project-dependencies.sh", kind="script",
+        project_id=7, validated_at=object(), error=None,
+    )
+    root = tmp_path / "projects/7/assets/1"
+    root.mkdir(parents=True)
+    (root / "safe.sh").symlink_to(tmp_path / "outside.sh")
+    inspector = SimpleNamespace(
+        inspect=lambda _tag: SimpleNamespace(
+            image_id="sha256:parent", os="linux", architecture="amd64",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="unsafe entry"):
+        ProjectLayerService(tmp_path, _Builder(), inspector).prepare(
+            project, parent, asset, lambda _text: None,
+        )
+
+
 def test_concurrent_layer_builds_do_not_cross_sink_output(tmp_path: Path) -> None:
     from backend.fuzzing.layers.project_layer import ProjectLayerService
 

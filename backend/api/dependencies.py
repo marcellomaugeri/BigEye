@@ -70,6 +70,7 @@ from backend.fuzzing.campaigns.production_factory import (
 from backend.services.initial_tasks import InitialTaskService
 from backend.fuzzing.coverage.exposure import ExposureAccountant
 from backend.fuzzing.docker.client import DockerClient
+from backend.fuzzing.docker.container_runner import DeferredEphemeralContainerRecovery
 from backend.fuzzing.assets.store import AssetStore
 from backend.services.campaigns.production_progression import ProgressionAssetPublisher
 
@@ -95,6 +96,7 @@ class Services:
     target_lifecycle: object | None = None
     reproduction_bundles: object | None = None
     reproductions: object | None = None
+    ephemeral_recovery: object | None = None
 
     async def close(self) -> None:
         if self.reproductions is not None:
@@ -146,6 +148,7 @@ def build_services(pool, workspace: Path, *, reproduction_limit: int = 2) -> Ser
         workspace,
         FindingReproductionService(
             workspace, findings, reproduction_bundles, DockerClient(),
+            finding_artifacts=finding_artifacts,
         ),
         max_concurrent=reproduction_limit,
     )
@@ -191,6 +194,7 @@ def build_services(pool, workspace: Path, *, reproduction_limit: int = 2) -> Ser
         invocations=invocation_store,
         cpu_counters=campaigns,
         crash_groups=findings,
+        finding_artifacts=finding_artifacts,
         campaign_contexts=campaigns,
         evidence_processor=evidence_processor,
         artifact_state=campaign_artifacts,
@@ -281,4 +285,5 @@ def build_services(pool, workspace: Path, *, reproduction_limit: int = 2) -> Ser
         target_lifecycle=target_lifecycle,
         reproduction_bundles=reproduction_bundles,
         reproductions=reproductions,
+        ephemeral_recovery=DeferredEphemeralContainerRecovery(DockerClient()),
     )

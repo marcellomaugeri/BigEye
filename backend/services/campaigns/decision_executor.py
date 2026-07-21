@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from collections.abc import Mapping
 from typing import Generic, TypeVar
 
 from backend.agents.outputs.campaign_review import (
@@ -26,6 +27,7 @@ class ActionError:
 
     error_type: str
     message: str
+    details: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -114,7 +116,15 @@ class DecisionExecutor:
             return ActionResult(
                 action_id,
                 None,
-                ActionError(type(error).__name__, str(error)),
+                ActionError(
+                    type(error).__name__, str(error)[:2_000],
+                    dict(error.failure_detail)
+                    if (
+                        isinstance(getattr(error, "failure_detail", None), Mapping)
+                        and error.failure_detail
+                    )
+                    else None,
+                ),
             )
 
     @staticmethod

@@ -69,7 +69,8 @@ def test_manager_selects_target_result_while_operation_requests_remain_audit_onl
     )
     proposal = TargetProposal(
         target_name="parser", instance_type="system-level", byte_path="stdin -> parser",
-        expected_project_reach="parser.c", build_command="clang parser.c -o parser",
+        expected_project_reach="parser.c",
+        build_command="clang /src/parser.c -o /opt/bigeye/parser",
         run_command="/opt/bigeye/parser", seeds=[], configuration="default",
         sanitizer_plan="ASan and UBSan", generated_asset_intents=[],
         probe_assertions=["seed reaches parser"], evidence_ids=["source:parser"],
@@ -121,11 +122,12 @@ def test_manager_selects_target_result_while_operation_requests_remain_audit_onl
             context, tool_name=target_tool.name, tool_call_id="target-1",
             tool_arguments=arguments, run_config=RunConfig(),
         ), arguments)
-        assert output["target_result_ids"]
+        assert output["target_result_ids"] == []
+        assert output["pipeline_action_ids"]
         return SimpleNamespace(
             final_output=CampaignDecision(
                 decision="prepare parser", motivation="validated target proposal",
-                evidence_ids=["source:parser"], bounded_actions=output["target_result_ids"],
+                evidence_ids=["source:parser"], bounded_actions=output["pipeline_action_ids"],
                 next_review_delay_seconds=900,
                 next_review_reason="Recheck after the deterministic probe", uncertainty="not probed",
             ), raw_responses=[], new_items=[],
@@ -136,13 +138,19 @@ def test_manager_selects_target_result_while_operation_requests_remain_audit_onl
         "initial target preparation",
     ))
     preparation = AsyncMock(return_value=SimpleNamespace(id=9))
-    executor = DecisionExecutor(SimpleNamespace(prepare=preparation))
+    pipeline = AsyncMock(return_value=SimpleNamespace(id=9))
+    executor = DecisionExecutor(
+        SimpleNamespace(prepare=preparation),
+        pipeline_operations=SimpleNamespace(execute=pipeline),
+    )
 
     results = run(executor.execute(SimpleNamespace(id=7), review))
 
-    preparation.assert_awaited_once()
+    preparation.assert_not_awaited()
+    pipeline.assert_awaited_once()
     assert results[0].succeeded is True
-    assert review.selected_target_proposals[0].result_id == review.selected_action_ids[0]
+    assert review.selected_target_proposals == ()
+    assert review.selected_pipeline_operations[0].action_id == review.selected_action_ids[0]
     assert review.known_action_ids == review.selected_action_ids
     assert len(review.known_operation_requests) == 1
     assert review.known_operation_requests[0].actionable is False

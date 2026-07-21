@@ -13,12 +13,14 @@ from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from tempfile import mkdtemp
 from typing import Protocol
+from uuid import uuid4
 
 from backend.fuzzing.campaigns.coverage_contract import (
     valid_replay_command_markers,
     valid_replay_environment,
 )
 from backend.fuzzing.coverage.source_paths import is_forbidden_source_path
+from backend.fuzzing.docker.container_runner import ephemeral_container_identity
 from backend.fuzzing.docker.stdin import (
     MAX_STDIN_BYTES,
     close_attached_stdin,
@@ -145,6 +147,8 @@ class CoverageExecutor(Protocol):
         profile_directory: Path,
         input_file: Path | None = None,
         stdin_bytes: bytes | None = None,
+        *,
+        project_id: int = 0,
     ) -> bytes: ...
 
 
@@ -162,7 +166,26 @@ class DockerCoverageExecutor:
 
     def run(
         self, image_id, command, environment, profile_directory, input_file=None,
-        stdin_bytes=None,
+        stdin_bytes=None, *, project_id=0,
+    ) -> bytes:
+        return self._run(
+            image_id, command, environment, profile_directory, input_file,
+            stdin_bytes, allow_application_exit=False, project_id=project_id,
+        )
+
+    def run_target(
+        self, image_id, command, environment, profile_directory, input_file=None,
+        stdin_bytes=None, *, project_id=0,
+    ) -> bytes:
+        """Replay one fuzzer-retained input while preserving ordinary target exits."""
+        return self._run(
+            image_id, command, environment, profile_directory, input_file,
+            stdin_bytes, allow_application_exit=True, project_id=project_id,
+        )
+
+    def _run(
+        self, image_id, command, environment, profile_directory, input_file,
+        stdin_bytes, *, allow_application_exit: bool, project_id: int,
     ) -> bytes:
         if not isinstance(command, tuple) or not 1 <= len(command) <= 256:
             raise ValueError("coverage command argument count is invalid")
@@ -214,6 +237,10 @@ class DockerCoverageExecutor:
         )
         if stdin_bytes is not None:
             options.update({"detach": False, "stdin_open": True, "tty": False})
+        identity = ephemeral_container_identity(
+            uuid4().hex, "clean-coverage", project_id,
+        )
+        options.update(name=identity["name"], labels=identity["labels"])
         container = self._client.containers.create(
             image_id,
             list(command),
@@ -230,9 +257,12 @@ class DockerCoverageExecutor:
             exit_code = int(result["StatusCode"])
             if exit_code != 0:
                 stderr, truncated, unavailable = _bounded_failure_stderr(container)
-                raise CoverageIntegrityError(
-                    _coverage_failure_diagnostic(exit_code, stderr, truncated, unavailable)
-                )
+                if not _ordinary_application_exit(
+                    exit_code, stderr, truncated, unavailable,
+                ) or not allow_application_exit:
+                    raise CoverageIntegrityError(
+                        _coverage_failure_diagnostic(exit_code, stderr, truncated, unavailable)
+                    )
             output = bytearray()
             for chunk in container.logs(stdout=True, stderr=False, stream=True, follow=False):
                 encoded = chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8", errors="replace")
@@ -293,6 +323,24 @@ def _coverage_failure_diagnostic(
     return f"clean coverage command failed (exit {exit_code}; {detail})"
 
 
+def _ordinary_application_exit(
+    exit_code: int, stderr: bytes, truncated: bool, unavailable: bool,
+) -> bool:
+    """Distinguish a target's bounded rejection from a failed/sanitized replay."""
+    if not 1 <= exit_code <= 125 or truncated or unavailable:
+        return False
+    text = stderr.decode("utf-8", errors="replace")
+    return not any(marker in text for marker, _label in (
+        ("AddressSanitizer", "AddressSanitizer"),
+        ("UndefinedBehaviorSanitizer", "UndefinedBehaviorSanitizer"),
+        ("LeakSanitizer", "LeakSanitizer"),
+        ("MemorySanitizer", "MemorySanitizer"),
+        ("ThreadSanitizer", "ThreadSanitizer"),
+        ("runtime error:", "undefined-behaviour runtime error"),
+        ("Failed spawning a tracer thread", "sanitizer tracer thread unavailable"),
+    ))
+
+
 class LlvmCoverage:
     """Produce line evidence only from a verified clean image and isolated inputs."""
 
@@ -332,13 +380,15 @@ class LlvmCoverage:
                 replay_environment = dict(campaign.replay_environment)
                 replay_environment["LLVM_PROFILE_FILE"] = profile_pattern
                 if stdin_mode:
-                    self._executor.run(
+                    getattr(self._executor, "run_target", self._executor.run)(
                         image["id"], command, replay_environment, profile_dir,
                         stdin_bytes=content,
+                        project_id=campaign.project_id,
                     )
                 else:
-                    self._executor.run(
+                    getattr(self._executor, "run_target", self._executor.run)(
                         image["id"], command, replay_environment, profile_dir, input_path,
+                        project_id=campaign.project_id,
                     )
                 self._require_file(input_path, input_identity, digest)
                 raw_names = self._profile_names(profile_dir, stem)
@@ -350,6 +400,7 @@ class LlvmCoverage:
                      "-o", f"/coverage/profiles/{profdata}"),
                     {},
                     profile_dir,
+                    project_id=campaign.project_id,
                 )
                 self._require_profile_directory(profile_dir, {*raw_names, profdata})
                 self._require_profile_manifest(profile_dir, raw_manifest)
@@ -360,6 +411,7 @@ class LlvmCoverage:
                      f"-instr-profile=/coverage/profiles/{profdata}"),
                     {},
                     profile_dir,
+                    project_id=campaign.project_id,
                 )
                 self._require_profile_directory(profile_dir, {*raw_names, profdata})
                 self._require_profile_manifest(profile_dir, replay_manifest)
@@ -380,6 +432,7 @@ class LlvmCoverage:
                      "-o", "/coverage/profiles/merged.profdata"),
                     {},
                     aggregate,
+                    project_id=campaign.project_id,
                 )
                 self._require_profile_directory(
                     aggregate, {Path(name).name for name in merged_profiles} | {"merged.profdata"}
@@ -394,6 +447,7 @@ class LlvmCoverage:
                      "-instr-profile=/coverage/profiles/merged.profdata"),
                     {},
                     aggregate,
+                    project_id=campaign.project_id,
                 )
                 self._require_profile_manifest(aggregate, merged_manifest)
                 merged = self._parse_export(exported, campaign)
@@ -444,7 +498,10 @@ class LlvmCoverage:
         }
         for source_path in sorted(source_paths):
             image_path = str(PurePosixPath(campaign.source_root) / PurePosixPath(source_path))
-            clean_content = self._executor.run(image_id, ("cat", image_path), {}, profile_directory)
+            clean_content = self._executor.run(
+                image_id, ("cat", image_path), {}, profile_directory,
+                project_id=campaign.project_id,
+            )
             self._require_profile_directory(profile_directory, allowed)
             self._require_profile_manifest(profile_directory, manifest)
             local_content = self._read_project_source(campaign.repository_root, source_path)

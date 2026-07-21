@@ -77,8 +77,16 @@ class CampaignEvidenceProcessor:
             progress.artifacts,
             key=lambda item: (0 if item.kind == "crash" else 1, item.relative_path),
         )
-        outcomes: list[ArtifactProcessingOutcome] = []
+        unique = []
+        seen_identities = set()
         for artifact in ordered:
+            identity = (artifact.kind, artifact.content_sha256)
+            if identity in seen_identities:
+                continue
+            seen_identities.add(identity)
+            unique.append(artifact)
+        outcomes: list[ArtifactProcessingOutcome] = []
+        for artifact in unique:
             handler = self._crashes if artifact.kind == "crash" else self._corpus
             value = await _await(handler.process(
                 project=project,
@@ -113,6 +121,17 @@ class CampaignEvidenceProcessor:
                     "trusted_instructions": False,
                 })
 
+        unique_evidence = []
+        seen_evidence_ids = set()
+        for item in evidence:
+            evidence_id = item.get("evidence_id")
+            if not _bounded(evidence_id, 256):
+                raise ValueError("campaign processing evidence ID is invalid")
+            if evidence_id in seen_evidence_ids:
+                continue
+            seen_evidence_ids.add(evidence_id)
+            unique_evidence.append(item)
+
         if self._events is not None:
             for value in outcomes:
                 if value.accepted:
@@ -134,7 +153,7 @@ class CampaignEvidenceProcessor:
                 "cpu_seconds": progress.cpu_seconds,
                 "outcomes": [self._debug_outcome(item) for item in outcomes],
             })
-        return CampaignProcessingResult(admitted, replayed, tuple(evidence))
+        return CampaignProcessingResult(admitted, replayed, tuple(unique_evidence))
 
     @staticmethod
     def _evidence(project_id: int, campaign_id: int, value: ArtifactProcessingOutcome) -> dict:

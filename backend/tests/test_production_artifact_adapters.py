@@ -390,6 +390,65 @@ def test_clean_coverage_contract_survives_restart_and_resolves_exact_validated_a
     assert campaign_root.joinpath("config/coverage.json").is_file()
 
 
+def test_campaign_strategy_identity_survives_restart_with_asset_and_seed_provenance(
+    tmp_path: Path,
+) -> None:
+    from backend.agents.outputs.campaign_review import TargetProposalRecord
+    from backend.agents.outputs.target_proposal import TargetProposal
+    from backend.fuzzing.campaigns.probe import ProbeInvocation
+    from backend.services.campaigns.production_runtime import CampaignInvocationStore
+
+    _workspace(tmp_path)
+    proposal = TargetProposal(
+        target_name="decoder_cli", instance_type="system-level",
+        byte_path="stdin -> decoder", expected_project_reach="decoder_decode",
+        build_command="cmake -S /src -B /opt/bigeye/build && cmake --build /opt/bigeye/build",
+        run_command="/opt/bigeye/build/decoder_cli",
+        seeds=[{"path": "seeds/plain.input", "provenance": "repository"}],
+        configuration="default CMake configuration", sanitizer_plan="ASan and UBSan",
+        generated_asset_intents=[], probe_assertions=["seed reaches decoder"],
+        evidence_ids=["repository:decoder"], uncertainty="not yet fuzzed",
+    )
+    record = TargetProposalRecord(
+        result_id="target_" + "1" * 24, worker_assignment="prepare decoder",
+        tool_call_id="call-1", attempt=1, model="gpt-5.6-luna", proposal=proposal,
+    )
+    prepared = SimpleNamespace(
+        target_manifest=SimpleNamespace(labels={"bigeye.target-asset": "31"}),
+        coverage_manifest=SimpleNamespace(
+            content_hash="d" * 64,
+            labels={
+                "bigeye.configuration-asset-id": "32",
+                "bigeye.coverage-asset-id": "34",
+            },
+        ),
+        coverage_image_id="sha256:" + "c" * 64,
+        assets=(
+            SimpleNamespace(id=31, content_hash="a" * 64),
+            SimpleNamespace(id=32, content_hash="b" * 64),
+            SimpleNamespace(id=34, content_hash="e" * 64),
+        ),
+        probe_invocations=(
+            ProbeInvocation(
+                "seed:plain", "seed", ("/opt/bigeye/build/decoder_cli", "{stdin}"), b"A:plain",
+            ),
+        ),
+    )
+    store = CampaignInvocationStore(tmp_path)
+
+    asyncio.run(store.publish_strategy(
+        7, 9, COMMIT, record, prepared, SimpleNamespace(engine="afl"),
+    ))
+    restarted = CampaignInvocationStore(tmp_path).load_strategy(7, 9)
+
+    assert restarted["engine"] == "afl"
+    assert restarted["argv"] == ["/opt/bigeye/build/decoder_cli"]
+    assert restarted["seed_set"] == [sha256(b"A:plain").hexdigest()]
+    assert restarted["target"] == {"asset_id": 31, "content_sha256": "a" * 64}
+    assert restarted["configuration"] == {"asset_id": 32, "content_sha256": "b" * 64}
+    assert restarted["coverage"]["clean_image_id"] == "sha256:" + "c" * 64
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -950,6 +1009,18 @@ def test_docker_crash_replay_is_bounded_and_forces_linux_amd64(tmp_path: Path) -
     assert containers.kwargs[1]["tmpfs"] == {
         "/tmp": "rw,nosuid,nodev,noexec,size=64m,mode=1777",
     }
+    from backend.fuzzing.docker.container_runner import (
+        ContainerRunner,
+        ephemeral_container_identity,
+    )
+    options = containers.kwargs[1]
+    run_id = options["labels"]["com.bigeye.ephemeral.run_id"]
+    expected_identity = ephemeral_container_identity(run_id, "crash-replay", 7)
+    assert options["name"] == expected_identity["name"]
+    assert options["labels"] == expected_identity["labels"]
+    assert ContainerRunner._is_exact_ephemeral(SimpleNamespace(
+        name=options["name"], labels=options["labels"],
+    )) is True
     assert containers.container.removed == [True]
 
 
@@ -1216,6 +1287,19 @@ def test_native_corpus_runner_uses_the_complete_bounded_container_contract(tmp_p
     assert containers.kwargs["tmpfs"] == {
         "/tmp": "rw,nosuid,nodev,noexec,size=64m,mode=1777",
     }
+    from backend.fuzzing.docker.container_runner import (
+        ContainerRunner,
+        ephemeral_container_identity,
+    )
+    run_id = containers.kwargs["labels"]["com.bigeye.ephemeral.run_id"]
+    expected_identity = ephemeral_container_identity(
+        run_id, "corpus-minimisation", 7,
+    )
+    assert containers.kwargs["name"] == expected_identity["name"]
+    assert containers.kwargs["labels"] == expected_identity["labels"]
+    assert ContainerRunner._is_exact_ephemeral(SimpleNamespace(
+        name=containers.kwargs["name"], labels=containers.kwargs["labels"],
+    )) is True
     assert containers.args[1][4] == "/campaign/minimised/.bigeye-afl-cmin-output"
     assert (output / "selected").read_bytes() == b"seed"
     assert not (output / ".bigeye-afl-cmin-output").exists()
@@ -1589,6 +1673,154 @@ def test_crash_triage_retries_invalid_luna_output_once_with_terra_and_same_evide
         "gpt-5.6-luna", "gpt-5.6-terra",
     ]
     assert calls[0][1:] == calls[1][1:]
+
+
+def _confirmed_system_memory_safety_evidence():
+    from backend.fuzzing.crashes.triage import CrashTriageEvidence
+
+    return CrashTriageEvidence(
+        project_id=7, campaign_id=9, fingerprint="f" * 64, reproducible=True,
+        original_attempts=3, matching_original_runs=3, signal="SIGABRT",
+        sanitizer="address", source_location="src/decoder.c:36",
+        stack=("#1 decode_payload /src/src/decoder.c:36:5",),
+        coverage=("src/decoder.c:36",),
+        compatible_variants=(), clean_variant={
+            "variant": "clean", "crashed": True, "signal": "SIGABRT",
+            "sanitizer": "address", "source_location": "src/decoder.c:36",
+            "image_id": "sha256:" + "c" * 64, "error": None,
+        },
+        minimisation={"accepted": True, "original_size": 27, "minimal_size": 11},
+        correction=None, harness_misuse_evidence=(),
+        evidence_ids=(
+            "replay:original:1", "replay:original:2", "replay:original:3",
+            "replay:clean", "minimisation:accepted",
+        ),
+        grouping={
+            "version": 1, "commit_sha": COMMIT, "failure_class": "address",
+            "reproducible": True, "minimisation_accepted": True,
+            "minimised_sha256": "a" * 64, "harness_misuse": False,
+            "frames": [{"function": "decode_payload", "source_location": "decoder.c:36"}],
+        },
+        engine="afl", input_mode="stdin", target_boundary="system",
+        original_image_id="sha256:" + "b" * 64,
+        clean_image_id="sha256:" + "c" * 64,
+    )
+
+
+def test_confirmed_system_cli_memory_fault_rejects_luna_unresolved_and_accepts_terra_true(
+    tmp_path: Path,
+) -> None:
+    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageWorker
+
+    evidence = _confirmed_system_memory_safety_evidence()
+    calls = []
+
+    async def runner(agent, prompt, **_kwargs):
+        calls.append((agent.model, prompt))
+        classification = "unresolved" if agent.model == "gpt-5.6-luna" else "true vulnerability"
+        output = {
+            **_triage_output(["replay:original:1", "replay:clean"]),
+            "classification": classification,
+            "uncertainty": (
+                "No correction patch or exploitability evidence was supplied."
+                if classification == "unresolved" else "Impact remains unknown."
+            ),
+        }
+        return _triage_result(output)
+
+    context = _triage_context(tmp_path)
+    result = asyncio.run(ProductionCrashTriageWorker(
+        SimpleNamespace(context=lambda _project_id: context), runner=runner,
+    ).triage(evidence))
+
+    assert result.classification == "true vulnerability"
+    assert [model for model, _prompt in calls] == ["gpt-5.6-luna", "gpt-5.6-terra"]
+    assert "Classification is distinct from exploitability" in calls[0][1]
+    assert "Deterministic validation correction for Terra" in calls[1][1]
+    assert "all 3 original replays match" in calls[1][1]
+
+
+def test_component_fault_without_valid_contract_evidence_stays_unresolved(tmp_path: Path) -> None:
+    from dataclasses import replace
+    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageWorker
+
+    evidence = replace(
+        _confirmed_system_memory_safety_evidence(),
+        engine="libfuzzer", input_mode="inprocess", target_boundary="component",
+        component_contract_valid=None, contract_evidence_ids=(),
+    )
+    calls = []
+
+    async def runner(agent, _prompt, **_kwargs):
+        calls.append(agent.model)
+        return _triage_result({
+            **_triage_output(["replay:original:1"]),
+            "classification": "unresolved",
+        })
+
+    context = _triage_context(tmp_path)
+    result = asyncio.run(ProductionCrashTriageWorker(
+        SimpleNamespace(context=lambda _project_id: context), runner=runner,
+    ).triage(evidence))
+
+    assert result.classification == "unresolved"
+    assert calls == ["gpt-5.6-luna"]
+
+
+def test_component_contract_misuse_classification_is_preserved(tmp_path: Path) -> None:
+    from dataclasses import replace
+    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageWorker
+
+    contract_id = "contract:decoder-output-nonnull"
+    evidence = replace(
+        _confirmed_system_memory_safety_evidence(),
+        engine="libfuzzer", input_mode="inprocess", target_boundary="component",
+        component_contract_valid=False, contract_evidence_ids=(contract_id,),
+        evidence_ids=("replay:original:1", contract_id),
+    )
+
+    async def runner(_agent, _prompt, **_kwargs):
+        return _triage_result({
+            **_triage_output(["replay:original:1", contract_id]),
+            "classification": "improper contract usage",
+        })
+
+    context = _triage_context(tmp_path)
+    result = asyncio.run(ProductionCrashTriageWorker(
+        SimpleNamespace(context=lambda _project_id: context), runner=runner,
+    ).triage(evidence))
+
+    assert result.classification == "improper contract usage"
+    assert result.evidence_ids == ["replay:original:1", contract_id]
+
+
+def test_harness_crash_classification_is_preserved(tmp_path: Path) -> None:
+    from dataclasses import replace
+    from backend.services.campaigns.production_evidence_factory import ProductionCrashTriageWorker
+
+    harness_id = "harness:invalid-null-output"
+    evidence = replace(
+        _confirmed_system_memory_safety_evidence(),
+        harness_misuse_evidence=(harness_id,),
+        evidence_ids=("replay:original:1", harness_id),
+        grouping={
+            **_confirmed_system_memory_safety_evidence().grouping,
+            "harness_misuse": True,
+        },
+    )
+
+    async def runner(_agent, _prompt, **_kwargs):
+        return _triage_result({
+            **_triage_output(["replay:original:1", harness_id]),
+            "classification": "harness-induced false positive",
+        })
+
+    context = _triage_context(tmp_path)
+    result = asyncio.run(ProductionCrashTriageWorker(
+        SimpleNamespace(context=lambda _project_id: context), runner=runner,
+    ).triage(evidence))
+
+    assert result.classification == "harness-induced false positive"
 
 
 def test_crash_triage_does_not_escalate_a_transport_failure_to_terra() -> None:

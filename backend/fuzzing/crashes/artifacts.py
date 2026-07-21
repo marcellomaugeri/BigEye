@@ -237,6 +237,7 @@ class FindingArtifactStore:
                 "minimisation": self._mapping(document.get("minimisation")),
                 "correction": self._optional_mapping(document.get("correction")),
                 "repair_intent": self._required_text(document.get("repair_intent"), 2_000),
+                "grouping": self._optional_mapping(document.get("grouping")),
             }
         finally:
             os.close(generation); os.close(directory); os.close(root)
@@ -313,6 +314,7 @@ class FindingArtifactStore:
             "minimisation": evidence.minimisation,
             "correction": evidence.correction,
             "repair_intent": triage.repair_intent[:2_000],
+            "grouping": evidence.grouping,
         }
         evidence_bytes = self._json(manifest)
         if len(evidence_bytes) > _EVIDENCE_MAX_BYTES:
@@ -489,6 +491,8 @@ class FindingArtifactStore:
         try:
             name = f"{crash.group_key}-{crash.occurrence}.json"
             content = self._json({
+                "campaign_id": crash.campaign_id,
+                "engine": crash.engine,
                 "quarantine_group": crash.group_key,
                 "quarantine_occurrence": crash.occurrence,
                 "input_sha256": crash.input_sha256,

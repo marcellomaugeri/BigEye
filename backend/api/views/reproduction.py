@@ -19,6 +19,7 @@ class ReproductionResponse(BaseModel):
     command: list[str]
     exit_code: int | None
     terminal_reason: str | None
+    sanitizer_crash_observed: bool
 
     @classmethod
     def from_run(cls, run: ReproductionRun) -> "ReproductionResponse":
@@ -27,4 +28,5 @@ class ReproductionResponse(BaseModel):
             completed_at=run.completed_at, image_id=run.image_id,
             command=list(run.command), exit_code=run.exit_code,
             terminal_reason=run.terminal_reason,
+            sanitizer_crash_observed=run.sanitizer_crash_observed,
         )

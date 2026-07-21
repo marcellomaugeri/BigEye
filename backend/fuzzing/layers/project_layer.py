@@ -195,12 +195,29 @@ class _GeneratedLayerService:
         if getattr(asset, "validated_at", None) is None or getattr(asset, "error", None) is not None:
             raise ValueError("asset must be validated without an error")
 
-    @staticmethod
-    def _asset_entrypoint(asset) -> str:
-        name = getattr(asset, "name", "")
-        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", name):
-            raise ValueError("asset script name is unsafe for a Dockerfile")
-        return name
+    def _asset_entrypoint(
+        self, project_id: int, asset, *, suffixes: frozenset[str],
+    ) -> str:
+        """Resolve an executable path from contained asset files, never display metadata."""
+        self._validated_asset(project_id, asset)
+        root = self._asset_path(project_id, asset)
+        if root.is_symlink() or not root.is_dir():
+            raise ValueError("validated asset directory is missing")
+        candidates: list[str] = []
+        for entry in root.rglob("*"):
+            if entry.is_symlink() or not (entry.is_file() or entry.is_dir()):
+                raise ValueError("asset path contains an unsafe entry")
+            if not entry.is_file() or entry.name == "Dockerfile":
+                continue
+            relative = entry.relative_to(root).as_posix()
+            if entry.suffix.casefold() not in suffixes:
+                continue
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", relative) is None:
+                raise ValueError("asset script path is unsafe for a Dockerfile")
+            candidates.append(relative)
+        if len(candidates) != 1:
+            raise ValueError("asset must contain exactly one Dockerfile entrypoint")
+        return candidates[0]
 
     @staticmethod
     def _digest(*values: str) -> str:
@@ -318,7 +335,9 @@ class ProjectLayerService(_GeneratedLayerService):
         cancellation_signal=None,
     ) -> LayerManifest:
         parent_image = self._inspector.inspect(repository_manifest.tag).image_id
-        build_name = self._asset_entrypoint(build_asset)
+        build_name = self._asset_entrypoint(
+            project.id, build_asset, suffixes=frozenset({".sh"}),
+        )
         template = (
             "FROM {parent}\nWORKDIR /src\nCOPY build/ /bigeye/build/\n"
             "RUN /bin/sh /bigeye/build/" + build_name + "\n"

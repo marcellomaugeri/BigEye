@@ -357,6 +357,14 @@ def _record_id(prefix: str, value: dict) -> str:
     return prefix + "_" + sha256(encoded).hexdigest()[:24]
 
 
+def _same_unique_paths(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
+    return (
+        len(left) == len(set(left))
+        and len(right) == len(set(right))
+        and set(left) == set(right)
+    )
+
+
 class CampaignReviewCollection:
     """Collect one review's validated outputs without parsing model traces.
 
@@ -531,10 +539,13 @@ class CampaignReviewCollection:
                 if (
                     record.worker_assignment, record.tool_call_id, record.attempt, record.model
                 ) == invocation.key
-                and set(request.asset_paths) == {
-                    intent.relative_path for intent in record.proposal.generated_asset_intents
-                }
-                and set(request.assertions).issubset(set(record.proposal.probe_assertions))
+                and _same_unique_paths(
+                    request.asset_paths,
+                    tuple(
+                        intent.relative_path
+                        for intent in record.proposal.generated_asset_intents
+                    ),
+                )
             )
             if len(candidates) != 1:
                 raise ValueError("pipeline operation must bind one exact target proposal")

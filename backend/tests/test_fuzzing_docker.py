@@ -294,6 +294,40 @@ class TestDockerClient:
 
 
 class TestContainerRunner:
+    def test_reproduction_timeout_preserves_stderr_only_after_verified_cleanup(self, tmp_path: Path) -> None:
+        from backend.fuzzing.docker.container_runner import ContainerRunner, ContainerTimedOut
+
+        testcase = tmp_path / "minimal.input"
+        testcase.write_bytes(b"crash")
+        removed = []
+
+        class Container:
+            id = "emulated-timeout"
+            def start(self): pass
+            def attach(self, **_kwargs):
+                return iter(((b"untrusted stdout decoder.c:36\n", None), (None, b"ERROR: AddressSanitizer: stack-buffer-overflow decoder.c:36\n")))
+            def wait(self, timeout): raise TimeoutError("qemu wait froze")
+            def stop(self, timeout=0): pass
+            def kill(self): pass
+            def remove(self, force=False): removed.append(force)
+
+        class Containers:
+            def create(self, *_args, **_kwargs): return Container()
+            def get(self, _container_id): raise docker.errors.NotFound("removed")
+
+        with pytest.raises(ContainerTimedOut) as raised:
+            run(ContainerRunner(SimpleNamespace(
+                containers=Containers(), errors=docker.errors,
+            )).run_reproduction(
+                "sha256:" + "a" * 64, ["/reproduce", "/finding/input"], 1, lambda *_args: None,
+                testcase, run_id="d" * 32, project_id=7, finding_id=5,
+            ))
+
+        assert raised.value.cleanup_verified is True
+        assert raised.value.stderr == "ERROR: AddressSanitizer: stack-buffer-overflow decoder.c:36\n"
+        assert "untrusted stdout" not in raised.value.stderr
+        assert removed == [True]
+
     def test_reproduction_streams_demuxed_output_with_only_read_only_testcase(self, tmp_path: Path) -> None:
         from backend.fuzzing.docker.container_runner import ContainerRunner
 
@@ -332,6 +366,7 @@ class TestContainerRunner:
         assert result.exit_code == 1
         assert output == [("stdout", "stdout\ufffd\n"), ("stderr", "asan\n")]
         assert removed == [("reproduction-1", True)]
+        assert "working_dir" not in created[0][2]
         assert created[0][2] == {
             "platform": "linux/amd64", "network_disabled": True, "read_only": True,
             "cap_drop": ["ALL"], "security_opt": ["no-new-privileges"], "pids_limit": 64,
@@ -347,6 +382,100 @@ class TestContainerRunner:
                 "com.bigeye.project_id": "7", "com.bigeye.finding_id": "5",
             },
         }
+
+    def test_reproduction_feeds_exact_bounded_stdin_without_mount_or_terminal(self, tmp_path: Path) -> None:
+        import socket
+
+        from backend.fuzzing.docker.container_runner import ContainerRunner
+
+        testcase = tmp_path / "minimal.input"
+        testcase.write_bytes(b"\x00exact\xff")
+        created, output, removed = [], [], []
+
+        class RawSocket:
+            def __init__(self):
+                self.timeout = None
+                self.sent = b""
+                self.shutdown_mode = None
+            def settimeout(self, timeout): self.timeout = timeout
+            def sendall(self, content): self.sent += content
+            def shutdown(self, mode): self.shutdown_mode = mode
+
+        class Attached:
+            def __init__(self):
+                self._sock = RawSocket()
+                self.closed = False
+            def close(self): self.closed = True
+
+        attached = Attached()
+
+        class Container:
+            id = "reproduction-stdin-1"
+            def attach_socket(self, **kwargs):
+                assert kwargs == {"params": {"stdin": 1, "stream": 1}}
+                return attached
+            def start(self): pass
+            def attach(self, **kwargs):
+                assert kwargs == {
+                    "stream": True, "logs": True, "stdout": True,
+                    "stderr": True, "demux": True,
+                }
+                return iter(((None, b"asan\x1b[31m\n"),))
+            def wait(self, timeout): return {"StatusCode": 1}
+            def remove(self, force=False): removed.append((self.id, force))
+
+        class Containers:
+            def create(self, image, command, **kwargs):
+                created.append((image, command, kwargs))
+                return Container()
+            def get(self, _container_id):
+                raise docker.errors.NotFound("removed")
+
+        result = run(ContainerRunner(SimpleNamespace(
+            containers=Containers(), errors=docker.errors,
+        )).run_reproduction(
+            "sha256:" + "a" * 64, ["/opt/bigeye/build/decoder_cli"], 12,
+            lambda stream, text: output.append((stream, text)), testcase,
+            stdin_bytes=b"\x00exact\xff", run_id="d" * 32,
+            project_id=7, finding_id=5,
+        ))
+
+        assert result.exit_code == 1
+        assert output == [("stderr", "asan\n")]
+        assert attached._sock.sent == b"\x00exact\xff"
+        assert attached._sock.shutdown_mode == socket.SHUT_WR
+        assert attached.closed is True
+        assert removed == [("reproduction-stdin-1", True)]
+        assert created[0][1] == ["/opt/bigeye/build/decoder_cli"]
+        options = created[0][2]
+        assert "working_dir" not in options
+        assert "volumes" not in options
+        assert "entrypoint" not in options
+        assert options["stdin_open"] is True
+        assert options["tty"] is False
+        assert options["name"] == "bigeye-reproduction-" + "d" * 32
+        assert options["labels"] == {
+            "com.bigeye.managed": "finding-reproduction",
+            "com.bigeye.reproduction.run_id": "d" * 32,
+            "com.bigeye.project_id": "7", "com.bigeye.finding_id": "5",
+        }
+
+    def test_reproduction_rejects_stdin_different_from_sealed_testcase(self, tmp_path: Path) -> None:
+        from backend.fuzzing.docker.container_runner import ContainerRunner
+
+        testcase = tmp_path / "minimal.input"
+        testcase.write_bytes(b"sealed")
+
+        with pytest.raises(ValueError, match="sealed testcase"):
+            run(ContainerRunner(SimpleNamespace(
+                containers=SimpleNamespace(create=lambda *_args, **_kwargs: pytest.fail(
+                    "unsafe container creation"
+                )),
+            )).run_reproduction(
+                "sha256:" + "a" * 64, ["/opt/bigeye/build/decoder_cli"], 12,
+                lambda *_args: None, testcase, stdin_bytes=b"different",
+                run_id="d" * 32, project_id=7, finding_id=5,
+            ))
 
     def test_reproduction_cleanup_failure_is_not_reported_as_success(self, tmp_path: Path) -> None:
         from backend.fuzzing.docker.container_runner import ContainerCleanupFailed, ContainerRunner
@@ -421,6 +550,16 @@ class TestContainerRunner:
         assert logs == ["clang works\n"]
         image, command, options = created[0]
         assert image == "bigeye-llvm:test" and command == ["clang-18", "--version"]
+        assert options.pop("name").startswith("bigeye-ephemeral-")
+        labels = options.pop("labels")
+        options_run_id = labels["com.bigeye.ephemeral.run_id"]
+        assert labels == {
+            "com.bigeye.managed": "bounded-verification",
+            "com.bigeye.ephemeral.run_id": options_run_id,
+            "com.bigeye.purpose": "verification",
+            "com.bigeye.project_id": "0",
+        }
+        assert len(options_run_id) == 32
         assert options == {
             "platform": "linux/amd64", "network_disabled": True, "read_only": True,
             "cap_drop": ["ALL"], "security_opt": ["no-new-privileges"], "pids_limit": 64,
@@ -648,12 +787,52 @@ class TestContainerRunner:
             operation = asyncio.create_task(ContainerRunner(SimpleNamespace(containers=Containers())).run("image", ["true"], 10, lambda text: None))
             assert await asyncio.to_thread(entered.wait, 1)
             operation.cancel()
+            await asyncio.sleep(0)
+            assert not operation.done()
+            release.set()
             with pytest.raises(asyncio.CancelledError):
                 await operation
-            release.set()
             assert await asyncio.to_thread(removed.wait, 1)
             assert cleaned == [("stop", 0), ("kill",), ("remove", True)]
         run(scenario())
+
+    def test_ephemeral_recovery_removes_only_exact_bigeye_owned_orphans(self) -> None:
+        from backend.fuzzing.docker.container_runner import (
+            ContainerRunner,
+            ephemeral_container_identity,
+        )
+
+        exact_identity = ephemeral_container_identity("a" * 32, "coverage", 7)
+        removed = []
+
+        class Container:
+            def __init__(self, name, labels):
+                self.id, self.name, self.labels = name, name, labels
+            def stop(self, timeout=0): pass
+            def kill(self): pass
+            def remove(self, force=False):
+                removed.append(self.name)
+                containers.items.remove(self)
+
+        exact = Container(exact_identity["name"], exact_identity["labels"])
+        wrong_name = Container("unowned-random-name", exact_identity["labels"])
+        unrelated = Container("other", {"com.bigeye.managed": "fuzz-campaign"})
+
+        class Containers:
+            def __init__(self): self.items = [exact, wrong_name, unrelated]
+            def list(self, **_kwargs): return list(self.items)
+            def get(self, container_id):
+                for item in self.items:
+                    if item.id == container_id: return item
+                raise docker.errors.NotFound("removed")
+
+        containers = Containers()
+        ContainerRunner(SimpleNamespace(
+            containers=containers, errors=docker.errors,
+        )).reconcile_ephemeral()
+
+        assert removed == [exact_identity["name"]]
+        assert containers.items == [wrong_name, unrelated]
 
     def test_late_cancelled_worker_exception_is_observed(self) -> None:
         from backend.fuzzing.docker.container_runner import ContainerRunner
@@ -682,9 +861,11 @@ class TestContainerRunner:
                 operation = asyncio.create_task(ContainerRunner(SimpleNamespace(containers=Containers())).run("image", ["true"], 10, lambda text: None))
                 assert await asyncio.to_thread(entered.wait, 1)
                 operation.cancel()
+                await asyncio.sleep(0)
+                assert not operation.done()
+                release.set()
                 with pytest.raises(asyncio.CancelledError):
                     await operation
-                release.set()
                 assert await asyncio.to_thread(removed.wait, 1)
                 for _ in range(2):
                     await asyncio.sleep(0)

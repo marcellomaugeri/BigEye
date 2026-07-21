@@ -9,11 +9,33 @@
 
 #define BIGEYE_MAX_INPUT_BYTES 4096U
 
+#if defined(__clang__) || defined(__GNUC__)
+#define BIGEYE_NOINLINE __attribute__((noinline))
+#else
+#define BIGEYE_NOINLINE
+#endif
+
+static volatile unsigned int crash_path_marker = 0U;
+
+static BIGEYE_NOINLINE void mark_crash_path_b(void) {
+    crash_path_marker ^= 0x42U;
+}
+
+static BIGEYE_NOINLINE void mark_crash_path_c(void) {
+    crash_path_marker ^= 0x43U;
+}
+
 static int process_payload(const unsigned char *data, size_t size) {
     unsigned char decoded[8] = {0};
     size_t copy_size = size < sizeof(decoded) ? size : sizeof(decoded);
 
-    if (size >= 7U && memcmp(data, "BIGEYE!", 7U) == 0) {
+    if (size > sizeof(decoded) &&
+        (data[0] == (unsigned char)'B' || data[0] == (unsigned char)'C')) {
+        if (data[0] == (unsigned char)'B') {
+            mark_crash_path_b();
+        } else {
+            mark_crash_path_c();
+        }
         /* Deliberate acceptance-fixture defect: the input length is not bounded. */
         copy_size = size;
     }

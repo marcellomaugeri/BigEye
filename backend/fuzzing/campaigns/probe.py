@@ -272,6 +272,15 @@ class ProbeEvidenceMismatch(RuntimeError):
     """Clean replay evidence does not belong to the exact supervised testcase."""
 
 
+class ProbeInputExecutionFailed(ValueError):
+    """Retain which exact fixed-argv input failed deterministic clean replay."""
+
+    def __init__(self, invocation: ProbeInvocation, phase: str, message: str):
+        super().__init__(message)
+        self.invocation = invocation
+        self.phase = phase
+
+
 @dataclass(frozen=True)
 class ProbeExecutionEvidence:
     process: ProbeProcessObservation
@@ -331,17 +340,53 @@ class ProbeInputEvidence:
 
 
 @dataclass(frozen=True)
+class RejectedProbeInput:
+    """An input deterministically rejected without a crash by one fixed target argv."""
+
+    name: str
+    role: str
+    command: tuple[str, ...]
+    testcase_sha256: str
+    first: ProbeProcessObservation
+    replay: ProbeProcessObservation
+    deterministic: bool
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.name or len(self.name) > 500 or self.role not in _INPUT_ROLES:
+            raise ValueError("rejected probe input identity is invalid")
+        if not isinstance(self.command, tuple) or not self.command:
+            raise ValueError("rejected probe input command is invalid")
+        _hex(self.testcase_sha256, {64}, "rejected probe input testcase")
+        if not isinstance(self.first, ProbeProcessObservation) or not isinstance(
+            self.replay, ProbeProcessObservation,
+        ):
+            raise ValueError("rejected probe input process evidence is invalid")
+        if type(self.deterministic) is not bool:
+            raise ValueError("rejected probe input determinism is invalid")
+        if not isinstance(self.reason, str) or not self.reason or len(self.reason) > 2_000:
+            raise ValueError("rejected probe input reason is invalid")
+
+
+@dataclass(frozen=True)
 class ProbeEvidence:
     """All supervised evidence, including rejected crash replay facts."""
 
     inputs: tuple[ProbeInputEvidence, ...]
+    rejected_inputs: tuple[RejectedProbeInput, ...] = ()
 
     @classmethod
-    def from_inputs(cls, inputs) -> "ProbeEvidence":
+    def from_inputs(cls, inputs, rejected_inputs=()) -> "ProbeEvidence":
         values = tuple(inputs)
         if not values or any(not isinstance(item, ProbeInputEvidence) for item in values):
             raise ValueError("probe evidence requires input results")
-        return cls(values)
+        rejected = tuple(rejected_inputs)
+        if any(not isinstance(item, RejectedProbeInput) for item in rejected):
+            raise ValueError("probe evidence rejected inputs are invalid")
+        names = tuple(item.name for item in (*values, *rejected))
+        if len(names) != len(set(names)):
+            raise ValueError("probe evidence input names must be unique")
+        return cls(values, rejected)
 
     @property
     def executions(self) -> tuple[ProbeExecutionEvidence, ...]:
@@ -364,7 +409,24 @@ class ProbeEvidence:
 
     @property
     def deterministic(self) -> bool:
-        return all(item.deterministic for item in self.inputs)
+        return all(item.deterministic for item in self.inputs) and all(
+            item.deterministic for item in self.rejected_inputs
+        )
+
+    @property
+    def accepted_seed_names(self) -> frozenset[str]:
+        return frozenset(
+            item.name for item in self.inputs
+            if item.role == "seed" and item.first.accepted_input and item.replay.accepted_input
+        )
+
+    @property
+    def rejected_input_names(self) -> frozenset[str]:
+        return frozenset(item.name for item in self.rejected_inputs)
+
+    @property
+    def rejected_seeds(self) -> tuple[RejectedProbeInput, ...]:
+        return tuple(item for item in self.rejected_inputs if item.role == "seed")
 
     @property
     def project_lines(self) -> frozenset[str]:
@@ -439,7 +501,13 @@ class ProbePolicy:
             return ProbeAcceptance(False, "the accepted real seed did not reproducibly reach project code")
         if not evidence.project_lines:
             return ProbeAcceptance(False, "the probe reached harness or startup code but no project code")
-        return ProbeAcceptance(True, "the target accepts a real seed and reaches attested project code reproducibly")
+        reason = "the target accepts a real seed and reaches attested project code reproducibly"
+        if evidence.rejected_inputs:
+            names = ", ".join(
+                item.name.removeprefix("seed:") for item in evidence.rejected_inputs
+            )
+            reason += f"; quarantined deterministic non-crash input rejections: {names}"
+        return ProbeAcceptance(True, reason)
 
 
 class ProbeService:
@@ -464,8 +532,27 @@ class ProbeService:
         if len(invocations) > 34 or len({item.name for item in invocations}) != len(invocations):
             raise ValueError("prepared target probe inputs are outside their bound")
         evidence = []
+        rejected_inputs = []
         for invocation in invocations:
-            first = await self._execution(prepared_target, invocation)
+            first_process = await self._process(prepared_target, invocation)
+            if self._configuration_incompatible(first_process):
+                replay_process = await self._process(prepared_target, invocation)
+                deterministic = first_process == replay_process
+                rejected_inputs.append(RejectedProbeInput(
+                    invocation.name,
+                    invocation.role,
+                    invocation.command,
+                    invocation.testcase_sha256,
+                    first_process,
+                    replay_process,
+                    deterministic,
+                    (
+                        "fixed target argv rejected this repository seed twice "
+                        f"with exit code {first_process.exit_code}"
+                    ),
+                ))
+                continue
+            first = await self._execution(prepared_target, invocation, first_process)
             replay = await self._execution(prepared_target, invocation)
             evidence.append(ProbeInputEvidence(
                 invocation.name,
@@ -474,17 +561,29 @@ class ProbeService:
                 replay,
                 self._signature(first) == self._signature(replay),
             ))
-        return ProbeEvidence.from_inputs(evidence)
+        return ProbeEvidence.from_inputs(evidence, rejected_inputs)
 
-    async def _execution(self, target, invocation: ProbeInvocation) -> ProbeExecutionEvidence:
-        process = await self._runner.run(
+    async def _process(self, target, invocation: ProbeInvocation) -> ProbeProcessObservation:
+        return await self._runner.run(
             target.image,
             invocation,
             self._timeout,
             self._sink,
             target.replay_environment,
         )
-        coverage = await self._clean_coverage.collect(target, invocation, process)
+
+    async def _execution(
+        self, target, invocation: ProbeInvocation,
+        process: ProbeProcessObservation | None = None,
+    ) -> ProbeExecutionEvidence:
+        if process is None:
+            process = await self._process(target, invocation)
+        try:
+            coverage = await self._clean_coverage.collect(target, invocation, process)
+        except ValueError as error:
+            raise ProbeInputExecutionFailed(
+                invocation, "clean-coverage", str(error)[:2_000] or type(error).__name__,
+            ) from error
         if not isinstance(coverage, AttestedCoverage):
             raise ValueError("clean coverage collector returned invalid evidence")
         provenance = coverage.provenance
@@ -503,6 +602,16 @@ class ProbeService:
             and bool(coverage.project_lines or coverage.harness_lines or coverage.startup_lines)
         )
         return ProbeExecutionEvidence(process, coverage, accepted)
+
+    @staticmethod
+    def _configuration_incompatible(process: ProbeProcessObservation) -> bool:
+        return (
+            process.exit_code not in {None, 0}
+            and process.alive
+            and not process.timed_out
+            and not process.immediate_crash
+            and not process.sanitizer_output
+        )
 
     @staticmethod
     def _signature(value: ProbeExecutionEvidence) -> tuple:

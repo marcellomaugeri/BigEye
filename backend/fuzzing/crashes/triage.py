@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 from backend.agents.outputs.triage_result import TriageResult
 from backend.fuzzing.crashes.artifacts import FindingArtifactStore
 from backend.fuzzing.crashes.correction import CorrectionEvidence
-from backend.fuzzing.crashes.fingerprint import crash_fingerprint
+from backend.fuzzing.crashes.fingerprint import (
+    CrashGroupIdentity,
+    compatible_crash_groups,
+    crash_fingerprint,
+    crash_group_identity,
+)
 from backend.fuzzing.crashes.minimisation import CrashMinimiser, MinimisationResult
 from backend.fuzzing.crashes.quarantine import (
     CrashObservation,
@@ -46,6 +52,77 @@ class CrashTriageEvidence:
     correction: dict[str, object] | None
     harness_misuse_evidence: tuple[str, ...]
     evidence_ids: tuple[str, ...]
+    grouping: dict[str, object] | None = None
+    engine: str | None = None
+    input_mode: str | None = None
+    target_boundary: str | None = None
+    component_contract_valid: bool | None = None
+    contract_evidence_ids: tuple[str, ...] = ()
+    original_image_id: str | None = None
+    clean_image_id: str | None = None
+
+
+_MEMORY_SAFETY_SANITIZERS = frozenset({"address", "memory", "cfi"})
+_IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
+
+
+def confirmed_project_memory_safety(evidence: CrashTriageEvidence) -> bool:
+    """Recognise a confirmed project fault without making an exploitability claim."""
+    clean = evidence.clean_variant
+    grouping = evidence.grouping
+    if (
+        evidence.reproducible is not True
+        or evidence.original_attempts != 3
+        or evidence.matching_original_runs != 3
+        or not _memory_safety_sanitizer(evidence.sanitizer)
+        or not isinstance(clean, dict)
+        or clean.get("crashed") is not True
+        or clean.get("error") is not None
+        or not _memory_safety_sanitizer(clean.get("sanitizer"))
+        or not isinstance(evidence.original_image_id, str)
+        or _IMAGE_ID.fullmatch(evidence.original_image_id) is None
+        or not isinstance(evidence.clean_image_id, str)
+        or _IMAGE_ID.fullmatch(evidence.clean_image_id) is None
+        or clean.get("image_id") != evidence.clean_image_id
+        or evidence.original_image_id == evidence.clean_image_id
+        or not isinstance(grouping, dict)
+        or grouping.get("reproducible") is not True
+        or not _memory_safety_sanitizer(grouping.get("failure_class"))
+        or grouping.get("harness_misuse") is not False
+        or evidence.harness_misuse_evidence
+    ):
+        return False
+    frames = grouping.get("frames")
+    if not isinstance(frames, list) or not frames or not isinstance(frames[0], dict):
+        return False
+    primary_source = frames[0].get("source_location")
+    primary_function = frames[0].get("function")
+    clean_source = clean.get("source_location")
+    if not all(
+        isinstance(value, str) and value
+        for value in (primary_source, primary_function, clean_source)
+    ) or _source_identity(primary_source) != _source_identity(clean_source):
+        return False
+    if evidence.target_boundary == "system" and evidence.engine == "afl":
+        return evidence.input_mode in {"file", "stdin"}
+    return bool(
+        evidence.target_boundary == "component"
+        and evidence.engine == "libfuzzer"
+        and evidence.input_mode == "inprocess"
+        and evidence.component_contract_valid is True
+        and evidence.contract_evidence_ids
+        and set(evidence.contract_evidence_ids) <= set(evidence.evidence_ids)
+    )
+
+
+def _memory_safety_sanitizer(value: object) -> bool:
+    return isinstance(value, str) and bool(
+        set(value.split("+")) & _MEMORY_SAFETY_SANITIZERS
+    )
+
+
+def _source_identity(value: str) -> str:
+    return value.replace("\\", "/").rsplit("/", 1)[-1].casefold()
 
 
 class CrashPipeline:
@@ -72,10 +149,24 @@ class CrashPipeline:
         representative = next((result for result in replay.original if result.crashed), None)
         if representative is None:
             representative = self._observation_result(observation)
-        fingerprint = crash_fingerprint(representative)
+        raw_fingerprint = crash_fingerprint(representative)
+        grouping = crash_group_identity(
+            representative,
+            commit_sha=observation.commit_sha,
+            reproducible=replay.reproducible,
+            minimised_testcase=minimum.input_bytes,
+            minimisation_accepted=minimum.accepted,
+            harness_misuse=bool(observation.harness_misuse_evidence),
+        )
+        fingerprint = await self._compatible_fingerprint(
+            observation.project_id, raw_fingerprint, grouping,
+        )
         correction = await self._correction_experiment(observation, fingerprint, minimum, replay)
         quarantined = self.quarantine.persist(observation)
-        evidence = self._evidence(observation, fingerprint, replay, minimum, correction, representative, quarantined)
+        evidence = self._evidence(
+            observation, fingerprint, replay, minimum, correction, representative,
+            quarantined, grouping,
+        )
         forced = self._deterministic_classification(observation, replay, correction)
         triage = await self._triage(evidence)
         classification = forced or triage.classification
@@ -101,6 +192,30 @@ class CrashPipeline:
         if self._events is not None:
             await self._events.append(observation.project_id, "events", {"name": "findings"})
         return finding
+
+    async def _compatible_fingerprint(
+        self, project_id: int, raw_fingerprint: str, grouping: CrashGroupIdentity,
+    ) -> str:
+        list_findings = getattr(self._findings, "list_for_project", None)
+        if list_findings is None:
+            return raw_fingerprint
+        findings = await list_findings(project_id)
+        if any(finding.fingerprint == raw_fingerprint for finding in findings):
+            return raw_fingerprint
+        compatible = []
+        for finding in findings:
+            detail = self.artifacts.detail(finding)
+            stored = detail.get("grouping")
+            if stored is None:
+                continue
+            try:
+                identity = CrashGroupIdentity.from_mapping(stored)
+            except ValueError:
+                continue
+            if compatible_crash_groups(grouping, identity):
+                compatible.append(finding.fingerprint)
+        # Ambiguous compatibility is retained as a separate exact group.
+        return compatible[0] if len(compatible) == 1 else raw_fingerprint
 
     async def _correction_experiment(
         self, observation: CrashObservation, fingerprint: str,
@@ -244,6 +359,7 @@ class CrashPipeline:
         cls, observation: CrashObservation, fingerprint: str, replay: ReplayEvidence,
         minimum: MinimisationResult, correction: dict[str, object] | None,
         representative: ReplayResult, quarantined: QuarantinedCrash,
+        grouping: CrashGroupIdentity,
     ) -> CrashTriageEvidence:
         evidence_ids = [f"quarantine:{quarantined.group_key}:{quarantined.occurrence}"]
         evidence_ids.extend(replay.evidence_ids)
@@ -273,4 +389,12 @@ class CrashPipeline:
             correction=correction,
             harness_misuse_evidence=observation.harness_misuse_evidence,
             evidence_ids=tuple(dict.fromkeys(evidence_ids)),
+            grouping=grouping.as_dict(),
+            engine=observation.engine,
+            input_mode=observation.input_mode,
+            target_boundary=("system" if observation.engine == "afl" else "component"),
+            component_contract_valid=None,
+            contract_evidence_ids=(),
+            original_image_id=observation.image_id,
+            clean_image_id=observation.clean_image_id,
         )

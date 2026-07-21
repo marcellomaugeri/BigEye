@@ -27,9 +27,12 @@ class CoverageLayerService(_GeneratedLayerService):
         LayerPolicy().validate_coverage_inputs((
             (adapter_asset.name, adapter_asset.kind), (coverage_configuration.name, coverage_configuration.kind),
         ))
-        configuration_name = self._asset_entrypoint(coverage_configuration)
+        configuration_name = self._asset_entrypoint(
+            project.id, coverage_configuration, suffixes=frozenset({".sh"}),
+        )
         template = (
             "FROM {parent}\nWORKDIR /src\nCOPY adapter/ /bigeye/adapter/\n"
+            "COPY adapter/ /opt/bigeye/generated-assets/\n"
             "COPY coverage-configuration/ /bigeye/coverage-configuration/\n"
             "RUN /bin/sh /bigeye/coverage-configuration/" + configuration_name + "\n"
             f"LABEL bigeye.project=\"{project.id}\" bigeye.commit=\"{project.commit_sha}\" "

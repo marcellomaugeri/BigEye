@@ -178,12 +178,7 @@ class PipelineOperationService:
             "trusted_instructions": False,
         }
         await _await(self._events.append(project_id, "debug", payload))
-        await _await(self._events.append(project_id, "events", {
-            "name": "pipeline-operation",
-            "action_id": record.action_id,
-            "status": payload["status"],
-            "evidence_id": payload["evidence_id"],
-        }))
+        await _await(self._events.append(project_id, "events", {"name": "campaigns"}))
 
     @staticmethod
     def _validate(project, record) -> None:

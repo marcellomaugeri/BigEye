@@ -25,11 +25,15 @@ class TargetLayerService(_GeneratedLayerService):
         fuzz_patch_asset=None, cancellation_signal=None,
     ):
         parent_image = self._inspector.inspect(project_manifest.tag).image_id
-        configuration_name = self._asset_entrypoint(configuration_asset)
+        configuration_name = self._asset_entrypoint(
+            project.id, configuration_asset, suffixes=frozenset({".sh"}),
+        )
         assets = [("target", target_asset), ("configuration", configuration_asset)]
         patch_steps = ""
         if fuzz_patch_asset is not None:
-            patch_name = self._asset_entrypoint(fuzz_patch_asset)
+            patch_name = self._asset_entrypoint(
+                project.id, fuzz_patch_asset, suffixes=frozenset({".patch", ".diff"}),
+            )
             assets.append(("fuzz-patch", fuzz_patch_asset))
             patch_steps = f"COPY fuzz-patch/ /bigeye/fuzz-patch/\nRUN patch -p1 < /bigeye/fuzz-patch/{patch_name}\n"
         target_lineage = {
@@ -40,6 +44,7 @@ class TargetLayerService(_GeneratedLayerService):
             target_lineage["bigeye.parent-target-asset"] = str(target_asset.parent_id)
         template = (
             "FROM {parent}\nWORKDIR /src\nCOPY target/ /bigeye/target/\n"
+            "COPY target/ /opt/bigeye/generated-assets/\n"
             "COPY configuration/ /bigeye/configuration/\n"
             + patch_steps + "RUN /bin/sh /bigeye/configuration/" + configuration_name + "\n"
             f"LABEL bigeye.project=\"{project.id}\" bigeye.commit=\"{project.commit_sha}\" "

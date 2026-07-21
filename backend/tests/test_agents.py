@@ -13,7 +13,7 @@ from backend.agents.context import AgentContext
 from backend.agents.manager import build_manager_agent
 from backend.agents.outputs.campaign_decision import CampaignDecision
 from backend.agents.outputs.fuzzing_worker_result import FuzzingWorkerResult
-from backend.agents.outputs.target_proposal import TargetProposal
+from backend.agents.outputs.target_proposal import GeneratedAssetIntent, TargetProposal
 from backend.agents.outputs.triage_result import TriageResult
 from backend.agents.prompts.fuzzing_worker import FUZZING_WORKER_PROMPT
 from backend.agents.prompts.manager import MANAGER_PROMPT
@@ -28,8 +28,10 @@ from backend.agents.tools.agent_dispatch import (
     _validate_evidence_ids,
     _validate_target,
     _validate_triage,
+    _validate_worker_result,
     dispatch_tools,
 )
+from backend.fuzzing.campaigns.strategy_identity import proposal_strategy_identity
 from backend.agents.tools.contained_operations import contained_operation_request, contained_operation_tools
 from backend.agents.tools.generated_assets import (
     GeneratedAssetError,
@@ -71,6 +73,8 @@ def write_repository(tmp_path: Path) -> Path:
 
 def agent_context(tmp_path: Path, project_id: int = 4) -> AgentContext:
     root = write_repository(tmp_path)
+    (root / "tests").mkdir()
+    (root / "tests" / "minimal.txt").write_bytes(b"seed")
     return AgentContext(project_id, "a" * 40, root, tmp_path / "assets", EvidenceRetriever(root))
 
 
@@ -140,6 +144,20 @@ def test_navigation_rejects_unsafe_model_paths(tmp_path: Path, path: str) -> Non
 
     with pytest.raises(CodeNavigationError):
         read_source_lines(root, path, 1, 1)
+
+
+def test_navigation_distinguishes_missing_files_from_repository_escape(tmp_path: Path) -> None:
+    root = write_repository(tmp_path)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret\n", encoding="utf-8")
+    (root / "linked.txt").symlink_to(outside)
+
+    with pytest.raises(CodeNavigationError, match="repository file was not found"):
+        read_source_lines(root, "missing.txt", 1, 1)
+    with pytest.raises(CodeNavigationError, match="path escapes the repository"):
+        read_source_lines(root, "../outside.txt", 1, 1)
+    with pytest.raises(CodeNavigationError, match="path escapes the repository"):
+        read_source_lines(root, "linked.txt", 1, 1)
 
 
 def test_navigation_rejects_symlink_escape_binary_and_bounds(tmp_path: Path) -> None:
@@ -499,7 +517,8 @@ def test_campaign_decision_requires_a_bounded_manager_selected_review_delay() ->
 def _target_proposal(evidence_id: str) -> TargetProposal:
     return TargetProposal(
         target_name="parser", instance_type="system-level", byte_path="stdin -> parser",
-        expected_project_reach="parser state machine", build_command="cmake --build build --target parser",
+        expected_project_reach="parser state machine",
+        build_command="cmake --build /opt/bigeye/build --target parser",
         run_command="/src/build/parser", seeds=[{"path": "tests/minimal.txt", "provenance": "repository"}],
         configuration="default", sanitizer_plan="ASan and UBSan", generated_asset_intents=[{
             "relative_path": "system/parser/Dockerfile", "purpose": "target layer"
@@ -533,12 +552,176 @@ def _worker_result(
     )
 
 
+def test_worker_validation_rejects_an_exact_existing_campaign_strategy() -> None:
+    proposal = _target_proposal("known")
+
+    with pytest.raises(WorkerValidationError, match="exact duplicate"):
+        _validate_worker_result(
+            _worker_result(targets=[proposal]),
+            frozenset({"known"}),
+            frozenset(),
+            rejected_strategy_ids=frozenset({proposal_strategy_identity(proposal)}),
+        )
+
+
+def test_worker_validation_allows_the_same_target_with_a_different_operational_configuration() -> None:
+    existing = _target_proposal("known")
+    configured = existing.model_copy(update={
+        "build_command": "cmake --build /opt/bigeye/build --target parser --parallel 2",
+    })
+
+    result = _validate_worker_result(
+        _worker_result(targets=[configured]),
+        frozenset({"known"}),
+        frozenset(),
+        rejected_strategy_ids=frozenset({proposal_strategy_identity(existing)}),
+    )
+
+    assert result.target_proposals == [configured]
+
+
+def test_component_gap_rejects_a_second_system_strategy_and_accepts_component_work() -> None:
+    system = _target_proposal("known").model_copy(update={
+        "run_command": "/src/build/parser --alternate",
+    })
+    with pytest.raises(WorkerValidationError, match="requires.*component-level"):
+        _validate_worker_result(
+            _worker_result(targets=[system]),
+            frozenset({"known"}),
+            frozenset(),
+            required_instance_type="component-level",
+        )
+
+    component = system.model_copy(update={
+        "instance_type": "component-level",
+        "run_command": "/src/build/parser_component_fuzz",
+    })
+    result = _validate_worker_result(
+        _worker_result(targets=[component]),
+        frozenset({"known"}),
+        frozenset(),
+        required_instance_type="component-level",
+    )
+    assert result.target_proposals == [component]
+
+
+def test_pending_target_repair_and_supported_gap_reject_replay_only_retriage() -> None:
+    triage = TriageResult(
+        classification="unresolved",
+        description="Replay details were not assigned.",
+        evidence_ids=["known"],
+        uncertainty="Replay details were not assigned.",
+        priority_rationale="Await replay evidence.",
+        repair_intent="Replay the existing crash.",
+    )
+
+    with pytest.raises(WorkerValidationError, match="target repair.*system-level"):
+        _validate_worker_result(
+            _worker_result(triage=[triage]),
+            frozenset({"known"}),
+            frozenset(),
+            required_instance_type="system-level",
+            repair_required=True,
+            finalized_finding=True,
+        )
+
+
+def test_manager_prompt_prioritises_failed_target_repair_over_finalized_finding_retriage() -> None:
+    prompt = MANAGER_PROMPT.casefold()
+
+    assert "unresolved action failure" in prompt
+    assert "required_next_instance_type" in prompt
+    assert "must outrank" in prompt
+    assert "do not re-triage" in prompt
+
+
 def test_target_validator_normalizes_a_descriptive_suffix_to_the_authoritative_tool_type() -> None:
     proposal = _target_proposal("known").model_copy(update={"instance_type": "system-level executable"})
 
     validated = _validate_target(proposal, frozenset({"known"}), "system-level")
 
     assert validated.instance_type == "system-level"
+
+
+def test_target_validator_requires_an_existing_contained_repository_seed(tmp_path: Path) -> None:
+    context = agent_context(tmp_path)
+    values = _target_proposal("known").model_dump(mode="json")
+    values["seeds"] = [{"path": "tests/missing.input", "provenance": "repository"}]
+    proposal = TargetProposal.model_validate(values)
+
+    with pytest.raises(WorkerValidationError, match="repository seed was not found"):
+        _validate_target(proposal, frozenset({"known"}), "system-level", context=context)
+
+
+def test_target_validator_rejects_prose_as_a_seed_path_before_preparation(tmp_path: Path) -> None:
+    context = agent_context(tmp_path)
+    values = _target_proposal("known").model_dump(mode="json")
+    values["seeds"] = [{"path": "FRAME:` prefix.", "provenance": "Evidence correction"}]
+    proposal = TargetProposal.model_validate(values)
+
+    with pytest.raises(WorkerValidationError, match="invalid seed path"):
+        _validate_target(proposal, frozenset({"known"}), "system-level", context=context)
+
+
+def test_target_validator_verifies_optional_repository_seed_hash(tmp_path: Path) -> None:
+    context = agent_context(tmp_path)
+    values = _target_proposal("known").model_dump(mode="json")
+    values["seeds"] = [{
+        "path": "tests/minimal.txt", "provenance": "repository", "sha256": "0" * 64,
+    }]
+    proposal = TargetProposal.model_validate(values)
+
+    with pytest.raises(WorkerValidationError, match="repository seed hash does not match"):
+        _validate_target(proposal, frozenset({"known"}), "system-level", context=context)
+
+
+def test_generated_seed_must_be_explicitly_declared_published_and_sha_bound(tmp_path: Path) -> None:
+    context = agent_context(tmp_path)
+    generated = write_asset_file(context, "seeds/generated.txt", "generated seed", None)
+    base = _target_proposal("known").model_dump(mode="json")
+    base["generated_asset_intents"] = [{
+        "relative_path": "seeds/generated.txt", "purpose": "deterministic generated seed",
+    }]
+    base["seeds"] = [{
+        "path": "seeds/generated.txt", "provenance": "generated asset",
+    }]
+
+    with pytest.raises(WorkerValidationError, match="generated seed requires an exact sha256"):
+        _validate_target(
+            TargetProposal.model_validate(base), frozenset({"known"}), "system-level",
+            context=context,
+        )
+
+    base["seeds"][0]["sha256"] = generated["sha256"]
+    validated = _validate_target(
+        TargetProposal.model_validate(base), frozenset({"known"}), "system-level",
+        context=context,
+    )
+
+    assert validated.seeds[0].sha256 == generated["sha256"]
+
+
+def test_cmake_configured_target_run_path_must_use_the_canonical_build_output() -> None:
+    proposal = _target_proposal("known").model_copy(update={
+        "build_command": (
+            "cmake -S /src -B /opt/bigeye/build && "
+            "cmake --build /opt/bigeye/build --target parser"
+        ),
+        "run_command": "/opt/bigeye/parser",
+    })
+
+    with pytest.raises(WorkerValidationError, match=r"CMake executable.*/opt/bigeye/build"):
+        _validate_target(proposal, frozenset({"known"}), "system-level")
+
+
+def test_direct_compiler_target_run_path_must_match_the_declared_output() -> None:
+    proposal = _target_proposal("known").model_copy(update={
+        "build_command": "clang /src/parser.c -o /opt/bigeye/parser",
+        "run_command": "/opt/bigeye/other-parser",
+    })
+
+    with pytest.raises(WorkerValidationError, match="run executable must match.*compiler output"):
+        _validate_target(proposal, frozenset({"known"}), "system-level")
 
 
 @pytest.mark.parametrize(
@@ -650,6 +833,14 @@ def test_target_prompts_require_shell_free_run_commands_and_afl_input_modes() ->
     assert "application-owned" in system
     component = FUZZING_WORKER_PROMPT.casefold()
     assert "must not include @@ or {input}" in component
+    assert "existing relative project or generated-asset path" in component
+    assert "never a label, prefix, explanation, or other prose" in component
+    assert "fixed application argv" in component
+    assert "/opt/bigeye/build/<cmake-target>" in component
+    assert "c libfuzzer harness with `clang`" in component
+    assert "extern \"c\" int llvmfuzzertestoneinput" in component
+    assert "c libfuzzer harness use `clang`" in TARGET_REPAIR_ASSIGNMENT.casefold()
+    assert "extern \"c\"" in TARGET_REPAIR_ASSIGNMENT.casefold()
 
 
 @pytest.mark.parametrize(
@@ -658,8 +849,12 @@ def test_target_prompts_require_shell_free_run_commands_and_afl_input_modes() ->
         {"evidence_ids": ["unknown"]},
         {"run_command": "/opt/bigeye/parser < @@"},
         {"run_command": "/opt/bigeye/parser {input}"},
+        {"build_command": "/usr/bin/clang harness.c -o /opt/bigeye/parser"},
     ],
-    ids=["unknown-evidence", "shell-run-command", "invalid-input-placeholder"],
+    ids=[
+        "unknown-evidence", "shell-run-command", "invalid-input-placeholder",
+        "absolute-compiler-path",
+    ],
 )
 def test_luna_specialist_retries_once_with_terra_only_after_validation_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, luna_update: dict[str, object],
@@ -735,6 +930,109 @@ def test_luna_specialist_retries_once_with_terra_only_after_validation_failure(
     assert all(event["parent_tool_arguments"]["assignment"] == "prepare parser" for event in nested)
 
 
+def test_run14_malformed_third_seed_rejects_luna_before_action_and_accepts_terra(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agents import Runner
+
+    context = agent_context(tmp_path)
+    (context.repository_root / "seeds").mkdir()
+    (context.repository_root / "seeds" / "framed.input").write_bytes(b"FRAME:A:abcdefghijklmnop")
+    (context.repository_root / "seeds" / "plain.input").write_bytes(b"A:abcdefghijklmnop")
+    collection = CampaignReviewCollection()
+    calls: list[str] = []
+    operation_ids: dict[str, str] = {}
+
+    def proposal(model: str) -> TargetProposal:
+        seeds = [
+            {"path": "seeds/framed.input", "provenance": "repository"},
+            {"path": "seeds/plain.input", "provenance": "repository"},
+        ]
+        if model == "gpt-5.6-luna":
+            seeds.append({"path": "FRAME:` prefix.", "provenance": "Evidence correction"})
+        return TargetProposal(
+            target_name="decoder_cli_framed_file", instance_type="system-level",
+            byte_path="file input through --file @@ and --framed",
+            expected_project_reach="decoder_cli and decoder_decode",
+            build_command=(
+                "cmake -S /src -B /opt/bigeye/build && "
+                "cmake --build /opt/bigeye/build --target decoder_cli"
+            ),
+            run_command="/opt/bigeye/build/decoder_cli --file @@ --framed",
+            seeds=seeds, configuration="AFL++ file mode", sanitizer_plan="ASan and UBSan",
+            generated_asset_intents=[],
+            probe_assertions=["The fixed argv accepts every retained seed."],
+            evidence_ids=["known"], uncertainty="The deterministic probe has not run.",
+        )
+
+    class Result:
+        interruptions = []
+        new_items = []
+        raw_responses = []
+        input = "nested"
+
+        def __init__(self, agent, outer_context):
+            self.final_output = _worker_result(
+                targets=[proposal(agent.model)],
+                operation_request_ids=[operation_ids[agent.model]],
+            )
+            self.agent_tool_invocation = SimpleNamespace(
+                tool_name=outer_context.tool_name,
+                tool_call_id=outer_context.tool_call_id,
+                tool_arguments=outer_context.tool_arguments,
+            )
+
+        def to_input_list(self):
+            return []
+
+    async def runner(starting_agent=None, context=None, **_kwargs):
+        calls.append(starting_agent.model)
+        operation = next(
+            item for item in starting_agent.tools if item.name == "request_contained_operation"
+        )
+        arguments = (
+            '{"operation":"probe","asset_paths":[],"assertions":'
+            '["Build and probe the fixed decoder CLI argv."]}'
+        )
+        retained = await operation.on_invoke_tool(ToolContext(
+            context.context, tool_name=operation.name,
+            tool_call_id="operation-" + starting_agent.model,
+            tool_arguments=arguments, tool_input=context.tool_input,
+            run_config=RunConfig(), agent=starting_agent,
+        ), arguments)
+        operation_ids[starting_agent.model] = retained["request_id"]
+        return Result(starting_agent, context)
+
+    monkeypatch.setattr(Runner, "run", runner)
+    tool = dispatch_tools(
+        context, evidence_ids={"known"}, collection=collection,
+    )[0]
+    arguments = '{"assignment":"prepare decoder CLI","evidence_ids":["known"]}'
+
+    output = asyncio.run(tool.on_invoke_tool(ToolContext(
+        context, tool_name=tool.name, tool_call_id="call-run14-seed",
+        tool_arguments=arguments, run_config=RunConfig(),
+    ), arguments))
+
+    assert calls == ["gpt-5.6-luna", "gpt-5.6-terra"]
+    assert [value["path"] for value in output["result"]["target_proposals"][0]["seeds"]] == [
+        "seeds/framed.input", "seeds/plain.input",
+    ]
+    assert output["pipeline_action_ids"] == [
+        collection.pipeline_action_id(operation_ids["gpt-5.6-terra"]),
+    ]
+    review = collection.result(CampaignDecision(
+        decision="select corrected decoder CLI",
+        motivation="Terra corrected the invalid Luna seed reference.", evidence_ids=["known"],
+        bounded_actions=output["pipeline_action_ids"], next_review_delay_seconds=180,
+        next_review_reason="Review the deterministic decoder CLI build and probe.",
+        uncertainty="The corrected action has not executed.",
+    ))
+    assert {record.model for record in review.known_operation_requests} == {"gpt-5.6-terra"}
+    assert {record.model for record in review.quarantined_operation_requests} == {"gpt-5.6-luna"}
+    assert review.selected_pipeline_operations[0].target_proposal.model == "gpt-5.6-terra"
+
+
 def test_luna_explicit_bounded_difficulty_gets_one_terra_correction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -805,12 +1103,13 @@ def test_retry_quarantines_luna_requests_and_returns_only_terra_invocation_ids(
                 "unknown" if agent.model == "gpt-5.6-luna" else "known"
             )
             self.final_output = _worker_result(
-                targets=[proposal.model_copy(update={
-                    "target_name": (
-                        "failed-luna-target" if agent.model == "gpt-5.6-luna"
-                        else "validated-terra-target"
-                    ),
-                })],
+                    targets=[proposal.model_copy(update={
+                        "target_name": (
+                            "failed-luna-target" if agent.model == "gpt-5.6-luna"
+                            else "validated-terra-target"
+                        ),
+                        "generated_asset_intents": [],
+                    })],
                 operation_request_ids=[operations_by_model[agent.model]],
             )
             self.agent_tool_invocation = (
@@ -1255,10 +1554,12 @@ def test_parallel_agent_tool_results_and_requests_never_cross_invocations(
                 )
             else:
                 self.final_output = _worker_result(
-                    targets=[_target_proposal("known").model_copy(update={
-                        "target_name": "parser-" + invocation.tool_call_id,
-                        "byte_path": "stdin -> parser -> " + invocation.tool_call_id,
-                    })],
+                        targets=[_target_proposal("known").model_copy(update={
+                            "target_name": "parser-" + invocation.tool_call_id,
+                                "byte_path": "stdin -> parser -> " + invocation.tool_call_id,
+                                "run_command": "/src/build/parser --mode=" + invocation.tool_call_id,
+                                "generated_asset_intents": [],
+                            })],
                     operation_request_ids=[operation_request_id],
                 )
             self.agent_tool_invocation = SimpleNamespace(
@@ -1302,7 +1603,8 @@ def test_parallel_agent_tool_results_and_requests_never_cross_invocations(
 
     first, second, triage = asyncio.run(scenario())
 
-    assert first["target_result_ids"] != second["target_result_ids"]
+    assert first["target_result_ids"] == second["target_result_ids"] == []
+    assert first["pipeline_action_ids"] != second["pipeline_action_ids"]
     assert first["result"]["target_proposals"][0]["target_name"] == "parser-call-a"
     assert second["result"]["target_proposals"][0]["target_name"] == "parser-call-b"
     assert (
@@ -1317,19 +1619,24 @@ def test_parallel_agent_tool_results_and_requests_never_cross_invocations(
     assert set(triage_result) == set(TriageResult.model_fields)
     decision = CampaignDecision(
         decision="select first", motivation="first proposal", evidence_ids=["known"],
-        bounded_actions=first["target_result_ids"],
+        bounded_actions=first["pipeline_action_ids"],
         next_review_delay_seconds=900, next_review_reason="Recheck after the probe", uncertainty="not probed",
     )
     review = collection.result(decision)
-    assert {record.tool_call_id for record in review.known_target_proposals} == {"call-a", "call-b"}
+    assert review.known_target_proposals == ()
+    assert {
+        record.target_proposal.tool_call_id for record in review.known_pipeline_operations
+        if record.target_proposal is not None
+    } == {"call-a", "call-b"}
     assert {record.tool_call_id for record in review.known_triage_results} == {"call-triage"}
     assert {record.tool_call_id for record in review.known_operation_requests} == {
         "call-a", "call-b",
     }
     assert len({record.request_id for record in review.known_operation_requests}) == 2
     assert {record.actionable for record in review.known_operation_requests} == {False}
-    assert {record.result_id for record in review.selected_target_proposals} == {
-        first["target_result_ids"][0]
+    assert review.selected_target_proposals == ()
+    assert {record.action_id for record in review.selected_pipeline_operations} == {
+        first["pipeline_action_ids"][0]
     }
     assert review.selected_operation_requests == ()
 
@@ -1678,6 +1985,109 @@ def test_review_collection_retains_typed_worker_results_and_operation_requests(t
             ),
             frozenset({"known"}), collection.actionable_ids(),
         )
+
+
+def test_pipeline_binding_uses_exact_unique_assets_not_descriptive_assertion_wording_or_order() -> None:
+    collection = CampaignReviewCollection()
+    invocation = WorkerInvocation(
+        worker_assignment="prepare a component target", tool_call_id="call-order", attempt=1,
+        model="gpt-5.6-luna",
+    )
+    proposal = _target_proposal("known").model_copy(update={
+        "instance_type": "component-level",
+        "generated_asset_intents": [
+            GeneratedAssetIntent(relative_path="decoder_fuzz.c", purpose="component harness"),
+            GeneratedAssetIntent(relative_path="decoder.dict", purpose="component dictionary"),
+        ],
+    })
+    collection.record_worker_outcome(invocation, proposal)
+    request = {
+        "operation": "build",
+        "asset_paths": ["decoder.dict", "decoder_fuzz.c"],
+        "assertions": ["Build the exact generated component target."],
+        "executed": False,
+        "provenance": "agent_request",
+        "trusted_instructions": False,
+    }
+    operation = collection.record_operation(
+        invocation,
+        request,
+        project_id=4,
+        project_commit_sha="a" * 40,
+        draft_sha256s=(("decoder.dict", "b" * 64), ("decoder_fuzz.c", "c" * 64)),
+    )
+
+    collection.complete_attempt(invocation, accepted=True)
+
+    promoted = collection.pipeline_operation(operation.request_id)
+    assert promoted.target_proposal is not None
+    assert promoted.asset_paths == ("decoder.dict", "decoder_fuzz.c")
+
+
+@pytest.mark.parametrize("asset_paths", [
+    ("decoder_fuzz.c",),
+    ("decoder_fuzz.c", "decoder.dict", "extra.cfg"),
+    ("decoder_fuzz.c", "decoder_fuzz.c"),
+])
+def test_pipeline_binding_rejects_missing_extra_or_duplicate_generated_assets(
+    asset_paths: tuple[str, ...],
+) -> None:
+    collection = CampaignReviewCollection()
+    invocation = WorkerInvocation(
+        worker_assignment="prepare a component target", tool_call_id="call-assets", attempt=1,
+        model="gpt-5.6-luna",
+    )
+    proposal = _target_proposal("known").model_copy(update={
+        "instance_type": "component-level",
+        "generated_asset_intents": [
+            GeneratedAssetIntent(relative_path="decoder_fuzz.c", purpose="component harness"),
+            GeneratedAssetIntent(relative_path="decoder.dict", purpose="component dictionary"),
+        ],
+    })
+    collection.record_worker_outcome(invocation, proposal)
+    request = {
+        "operation": "build",
+        "asset_paths": list(asset_paths),
+        "assertions": ["Build the exact generated component target."],
+        "executed": False,
+        "provenance": "agent_request",
+        "trusted_instructions": False,
+    }
+    collection.record_operation(
+        invocation,
+        request,
+        project_id=4,
+        project_commit_sha="a" * 40,
+        draft_sha256s=tuple((path, "b" * 64) for path in asset_paths),
+    )
+
+    with pytest.raises(ValueError, match="must bind one exact target proposal"):
+        collection.complete_attempt(invocation, accepted=True)
+
+
+@pytest.mark.parametrize("reserved", ["target-build.sh", "coverage-build.sh"])
+def test_worker_cannot_claim_bigeye_owned_generated_script_names(
+    tmp_path: Path, reserved: str,
+) -> None:
+    context = agent_context(tmp_path)
+    proposal = _target_proposal("known").model_copy(update={
+        "generated_asset_intents": [GeneratedAssetIntent(
+            relative_path=reserved,
+            purpose="replace the service-owned build script",
+        )],
+    })
+
+    with pytest.raises(WorkerValidationError, match="unsafe generated asset intent"):
+        _validate_target(proposal, frozenset({"known"}), "system-level", context=context)
+    with pytest.raises(GeneratedAssetError, match="reserved"):
+        write_asset_file(context, reserved, "#!/bin/sh\n", None)
+
+
+def test_worker_prompt_reserves_service_owned_build_script_names() -> None:
+    prompt = FUZZING_WORKER_PROMPT.casefold()
+    assert "target-build.sh" in prompt
+    assert "coverage-build.sh" in prompt
+    assert "bigeye-owned" in prompt
 
 
 def test_manager_normalizes_only_selected_action_ids_out_of_factual_evidence() -> None:

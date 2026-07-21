@@ -34,6 +34,7 @@ class ReproductionRun:
     command: tuple[str, ...]
     exit_code: int | None = None
     terminal_reason: str | None = None
+    sanitizer_crash_observed: bool = False
 
 
 class ReproductionRegistry:
@@ -151,7 +152,11 @@ class ReproductionRegistry:
             outcome = await self._reproducer.execute(
                 prepared, lambda event, data: self._emit(key, event, data),
             )
-            await self._finish(key, "completed", outcome.exit_code, outcome.terminal_reason)
+            phase = "timed_out" if getattr(outcome, "timed_out", False) else "completed"
+            await self._finish(
+                key, phase, outcome.exit_code, outcome.terminal_reason,
+                sanitizer_crash_observed=getattr(outcome, "sanitizer_crash_observed", False),
+            )
         except asyncio.CancelledError:
             await self._finish(key, "interrupted", None, "reproduction cancelled")
             raise
@@ -171,11 +176,15 @@ class ReproductionRegistry:
                 self._active_findings.remove(finding_key)
                 self._reserved -= 1
 
-    async def _finish(self, key, phase: str, exit_code: int | None, reason: str) -> None:
+    async def _finish(
+        self, key, phase: str, exit_code: int | None, reason: str, *,
+        sanitizer_crash_observed: bool = False,
+    ) -> None:
         current = self._runs[key]
         run = replace(
             current, phase=phase, completed_at=datetime.now(UTC),
             exit_code=exit_code, terminal_reason=reason,
+            sanitizer_crash_observed=sanitizer_crash_observed,
         )
         self._runs[key] = run
         data = self._view(run)
@@ -224,6 +233,7 @@ class ReproductionRegistry:
             "completed_at": None if run.completed_at is None else run.completed_at.isoformat().replace("+00:00", "Z"),
             "image_id": run.image_id, "command": list(run.command),
             "exit_code": run.exit_code, "terminal_reason": run.terminal_reason,
+            "sanitizer_crash_observed": run.sanitizer_crash_observed,
         }
 
     @staticmethod
@@ -240,6 +250,7 @@ class ReproductionRegistry:
             run_root = events.parent
             if run_root.is_symlink() or (run_root / "final.json").exists() or _RUN_ID.fullmatch(run_root.name) is None:
                 continue
+            attempted_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
             try:
                 project_id = int(events.parents[4].name)
                 finding_id = int(events.parents[2].name)
@@ -248,15 +259,29 @@ class ReproductionRegistry:
                     raise ValueError("reproduction container identity is unavailable")
                 identity = json.loads(identity_path.read_text(encoding="utf-8"))
                 self._reproducer.reconcile_orphan(identity)
-                reason = "backend restarted before reproduction completed"
             except Exception:
-                reason = "backend restarted; container cleanup could not be verified"
+                try:
+                    self._atomic_json(run_root / "cleanup.json", {
+                        "phase": "cleanup_pending",
+                        "verified": False,
+                        "attempted_at": attempted_at,
+                        "reason": "backend restarted; container cleanup could not be verified",
+                    })
+                except (OSError, ValueError):
+                    pass
+                continue
             try:
+                self._atomic_json(run_root / "cleanup.json", {
+                    "phase": "cleanup_verified",
+                    "verified": True,
+                    "attempted_at": attempted_at,
+                })
                 data = {
                     "run_id": run_root.name, "phase": "interrupted", "started_at": None,
                     "completed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                     "image_id": None, "command": [], "exit_code": None,
-                    "terminal_reason": reason,
+                    "terminal_reason": "backend restarted before reproduction completed",
+                    "sanitizer_crash_observed": False,
                 }
                 with events.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps({"event": "reproduction", "data": data}, sort_keys=True) + "\n")

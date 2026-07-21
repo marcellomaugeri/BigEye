@@ -18,6 +18,7 @@ from backend.fuzzing.campaigns.probe import (
     ProbeAcceptance,
     ProbeEvidence,
     ProbeInvocation,
+    ProbeInputExecutionFailed,
     ProbePolicy,
 )
 from backend.fuzzing.docker.image_builder import (
@@ -42,6 +43,10 @@ class DeterministicPreparationError(ValueError):
 
     target_asset_id: int | None = None
 
+    def __init__(self, message: str, failure_detail: Mapping[str, object] | None = None):
+        super().__init__(message)
+        self.failure_detail = MappingProxyType(dict(failure_detail or {}))
+
 
 class ProbeRejected(DeterministicPreparationError):
     """A complete supervised probe was rejected while retaining its evidence."""
@@ -63,8 +68,9 @@ class TargetPreparationFailed(DeterministicPreparationError):
         retained_target: "PreparedTarget | None",
         probe_evidence: ProbeEvidence | None = None,
         target_asset_id: int | None = None,
+        failure_detail: Mapping[str, object] | None = None,
     ):
-        super().__init__(message)
+        super().__init__(message, failure_detail)
         self.agent_attempts = agent_attempts
         self.retained_target = retained_target
         self.probe_evidence = probe_evidence
@@ -362,6 +368,7 @@ class TargetPreparationService:
                     str(error), agent_attempts=tuple(attempts), retained_target=retained,
                     probe_evidence=getattr(error, "evidence", None),
                     target_asset_id=getattr(error, "target_asset_id", None),
+                    failure_detail=getattr(error, "failure_detail", None),
                 ) from error
             self._validated[self._target_key(project, candidate)] = prepared
             await self._record_activity(
@@ -418,26 +425,41 @@ class TargetPreparationService:
                 ("asset", project.id, asset.id) for asset in assets.values()
             )
             async with self._locks.acquire_many(asset_lock_keys):
-                target_manifest = await self._run_layer(
-                    self._target_layers.prepare,
-                    project,
-                    project_manifest,
-                    assets["target"],
-                    assets["configuration"],
-                    self._sink,
-                    assets.get("fuzz_patch"),
+                target_log: list[str] = []
+                try:
+                    target_manifest = await self._run_layer(
+                        self._target_layers.prepare,
+                        project,
+                        project_manifest,
+                        assets["target"],
+                        assets["configuration"],
+                        self._capture_sink(target_log),
+                        assets.get("fuzz_patch"),
+                    )
+                except DeterministicPreparationError as error:
+                    self._annotate_failure(error, "target-build", proposal, target_log)
+                    raise
+                coverage_log: list[str] = []
+                coverage_input = (
+                    assets["target"]
+                    if proposal.instance_type == "component-level"
+                    else assets["coverage_adapter"]
                 )
-                coverage_manifest = await self._run_layer(
-                    self._coverage_layers.prepare,
-                    project,
-                    project_manifest,
-                    assets["coverage_adapter"],
-                    assets["coverage_configuration"],
-                    self._sink,
-                    target_asset_id=assets["target"].id,
-                    configuration_asset_id=assets["configuration"].id,
-                    coverage_asset_id=assets["coverage_adapter"].id,
-                )
+                try:
+                    coverage_manifest = await self._run_layer(
+                        self._coverage_layers.prepare,
+                        project,
+                        project_manifest,
+                        coverage_input,
+                        assets["coverage_configuration"],
+                        self._capture_sink(coverage_log),
+                        target_asset_id=assets["target"].id,
+                        configuration_asset_id=assets["configuration"].id,
+                        coverage_asset_id=coverage_input.id,
+                    )
+                except DeterministicPreparationError as error:
+                    self._annotate_failure(error, "coverage-build", proposal, coverage_log)
+                    raise
                 self._validate_manifest(target_manifest, "target")
                 self._validate_manifest(coverage_manifest, "coverage")
                 target_image_id = self._inspect_image(target_manifest.tag)
@@ -459,6 +481,10 @@ class TargetPreparationService:
                 acceptance = ProbePolicy.accept(evidence)
                 if not acceptance.accepted:
                     raise ProbeRejected(acceptance.reason, evidence)
+                accepted_invocations = tuple(
+                    invocation for invocation in plan.probe_invocations
+                    if invocation.name not in evidence.rejected_input_names
+                )
                 return PreparedTarget(
                     project.id,
                     project.commit_sha,
@@ -469,7 +495,7 @@ class TargetPreparationService:
                     target_image_id,
                     coverage_image_id,
                     built.assets,
-                    plan.probe_invocations,
+                    accepted_invocations,
                     evidence,
                     acceptance,
                     attempts,
@@ -480,7 +506,50 @@ class TargetPreparationService:
                 error.target_asset_id = target_asset_id
             raise
         except ValueError as error:
-            raise DeterministicPreparationError(str(error)) from error
+            detail = None
+            if isinstance(error, ProbeInputExecutionFailed):
+                detail = {
+                    "phase": error.phase,
+                    "command": list(error.invocation.command),
+                    "exit_code": None,
+                    "stderr": str(error)[:2_000],
+                    "failing_seed": error.invocation.name.removeprefix("seed:"),
+                    "testcase_sha256": error.invocation.testcase_sha256,
+                }
+            raise DeterministicPreparationError(str(error), detail) from error
+
+    def _capture_sink(self, captured: list[str]):
+        def sink(text: str) -> None:
+            self._sink(text)
+            captured.append(str(text))
+            total = sum(len(value) for value in captured)
+            while captured and total > 8_192:
+                total -= len(captured.pop(0))
+        return sink
+
+    @staticmethod
+    def _annotate_failure(
+        error: DeterministicPreparationError, phase: str,
+        proposal: TargetProposal, captured: list[str],
+    ) -> None:
+        inherited = dict(getattr(error, "failure_detail", {}))
+        detail = {
+            **inherited,
+            "phase": phase,
+            "command": proposal.build_command[:4_096],
+            "exit_code": inherited.get("exit_code"),
+            "stderr": "".join(captured)[-8_192:],
+            "generated_path_mapping": [
+                {
+                    "relative_path": intent.relative_path,
+                    "container_path": (
+                        "/opt/bigeye/generated-assets/" + intent.relative_path
+                    ),
+                }
+                for intent in proposal.generated_asset_intents
+            ],
+        }
+        error.failure_detail = MappingProxyType(detail)
 
     @staticmethod
     async def _run_layer(method, *arguments, **keywords):
@@ -519,7 +588,12 @@ class TargetPreparationService:
                 cancelled.add_note(f"layer worker cleanup failed: {cleanup_error}")
             raise
         except ImageCompilationFailed as error:
-            raise DeterministicPreparationError(str(error)) from error
+            detail = getattr(error, "detail", None)
+            raise DeterministicPreparationError(str(error), {
+                "phase": getattr(detail, "phase", "image-build"),
+                "exit_code": getattr(detail, "exit_code", None),
+                "stderr": getattr(detail, "message", str(error))[:2_000],
+            }) from error
 
     async def _record_activity(
         self,
