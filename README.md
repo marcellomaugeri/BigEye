@@ -142,7 +142,6 @@ Clone this release branch and enter the repository:
 ```sh
 git clone https://github.com/marcellomaugeri/BigEye.git
 cd BigEye
-git switch codex/bigeye-backbone
 ```
 
 ### 1. Configure the local environment
