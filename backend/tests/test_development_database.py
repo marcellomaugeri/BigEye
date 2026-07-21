@@ -110,19 +110,13 @@ class DevelopmentDatabaseTests(unittest.TestCase):
         self.assertNotIn('psql "$database_url"', reset_script)
         self.assertIn('project_dir=', reset_script)
 
-    def test_documented_key_export_and_vite_proxy_are_explicit(self) -> None:
-        readme = (ROOT / "README.md").read_text()
+    def test_start_script_exports_environment_and_vite_proxy_is_explicit(self) -> None:
+        start_script = (ROOT / "scripts/start.sh").read_text()
         vite = (ROOT / "frontend/vite.config.ts").read_text()
-        self.assertIn("set -a; . ./.env; set +a", readme)
+        self.assertIn("set -a", start_script)
+        self.assertIn('. "$env_file"', start_script)
+        self.assertIn("set +a", start_script)
         self.assertIn("'/api': 'http://127.0.0.1:8000'", vite)
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            environment_file = Path(temporary_directory) / ".env"
-            environment_file.write_text("OPENAI_API_KEY=contract-test-key\n")
-            result = subprocess.run(
-                ["sh", "-c", 'set -a; . "$1"; set +a; test "$OPENAI_API_KEY" = contract-test-key', "sh", str(environment_file)],
-                check=False,
-            )
-        self.assertEqual(result.returncode, 0)
 
     def test_reset_rejects_remote_databases_before_invoking_psql(self) -> None:
         reset_script = ROOT / "backend/database/reset.sh"

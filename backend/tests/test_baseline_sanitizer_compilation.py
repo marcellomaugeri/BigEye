@@ -222,9 +222,13 @@ def test_same_content_preparation_source_is_idempotent_during_concurrent_creatio
     barrier = threading.Barrier(2)
     real_read = production_factory.read_asset_file
 
-    def read_together(selected_context, relative_path):
+    def read_together(selected_context, relative_path, *, _allow_reserved=False):
         try:
-            return real_read(selected_context, relative_path)
+            return real_read(
+                selected_context,
+                relative_path,
+                _allow_reserved=_allow_reserved,
+            )
         except GeneratedAssetError:
             barrier.wait(timeout=5)
             raise
@@ -303,7 +307,12 @@ def test_application_source_is_bound_before_asset_store_normalization(
                 selected = files[source_name]
                 path = selected[0] if isinstance(selected, tuple) else selected
                 relative_path = path.relative_to(context.generated_assets_root).as_posix()
-                existing = read_asset_file(context, relative_path)
+                allow_reserved = path.name.casefold() in {
+                    "target-build.sh", "coverage-build.sh",
+                }
+                existing = read_asset_file(
+                    context, relative_path, _allow_reserved=allow_reserved,
+                )
                 replacement = (
                     "#!/bin/sh\nset -eu\nexit 2\n"
                     if path.suffix == ".sh"
@@ -311,6 +320,7 @@ def test_application_source_is_bound_before_asset_store_normalization(
                 )
                 write_asset_file(
                     context, relative_path, replacement, existing["sha256"],
+                    _allow_reserved=allow_reserved,
                 )
             return super()._normalise(project_id, kind, files)
 

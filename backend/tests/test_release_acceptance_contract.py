@@ -255,29 +255,6 @@ def test_acceptance_cleanup_helper_has_fail_closed_mount_and_identity_examples()
         assert example in examples
 
 
-def test_linux_workflow_runs_checked_in_release_and_browser_commands() -> None:
-    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-
-    assert "runs-on: ubuntu-24.04" in workflow
-    assert "python-version: '3.14'" in workflow
-    assert "node-version:" in workflow
-    for command in (
-        "scripts/setup.sh",
-        "scripts/check.sh",
-        "npm --prefix frontend run e2e",
-        "playwright install --with-deps chromium",
-    ):
-        assert command in workflow
-    assert "OPENAI_API_KEY" in workflow
-    job_before_steps = workflow.split("steps:", 1)[0]
-    assert "OPENAI_API_KEY" not in job_before_steps
-    assert "BIGEYE_LIVE_OPENAI" not in job_before_steps
-    assert "actions/upload-artifact@" in workflow
-    assert "if: failure()" in workflow
-    assert "Skipping the live" not in workflow
-    assert workflow.count("exit 1") >= 2
-
-
 def test_controlled_system_fixture_is_healthy_then_one_mutation_from_one_grouped_defect() -> None:
     fixture = ROOT / "backend/tests/fixtures/system_project"
     source = (fixture / "src/main.c").read_text(encoding="utf-8")

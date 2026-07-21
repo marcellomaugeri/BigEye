@@ -100,6 +100,12 @@ BigEye uses agents only for work that needs judgement. Repository cloning, build
 - **OpenAI Agents SDK** provides typed agents, structured outputs, tracing and `Agent.as_tool()`. The manager never receives repository, shell or Docker access directly.
 - **Codex** accelerated the project from architecture to a working vertical slice: decomposing the agent and deterministic-service boundary, implementing the FastAPI/React product, developing the reusable Docker layers, building controlled fuzzing fixtures, writing tests, debugging complete campaign runs, and refining the UI and release documentation.
 
+### Development methodology
+
+BigEye was built in Codex with GPT-5.6. The first implementation pass ran continuously for 18 hours using GPT-5.6 Sol at Extra High reasoning effort, without pausing between implementation and review tasks. We used Jesse Vincent's [Superpowers](https://github.com/obra/superpowers) plugin to structure this work. [Writing Plans](https://github.com/obra/superpowers/blob/main/skills/writing-plans/SKILL.md) converted the approved design into explicit, file-specific implementation tasks. [Test-Driven Development](https://github.com/obra/superpowers/blob/main/skills/test-driven-development/SKILL.md) required each behaviour change to begin with a failing automated test, followed by only the code needed to make it pass and another test run before continuing. [Subagent-Driven Development](https://github.com/obra/superpowers/blob/main/skills/subagent-driven-development/SKILL.md) assigned each task to focused implementation and review agents, allowing development to proceed autonomously while preserving clear quality checks.
+
+Superpowers supplied the workflows, Codex supplied the development environment and multi-agent tools, and GPT-5.6 reasoned through and executed the work. These development skills are separate from BigEye's runtime agent architecture.
+
 Three decisions shaped the implementation:
 
 1. **Agents are decision-makers, not fuzzer processes.** Healthy fuzzers keep running without spending model tokens.
