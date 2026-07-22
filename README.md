@@ -37,7 +37,11 @@ The execution engine is secondary to the campaign objective. BigEye decides what
 
 ## Demo
 
-[Watch the BigEye demo on YouTube](https://youtu.be/tDa2Z2_gqNw)
+<p align="center">
+  <a href="https://youtu.be/tDa2Z2_gqNw">
+    <img src="docs/assets/demo-thumbnail.png" alt="Watch the BigEye demo on YouTube" width="654">
+  </a>
+</p>
 
 ## Getting started
 
